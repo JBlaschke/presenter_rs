@@ -22,6 +22,10 @@
 //! Everything is `Cache-Control: no-store` except vendored files (`max-age=3600`, they never
 //! change within one binary) and the event stream (`no-cache`, axum's SSE default).
 //! Unknown paths and unknown assets are `404 Not Found`.
+//!
+//! Both asset routes answer single byte-range requests (`206 Partial Content`, which media
+//! elements rely on; Safari plays no video without it), and a file-backed deck asset is
+//! streamed from disk rather than read into memory as a whole.
 
 use std::convert::Infallible;
 use std::future::{Future, IntoFuture};
@@ -31,7 +35,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -44,12 +48,13 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::assets::emit::SERVE_ASSET_PREFIX;
-use crate::assets::registry::AssetRegistry;
+use crate::assets::registry::{AssetData, AssetRegistry};
 use crate::error::{Error, Result};
 use crate::pipeline::Build;
 use crate::render::html::{SERVE_HELPER_PREFIX, SERVE_LIVE_RELOAD_JS, SERVE_THEME_CSS};
 use crate::render::{normalize_helper_path, resolve_helper_path};
 use crate::serve::events::{BuildEvent, ErrorPayload, Hello, Status};
+use crate::serve::files::{bytes_response, file_response, whole_response};
 use crate::theme::Theme;
 
 /// Capacity of the build-event channel (live-reload.md §4). A browser that falls further
@@ -186,8 +191,8 @@ pub fn router(state: Shared, events: broadcast::Sender<BuildEvent>) -> Router {
         .with_state(App { state, events })
 }
 
-/// Serves `router` on `listener` until ctrl-c, then shuts down gracefully (see
-/// [`serve_until`]).
+/// Serves `router` on `listener` until ctrl-c (SIGINT), then shuts down gracefully: exactly
+/// [`serve_until`] with ctrl-c as the shutdown signal.
 pub async fn serve(listener: TcpListener, router: Router) -> Result<()> {
     serve_until(listener, router, ctrl_c()).await
 }
@@ -300,24 +305,58 @@ async fn index(State(app): State<App>) -> Response {
 /// `GET /__presenter/theme.css`.
 async fn theme_css(State(app): State<App>) -> Response {
     let css = read(&app.state).theme_css.clone();
-    file_response(css.into_bytes(), "text/css", NO_STORE)
+    whole_response(css.into_bytes(), "text/css", NO_STORE)
 }
 
 /// `GET /__presenter/asset/{*path}` (axum percent-decodes `path`).
-async fn helper_asset(State(app): State<App>, Path(path): Path<String>) -> Response {
+async fn helper_asset(
+    State(app): State<App>,
+    Path(path): Path<String>,
+    request: HeaderMap,
+) -> Response {
     let theme = read(&app.state).theme.clone();
-    blocking(move || helper_asset_response(theme.as_ref(), &path)).await
+    blocking(move || helper_asset_response(theme.as_ref(), &path, &request)).await
 }
 
-/// `GET /__presenter/deck-asset/{id}`.
-async fn deck_asset(State(app): State<App>, Path(id): Path<String>) -> Response {
-    blocking(move || deck_asset_response(&app.state, &id)).await
+/// `GET /__presenter/deck-asset/{id}`: the asset's bytes (or the requested range of them)
+/// with its MIME type; 404 if the id is not registered or its file is gone.
+async fn deck_asset(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    request: HeaderMap,
+) -> Response {
+    // Only the registration is copied under the lock (a path, or the bytes of an in-memory
+    // asset); the file is read after the lock is released.
+    let asset = read(&app.state).assets.get(&id).cloned();
+    let Some(asset) = asset else {
+        return not_found(&format!("{SERVE_ASSET_PREFIX}{id}"));
+    };
+    match asset.data {
+        AssetData::Bytes(bytes) => bytes_response(bytes, &asset.mime, NO_STORE, &request),
+        AssetData::File(path) => {
+            match file_response(path.clone(), &asset.mime, NO_STORE, &request).await {
+                Ok(response) => response,
+                Err(err) if is_missing(&err) => {
+                    not_found(&Error::MissingAsset { path, span: None }.to_string())
+                }
+                Err(err) => server_error(&format!("{}: {err}", path.display())),
+            }
+        }
+    }
+}
+
+/// Whether `err` means that a file does not exist (as [`AssetRegistry::read`] decides).
+fn is_missing(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// `GET /__presenter/live-reload.js`.
 async fn live_reload_js() -> Response {
     blocking(|| match crate::vendor::get(LIVE_RELOAD_KEY) {
-        Some(bytes) => file_response(bytes.into_owned(), "text/javascript", NO_STORE),
+        Some(bytes) => whole_response(bytes.into_owned(), "text/javascript", NO_STORE),
         None => server_error(&format!("embedded {LIVE_RELOAD_KEY} is missing")),
     })
     .await
@@ -345,30 +384,47 @@ async fn state_json(State(app): State<App>) -> Response {
     ([(header::CACHE_CONTROL, NO_STORE)], Json(body)).into_response()
 }
 
-/// `GET /__presenter/events`: `hello` with the current build, then one `build` event per
-/// [`publish`]ed [`BuildEvent`]. A browser that lags behind skips the oldest events; the
-/// stream ends when the server shuts down.
+/// `GET /__presenter/events`: [`event_stream`] with a keep-alive every 15 s.
 async fn build_events(
     State(app): State<App>,
     shutdown: Option<Extension<ShutdownSignal>>,
 ) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    event_stream(&app, shutdown.map(|Extension(signal)| signal), KEEP_ALIVE)
+}
+
+/// `hello` with the current build, then one `build` event per [`publish`]ed [`BuildEvent`]
+/// ([`build_stream`]), and a keep-alive comment after `keep_alive` without an event. The
+/// stream ends when `shutdown` fires.
+fn event_stream(
+    app: &App,
+    shutdown: Option<ShutdownSignal>,
+    keep_alive: Duration,
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>> + use<>> {
     // Subscribe before reading the state, so that no build stored after `hello` is missed.
     // A build stored in between is reported twice (in `hello` and as an event); the client
     // then refreshes the page it already shows, which changes nothing.
     let receiver = app.events.subscribe();
     let hello = read(&app.state).hello();
-    let builds = BroadcastStream::new(receiver).filter_map(|item| match item {
-        Ok(event) => sse_event("build", &event),
+    let builds = build_stream(receiver).filter_map(|event| sse_event("build", &event));
+    let stream = tokio_stream::iter(sse_event("hello", &hello))
+        .chain(builds)
+        .map(Ok);
+    let stream = UntilShutdown::new(stream, shutdown);
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(keep_alive))
+}
+
+/// The build events `receiver` gets. A receiver that fell more than [`EVENT_CAPACITY`]
+/// events behind skips the oldest ones (logged) and goes on with the newest.
+fn build_stream(
+    receiver: broadcast::Receiver<BuildEvent>,
+) -> impl Stream<Item = BuildEvent> + Send + Unpin + 'static {
+    BroadcastStream::new(receiver).filter_map(|item| match item {
+        Ok(event) => Some(event),
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
             tracing::debug!("event stream lagged behind; {skipped} build event(s) skipped");
             None
         }
-    });
-    let stream = tokio_stream::iter(sse_event("hello", &hello))
-        .chain(builds)
-        .map(Ok);
-    let stream = UntilShutdown::new(stream, shutdown.map(|Extension(signal)| signal));
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
+    })
 }
 
 /// An SSE event named `name` with `data` as JSON; `None` (logged) if it cannot be encoded.
@@ -382,10 +438,10 @@ fn sse_event<T: Serialize>(name: &str, data: &T) -> Option<Event> {
     }
 }
 
-/// The response for helper path `path`: the file with its MIME type, 404 if there is none.
-/// Before any build succeeded there is no theme, and only `vendor/…` and `presenter/…`
-/// files exist.
-fn helper_asset_response(theme: Option<&Theme>, path: &str) -> Response {
+/// The response for helper path `path` to a request with `request` headers: the file (or
+/// the requested range of it) with its MIME type, 404 if there is none. Before any build
+/// succeeded there is no theme, and only `vendor/…` and `presenter/…` files exist.
+fn helper_asset_response(theme: Option<&Theme>, path: &str, request: &HeaderMap) -> Response {
     let found = match theme {
         Some(theme) => resolve_helper_path(theme, path),
         None => Ok(builtin_file(path)),
@@ -393,7 +449,8 @@ fn helper_asset_response(theme: Option<&Theme>, path: &str) -> Response {
     match found {
         Ok(Some((bytes, mime))) => {
             let vendor = normalize_helper_path(path).is_some_and(|key| key.starts_with("vendor/"));
-            file_response(bytes, &mime, if vendor { VENDOR_CACHE } else { NO_STORE })
+            let cache = if vendor { VENDOR_CACHE } else { NO_STORE };
+            bytes_response(bytes, &mime, cache, request)
         }
         Ok(None) => not_found(&format!("{SERVE_HELPER_PREFIX}{path}")),
         Err(err) => server_error(&err.to_string()),
@@ -411,20 +468,6 @@ fn builtin_file(path: &str) -> Option<(Vec<u8>, String)> {
     Some((bytes, mime.essence_str().to_string()))
 }
 
-/// The response for deck asset `id`: its bytes with its MIME type, 404 if the id is not
-/// registered or its file is gone.
-fn deck_asset_response(state: &Shared, id: &str) -> Response {
-    let state = read(state);
-    let Some(asset) = state.assets.get(id) else {
-        return not_found(&format!("{SERVE_ASSET_PREFIX}{id}"));
-    };
-    match state.assets.read(id) {
-        Ok(bytes) => file_response(bytes.into_owned(), &asset.mime, NO_STORE),
-        Err(err @ Error::MissingAsset { .. }) => not_found(&err.to_string()),
-        Err(err) => server_error(&err.to_string()),
-    }
-}
-
 /// Runs `f` (file reads) on the blocking pool.
 async fn blocking<F>(f: F) -> Response
 where
@@ -433,25 +476,6 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .unwrap_or_else(|err| server_error(&format!("request handler failed: {err}")))
-}
-
-/// A `200 OK` with `bytes`, `Content-Type: mime` (`; charset=utf-8` for text) and
-/// `Cache-Control: cache`.
-fn file_response(bytes: Vec<u8>, mime: &str, cache: &'static str) -> Response {
-    let text = mime.starts_with("text/") || matches!(mime, "application/javascript");
-    let content_type = if text {
-        format!("{mime}; charset=utf-8")
-    } else {
-        mime.to_string()
-    };
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, cache.to_string()),
-        ],
-        bytes,
-    )
-        .into_response()
 }
 
 /// `404 Not Found` naming `what`.
@@ -465,21 +489,23 @@ fn server_error(message: &str) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{message}\n")).into_response()
 }
 
-/// The inline style of the error overlay, as the client script sets it.
+/// The inline style of the error overlay, as the client script's `showOverlay` sets it.
 const OVERLAY_STYLE: &str = "position:fixed;top:1em;right:1em;max-width:50%;max-height:80vh;\
 overflow:auto;z-index:10000;background:#222;color:#eee;border-left:4px solid #e55;\
-padding:1em;font:13px monospace;white-space:pre-wrap";
+padding:1em;font:13px monospace;white-space:pre-wrap;cursor:pointer";
 
 /// The page `GET /` serves until a build succeeds: the client script (which reloads into
 /// the deck on the first good build) and, after a failed build, the error overlay
-/// pre-rendered with the same text the client would show.
+/// pre-rendered as the client's `showOverlay` renders it: same style, same text, hidden on
+/// click. (The client re-renders it from `hello`, with any field this page does not show.)
 fn fallback_page(error: Option<&ErrorPayload>) -> String {
     let (title, lead, overlay) = match error {
         Some(err) => (
             "presenter: build error",
             "The deck could not be built. Fix the error and save: this page reloads by itself.",
             format!(
-                "<div id=\"presenter-overlay\" style=\"{OVERLAY_STYLE}\">{}</div>\n",
+                "<div id=\"presenter-overlay\" style=\"{OVERLAY_STYLE}\" \
+onclick=\"this.style.display='none'\">{}</div>\n",
                 html_escape::encode_text(&overlay_text(err))
             ),
         ),
@@ -499,16 +525,27 @@ background:#fafafa;color:#222}}</style>\n</head>\n<body>\n<p>{lead}</p>\n{overla
     )
 }
 
-/// The overlay text of `err`, line by line as the client builds it: `build error (kind)`,
-/// the message, then `file:line` when the file is known.
+/// The overlay text of `err`, line by line as the client's `showOverlay` builds it:
+/// `build error (kind)`, the message, `file:line` when the file is known, then
+/// `(click to dismiss)`.
 fn overlay_text(err: &ErrorPayload) -> String {
-    let mut lines = vec![format!("build error ({})", err.kind), err.message.clone()];
-    if let Some(file) = &err.file {
+    let mut lines = vec![
+        match err.kind.as_str() {
+            "" => "build error".to_string(),
+            kind => format!("build error ({kind})"),
+        },
+        match err.message.as_str() {
+            "" => "unknown error".to_string(),
+            message => message.to_string(),
+        },
+    ];
+    if let Some(file) = err.file.as_deref().filter(|file| !file.is_empty()) {
         lines.push(match err.line {
-            Some(line) => format!("{file}:{line}"),
-            None => file.clone(),
+            Some(line) if line != 0 => format!("{file}:{line}"),
+            _ => file.to_string(),
         });
     }
+    lines.push("(click to dismiss)".to_string());
     lines.join("\n")
 }
 
@@ -585,25 +622,31 @@ mod tests {
         assert_eq!(read(&state).last_error, None);
     }
 
+    /// A parse error in `slides.md` at line 3, as an overlay payload.
+    fn parse_payload(message: &str) -> ErrorPayload {
+        ErrorPayload::from(&Error::Parse {
+            path: PathBuf::from("slides.md"),
+            line: Some(3),
+            message: message.into(),
+        })
+    }
+
     #[test]
     fn fallback_page_loads_the_client_and_shows_the_error() {
-        let err = ErrorPayload {
-            message: "slides.md:3 <unknown> & \"bad\"".into(),
-            file: Some("slides.md".into()),
-            line: Some(3),
-            kind: "parse".into(),
-        };
+        let err = parse_payload("<unknown> & \"bad\"");
         let page = fallback_page(Some(&err));
         assert!(page.starts_with("<!DOCTYPE html>"), "{page}");
         assert!(page.contains(r#"<script src="/__presenter/live-reload.js"></script>"#));
+        // The client's overlay: its style (a pointer cursor too), hidden on click.
+        assert!(page.contains(&format!(
+            "<div id=\"presenter-overlay\" style=\"{OVERLAY_STYLE}\" \
+             onclick=\"this.style.display='none'\">"
+        )));
+        assert!(OVERLAY_STYLE.ends_with(";white-space:pre-wrap;cursor:pointer"));
         assert!(
             page.contains(
-                "<div id=\"presenter-overlay\" style=\"position:fixed;top:1em;right:1em;"
-            )
-        );
-        assert!(
-            page.contains(
-                "build error (parse)\nslides.md:3 &lt;unknown&gt; &amp; \"bad\"\nslides.md:3</div>"
+                "build error (parse)\nslides.md:3: &lt;unknown&gt; &amp; \"bad\"\nslides.md:3\n\
+                 (click to dismiss)</div>"
             ),
             "{page}"
         );
@@ -616,18 +659,33 @@ mod tests {
 
     #[test]
     fn overlay_text_leaves_out_an_unknown_location() {
-        let mut err = ErrorPayload {
-            message: "m".into(),
-            file: None,
-            line: Some(4),
-            kind: "missing-asset".into(),
-        };
-        assert_eq!(overlay_text(&err), "build error (missing-asset)\nm");
+        let mut err = ErrorPayload::from(&Error::MissingAsset {
+            path: PathBuf::from("/deck/x.png"),
+            span: Some(crate::ir::SourceSpan {
+                start_line: 4,
+                end_line: 4,
+                cell: None,
+            }),
+        });
+        assert_eq!((err.file.as_deref(), err.line), (None, Some(4)));
+        assert_eq!(
+            overlay_text(&err),
+            "build error (missing-asset)\nasset not found: /deck/x.png\n(click to dismiss)"
+        );
         err.file = Some("styles/theme.css".into());
         err.line = None;
         assert_eq!(
             overlay_text(&err),
-            "build error (missing-asset)\nm\nstyles/theme.css"
+            "build error (missing-asset)\nasset not found: /deck/x.png\nstyles/theme.css\n\
+             (click to dismiss)"
+        );
+        // Empty fields read as the client reads them.
+        err.kind.clear();
+        err.message.clear();
+        err.file = None;
+        assert_eq!(
+            overlay_text(&err),
+            "build error\nunknown error\n(click to dismiss)"
         );
     }
 
@@ -641,7 +699,7 @@ mod tests {
         assert!(builtin_file("themes/default/theme.toml").is_none());
         assert!(builtin_file("vendor/../themes/default/theme.toml").is_none());
         assert!(builtin_file("../vendor/reveal/dist/reveal.css").is_none());
-        let response = helper_asset_response(None, "logo.png");
+        let response = helper_asset_response(None, "logo.png", &HeaderMap::new());
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -655,7 +713,8 @@ mod tests {
                 .map(str::to_string)
         };
         let theme = minimal_build(1).theme;
-        let vendor = helper_asset_response(Some(&theme), "vendor/reveal/dist/reveal.js");
+        let none = HeaderMap::new();
+        let vendor = helper_asset_response(Some(&theme), "vendor/reveal/dist/reveal.js", &none);
         assert_eq!(vendor.status(), StatusCode::OK);
         assert_eq!(
             header_of(&vendor, header::CONTENT_TYPE).as_deref(),
@@ -665,13 +724,13 @@ mod tests {
             header_of(&vendor, header::CACHE_CONTROL).as_deref(),
             Some(VENDOR_CACHE)
         );
-        let own = helper_asset_response(Some(&theme), "@default/theme.toml");
+        let own = helper_asset_response(Some(&theme), "@default/theme.toml", &none);
         assert_eq!(own.status(), StatusCode::OK);
         assert_eq!(
             header_of(&own, header::CACHE_CONTROL).as_deref(),
             Some(NO_STORE)
         );
-        let png = file_response(vec![1, 2], "image/png", NO_STORE);
+        let png = whole_response(vec![1, 2], "image/png", NO_STORE);
         assert_eq!(
             header_of(&png, header::CONTENT_TYPE).as_deref(),
             Some("image/png")
@@ -695,6 +754,68 @@ mod tests {
         assert_eq!(open.next().await, Some(1));
         assert_eq!(open.next().await, Some(2));
         assert_eq!(open.next().await, None);
+    }
+
+    fn ok_event(build_id: u64) -> BuildEvent {
+        BuildEvent::Ok {
+            build_id,
+            kind: ChangeKind::Content,
+            duration_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lagging_browser_skips_the_oldest_events_and_keeps_going() {
+        let events = event_channel();
+        let mut stream = build_stream(events.subscribe());
+        let total = EVENT_CAPACITY as u64 + 6;
+        for id in 1..=total {
+            publish(&events, ok_event(id));
+        }
+        // The channel keeps the newest EVENT_CAPACITY events; the 6 oldest are skipped.
+        for id in 7..=total {
+            let event = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
+            assert_eq!(event.unwrap().map(|e| e.build_id()), Some(id));
+        }
+        // And the stream goes on.
+        publish(&events, ok_event(total + 1));
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
+        assert_eq!(event.unwrap(), Some(ok_event(total + 1)));
+        let quiet = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+        assert!(quiet.is_err(), "no more events");
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_sends_hello_keep_alives_and_builds() {
+        let app = App {
+            state: shared(),
+            events: event_channel(),
+        };
+        apply_error(&app.state, &Error::Config("bad".into()));
+        let interval = Duration::from_millis(30);
+        let sse = event_stream(&app, None, interval).into_response();
+        let mut body = sse.into_body().into_data_stream();
+        let mut next = async || {
+            let chunk = tokio::time::timeout(Duration::from_secs(2), body.next()).await;
+            String::from_utf8(chunk.unwrap().unwrap().unwrap().to_vec()).unwrap()
+        };
+        assert_eq!(
+            next().await,
+            "event: hello\ndata: {\"build_id\":1,\"status\":\"error\",\"error\":\
+             {\"message\":\"config: bad\",\"file\":null,\"line\":null,\"kind\":\"config\"}}\n\n"
+        );
+        // Nothing happens: a keep-alive comment (an empty one, axum's default).
+        assert_eq!(next().await, ":\n\n");
+        publish(&app.events, ok_event(2));
+        let mut chunk = next().await;
+        while chunk == ":\n\n" {
+            chunk = next().await;
+        }
+        assert_eq!(
+            chunk,
+            "event: build\ndata: {\"status\":\"ok\",\"build_id\":2,\"kind\":\"content\",\
+             \"duration_ms\":1}\n\n"
+        );
     }
 
     #[test]

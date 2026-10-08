@@ -11,10 +11,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use presenter::assets::emit::OutputMode;
+use presenter::assets::registry::AssetData;
 use presenter::error::Error;
-use presenter::pipeline::{Build, BuildOptions, build_deck};
+use presenter::pipeline::{Build, BuildOptions, build_deck, try_build_deck};
 use presenter::render::BuildInfo;
-use presenter::serve::events::BuildEvent;
+use presenter::serve::events::{BuildEvent, ErrorPayload};
 use presenter::serve::server::{self, ServeState, Shared};
 use presenter::serve::watch::ChangeKind;
 use serde_json::{Value, json};
@@ -70,8 +71,16 @@ impl TestServer {
 
     /// `GET path`, any status.
     fn get(&self, path: &str) -> Response {
-        let mut response = agent(Duration::from_secs(10))
-            .get(&self.url(path))
+        self.get_with(path, &[])
+    }
+
+    /// `GET path` with request `headers`, any status.
+    fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> Response {
+        let mut request = agent(Duration::from_secs(10)).get(&self.url(path));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut response = request
             .call()
             .unwrap_or_else(|err| panic!("GET {path}: {err}"));
         let header = |name: &str| {
@@ -83,6 +92,7 @@ impl TestServer {
                 .to_string()
         };
         let (content_type, cache_control) = (header("content-type"), header("cache-control"));
+        let headers = response.headers().clone();
         let body = response
             .body_mut()
             .with_config()
@@ -93,6 +103,7 @@ impl TestServer {
             status: response.status().as_u16(),
             content_type,
             cache_control,
+            headers,
             body,
         }
     }
@@ -109,7 +120,15 @@ struct Response {
     status: u16,
     content_type: String,
     cache_control: String,
+    headers: ureq::http::HeaderMap,
     body: Vec<u8>,
+}
+
+impl Response {
+    /// The value of header `name`, if present.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
 }
 
 /// A ureq agent that returns error statuses as responses, ignores proxy settings and gives
@@ -420,8 +439,14 @@ struct Events {
 impl Events {
     /// Opens the stream; every read must finish within 2 s of opening it.
     fn open(server: &TestServer) -> Events {
-        let response = agent(Duration::from_secs(2))
-            .get(&server.url("/__presenter/events"))
+        Events::open_at(server.addr, Duration::from_secs(2))
+    }
+
+    /// Opens the stream of the server at `addr`; every read must finish within `timeout`
+    /// of opening it.
+    fn open_at(addr: SocketAddr, timeout: Duration) -> Events {
+        let response = agent(timeout)
+            .get(&format!("http://{addr}/__presenter/events"))
             .call()
             .unwrap();
         assert_eq!(response.status().as_u16(), 200);
@@ -503,10 +528,11 @@ fn events_send_hello_then_one_build_event_per_rebuild() {
     );
     let failed = events.next().unwrap();
     assert_eq!(failed.event, "build");
+    // Exactly live-reload.md §2's example.
     assert_eq!(
         failed.data,
         json!({"build_id": 3, "status": "error", "error": {
-            "message": "slides.md:41 unknown directive 'include'",
+            "message": "slides.md:41: unknown directive 'include'",
             "file": "slides.md", "line": 41, "kind": "parse"}})
     );
     // The last good document stays; the status reports the failure.
@@ -643,4 +669,263 @@ fn a_dropped_browser_does_not_disturb_the_others() {
         .read_to_string(&mut body)
         .unwrap();
     assert!(body.contains("\"build_id\":2"));
+}
+
+#[test]
+fn a_parse_error_of_the_pipeline_has_the_shape_of_the_spec() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deck = tmp.path().join("slides.md");
+    std::fs::write(&deck, "# A\n\n--- {title=\"ab}\n").unwrap();
+    let options = BuildOptions {
+        output: OutputMode::Serve,
+        build: BuildInfo::serve(1),
+        ..BuildOptions::new(&deck)
+    };
+    let err = match try_build_deck(&options) {
+        Ok(_) => panic!("an unbalanced quote must not build"),
+        Err(failure) => failure.error,
+    };
+    // Relative to the deck's directory, as when `presenter serve` runs in it (the current
+    // directory is resolved; the temporary directory may not be, e.g. /var on macOS).
+    let canonical = tmp.path().canonicalize().unwrap();
+    for base in [tmp.path(), canonical.as_path()] {
+        let payload = ErrorPayload::relative_to(&err, Some(base));
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            json!({"message": "slides.md:3: unbalanced \" quote in attribute block {title=\"ab}",
+                   "file": "slides.md", "line": 3, "kind": "parse"}),
+            "base {}",
+            base.display()
+        );
+    }
+    // Served from elsewhere (the tests' directory), the path stays absolute, said once in
+    // `file` and once in front of the message.
+    let state: Shared = Arc::new(RwLock::new(ServeState::default()));
+    server::apply_error(&state, &err);
+    let server = TestServer::start(state);
+    let status: Value = serde_json::from_str(&server.text("/__presenter/state")).unwrap();
+    let file = status["error"]["file"].as_str().unwrap().to_string();
+    assert_eq!(
+        Path::new(&file).canonicalize().unwrap(),
+        canonical.join("slides.md")
+    );
+    assert_eq!(
+        status["error"]["message"],
+        format!("{file}:3: unbalanced \" quote in attribute block {{title=\"ab}}")
+    );
+}
+
+/// The deck-asset URLs of the served document.
+fn deck_asset_urls(server: &TestServer) -> Vec<String> {
+    presenter_urls(&server.text("/"))
+        .into_iter()
+        .filter(|url| url.starts_with("/__presenter/deck-asset/"))
+        .collect()
+}
+
+#[test]
+fn file_backed_deck_assets_answer_byte_ranges() {
+    // A local video, which the browser plays only from a server with byte ranges.
+    let tmp = tempfile::tempdir().unwrap();
+    let clip: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let clip_path = tmp.path().join("clip.mp4");
+    std::fs::write(&clip_path, &clip).unwrap();
+    let deck = tmp.path().join("slides.md");
+    std::fs::write(
+        &deck,
+        "# Video\n\n<video src=\"clip.mp4\" controls></video>\n",
+    )
+    .unwrap();
+    let (state, _) = state_with(&deck);
+    let server = TestServer::start(state);
+    let urls = deck_asset_urls(&server);
+    assert_eq!(urls.len(), 1, "{urls:?}");
+    let url = &urls[0];
+
+    let whole = server.get(url);
+    assert_eq!(whole.status, 200);
+    assert_eq!(whole.content_type, "video/mp4");
+    assert_eq!(whole.header("accept-ranges"), Some("bytes"));
+    assert_eq!(whole.header("content-length"), Some("300000"));
+    assert_eq!(whole.header("content-range"), None);
+    assert_eq!(whole.body, clip);
+
+    let range = |spec: &str| server.get_with(url, &[("Range", spec)]);
+    let first = range("bytes=0-1");
+    assert_eq!(first.status, 206);
+    assert_eq!(first.header("content-range"), Some("bytes 0-1/300000"));
+    assert_eq!(first.header("content-length"), Some("2"));
+    assert_eq!(first.header("accept-ranges"), Some("bytes"));
+    assert_eq!(first.content_type, "video/mp4");
+    assert_eq!(first.cache_control, "no-store");
+    assert_eq!(first.body, clip[..2]);
+    let middle = range("bytes=150000-150099");
+    assert_eq!(middle.status, 206);
+    assert_eq!(middle.body, clip[150_000..150_100]);
+    // What a media element asks for first: everything from the start, as 206.
+    let open = range("bytes=0-");
+    assert_eq!(open.status, 206);
+    assert_eq!(open.header("content-range"), Some("bytes 0-299999/300000"));
+    assert_eq!(open.body, clip);
+    let suffix = range("bytes=-10");
+    assert_eq!(
+        suffix.header("content-range"),
+        Some("bytes 299990-299999/300000")
+    );
+    assert_eq!(suffix.body, clip[299_990..]);
+    let past = range("bytes=300000-");
+    assert_eq!(past.status, 416);
+    assert_eq!(past.header("content-range"), Some("bytes */300000"));
+    // Several ranges at once: the whole file.
+    let several = range("bytes=0-1,4-5");
+    assert_eq!(several.status, 200);
+    assert_eq!(several.body, clip);
+
+    // A file deleted after the build is gone.
+    std::fs::remove_file(&clip_path).unwrap();
+    assert_eq!(server.get(url).status, 404);
+    assert_eq!(range("bytes=0-1").status, 404);
+}
+
+#[test]
+fn in_memory_deck_assets_and_helper_assets_answer_byte_ranges() {
+    let (state, build) = state_with(&fixture("ipynb/outputs.ipynb"));
+    let server = TestServer::start(state);
+    let in_memory: Vec<String> = deck_asset_urls(&server)
+        .into_iter()
+        .filter(|url| {
+            let id = url.rsplit('/').next().unwrap();
+            matches!(build.assets.get(id).unwrap().data, AssetData::Bytes(_))
+        })
+        .collect();
+    assert!(!in_memory.is_empty(), "outputs.ipynb has an image output");
+    for url in in_memory {
+        let whole = server.get(&url);
+        assert_eq!(whole.status, 200, "GET {url}");
+        assert_eq!(whole.header("accept-ranges"), Some("bytes"));
+        let part = server.get_with(&url, &[("Range", "bytes=1-3")]);
+        assert_eq!(part.status, 206, "GET {url}");
+        let len = whole.body.len();
+        assert_eq!(
+            part.header("content-range"),
+            Some(format!("bytes 1-3/{len}").as_str())
+        );
+        assert_eq!(part.body, whole.body[1..4]);
+    }
+
+    let url = "/__presenter/asset/vendor/reveal/dist/reveal.js";
+    let whole = server.get(url);
+    assert_eq!(whole.header("accept-ranges"), Some("bytes"));
+    let part = server.get_with(url, &[("Range", "bytes=0-9")]);
+    assert_eq!(part.status, 206);
+    assert_eq!(part.cache_control, "max-age=3600");
+    assert_eq!(part.body, whole.body[..10]);
+}
+
+/// Set in the child process of [`serve_returns_on_ctrl_c`].
+#[cfg(unix)]
+const SERVE_CHILD: &str = "PRESENTER_TEST_SERVE_CHILD";
+
+/// `server::serve`, the entry point of `presenter serve`, returns `Ok` on ctrl-c with an
+/// event stream open, and the stream ends cleanly. The server runs in a child process (this
+/// test binary again, running only this test), which gets a real SIGINT.
+#[cfg(unix)]
+#[test]
+fn serve_returns_on_ctrl_c() {
+    if std::env::var_os(SERVE_CHILD).is_some() {
+        serve_child();
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "serve_returns_on_ctrl_c",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SERVE_CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (line_tx, lines) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    // The text after `marker` in the next line that has it, if one comes within `timeout`
+    // (libtest may print its own `test … ...` in front of it).
+    let wait_for = |marker: &str, timeout: Duration| -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            let line = lines.recv_timeout(left).ok()?;
+            if let Some((_, rest)) = line.split_once(marker) {
+                return Some(rest.trim().to_string());
+            }
+        }
+    };
+
+    let Some(addr) = wait_for("LISTENING ", Duration::from_secs(60)) else {
+        let _ = child.kill();
+        panic!("the child never served: {}", stderr.join().unwrap());
+    };
+    let addr: SocketAddr = addr.parse().unwrap();
+    let mut events = Events::open_at(addr, Duration::from_secs(20));
+    assert_eq!(events.next().unwrap().event, "hello");
+
+    // ctrl-c, repeated until `serve` returns: a SIGINT that comes before `serve` listens for
+    // it is missed (the child ignores it, see `serve_child`).
+    let start = Instant::now();
+    let mut returned = None;
+    while returned.is_none() && start.elapsed() < Duration::from_secs(10) {
+        let kill = std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(kill.success());
+        returned = wait_for("SERVE RETURNED ", Duration::from_millis(500));
+    }
+    let elapsed = start.elapsed();
+    if returned.is_none() {
+        let _ = child.kill();
+    }
+    let status = child.wait().unwrap();
+    let stderr = stderr.join().unwrap();
+    assert_eq!(returned.as_deref(), Some("Ok(())"), "{stderr}");
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    // The open stream was closed cleanly.
+    assert!(events.next().is_none());
+}
+
+/// The child of [`serve_returns_on_ctrl_c`]: serves `minimal.md` with `server::serve`,
+/// prints `LISTENING <addr>` and, once `serve` returns, `SERVE RETURNED <result>`.
+#[cfg(unix)]
+fn serve_child() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        // `serve` listens for ctrl-c once its shutdown task runs; until then a SIGINT would
+        // kill the process. Listening here first (tokio's handler stays installed) turns an
+        // early SIGINT into a missed one, which the parent repeats.
+        use tokio::signal::unix::{SignalKind, signal};
+        let _early = signal(SignalKind::interrupt()).unwrap();
+        let (state, _) = state_with(&fixture("md/minimal.md"));
+        let router = server::router(state, server::event_channel());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        println!("LISTENING {}", listener.local_addr().unwrap());
+        let result = server::serve(listener, router).await;
+        println!("SERVE RETURNED {result:?}");
+    });
 }
