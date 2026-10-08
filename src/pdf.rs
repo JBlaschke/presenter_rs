@@ -13,12 +13,13 @@
 //! network port, so no other local user or process can drive it.
 //!
 //! 1. A private temporary directory (mode 0700) holds the deck, `deck.html`, and Chrome's
-//!    fresh profile: in the system's temporary directory (`$TMPDIR`), or for a snap browser
-//!    in its `~/snap/<name>/common` when that exists (a snap has a private `/tmp`, and
-//!    `~/snap/<name>/common` is its `$SNAP_USER_COMMON`, which it can read). Chrome starts
-//!    headless with a quiet throwaway configuration (no first-run UI, sync, extensions or
-//!    keychain access; plus `--no-sandbox` when running as root on Linux, which Chrome
-//!    requires); `/bin/sh` moves presenter's pipes to descriptors 3 and 4 and `exec`s it.
+//!    fresh profile: in the system's temporary directory (`$TMPDIR`, made absolute when it
+//!    is relative), or for a snap browser in its `~/snap/<name>/common` when that exists (a
+//!    snap has a private `/tmp`, and `~/snap/<name>/common` is its `$SNAP_USER_COMMON`,
+//!    which it can read). Chrome starts headless with a quiet throwaway configuration (no
+//!    first-run UI, sync, extensions or keychain access; plus `--no-sandbox` when running as
+//!    root on Linux, which Chrome requires); `/bin/sh` moves presenter's pipes to
+//!    descriptors 3 and 4 and `exec`s it.
 //! 2. `Target.createTarget` (about:blank) and `Target.attachToTarget {flatten: true}` open a
 //!    page; `Page.enable`, `Runtime.enable`, `Inspector.enable`; `Page.navigate` to
 //!    `file://<dir>/deck.html?print-pdf`, the same kind of page as the output of
@@ -1332,8 +1333,12 @@ struct TempDir {
 
 impl TempDir {
     /// Creates `<base>/<prefix>-<pid>-<n>` (mode 0700 on Unix) and starts its watchdog.
+    /// A relative `base` (`TMPDIR=tmp`; [`std::env::temp_dir`] returns `$TMPDIR` as set) is
+    /// made absolute against the current directory first: the directory's path becomes the
+    /// deck's `file://` URL and Chrome's `--user-data-dir`, which must not depend on the
+    /// current directory.
     fn new(base: &Path, prefix: &str) -> Result<TempDir> {
-        let path = create_private_dir(base, prefix)?;
+        let path = create_private_dir(&absolute(base), prefix)?;
         match Janitor::start(&path) {
             Ok(janitor) => Ok(TempDir { path, janitor }),
             Err(e) => {
@@ -1807,6 +1812,45 @@ mod tests {
         assert!(entries(base.path()).is_empty());
         // The watchdogs were told `done` and exited at once.
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// `path` (absolute) as a path relative to the current directory: `..` up to the root,
+    /// then `path` below it.
+    #[cfg(unix)]
+    fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let up = cwd.components().skip(1).map(|_| Path::new(".."));
+        up.collect::<PathBuf>()
+            .join(path.strip_prefix("/").unwrap())
+    }
+
+    /// `TMPDIR=tmp` makes [`std::env::temp_dir`] relative: the deck's `file://` URL (and
+    /// Chrome's profile) must still name the directory that was created, not `/tmp`.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_temporary_base_gives_absolute_paths_and_urls() {
+        let _serial = serial();
+        let base = tempfile::tempdir().unwrap();
+        let relative = relative_to_cwd(base.path());
+        assert!(relative.is_relative() && relative.is_dir(), "{relative:?}");
+        let dir = TempDir::new(&relative, "presenter-test").unwrap();
+        assert!(dir.path().is_absolute(), "{:?}", dir.path());
+        assert_eq!(entries(base.path()).len(), 1, "created below the base");
+        let deck = Deck::new(&dir, "<p>deck</p>", DeckSource::File).unwrap();
+        let page = deck
+            .url
+            .strip_prefix("file://")
+            .and_then(|url| url.strip_suffix("?print-pdf"))
+            .unwrap_or_else(|| panic!("{}", deck.url));
+        assert!(page.starts_with('/'), "{}", deck.url);
+        assert_eq!(
+            std::fs::read_to_string(page).unwrap(),
+            "<p>deck</p>",
+            "{} names the deck",
+            deck.url
+        );
+        drop(dir);
+        assert!(entries(base.path()).is_empty());
     }
 
     #[cfg(unix)]

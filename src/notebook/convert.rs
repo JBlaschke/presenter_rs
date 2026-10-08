@@ -47,16 +47,18 @@
 //!   the first separator continues `cur`.
 //! - **Attachments** of markdown and raw cells are resolved after rendering, in the cell's
 //!   HTML (body and notes) and in the slide attributes the cell sets: an `attachment:NAME`
-//!   URL in a start tag's `src`, `href`, `poster`, `data-src`, `data` or `xlink:href`
-//!   attribute (quoted or not), a `srcset` candidate, a CSS `url(…)` in a `style` attribute
-//!   or `<style>` element, or a `data-background`/`-image`/`-video`/`-iframe` slide
-//!   attribute is registered as an inline asset and becomes `asset:<id>`. HTML shown in code
-//!   is text, not a tag, and stays as written (so do scripts). The name is matched as
-//!   written, then with HTML entities and percent escapes decoded (`attachment:a%2Bb.png`
-//!   names `a+b.png`), then without a `?query` or `#fragment`, which is kept after the
-//!   placeholder. A URL whose attachment was skipped stays as written
-//!   (`notebook-attachment-skipped`, reported once per name); any other unresolved one warns
-//!   [`codes::MISSING_ATTACHMENT`].
+//!   URL that is the value of a start tag's attribute (quoted or not; `src`, `href`,
+//!   `poster`, reveal.js' `data-preview-image`/`-video`/`-link`, any `data-*`, … but not
+//!   the text attributes `alt`, `title`, `aria-*` and the like), a `srcset` candidate, a CSS
+//!   `url(…)` in a `style` attribute or `<style>` element, a URL written inside a
+//!   `<script>` element or an `on…` attribute (`'attachment:a.png'`), or a
+//!   `data-background`/`-image`/`-video`/`-iframe` slide attribute is registered as an
+//!   inline asset and becomes `asset:<id>`. HTML shown in code is text, not a tag, and stays
+//!   as written. The name is matched as written, then with HTML entities and percent escapes
+//!   decoded (`attachment:a%2Bb.png` names `a+b.png`), then without a `?query` or
+//!   `#fragment`, which is kept after the placeholder. A URL whose attachment was skipped
+//!   stays as written (`notebook-attachment-skipped`, reported once per name); any other
+//!   unresolved one warns [`codes::MISSING_ATTACHMENT`].
 //! - **Code cells**: [`Block::Cell`] with the outputs of [`render_outputs`] (T32); relative
 //!   `src`/`poster` URLs in `text/html` outputs go through T12's raw-HTML asset rewriting.
 //!   `hide_input` / `hide_output` come from the configured tag lists and
@@ -161,9 +163,11 @@ const ORPHAN_VERTICAL: &str = "orphan-vertical";
 /// The scheme of a notebook attachment URL (`attachment:NAME`).
 const ATTACHMENT_SCHEME: &str = "attachment:";
 
-/// The HTML attributes whose value is one URL, resolved when it is an `attachment:` URL
-/// (`srcset` and `style` hold several and are parsed: [`srcset_urls`], [`css_urls`]).
-const ATTACHMENT_ATTRS: [&str; 6] = ["src", "href", "poster", "data-src", "data", "xlink:href"];
+/// The HTML attributes whose value is text for people, not a URL: an `attachment:` value
+/// there (`alt="attachment:x"`) is left as written. So is every `aria-*` attribute. Every
+/// other attribute's value is resolved when it is an `attachment:` URL
+/// ([`attachment_url_candidates`]).
+const TEXT_ATTRS: [&str; 6] = ["alt", "title", "placeholder", "label", "value", "abbr"];
 
 /// The slide attributes whose `attachment:` URLs are resolved (`data-background-video` is a
 /// comma-separated list), as [`rewrite_slide_assets`] resolves files.
@@ -1148,8 +1152,12 @@ impl<'a> Converter<'a> {
         html: &mut String,
         span: &SourceSpan,
     ) {
+        // Longest first, for the names written in scripts (`script_urls`).
+        let mut names: Vec<&str> = cell.attachments.keys().map(String::as_str).collect();
+        names.retain(|name| !name.is_empty());
+        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
         let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-        for url in attachment_url_candidates(html) {
+        for url in attachment_url_candidates(html, &names) {
             if let Some(resolved) = self.attachment_url(index, cell, &html[url.clone()], span) {
                 edits.push((url, resolved));
             }
@@ -1513,13 +1521,21 @@ fn attachment_name(cell: &Cell, written: &str) -> Option<String> {
 }
 
 /// The byte ranges of the URLs in `html` that may be `attachment:` URLs, in document order:
-/// the value of an [`ATTACHMENT_ATTRS`] attribute, each `srcset` candidate
-/// ([`srcset_urls`]) and each CSS `url(…)` ([`css_urls`]) of a `style` attribute or a
-/// `<style>` element ([`style_elements`]). Attributes and elements are those of the start
-/// tags T12's HTML tokenizer finds ([`html_attr_values`]): text, comments, scripts and HTML
-/// shown in code (`&lt;img src=…`, quotes included) are not tags, so their URLs are not
-/// candidates.
-fn attachment_url_candidates(html: &str) -> Vec<Range<usize>> {
+///
+/// - the value (white space trimmed) of every attribute that holds one URL: any attribute
+///   but `srcset`, `style`, the `on…` event handlers and the text attributes
+///   ([`TEXT_ATTRS`], `aria-*`), so `src`, `href`, `poster`, reveal.js'
+///   `data-preview-image` / `-video` / `-link`, `data-src` and any other `data-*` attribute
+///   count ([`Converter::attachment_url`] then keeps only `attachment:` URLs);
+/// - each `srcset` candidate ([`srcset_urls`]), and each CSS `url(…)` ([`css_urls`]) of a
+///   `style` attribute or a `<style>` element;
+/// - the `attachment:` URLs written inside scripts, `<script>` elements and `on…`
+///   attributes ([`script_urls`]; `names` are the cell's attachment names, longest first).
+///
+/// Attributes and elements are those of the start tags T12's HTML tokenizer finds
+/// ([`html_attr_values`]): text, comments and HTML shown in code (`&lt;img src=…`, quotes
+/// included) are not tags, so their URLs are not candidates.
+fn attachment_url_candidates(html: &str, names: &[&str]) -> Vec<Range<usize>> {
     let shift = |base: usize| move |url: Range<usize>| base + url.start..base + url.end;
     let mut urls = Vec::new();
     for (name, value) in html_attr_values(html) {
@@ -1527,33 +1543,85 @@ fn attachment_url_candidates(html: &str) -> Vec<Range<usize>> {
         let found = match name.as_str() {
             "srcset" => srcset_urls(text),
             "style" => css_urls(text),
-            name if ATTACHMENT_ATTRS.contains(&name) => vec![trimmed(text)],
-            _ => continue,
+            name if TEXT_ATTRS.contains(&name) || name.starts_with("aria-") => continue,
+            name if name.starts_with("on") => script_urls(text, names),
+            _ => vec![trimmed(text)],
         };
         urls.extend(found.into_iter().map(shift(value.start)));
     }
-    for content in style_elements(html) {
+    for content in element_contents(html, "style") {
         let found = css_urls(&html[content.clone()]);
+        urls.extend(found.into_iter().map(shift(content.start)));
+    }
+    for content in element_contents(html, "script") {
+        let found = script_urls(&html[content.clone()], names);
         urls.extend(found.into_iter().map(shift(content.start)));
     }
     urls.sort_by_key(|url| url.start);
     urls
 }
 
-/// The byte ranges of the contents of the `<style>` elements of `html` (from the end of
-/// the start tag to the `</style` that closes it, or the end of `html`).
-fn style_elements(html: &str) -> Vec<Range<usize>> {
+/// The byte ranges of the contents of the `name` elements of `html` (`style`, `script`:
+/// raw-text elements), each from the end of the start tag to the `</name` that closes it,
+/// or the end of `html`.
+fn element_contents(html: &str, name: &str) -> Vec<Range<usize>> {
     // ASCII lowercasing keeps every byte offset.
     let lower = html.to_ascii_lowercase();
+    let close = format!("</{name}");
     html_start_tags(html)
         .into_iter()
-        .filter(|(name, _)| name == "style")
-        .map(|(_, end)| {
-            end..lower[end..]
-                .find("</style")
-                .map_or(html.len(), |at| end + at)
-        })
+        .filter(|(tag, _)| tag == name)
+        .map(|(_, end)| end..lower[end..].find(&close).map_or(html.len(), |at| end + at))
         .collect()
+}
+
+/// The byte ranges of the `attachment:` URLs written inside a script (`script`: a
+/// `<script>` element's content, or an `on…` attribute's value as written), in order. A
+/// script has no URL syntax, so each `attachment:` (any ASCII case) is followed by a name:
+/// the longest of the cell's attachment `names` written there exactly, when the URL ends
+/// after it ([`ends_script_url`], or `?` / `#`, which stay after the placeholder);
+/// otherwise everything up to the first [`ends_script_url`] character, which
+/// [`Converter::attachment_url`] decodes or reports as missing. A bare `attachment:` (a
+/// script that builds the URL, `'attachment:' + name`) is not a candidate.
+fn script_urls(script: &str, names: &[&str]) -> Vec<Range<usize>> {
+    // ASCII lowercasing keeps every byte offset.
+    let lower = script.to_ascii_lowercase();
+    let mut urls = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(ATTACHMENT_SCHEME) {
+        let start = from + at;
+        let rest = &script[start + ATTACHMENT_SCHEME.len()..];
+        let exact = names.iter().find(|name| {
+            rest.strip_prefix(**name).is_some_and(|after| {
+                after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| ends_script_url(c) || matches!(c, '?' | '#'))
+            })
+        });
+        let len = exact.map_or_else(
+            || rest.find(ends_script_url).unwrap_or(rest.len()),
+            |name| name.len(),
+        );
+        let end = start + ATTACHMENT_SCHEME.len() + len;
+        if len > 0 {
+            urls.push(start..end);
+        }
+        from = end;
+    }
+    urls
+}
+
+/// Whether `c` ends an `attachment:` URL written in a script ([`script_urls`]): white space,
+/// the quotes that delimit a string, `<` and `>` (a tag written in a string), parentheses
+/// (a call, a CSS `url(…)`), `\` (an escape), and `&`, `,`, `;` (an entity such as
+/// `&quot;` in an `on…` attribute, an argument list, a statement).
+fn ends_script_url(c: char) -> bool {
+    c.is_ascii_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '\\' | '&' | ',' | ';'
+        )
 }
 
 /// The byte ranges of the URLs of the CSS `url(…)` functions in `css` (a `style` attribute
@@ -1758,7 +1826,7 @@ mod tests {
                     <!-- <img src=no.png> --><script>'<img src=no.png>'</script>\
                     <code>&lt;img src=\"no.png\"&gt;</code><style>url(g.png)";
         assert_eq!(
-            texts(html, attachment_url_candidates(html)),
+            texts(html, attachment_url_candidates(html, &[])),
             [
                 "attachment:a.png",
                 "attachment:b.png",
@@ -1769,6 +1837,39 @@ mod tests {
                 "g.png"
             ]
         );
+    }
+
+    #[test]
+    fn every_url_attribute_and_scripts_have_url_candidates() {
+        let texts = |html: &str, ranges: Vec<Range<usize>>| -> Vec<String> {
+            ranges.into_iter().map(|r| html[r].to_owned()).collect()
+        };
+        // The cell's attachment names, longest first.
+        let names = ["my plot.png", "a.png", "a"];
+        let html = "<img data-preview-image=' attachment:a.png ' aria-label=\"attachment:a.png\" \
+                    label=attachment:a.png onclick=\"show(&quot;attachment:a.png&quot;)\">\
+                    <span data-preview-video=attachment:v.mp4>v</span>\
+                    <script>document.write('<img src=\"attachment:a.png\">'); \
+                    f(`attachment:my plot.png`, 'ATTACHMENT:a?x', \"attachment:a.pngx\", \
+                    'attachment:' + n, 'attachment:%61.png');</script>\
+                    <code>&lt;script&gt;'attachment:a.png'&lt;/script&gt;</code>";
+        assert_eq!(
+            texts(html, attachment_url_candidates(html, &names)),
+            [
+                "attachment:a.png",
+                "attachment:a.png",
+                "attachment:v.mp4",
+                "attachment:a.png",
+                "attachment:my plot.png",
+                "ATTACHMENT:a",
+                "attachment:a.pngx",
+                "attachment:%61.png",
+            ]
+        );
+        // Without the names, a name with a space ends at the space.
+        let script = "x = 'attachment:my plot.png'";
+        assert_eq!(texts(script, script_urls(script, &[])), ["attachment:my"]);
+        assert!(script_urls("'attachment:' + name", &names).is_empty());
     }
 
     #[test]

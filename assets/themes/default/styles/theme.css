@@ -300,9 +300,13 @@
  * Images, video and frames
  * ------------------------------------------------------------------------------------ */
 
-.reveal img,
-.reveal video,
-.reveal iframe {
+/* These rules style slide content only: reveal's slide backgrounds (`background-video`,
+   `background-iframe`) and its lightbox (`data-preview-image`) also hold images, videos and
+   iframes inside `.reveal`, and size them themselves. `:where(.slides)` adds no
+   specificity, so these rules weigh what they did before they were scoped. */
+.reveal :where(.slides) img,
+.reveal :where(.slides) video,
+.reveal :where(.slides) iframe {
   max-width: 100%;
 }
 
@@ -310,18 +314,18 @@
    sizes itself: those that are direct children of the slide. reveal lifts the caps of every
    `.r-stretch` element, so a Markdown image (wrapped in a paragraph, which reveal does not
    stretch) gets them back here. */
-.reveal :is(img, video):not(section > .r-stretch, section > .stretch) {
+.reveal :where(.slides) :is(img, video):not(section > .r-stretch, section > .stretch) {
   max-width: 100%;
   max-height: var(--p-image-max-height);
   object-fit: contain;
 }
 
-.reveal img {
+.reveal :where(.slides) img {
   margin: 0;
   vertical-align: middle;
 }
 
-.reveal iframe {
+.reveal :where(.slides) iframe {
   border: 1px solid var(--p-border);
   border-radius: var(--p-radius);
 }

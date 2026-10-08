@@ -354,6 +354,9 @@ fn init_never_writes_where_it_cannot_scaffold() {
         std::os::unix::fs::symlink("nowhere", cwd.join("dangling")).unwrap();
         std::os::unix::fs::symlink("notes.txt", cwd.join("to-file")).unwrap();
         std::os::unix::fs::symlink("src", cwd.join("to-src")).unwrap();
+        // A loop, and a link that runs through a file.
+        std::os::unix::fs::symlink("loop", cwd.join("loop")).unwrap();
+        std::os::unix::fs::symlink("notes.txt/x", cwd.join("via-file")).unwrap();
         std::fs::write(cwd.join("src/main.rs"), "fn main() {}").unwrap();
         let before = entries(cwd);
         for (dir, message) in [
@@ -364,6 +367,19 @@ fn init_never_writes_where_it_cannot_scaffold() {
             ("dangling/sub", "(a broken symbolic link)"),
             ("to-file", "to-file exists and is not a directory"),
             ("to-src", "to-src is not empty (it contains main.rs)"),
+            (
+                "loop",
+                "loop exists and is not a directory (a broken symbolic link: ",
+            ),
+            ("loop/sub", "loop exists and is not a directory (a broken"),
+            (
+                "via-file",
+                "via-file exists and is not a directory (a broken symbolic link: ",
+            ),
+            (
+                "via-file/sub",
+                "via-file exists and is not a directory (a broken",
+            ),
         ] {
             let stderr = text(&init_fails(cwd, &[dir]).stderr);
             assert!(stderr.contains(message), "{dir}: {stderr}");
@@ -386,6 +402,11 @@ fn init_creates_missing_directories_or_fills_an_empty_one() {
     let tmp = tempfile::tempdir().unwrap();
     init(tmp.path(), &["a/b/c", "-q"]);
     assert!(tmp.path().join("a/b/c/presenter.toml").is_file());
+    // `.` components name the directory before them, also one that does not exist yet.
+    init(tmp.path(), &["new/.", "-q"]);
+    assert!(tmp.path().join("new/slides.md").is_file());
+    init(tmp.path(), &["./other/./sub/.", "-q"]);
+    assert!(tmp.path().join("other/sub/slides.md").is_file());
 
     // `presenter init` without DIR scaffolds the (empty) current directory; the name is
     // the directory's.

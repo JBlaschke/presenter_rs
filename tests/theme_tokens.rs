@@ -356,7 +356,7 @@ fn only_images_reveal_stretches_lose_the_size_caps() {
     assert_eq!(caps.len(), 1, "{caps:?}");
     assert_eq!(
         caps[0].selector,
-        ".reveal :is(img, video):not(section > .r-stretch, section > .stretch)"
+        ".reveal :where(.slides) :is(img, video):not(section > .r-stretch, section > .stretch)"
     );
     assert_eq!(
         caps[0].get("max-width"),
@@ -370,6 +370,69 @@ fn only_images_reveal_stretches_lose_the_size_caps() {
             r.selector
         );
     }
+}
+
+/// The selectors of a selector list (split at the commas outside parentheses).
+fn complex_selectors(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0);
+    for (i, c) in list.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(list[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(list[start..].trim());
+    parts
+}
+
+#[test]
+fn complex_selectors_split_only_at_top_level_commas() {
+    assert_eq!(
+        complex_selectors(".a :is(img, video), .b:not(x, y) > p"),
+        [".a :is(img, video)", ".b:not(x, y) > p"]
+    );
+}
+
+/// reveal puts images, videos and iframes inside `.reveal` but outside `.slides` and sizes
+/// them itself: slide backgrounds (`background-video` must cover the slide, a
+/// `background-iframe` has no frame) and the lightbox of `data-preview-image`/`-video`.
+/// Every theme rule that selects one of these elements must therefore be scoped to the
+/// slides (`.slides` before the element in the selector), without gaining specificity over
+/// the unscoped rules it replaced (`:where(.slides)`), so child themes still win as before.
+#[test]
+fn media_rules_style_slide_content_only() {
+    let media = Regex::new(r"(^|[\s>+~(,])(img|video|iframe)\b").unwrap();
+    let rules = rules(&css());
+    let mut checked = 0;
+    for r in &rules {
+        for selector in complex_selectors(&r.selector) {
+            let Some(m) = media.find(selector) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                selector[..m.start()].contains(".slides"),
+                "`{selector}` ({}) also matches outside the slides",
+                r.context
+            );
+        }
+    }
+    assert!(checked >= 6, "{checked}");
+    for selector in [
+        ".reveal :where(.slides) img, .reveal :where(.slides) video, .reveal :where(.slides) iframe",
+        ".reveal :where(.slides) img",
+        ".reveal :where(.slides) iframe",
+    ] {
+        rule(&rules, selector);
+    }
+    let frame = rule(&rules, ".reveal :where(.slides) iframe");
+    assert_eq!(frame.get("border"), Some("1px solid var(--p-border)"));
 }
 
 /// CSS cannot see text nodes, so `p:has(> img:only-child)` also matches a sentence with an

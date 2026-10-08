@@ -11,7 +11,9 @@
 //!
 //! `DIR` must be empty or not exist; anything else is a [`UsageError`] (exit 2) and nothing
 //! is written. `DIR` is checked where the file system will resolve it: symbolic links are
-//! followed (a broken one is not a directory), a component that is a file is an error, and
+//! followed (a broken one, whose target is missing, runs through a file or loops, is not a
+//! directory; only a target that cannot be read is an I/O error, exit 1), a component that
+//! is a file is an error, and
 //! so is a `..` after a component that does not exist yet (`new/..` would create `new` and
 //! then write next to it). After creating `DIR`, `init` checks once more that it is empty
 //! before writing anything, and it never overwrites a file. On success stdout lists the
@@ -401,16 +403,7 @@ fn inspect(path: PathBuf, given: &Path) -> anyhow::Result<(PathBuf, Found)> {
         }
     };
     let (path, metadata) = if metadata.file_type().is_symlink() {
-        let target = std::fs::canonicalize(&path).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                anyhow::Error::new(UsageError(format!(
-                    "{} exists and is not a directory (a broken symbolic link)",
-                    given.display()
-                )))
-            } else {
-                anyhow::Error::new(err).context(format!("cannot read {}", given.display()))
-            }
-        })?;
+        let target = std::fs::canonicalize(&path).map_err(|err| broken_link(err, given))?;
         let metadata = std::fs::metadata(&target)
             .with_context(|| format!("cannot read {}", given.display()))?;
         (target, metadata)
@@ -423,6 +416,26 @@ fn inspect(path: PathBuf, given: &Path) -> anyhow::Result<(PathBuf, Found)> {
         Found::NotDir
     };
     Ok((path, found))
+}
+
+/// The error for symbolic link `given` whose target cannot be resolved (`err`, from
+/// `canonicalize`): a [`UsageError`] when the link is broken (its target is missing, runs
+/// through a file, or loops), so it is reported like the other target problems; a plain
+/// I/O error (exit 1) when the target may be fine but cannot be read (permission denied).
+fn broken_link(err: std::io::Error, given: &Path) -> anyhow::Error {
+    let given = given.display();
+    match err.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            anyhow::Error::new(err).context(format!("cannot read {given}"))
+        }
+        std::io::ErrorKind::NotFound => anyhow::Error::new(UsageError(format!(
+            "{given} exists and is not a directory (a broken symbolic link)"
+        ))),
+        // ENOTDIR (a file on the way), ELOOP (a loop: `FilesystemLoop` is unstable), …
+        _ => anyhow::Error::new(UsageError(format!(
+            "{given} exists and is not a directory (a broken symbolic link: {err})"
+        ))),
+    }
 }
 
 /// Fails with a [`UsageError`] naming the first few entries unless directory `dir` (shown
@@ -600,6 +613,10 @@ fn embedded(key: &str) -> anyhow::Result<Vec<u8>> {
 /// Creates `dir`, checks that it is (still) empty and writes `files` below it, creating
 /// directories as needed. Never overwrites a file.
 fn write_files(dir: &Path, files: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
+    // Without its `.` components after the first: `create_dir_all("new/.")` fails while
+    // `new` does not exist, although `new/.` names the same directory.
+    let dir: PathBuf = dir.components().collect();
+    let dir = dir.as_path();
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     check_empty(dir, &described(dir))?;
     for (rel, data) in files {
@@ -975,5 +992,36 @@ mod tests {
         }
         let err = check_target(&root.join("dangling")).unwrap_err();
         assert!(err.is::<UsageError>(), "{err}");
+
+        // A loop, and a link through a file, are broken links too (usage errors).
+        symlink("loop", root.join("loop")).unwrap();
+        symlink("file.txt/x", root.join("via-file")).unwrap();
+        for rel in ["loop", "loop/sub", "via-file", "via-file/sub"] {
+            let err = resolve(&root, rel).unwrap_err();
+            let name = rel.split('/').next().unwrap();
+            assert!(
+                err.starts_with(&format!(
+                    "{} exists and is not a directory (a broken symbolic link: ",
+                    root.join(name).display()
+                )),
+                "{rel}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_link_targets_are_io_errors() {
+        let err = broken_link(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            Path::new("talk"),
+        );
+        assert!(!err.is::<UsageError>(), "{err:#}");
+        assert!(err.to_string().starts_with("cannot read talk"), "{err:#}");
+        let err = broken_link(
+            std::io::Error::from(std::io::ErrorKind::NotADirectory),
+            Path::new("talk"),
+        );
+        assert!(err.is::<UsageError>(), "{err:#}");
     }
 }

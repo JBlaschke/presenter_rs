@@ -11,15 +11,16 @@ use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use presenter::pipeline::{self, BuildOptions};
 use presenter::serve::watch::{
     ChangeBatch, ChangeKind, DEBOUNCE, WatchSet, WatchStatus, Watcher, canonical,
-    run_build_watch_with, watch_set_before_build, watch_set_for, watch_set_for_failed,
+    run_build_watch_with, try_build_watched, watch_set_before_build, watch_set_for,
+    watch_set_for_failed,
 };
 
 /// How long a batch may take to arrive.
@@ -913,4 +914,96 @@ fn build_watch_follows_a_theme_being_created_and_fixed() {
     process.wait_for("the fixed theme", Duration::from_secs(15), |p| {
         p.stdout().starts_with("Wrote out.html (1 slide, ")
     });
+}
+
+/// `f`'s result and how many times it parsed a deck on this thread: the pipeline logs one
+/// `parsed <file>` debug event per parse ([`pipeline::try_parse_only`]), counted here.
+fn counting_parses<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let parses = log
+        .lines()
+        .filter(|line| line.contains("presenter::pipeline: parsed "))
+        .count();
+    (value, parses)
+}
+
+#[test]
+fn a_failed_build_parses_the_deck_once() {
+    let (dir, input) = project("# Hi\n\n![plot](figures/plot.png)\n");
+    let opts = BuildOptions::new(&input);
+    let out = dir.path().join("out.html");
+
+    // The measure: a successful build parses once.
+    let ((result, set), parses) = counting_parses(|| try_build_watched(&opts));
+    let build = result.unwrap();
+    assert_eq!(parses, 1);
+    assert_eq!(set, watch_set_for(&build));
+
+    // Failures after the parse: a missing asset (an error in `build`), a theme that does
+    // not resolve, rejected front matter. Each keeps watch_set_for_failed's set, from the
+    // one parse of the build.
+    for deck in [
+        "# Hi\n\n![plot](figures/plot.png)\n\n![gone](figures/missing.png)\n",
+        "---\ntheme: other\n---\n\n# Hi\n\n![plot](figures/plot.png)\n",
+        "---\nreveal:\n  plugins: [bogus]\n---\n\n# Hi\n\n![gone](figures/missing.png)\n",
+    ] {
+        write(&input, deck);
+        let ((result, set), parses) = counting_parses(|| try_build_watched(&opts));
+        assert!(result.is_err(), "{deck}");
+        assert_eq!(parses, 1, "{deck}");
+        let (expected, reparses) = counting_parses(|| watch_set_for_failed(&opts));
+        assert_eq!(reparses, 1, "watch_set_for_failed itself parses: {deck}");
+        assert_eq!(set, expected, "{deck}");
+    }
+    // The rebuild loop: one parse for a failed build, watching the same set.
+    write(
+        &input,
+        "# Hi\n\n![plot](figures/plot.png)\n\n![gone](figures/missing.png)\n",
+    );
+    let mut watched = None;
+    let (result, parses) = counting_parses(|| {
+        run_build_watch_with(&opts, &out, |status| {
+            if let WatchStatus::Failed(failure) = &status {
+                assert!(failure.error.to_string().contains("missing.png"));
+            }
+            if let WatchStatus::Watching(set) = status {
+                watched = Some(set.clone());
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })
+    });
+    result.unwrap();
+    assert_eq!(parses, 1);
+    let root = canonical(dir.path());
+    let watched = watched.expect("the loop reported what it watches");
+    assert!(watched.files.contains(&root.join("figures/missing.png")));
+    assert!(watched.files.contains(&root.join("figures/plot.png")));
+    assert_eq!(watched, watch_set_for_failed(&opts));
+
+    // A deck that does not parse: watched like before the first build.
+    write(&input, "---\ntitle: [unclosed\n---\n\n# Hi\n");
+    let (result, set) = try_build_watched(&opts);
+    assert!(result.is_err());
+    assert_eq!(set, watch_set_before_build(&opts));
+    assert_eq!(set, watch_set_for_failed(&opts));
 }
