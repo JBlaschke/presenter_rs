@@ -3,9 +3,10 @@
 //! Contract: `docs/spec/notebook-mapping.md` §1. The entry point is [`parse_notebook`]: it
 //! rejects anything older than nbformat 4, deserializes every cell, and **drops** outputs
 //! and attachments that do not deserialize (an unknown `output_type`, a stream without
-//! `text`, …), reporting each as a warning message instead of failing the deck. Other
-//! recoverable oddities (an unknown `slideshow.slide_type`, a `metadata.presenter` that is
-//! not an object) are reported the same way. Unknown keys anywhere are ignored.
+//! `text`, …), reporting each as a warning [`Diagnostic`] instead of failing the deck.
+//! Other recoverable oddities (an unknown `slideshow.slide_type` or `cell_type`, a
+//! `metadata.presenter` that is not an object) are reported the same way; the codes are in
+//! [`codes`]. Unknown keys anywhere are ignored, and `null` counts as absent everywhere.
 //!
 //! The accessors on [`Cell`] and [`Notebook`] read the nbformat metadata only. Tags are
 //! returned as written; mapping them to effects (`hide-input`, `fragment`, …, configurable
@@ -20,7 +21,27 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
-use crate::error::Error;
+use crate::error::{Diagnostic, Diagnostics, Error};
+use crate::ir::SourceSpan;
+
+/// The diagnostic codes of the warnings [`parse_notebook`] returns (all `Level::Warning`).
+pub mod codes {
+    /// `metadata.slideshow.slide_type` is not a known value; the cell is read as `"-"`.
+    pub const UNKNOWN_SLIDE_TYPE: &str = "unknown-slide-type";
+    /// `cell_type` is not `markdown`, `code` or `raw` (a cell from a newer nbformat minor
+    /// version); the cell is kept as `CellType::Unknown`, which the converter skips.
+    pub const UNKNOWN_CELL_TYPE: &str = "unknown-cell-type";
+    /// An output that does not deserialize (unknown `output_type`, missing field, …) was
+    /// dropped, or `outputs` was not a list and was ignored.
+    pub const OUTPUT_SKIPPED: &str = "notebook-output-skipped";
+    /// An attachment that does not deserialize was dropped, or `attachments` was not an
+    /// object and was ignored.
+    pub const ATTACHMENT_SKIPPED: &str = "notebook-attachment-skipped";
+    /// `metadata.presenter` (notebook or cell) is not an object and was ignored.
+    pub const PRESENTER_NOT_OBJECT: &str = "presenter-not-object";
+    /// `nbformat` is newer than 4; the notebook is read as nbformat 4.
+    pub const NBFORMAT_NEWER: &str = "nbformat-newer";
+}
 
 /// A parsed notebook. Build one with [`parse_notebook`].
 ///
@@ -78,6 +99,11 @@ pub enum CellType {
     Code,
     /// Raw content passed through by `nbconvert` (HTML when `raw_mimetype` says so).
     Raw,
+    /// Any other `cell_type` string: nbformat's "unrecognized cell from a future
+    /// minor-revision". The cell is kept so indices stay aligned with `SourceSpan::cell`;
+    /// [`parse_notebook`] warns ([`codes::UNKNOWN_CELL_TYPE`]) and converters skip it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One output of a code cell, tagged by `output_type`.
@@ -208,14 +234,17 @@ pub enum SlideType {
     Skip,
     /// `"notes"`: speaker notes of the current slide.
     Notes,
-    /// `"-"` or absent: appended to the current slide.
+    /// `"-"`, `""` or absent: appended to the current slide.
     #[default]
     Continue,
 }
 
 impl SlideType {
     /// Parses a `slide_type` value: `"slide"`, `"subslide"`, `"fragment"`, `"skip"`,
-    /// `"notes"`, or `"-"` (→ [`SlideType::Continue`]). `None` for anything else.
+    /// `"notes"`, or `"-"`/`""` (→ [`SlideType::Continue`]). `None` for anything else.
+    ///
+    /// `""` is what JupyterLab 4's property inspector writes for `"-"` (its metadata form
+    /// schema lists `{"const": "", "title": "-"}`), and nbconvert treats it as a plain cell.
     pub fn parse(name: &str) -> Option<SlideType> {
         Some(match name {
             "slide" => SlideType::Slide,
@@ -223,16 +252,21 @@ impl SlideType {
             "fragment" => SlideType::Fragment,
             "skip" => SlideType::Skip,
             "notes" => SlideType::Notes,
-            "-" => SlideType::Continue,
+            "-" | "" => SlideType::Continue,
             _ => return None,
         })
     }
 }
 
+/// `value` unless it is JSON `null` (which nbformat writers use for "absent").
+fn non_null(value: Option<&Value>) -> Option<&Value> {
+    value.filter(|value| !value.is_null())
+}
+
 impl Cell {
-    /// `metadata.slideshow.slide_type`. Absent, `"-"`, an unknown string or a non-string
-    /// → [`SlideType::Continue`] ([`parse_notebook`] warns about the unknown ones). Tags
-    /// (`fragment`, `notes`) are not considered here.
+    /// `metadata.slideshow.slide_type`. Absent, `null`, `"-"`, `""`, an unknown string or a
+    /// non-string → [`SlideType::Continue`] ([`parse_notebook`] warns about the unknown
+    /// ones). Tags (`fragment`, `notes`) are not considered here.
     pub fn slide_type(&self) -> SlideType {
         self.metadata
             .pointer("/slideshow/slide_type")
@@ -277,11 +311,24 @@ impl Cell {
     }
 
     /// `metadata.presenter` when it is an object (`{ "layout", "classes", "attrs" }` per
-    /// spec §3). A non-object value is ignored ([`parse_notebook`] warns).
+    /// spec §3). A non-object value is ignored ([`parse_notebook`] warns unless it is
+    /// `null`).
     pub fn presenter_overrides(&self) -> Option<&Value> {
         self.metadata
             .get("presenter")
             .filter(|value| value.is_object())
+    }
+
+    /// The span of this whole cell when it is cell `index` of its notebook: lines 1 to the
+    /// number of source lines (at least 1, so an empty cell is `1..=1`), `cell: Some(index)`.
+    /// This is the span of every cell-level warning from [`parse_notebook`] and the
+    /// `Slide.span` shape of spec §2.
+    pub fn span(&self, index: usize) -> SourceSpan {
+        SourceSpan {
+            start_line: 1,
+            end_line: self.source.as_str().lines().count().max(1),
+            cell: Some(index),
+        }
     }
 }
 
@@ -307,7 +354,7 @@ impl Notebook {
 
     /// `metadata.presenter` when it is an object: deck metadata with the same keys as
     /// Markdown front matter (spec §5). A non-object value is ignored ([`parse_notebook`]
-    /// warns).
+    /// warns unless it is `null`).
     pub fn presenter_meta(&self) -> Option<&Value> {
         self.metadata
             .get("presenter")
@@ -315,21 +362,31 @@ impl Notebook {
     }
 }
 
-/// Parses an `.ipynb` document leniently. `path` is used only in error messages.
+/// Parses an `.ipynb` document leniently.
 ///
-/// Returns the notebook and the warnings (human-readable, cell-level ones prefixed with
-/// `cell <index>: `, index 0-based) that the caller should turn into `Level::Warning`
-/// diagnostics. Warnings are produced for: outputs and attachments that do not deserialize
-/// (they are dropped; the rest of the cell is kept), an `outputs`/`attachments` value of
-/// the wrong shape (ignored), an unknown or non-string `slideshow.slide_type` (read as
-/// [`SlideType::Continue`]), a `metadata.presenter` that is not an object (ignored), and
-/// `nbformat` > 4 (read as 4).
+/// Returns the notebook and its warnings: [`Diagnostic`]s with `Level::Warning`, a code from
+/// [`codes`], `path` set to `path`, and a message without any location prefix. Cell-level
+/// warnings carry `span = cell.span(index)` (`cell: Some(index)`, 0-based, lines
+/// `1..=source lines`), so they print as `talk.ipynb: cell 3, line 1: warning: …`;
+/// notebook-level ones have no span. Callers append them unchanged to their
+/// `Diagnostics` (`diags.extend(warnings)`).
+///
+/// | Code | Cause | Effect |
+/// |---|---|---|
+/// | [`codes::OUTPUT_SKIPPED`] | an output that does not deserialize; `outputs` not a list | output dropped / `outputs` ignored, rest of the cell kept |
+/// | [`codes::ATTACHMENT_SKIPPED`] | an attachment that does not deserialize; `attachments` not an object | dropped / ignored |
+/// | [`codes::UNKNOWN_SLIDE_TYPE`] | `slideshow.slide_type` not one of `slide`, `subslide`, `fragment`, `skip`, `notes`, `-`, `""` | read as [`SlideType::Continue`] |
+/// | [`codes::UNKNOWN_CELL_TYPE`] | `cell_type` not `markdown`/`code`/`raw` | kept as [`CellType::Unknown`] |
+/// | [`codes::PRESENTER_NOT_OBJECT`] | notebook or cell `metadata.presenter` neither an object nor `null` | ignored |
+/// | [`codes::NBFORMAT_NEWER`] | `nbformat` > 4 | read as nbformat 4 |
 ///
 /// # Errors
-/// [`Error::Parse`] for invalid JSON (with its line), a document that is not an object,
-/// `nbformat` missing or < 4 (`"nbformat 4 required …"`), `cells` missing or not a list,
-/// and a cell that does not deserialize (e.g. an unknown `cell_type`).
-pub fn parse_notebook(path: &Path, json: &str) -> crate::error::Result<(Notebook, Vec<String>)> {
+/// [`Error::Parse`] (with `path`) for invalid JSON (with its line), a document that is not
+/// an object, `nbformat` < 4 (message exactly `"nbformat 4 required"`, spec §1), `nbformat`
+/// missing or not an integer, `cells` missing or not a list, and a cell that does not
+/// deserialize (not an object, no `cell_type`, wrongly typed `source`, …; the message
+/// starts with `cell <index>: `).
+pub fn parse_notebook(path: &Path, json: &str) -> crate::error::Result<(Notebook, Diagnostics)> {
     let parse_error = |line: Option<usize>, message: String| Error::Parse {
         path: path.to_path_buf(),
         line,
@@ -343,36 +400,57 @@ pub fn parse_notebook(path: &Path, json: &str) -> crate::error::Result<(Notebook
             "not a Jupyter notebook: expected a JSON object".to_owned(),
         ));
     };
-    let mut warnings = check_nbformat(&top).map_err(|message| parse_error(None, message))?;
+    let mut warnings = Diagnostics::new();
+    let newer = check_nbformat(&top).map_err(|message| parse_error(None, message))?;
+    if let Some(message) = newer {
+        warnings.push(Diagnostic::warning(codes::NBFORMAT_NEWER, message).with_path(path));
+    }
     let raw_cells = take_cells(&mut top).map_err(|message| parse_error(None, message))?;
     let mut notebook: Notebook = serde_json::from_value(Value::Object(top))
         .map_err(|err| parse_error(None, format!("invalid notebook: {err}")))?;
-    if notebook.metadata.get("presenter").is_some() && notebook.presenter_meta().is_none() {
-        warnings.push("metadata.presenter is not an object, ignored".to_owned());
+    if non_null(notebook.metadata.get("presenter")).is_some() && notebook.presenter_meta().is_none()
+    {
+        warnings.push(
+            Diagnostic::warning(codes::PRESENTER_NOT_OBJECT, PRESENTER_NOT_OBJECT_MESSAGE)
+                .with_path(path),
+        );
     }
-    notebook.cells = raw_cells
-        .into_iter()
-        .enumerate()
-        .map(|(index, raw)| parse_cell(index, raw, &mut warnings))
-        .collect::<Result<_, _>>()
-        .map_err(|message| parse_error(None, message))?;
+    let mut cells = Vec::with_capacity(raw_cells.len());
+    for (index, raw) in raw_cells.into_iter().enumerate() {
+        let (cell, findings) =
+            parse_cell(raw).map_err(|err| parse_error(None, format!("cell {index}: {err}")))?;
+        let span = cell.span(index);
+        warnings.extend(findings.into_iter().map(|(code, message)| {
+            Diagnostic::warning(code, message)
+                .with_path(path)
+                .with_span(span.clone())
+        }));
+        cells.push(cell);
+    }
+    notebook.cells = cells;
     Ok((notebook, warnings))
 }
 
-/// Requires `nbformat` ≥ 4; returns a warning for a newer major version.
-fn check_nbformat(top: &Map<String, Value>) -> Result<Vec<String>, String> {
+/// A cell-level warning before it gets a path and span: (code from [`codes`], message).
+type Finding = (&'static str, String);
+
+const PRESENTER_NOT_OBJECT_MESSAGE: &str = "metadata.presenter is not an object, ignored";
+
+/// Requires `nbformat` ≥ 4; returns a warning message for a newer major version.
+fn check_nbformat(top: &Map<String, Value>) -> Result<Option<String>, String> {
     match top.get("nbformat").and_then(Value::as_u64) {
-        Some(4) => Ok(Vec::new()),
-        Some(major) if major > 4 => Ok(vec![format!(
+        Some(4) => Ok(None),
+        Some(major) if major > 4 => Ok(Some(format!(
             "nbformat {major} is newer than this tool knows; reading it as nbformat 4"
-        )]),
-        Some(major) => Err(format!(
-            "nbformat 4 required, found nbformat {major} (re-save the notebook with Jupyter to upgrade it)"
-        )),
-        None => Err(
-            "nbformat 4 required: `nbformat` is missing or not an integer (is this a Jupyter notebook?)"
-                .to_owned(),
-        ),
+        ))),
+        Some(major) => {
+            tracing::debug!(
+                nbformat = major,
+                "notebook too old; re-save it with Jupyter"
+            );
+            Err("nbformat 4 required".to_owned())
+        }
+        None => Err("not a Jupyter notebook: `nbformat` is missing or not an integer".to_owned()),
     }
 }
 
@@ -387,23 +465,25 @@ fn take_cells(top: &mut Map<String, Value>) -> Result<Vec<Value>, String> {
 }
 
 /// Deserializes one cell; outputs and attachments leniently (see [`parse_outputs`]).
-fn parse_cell(index: usize, mut raw: Value, warnings: &mut Vec<String>) -> Result<Cell, String> {
+fn parse_cell(mut raw: Value) -> Result<(Cell, Vec<Finding>), serde_json::Error> {
+    let cell_type = raw.get("cell_type").cloned();
     let (outputs, attachments) = match raw.as_object_mut() {
         Some(object) => (object.remove("outputs"), object.remove("attachments")),
         None => (None, None),
     };
-    let mut cell: Cell =
-        serde_json::from_value(raw).map_err(|err| format!("cell {index}: {err}"))?;
-    let mut cell_warnings = Vec::new();
-    cell.outputs = lenient_outputs(outputs, &mut cell_warnings);
-    cell.attachments = lenient_attachments(attachments, &mut cell_warnings);
-    check_cell_metadata(&cell, &mut cell_warnings);
-    warnings.extend(
-        cell_warnings
-            .into_iter()
-            .map(|message| format!("cell {index}: {message}")),
-    );
-    Ok(cell)
+    let mut cell: Cell = serde_json::from_value(raw)?;
+    let mut findings = Vec::new();
+    if cell.cell_type == CellType::Unknown {
+        let name = cell_type.map(|name| name.to_string()).unwrap_or_default();
+        findings.push((
+            codes::UNKNOWN_CELL_TYPE,
+            format!("unknown cell_type {name}, cell ignored"),
+        ));
+    }
+    cell.outputs = lenient_outputs(outputs, &mut findings);
+    cell.attachments = lenient_attachments(attachments, &mut findings);
+    check_cell_metadata(&cell, &mut findings);
+    Ok((cell, findings))
 }
 
 /// Deserializes each raw output on its own, keeping those that succeed in order and
@@ -427,16 +507,23 @@ pub fn parse_outputs(raw: Vec<Value>) -> (Vec<Output>, Vec<String>) {
 }
 
 /// `outputs` as a list of [`Output`]s; absent or `null` → empty.
-fn lenient_outputs(raw: Option<Value>, warnings: &mut Vec<String>) -> Vec<Output> {
+fn lenient_outputs(raw: Option<Value>, findings: &mut Vec<Finding>) -> Vec<Output> {
     match raw {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(items)) => {
-            let (outputs, output_warnings) = parse_outputs(items);
-            warnings.extend(output_warnings);
+            let (outputs, warnings) = parse_outputs(items);
+            findings.extend(
+                warnings
+                    .into_iter()
+                    .map(|message| (codes::OUTPUT_SKIPPED, message)),
+            );
             outputs
         }
         Some(_) => {
-            warnings.push("`outputs` is not a list, ignored".to_owned());
+            findings.push((
+                codes::OUTPUT_SKIPPED,
+                "`outputs` is not a list, ignored".to_owned(),
+            ));
             Vec::new()
         }
     }
@@ -445,7 +532,7 @@ fn lenient_outputs(raw: Option<Value>, warnings: &mut Vec<String>) -> Vec<Output
 /// `attachments` per file name; a file whose bundle does not deserialize is dropped.
 fn lenient_attachments(
     raw: Option<Value>,
-    warnings: &mut Vec<String>,
+    findings: &mut Vec<Finding>,
 ) -> BTreeMap<String, BTreeMap<String, MultilineString>> {
     let mut attachments = BTreeMap::new();
     match raw {
@@ -456,26 +543,36 @@ fn lenient_attachments(
                     Ok(bundle) => {
                         attachments.insert(name, bundle);
                     }
-                    Err(err) => warnings.push(format!("attachment '{name}' skipped: {err}")),
+                    Err(err) => findings.push((
+                        codes::ATTACHMENT_SKIPPED,
+                        format!("attachment '{name}' skipped: {err}"),
+                    )),
                 }
             }
         }
-        Some(_) => warnings.push("`attachments` is not an object, ignored".to_owned()),
+        Some(_) => findings.push((
+            codes::ATTACHMENT_SKIPPED,
+            "`attachments` is not an object, ignored".to_owned(),
+        )),
     }
     attachments
 }
 
-/// Warns about metadata the accessors silently replace by a default.
-fn check_cell_metadata(cell: &Cell, warnings: &mut Vec<String>) {
-    if let Some(slide_type) = cell.metadata.pointer("/slideshow/slide_type")
+/// Warns about metadata the accessors silently replace by a default (`null` is absent).
+fn check_cell_metadata(cell: &Cell, findings: &mut Vec<Finding>) {
+    if let Some(slide_type) = non_null(cell.metadata.pointer("/slideshow/slide_type"))
         && slide_type.as_str().and_then(SlideType::parse).is_none()
     {
-        warnings.push(format!(
-            "unknown slideshow.slide_type {slide_type}, treated as \"-\""
+        findings.push((
+            codes::UNKNOWN_SLIDE_TYPE,
+            format!("unknown slideshow.slide_type {slide_type}, treated as \"-\""),
         ));
     }
-    if cell.metadata.get("presenter").is_some() && cell.presenter_overrides().is_none() {
-        warnings.push("metadata.presenter is not an object, ignored".to_owned());
+    if non_null(cell.metadata.get("presenter")).is_some() && cell.presenter_overrides().is_none() {
+        findings.push((
+            codes::PRESENTER_NOT_OBJECT,
+            PRESENTER_NOT_OBJECT_MESSAGE.to_owned(),
+        ));
     }
 }
 
@@ -524,13 +621,79 @@ mod tests {
             ("skip", SlideType::Skip),
             ("notes", SlideType::Notes),
             ("-", SlideType::Continue),
+            ("", SlideType::Continue), // JupyterLab 4's value for "-"
         ];
         for (name, expected) in cases {
             assert_eq!(SlideType::parse(name), Some(expected), "{name}");
         }
         assert_eq!(SlideType::parse("Slide"), None);
-        assert_eq!(SlideType::parse(""), None);
+        assert_eq!(SlideType::parse(" "), None);
         assert_eq!(SlideType::default(), SlideType::Continue);
+    }
+
+    fn parse_cells(cells: Value) -> (Notebook, Diagnostics) {
+        let notebook =
+            json!({ "cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 5 });
+        parse_notebook(Path::new("nb.ipynb"), &notebook.to_string()).unwrap()
+    }
+
+    #[test]
+    fn jupyterlab_4_empty_slide_type_is_continue_without_warning() {
+        // What JupyterLab 4's property inspector saves after choosing "-".
+        let metadata = json!({ "editable": true, "slideshow": { "slide_type": "" }, "tags": [] });
+        let (notebook, warnings) = parse_cells(json!([
+            { "cell_type": "markdown", "source": "a", "metadata": metadata },
+            { "cell_type": "code", "source": "b", "metadata": metadata, "outputs": [] }
+        ]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let types: Vec<SlideType> = notebook.cells.iter().map(Cell::slide_type).collect();
+        assert_eq!(types, [SlideType::Continue, SlideType::Continue]);
+    }
+
+    #[test]
+    fn null_metadata_values_count_as_absent() {
+        let source = json!({
+            "cells": [ { "cell_type": "markdown", "source": "",
+                         "metadata": { "presenter": null, "slideshow": { "slide_type": null } } } ],
+            "metadata": { "presenter": null },
+            "nbformat": 4
+        });
+        let (notebook, warnings) =
+            parse_notebook(Path::new("nb.ipynb"), &source.to_string()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(notebook.presenter_meta(), None);
+        assert_eq!(notebook.cells[0].presenter_overrides(), None);
+        assert_eq!(notebook.cells[0].slide_type(), SlideType::Continue);
+    }
+
+    #[test]
+    fn cell_type_other_is_unknown() {
+        let cell_type =
+            |name: &str| serde_json::from_value::<CellType>(json!(name)).map_err(|e| e.to_string());
+        assert_eq!(cell_type("raw"), Ok(CellType::Raw));
+        assert_eq!(cell_type("chart"), Ok(CellType::Unknown));
+        assert_eq!(cell_type("Markdown"), Ok(CellType::Unknown));
+        assert!(serde_json::from_value::<CellType>(json!(1)).is_err());
+        assert!(serde_json::from_value::<CellType>(json!(null)).is_err());
+    }
+
+    #[test]
+    fn cell_span_covers_the_source_lines() {
+        let (notebook, _) = parse_cells(json!([
+            { "cell_type": "markdown", "source": "" },
+            { "cell_type": "markdown", "source": ["a\n", "b\n", "c"] },
+            { "cell_type": "markdown", "source": "a\nb\n" }
+        ]));
+        let spans: Vec<(usize, usize, Option<usize>)> = notebook
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let span = cell.span(index);
+                (span.start_line, span.end_line, span.cell)
+            })
+            .collect();
+        assert_eq!(spans, [(1, 1, Some(0)), (1, 3, Some(1)), (1, 2, Some(2))]);
     }
 
     #[test]

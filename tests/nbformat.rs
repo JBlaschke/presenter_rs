@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use presenter::error::Error;
+use presenter::error::{Diagnostics, Error, Level};
+use presenter::ir::SourceSpan;
 use presenter::notebook::nbformat::{
-    CellType, MultilineString, Notebook, Output, SlideType, mime_text, parse_notebook,
+    CellType, MultilineString, Notebook, Output, SlideType, codes, mime_text, parse_notebook,
 };
 use serde_json::{Map, Value, json};
 
+/// The fixtures this task owns; later tasks may add more files next to them.
 const FIXTURES: [&str; 5] = [
     "frontmatter.ipynb",
     "minimal.ipynb",
@@ -32,8 +34,34 @@ fn fixture(name: &str) -> Notebook {
     notebook
 }
 
-fn parse(value: Value) -> (Notebook, Vec<String>) {
+fn parse(value: Value) -> (Notebook, Diagnostics) {
     parse_notebook(Path::new("test.ipynb"), &value.to_string()).unwrap()
+}
+
+/// (cell index from the span, code, message) of every warning, after checking the parts
+/// every warning shares: warning level, the path given to `parse_notebook`, and a
+/// whole-cell span (lines 1..=source lines) when the warning is about a cell.
+fn summary(
+    notebook: &Notebook,
+    warnings: &Diagnostics,
+) -> Vec<(Option<usize>, &'static str, String)> {
+    warnings
+        .iter()
+        .map(|warning| {
+            assert_eq!(warning.level, Level::Warning, "{warning}");
+            assert_eq!(
+                warning.path.as_deref(),
+                Some(Path::new("test.ipynb")),
+                "{warning}"
+            );
+            let cell = warning.span.as_ref().map(|span| {
+                let index = span.cell.expect("cell-level spans name their cell");
+                assert_eq!(span, &notebook.cells[index].span(index), "{warning}");
+                index
+            });
+            (cell, warning.code, warning.message.clone())
+        })
+        .collect()
 }
 
 /// A valid nbformat 4.5 notebook around `cells`.
@@ -54,13 +82,20 @@ fn parse_error(json: &str) -> (PathBuf, Option<usize>, String) {
 
 #[test]
 fn every_fixture_parses_without_warnings() {
-    let mut found: Vec<String> = std::fs::read_dir(fixture_dir())
+    let found: Vec<String> = std::fs::read_dir(fixture_dir())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| name.ends_with(".ipynb"))
         .collect();
-    found.sort();
-    assert_eq!(found, FIXTURES);
+    for name in FIXTURES {
+        assert!(found.iter().any(|f| f == name), "missing fixture {name}");
+    }
+    // Fixtures added by later tasks (e.g. lint inputs that warn on purpose) only need to parse.
+    for name in found.iter().filter(|f| !FIXTURES.contains(&f.as_str())) {
+        let path = fixture_dir().join(name);
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(parse_notebook(&path, &json).is_ok(), "{name}");
+    }
     for name in FIXTURES {
         let notebook = fixture(name);
         assert_eq!(
@@ -174,11 +209,28 @@ fn unknown_output_type_is_skipped_with_a_warning_and_the_cell_survives() {
             ]
         }
     ])));
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let found = summary(&notebook, &warnings);
+    assert_eq!(found.len(), 1, "{warnings:?}");
+    let (cell, code, message) = &found[0];
+    assert_eq!((*cell, *code), (Some(1), codes::OUTPUT_SKIPPED));
     assert!(
-        warnings[0].starts_with("cell 1: output 1 (weird) skipped: unknown variant `weird`"),
-        "{}",
-        warnings[0]
+        message.starts_with("output 1 (weird) skipped: unknown variant `weird`"),
+        "{message}"
+    );
+    let warning = warnings.iter().next().unwrap();
+    assert_eq!(
+        warning.span,
+        Some(SourceSpan {
+            start_line: 1,
+            end_line: 2,
+            cell: Some(1)
+        })
+    );
+    assert!(
+        warning
+            .to_string()
+            .starts_with("test.ipynb: cell 1, line 1: warning: output 1 (weird) skipped: "),
+        "{warning}"
     );
     let cell = &notebook.cells[1];
     assert_eq!(cell.id.as_deref(), Some("c1"));
@@ -219,15 +271,18 @@ fn malformed_known_outputs_and_odd_shapes_are_warnings_too() {
         },
         { "cell_type": "raw", "metadata": {}, "source": "", "attachments": [] }
     ])));
-    assert_eq!(
-        warnings,
-        [
-            "cell 0: output 0 (stream) skipped: missing field `text`",
-            "cell 1: `outputs` is not a list, ignored",
-            "cell 2: attachment 'bad.json' skipped: invalid type: map, expected a string or a list of strings",
-            "cell 3: `attachments` is not an object, ignored",
-        ]
-    );
+    let expected = [
+        (0, codes::OUTPUT_SKIPPED, "output 0 (stream) skipped: missing field `text`"),
+        (1, codes::OUTPUT_SKIPPED, "`outputs` is not a list, ignored"),
+        (
+            2,
+            codes::ATTACHMENT_SKIPPED,
+            "attachment 'bad.json' skipped: invalid type: map, expected a string or a list of strings",
+        ),
+        (3, codes::ATTACHMENT_SKIPPED, "`attachments` is not an object, ignored"),
+    ]
+    .map(|(cell, code, message)| (Some(cell), code, message.to_owned()));
+    assert_eq!(summary(&notebook, &warnings), expected);
     assert!(matches!(
         &notebook.cells[0].outputs[..],
         [Output::Error { .. }]
@@ -247,15 +302,23 @@ fn nbformat_3_is_a_parse_error_mentioning_nbformat_4() {
     let (path, line, message) = parse_error(&v3.to_string());
     assert_eq!(path, Path::new("talk.ipynb"));
     assert_eq!(line, None);
-    assert!(
-        message.starts_with("nbformat 4 required, found nbformat 3"),
-        "{message}"
-    );
+    assert_eq!(message, "nbformat 4 required"); // spec §1, verbatim
+    let (_, _, message) = parse_error(r#"{"cells": [], "nbformat": 2}"#);
+    assert_eq!(message, "nbformat 4 required");
 
-    let (_, _, message) = parse_error(r#"{"cells": [], "metadata": {}}"#);
-    assert!(message.starts_with("nbformat 4 required"), "{message}");
-    let (_, _, message) = parse_error(r#"{"cells": [], "nbformat": "4"}"#);
-    assert!(message.starts_with("nbformat 4 required"), "{message}");
+    // Not a notebook version at all (spec §1 does not cover these).
+    for json in [
+        r#"{"cells": [], "metadata": {}}"#,
+        r#"{"cells": [], "nbformat": "4"}"#,
+        r#"{"cells": [], "nbformat": 4.5}"#,
+        r#"{"cells": [], "nbformat": -4}"#,
+    ] {
+        let (_, _, message) = parse_error(json);
+        assert_eq!(
+            message, "not a Jupyter notebook: `nbformat` is missing or not an integer",
+            "{json}"
+        );
+    }
 }
 
 #[test]
@@ -270,17 +333,47 @@ fn other_unusable_documents_are_parse_errors() {
     assert_eq!(message, "not a Jupyter notebook: `cells` is missing");
     let (_, _, message) = parse_error(r#"{"nbformat": 4, "cells": {}}"#);
     assert_eq!(message, "`cells` is not a list");
-    let (_, _, message) = parse_error(
-        &notebook_with(json!([
-            { "cell_type": "markdown", "source": "" },
-            { "cell_type": "heading", "source": "" }
-        ]))
-        .to_string(),
-    );
+    let cell_error = |cell: Value| {
+        let notebook = notebook_with(json!([{ "cell_type": "markdown", "source": "" }, cell]));
+        parse_error(&notebook.to_string()).2
+    };
     assert!(
-        message.starts_with("cell 1: unknown variant `heading`"),
-        "{message}"
+        cell_error(json!({ "source": "no cell_type" }))
+            .starts_with("cell 1: missing field `cell_type`"),
     );
+    assert!(cell_error(json!({ "cell_type": 3 })).starts_with("cell 1: invalid type: integer `3`"));
+    assert!(
+        cell_error(json!({ "cell_type": "code", "source": 3 })).starts_with("cell 1: invalid type")
+    );
+    assert!(cell_error(json!("not an object")).starts_with("cell 1: invalid type: string"));
+}
+
+#[test]
+fn unknown_cell_type_is_kept_as_unknown_with_a_warning() {
+    // nbformat 5.11.1 validates and reads this (an "unrecognized cell" from 4.6).
+    let (notebook, warnings) = parse(json!({
+        "cells": [
+            { "cell_type": "markdown", "id": "a", "metadata": {}, "source": "# A" },
+            { "cell_type": "chart", "id": "b", "metadata": {}, "source": ["x\n", "y"] },
+            { "cell_type": "heading", "metadata": {}, "source": "", "level": 1 },
+            { "cell_type": "code", "id": "c", "metadata": {}, "source": "1", "outputs": [],
+              "execution_count": null }
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 6
+    }));
+    let kinds: Vec<CellType> = notebook.cells.iter().map(|cell| cell.cell_type).collect();
+    use CellType::{Code, Markdown, Unknown};
+    assert_eq!(kinds, [Markdown, Unknown, Unknown, Code]);
+    assert_eq!(notebook.cells[1].id.as_deref(), Some("b"));
+    assert_eq!(notebook.cells[1].source.as_str(), "x\ny");
+    let expected = [
+        (1, "unknown cell_type \"chart\", cell ignored"),
+        (2, "unknown cell_type \"heading\", cell ignored"),
+    ]
+    .map(|(cell, message)| (Some(cell), codes::UNKNOWN_CELL_TYPE, message.to_owned()));
+    assert_eq!(summary(&notebook, &warnings), expected);
 }
 
 #[test]
@@ -289,8 +382,16 @@ fn newer_nbformat_is_read_with_a_warning() {
     assert_eq!(notebook.nbformat, 5);
     assert_eq!(notebook.nbformat_minor, 0);
     assert_eq!(
-        warnings,
-        ["nbformat 5 is newer than this tool knows; reading it as nbformat 4"]
+        summary(&notebook, &warnings),
+        [(
+            None,
+            codes::NBFORMAT_NEWER,
+            "nbformat 5 is newer than this tool knows; reading it as nbformat 4".to_owned()
+        )]
+    );
+    assert_eq!(
+        warnings.iter().next().unwrap().to_string(),
+        "test.ipynb: warning: nbformat 5 is newer than this tool knows; reading it as nbformat 4"
     );
 }
 
@@ -379,26 +480,44 @@ fn unknown_slide_type_is_continue_with_a_warning() {
         cell(json!("Slide")),
         cell(json!(3)),
         cell(json!("-")),
-        { "cell_type": "markdown", "source": "", "metadata": { "slideshow": {} } }
+        { "cell_type": "markdown", "source": "", "metadata": { "slideshow": {} } },
+        cell(json!("")),   // JupyterLab 4 writes "" for "-"
+        cell(json!(null)), // null means absent
+        { "cell_type": "markdown", "source": "", "metadata": { "slideshow": null } }
     ])));
     let types: Vec<SlideType> = notebook.cells.iter().map(|c| c.slide_type()).collect();
+    let mut expected = vec![SlideType::Continue; 8];
+    expected[0] = SlideType::Slide;
+    assert_eq!(types, expected);
+    let expected = [
+        (
+            1,
+            "unknown slideshow.slide_type \"Slide\", treated as \"-\"",
+        ),
+        (2, "unknown slideshow.slide_type 3, treated as \"-\""),
+    ]
+    .map(|(cell, message)| (Some(cell), codes::UNKNOWN_SLIDE_TYPE, message.to_owned()));
+    assert_eq!(summary(&notebook, &warnings), expected);
     assert_eq!(
-        types,
-        [
-            SlideType::Slide,
-            SlideType::Continue,
-            SlideType::Continue,
-            SlideType::Continue,
-            SlideType::Continue,
-        ]
+        format!("{:#}", warnings.iter().next().unwrap()),
+        "test.ipynb: cell 1, line 1: warning: unknown slideshow.slide_type \"Slide\", treated as \"-\" [unknown-slide-type]"
     );
-    assert_eq!(
-        warnings,
-        [
-            "cell 1: unknown slideshow.slide_type \"Slide\", treated as \"-\"",
-            "cell 2: unknown slideshow.slide_type 3, treated as \"-\"",
-        ]
-    );
+}
+
+#[test]
+fn jupyterlab_4_metadata_parses_without_warnings() {
+    // The cell metadata JupyterLab 4's property inspector writes when "-" is selected.
+    let metadata = json!({ "editable": true, "slideshow": { "slide_type": "" }, "tags": [] });
+    let (notebook, warnings) = parse(notebook_with(json!([
+        { "cell_type": "markdown", "id": "m", "metadata": metadata, "source": "# Title" },
+        { "cell_type": "code", "id": "c", "metadata": metadata, "source": "1",
+          "outputs": [], "execution_count": null }
+    ])));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    for cell in &notebook.cells {
+        assert_eq!(cell.slide_type(), SlideType::Continue);
+        assert!(cell.tags().is_empty());
+    }
 }
 
 #[test]
@@ -474,8 +593,25 @@ fn frontmatter_fixture_metadata() {
     assert_eq!(presenter["title"], json!("Title from metadata.presenter"));
     assert_eq!(presenter["author"], json!("Author from metadata.presenter"));
     assert_eq!(presenter["event"], json!("Fixture Conf"));
-    let first = &notebook.cells[0];
+    let kinds: Vec<CellType> = notebook.cells.iter().map(|cell| cell.cell_type).collect();
+    use CellType::{Code, Markdown};
+    assert_eq!(kinds, [Code, Markdown, Code, Markdown]);
+    // The first markdown cell is not cell 0; cell 0 is skipped.
+    assert_eq!(notebook.cells[0].slide_type(), SlideType::Skip);
+    // A later markdown cell also starts with a `---` block, which must not become metadata.
+    let second = &notebook.cells[3];
+    assert_eq!(second.slide_type(), SlideType::Slide);
+    assert!(
+        second
+            .source
+            .as_str()
+            .starts_with("---\ntitle: must be ignored\n---\n## Second slide\n"),
+        "{:?}",
+        second.source
+    );
+    let first = &notebook.cells[1];
     assert_eq!(first.cell_type, CellType::Markdown);
+    assert_eq!(first.slide_type(), SlideType::Slide);
     assert!(
         first
             .source
@@ -503,13 +639,27 @@ fn non_object_presenter_metadata_is_ignored_with_a_warning() {
     assert_eq!(notebook.presenter_meta(), None);
     assert_eq!(notebook.title(), None);
     assert_eq!(notebook.cells[0].presenter_overrides(), None);
+    let message = "metadata.presenter is not an object, ignored".to_owned();
     assert_eq!(
-        warnings,
+        summary(&notebook, &warnings),
         [
-            "metadata.presenter is not an object, ignored",
-            "cell 0: metadata.presenter is not an object, ignored",
+            (None, codes::PRESENTER_NOT_OBJECT, message.clone()),
+            (Some(0), codes::PRESENTER_NOT_OBJECT, message),
         ]
     );
+}
+
+#[test]
+fn null_presenter_metadata_is_absent_without_a_warning() {
+    let (notebook, warnings) = parse(json!({
+        "cells": [ { "cell_type": "markdown", "source": "", "metadata": { "presenter": null } } ],
+        "metadata": { "presenter": null, "title": null },
+        "nbformat": 4
+    }));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(notebook.presenter_meta(), None);
+    assert_eq!(notebook.title(), None);
+    assert_eq!(notebook.cells[0].presenter_overrides(), None);
 }
 
 #[test]
