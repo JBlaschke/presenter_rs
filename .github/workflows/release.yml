@@ -1,0 +1,248 @@
+# Release builds (T47). The release process is in docs/dev/release.md.
+#
+# Pushing a tag `v<version>` (the version in Cargo.toml, e.g. `v0.1.0` or `v0.2.0-rc.1`)
+# tests and builds `presenter` natively on one runner per target, packages each binary as
+# `presenter-<tag>-<target>.tar.gz` (the binary, LICENSE, README.md and the
+# THIRD-PARTY-LICENSES of what it embeds and links, in a directory of the same name) and
+# publishes a GitHub Release with the four archives and `SHA256SUMS`.
+#
+# Running the workflow by hand ("Run workflow", any branch) builds the same archives,
+# named `presenter-v<version>-dev.<sha>-<target>`, as artifacts of the run and publishes
+# nothing: a dry run for workflow changes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  label:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      label: ${{ steps.label.outputs.label }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # As in the build jobs, so the tag is fetched as itself (annotated or not).
+          fetch-depth: 0
+          persist-credentials: false
+      - id: label
+        name: archive label
+        run: |
+          # The first `version = "…"` at the start of a line is [package]'s.
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [[ -z "$version" ]]; then
+            echo "::error file=Cargo.toml::no package version found"
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version (expected v$version)"
+              exit 1
+            fi
+            # Fail before four builds: `git describe`, and so --version, ignores
+            # lightweight tags, and the build jobs' smoke test would reject them.
+            if [[ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" != tag ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not annotated; push one made with git tag -a (see docs/dev/release.md)"
+              exit 1
+            fi
+            label=$GITHUB_REF_NAME
+          else
+            label="v$version-dev.${GITHUB_SHA::7}"
+          fi
+          echo "label=$label" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: label
+    strategy:
+      # Let every target finish, so one run shows all platform problems.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      RUNNER_LABEL: ${{ matrix.runner }}
+      ARCHIVE: presenter-${{ needs.label.outputs.label }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # All history and tags: build.rs embeds `git describe` (the tag) in --version.
+          fetch-depth: 0
+          persist-credentials: false
+      # No build cache: release binaries are built from a clean slate.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: native target check
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [[ "$host" != "$TARGET" ]]; then
+            echo "::error::runner $RUNNER_LABEL builds for $host, expected $TARGET"
+            exit 1
+          fi
+      # Release profile, so the tests run against embedded assets, as shipped.
+      - name: cargo test
+        run: cargo test --release --locked
+      - name: cargo build
+        run: cargo build --release --locked
+      - name: smoke test
+        run: |
+          bin=target/release/presenter
+          if command -v file >/dev/null; then file "$bin"; fi
+          ls -l "$bin"
+          "$bin" --version
+          "$bin" build examples/basic/slides.md -o "$RUNNER_TEMP/basic.html"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            # A clean checkout of an annotated tag: --version names the tag.
+            expected="presenter ${GITHUB_REF_NAME#v} ($GITHUB_REF_NAME)"
+            actual=$("$bin" --version)
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::--version printed '$actual', expected '$expected' (is the tag annotated? see docs/dev/release.md)"
+              exit 1
+            fi
+          fi
+      - name: third-party licenses
+        run: |
+          export LC_ALL=C
+          if ! command -v jq >/dev/null; then
+            echo "::error::jq is not installed on $RUNNER_LABEL"
+            exit 1
+          fi
+          notices="dist/$ARCHIVE/THIRD-PARTY-LICENSES"
+          mkdir -p "$notices/assets" "$notices/crates"
+          # The web assets embedded from assets/vendor (reveal.js, KaTeX, their fonts): the
+          # license files, at their paths there, and the versions.
+          cp assets/vendor/VERSIONS.toml "$notices/assets/"
+          (cd assets/vendor && find . -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' \)) \
+            | while IFS= read -r file; do
+                mkdir -p "$notices/assets/$(dirname "$file")"
+                cp "assets/vendor/$file" "$notices/assets/$file"
+              done
+          # The crates linked into the binary: the normal dependencies for this target,
+          # without proc-macros (they only run at compile time). Their license expression
+          # and source in crates.txt, and their license files.
+          cargo tree --locked -e normal,no-proc-macro --target "$TARGET" --prefix none --format '{p}' \
+            | sed -E 's/ \(.*$//' | sort -u > "$RUNNER_TEMP/linked.txt"
+          cargo metadata --locked --format-version 1 --filter-platform "$TARGET" \
+            | jq -r '.resolve.root as $root | .packages[] | select(.id != $root)
+                | [.name, .version, (.license // "see the license files"), (.source // "path"),
+                   (.manifest_path | rtrimstr("/Cargo.toml"))]
+                | @tsv' \
+            | sort > "$RUNNER_TEMP/packages.tsv"
+          found=0
+          while IFS=$'\t' read -r name version license source dir; do
+            grep -qxF "$name v$version" "$RUNNER_TEMP/linked.txt" || continue
+            found=$((found + 1))
+            if [[ "$source" == *crates.io-index ]]; then
+              source="https://crates.io/crates/$name/$version"
+            fi
+            echo "$name $version: $license ($source)" >> "$notices/crates.txt"
+            mkdir -p "$notices/crates/$name-$version"
+            find "$dir" -maxdepth 1 -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' -o -iname 'unlicense*' \) \
+              -exec cp {} "$notices/crates/$name-$version/" \;
+            if [[ -z "$(ls -A "$notices/crates/$name-$version")" ]]; then
+              rmdir "$notices/crates/$name-$version"
+              echo "note: $name $version has no license file; crates.txt names its license"
+            fi
+          done < "$RUNNER_TEMP/packages.tsv"
+          # Every linked crate but presenter itself is accounted for.
+          expected=$(($(wc -l < "$RUNNER_TEMP/linked.txt") - 1))
+          if [[ "$found" -ne "$expected" ]]; then
+            echo "::error::found $found of the $expected linked crates in cargo metadata"
+            exit 1
+          fi
+          echo "$found crates"
+      - name: package
+        run: |
+          mkdir -p "dist/$ARCHIVE"
+          cp target/release/presenter LICENSE README.md "dist/$ARCHIVE/"
+          # COPYFILE_DISABLE: no AppleDouble (._*) entries from macOS tar.
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
+          # The contents, without the ~140 crate license directories.
+          tar -tzvf "dist/$ARCHIVE.tar.gz" | grep -v "/THIRD-PARTY-LICENSES/crates/."
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: dist/${{ env.ARCHIVE }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [label, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: presenter-*
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          archives=(*.tar.gz)
+          if [[ ${#archives[@]} -ne 4 ]]; then
+            echo "::error::expected 4 archives, found ${#archives[@]}: ${archives[*]}"
+            exit 1
+          fi
+          sha256sum "${archives[@]}" | tee SHA256SUMS
+      - name: release notes
+        run: |
+          # The CHANGELOG.md section of this version: from its `## [<version>]` heading
+          # to the next `## ` heading.
+          version=${GITHUB_REF_NAME#v}
+          awk -v v="$version" '/^## /{ p = index($0, "[" v "]") > 0; next } p' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::warning file=CHANGELOG.md::no section for $version"
+            echo "presenter $GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          fi
+          cat "$RUNNER_TEMP/notes.md"
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          flags=()
+          # A tag with a pre-release suffix (v0.2.0-rc.1) makes a pre-release.
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "presenter $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${flags[@]}" \
+            dist/*.tar.gz dist/SHA256SUMS

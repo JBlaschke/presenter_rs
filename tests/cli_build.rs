@@ -714,3 +714,69 @@ fn rust_log_adds_to_the_verbosity_flags() {
         .stdout("")
         .stderr("");
 }
+
+/// T47: `presenter --version` names the exact build, `presenter <version> (<build id>)`,
+/// where the build id is what `build.rs` embeds: `git describe --always --dirty` output
+/// (`33a4607`, `v0.1.0`, `v0.1.0-3-g33a4607`, each optionally `-dirty`), `unknown` without
+/// git, or the `PRESENTER_GIT_SHA` override, in the charset `tests/cli_version.rs` accepts.
+#[test]
+fn version_names_the_build() {
+    let line = Regex::new(r"^presenter (\d+\.\d+\.\d+\S*) \(([0-9A-Za-z.+-]+)\)\n$").unwrap();
+    let build_id = env!("PRESENTER_GIT_SHA");
+    for flag in ["--version", "-V"] {
+        let stdout = stdout_of(presenter().arg(flag));
+        let caps = line
+            .captures(&stdout)
+            .unwrap_or_else(|| panic!("{flag}: {stdout:?}"));
+        assert_eq!(&caps[1], env!("CARGO_PKG_VERSION"));
+        assert_eq!(&caps[2], build_id);
+    }
+
+    // build.rs is wired to git: when git describes this checkout, the binary names HEAD
+    // (`cargo test` rebuilt it if HEAD moved). Cargo also exports the build script's
+    // `rustc-env` variables to test processes, so the runtime environment cannot tell an
+    // override from a described build; the script's PRESENTER_BUILD_ID_SOURCE can.
+    let source = env!("PRESENTER_BUILD_ID_SOURCE");
+    match git_in_root(&["describe", "--always"]) {
+        _ if source == "override" => {}
+        Some(described) => {
+            assert_eq!(
+                source, "git",
+                "git describes the checkout as {described}, but the build id is {build_id}"
+            );
+            // Edits outside src/ do not rerun build.rs, so `-dirty` may lag behind; and the
+            // abbreviation may have grown since the build. Compare commits, unless the id
+            // does not name one (a tag name with characters build.rs replaced).
+            let clean = build_id.strip_suffix("-dirty").unwrap_or(build_id);
+            let commit = |rev: &str| git_in_root(&["rev-parse", "--verify", "-q", rev]);
+            match (commit(&format!("{clean}^{{commit}}")), commit("HEAD")) {
+                (Some(built), Some(head)) => assert_eq!(built, head, "{build_id} is not HEAD"),
+                _ => {
+                    let charset = |c: char| c.is_ascii_alphanumeric() || "+.-".contains(c);
+                    assert_eq!(clean, described.replace(|c| !charset(c), "-"));
+                }
+            }
+        }
+        None => eprintln!("git does not describe {}; skipped", root().display()),
+    }
+}
+
+/// Runs git in the crate directory the way `build.rs` does (no search in parent
+/// directories, no caller `GIT_DIR`); its trimmed stdout, or `None` when git is missing,
+/// fails or prints nothing.
+fn git_in_root(args: &[&str]) -> Option<String> {
+    let root = root();
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(&root)
+        .env("GIT_CEILING_DIRECTORIES", root.parent()?)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let stdout = stdout.trim();
+    (output.status.success() && !stdout.is_empty()).then(|| stdout.to_string())
+}
