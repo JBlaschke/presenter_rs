@@ -12,8 +12,9 @@
 //! 4. each slide is rendered by [`render::render_nodes`] (through [`compat::render_slide`],
 //!    which splits off a `Note:` paragraph and what follows as notes); its attributes
 //!    (separator, `<!-- .slide: -->` comments and lifted heading attributes) are applied with
-//!    `SlideAttrs::apply_to`, and relative background images/videos/iframes are registered
-//!    ([`render::rewrite_slide_assets`]); the body and notes HTML then go through
+//!    `SlideAttrs::apply_to`, an image-like `data-background` becomes
+//!    `data-background-image` ([`compat::image_background`]), and relative background
+//!    images/videos/iframes are registered ([`render::rewrite_slide_assets`]); the body and notes HTML then go through
 //!    [`postprocess`] (`<!-- .element: -->` comments; incremental lists in the body when
 //!    [`postprocess::incremental_enabled`] says so for the slide);
 //! 5. `Deck.features` is the union of the slides' features and `Deck.assets` summarizes the
@@ -76,11 +77,12 @@ pub fn parse(source: &SourceInfo, text: &str, config: &Config) -> Result<Parsed>
         missing_asset_is_error: false,
     };
     let incremental = deck_config.slides.incremental_lists;
+    let lines = split::source_lines(text);
     for (raw_slide, raw_children) in raw.slides {
-        let mut slide = build_slide(&arena, raw_slide, &opts, &mut ctx, &mut features)?;
+        let mut slide = build_slide(&arena, raw_slide, &lines, &opts, &mut ctx, &mut features)?;
         postprocess_slide(&mut slide, incremental, ctx.diagnostics)?;
         for raw_child in raw_children {
-            let mut child = build_slide(&arena, raw_child, &opts, &mut ctx, &mut features)?;
+            let mut child = build_slide(&arena, raw_child, &lines, &opts, &mut ctx, &mut features)?;
             postprocess_slide(&mut child, incremental, ctx.diagnostics)?;
             slide.children.push(child);
         }
@@ -157,18 +159,21 @@ fn split_mode(slides: &SlidesConfig) -> SplitMode {
     }
 }
 
-/// Renders one raw slide into an IR [`Slide`] (without children).
+/// Renders one raw slide into an IR [`Slide`] (without children); `lines` is the source
+/// split by [`split::source_lines`] (for `Note:` paragraphs, T43).
 fn build_slide<'a>(
     arena: &'a Arena<'a>,
     raw: RawSlide<'a>,
+    lines: &[&str],
     opts: &Options,
     ctx: &mut RenderCtx,
     features: &mut Features,
 ) -> Result<Slide> {
     let span = raw.span();
-    let rendered = compat::render_slide(arena, &raw.nodes, opts, ctx)?;
+    let rendered = compat::render_slide(arena, &raw.nodes, Some(lines), opts, ctx)?;
     let mut slide = Slide::new();
     raw.attrs.apply_to(&mut slide);
+    compat::image_background(&mut slide.attrs);
     rewrite_slide_assets(&mut slide.attrs, Some(&span), ctx)?;
     slide.title = rendered.title;
     slide.notes = rendered.notes;

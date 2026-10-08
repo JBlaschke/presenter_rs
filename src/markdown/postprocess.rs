@@ -25,6 +25,15 @@
 //!   `slides.incremental_lists`, overridden by the slide classes `.incremental` and
 //!   `.no-incremental`.
 //!
+//! Both find "the element before" and "the top level" on the element tree as a browser
+//! builds it from the HTML (comrak's output is always balanced; raw HTML may not be): tag
+//! names are case-insensitive, a stray end tag closes nothing, and the end tags a browser
+//! implies are honored where it matters here (a `<ul>`, `<div>`, `<h2>`, … start tag closes
+//! an open `<p>`; `<li>` closes the previous `<li>`; see [`close_implied`]). Other implied
+//! end tags (such as `</td>`, `</option>` or `</dd>`) and the adoption agency's re-nesting of
+//! misnested inline tags are not modelled: in such raw HTML an `.element` comment may pick
+//! another element than reveal would, and a list may be taken as nested.
+//!
 //! [`slide_html`] runs both, in that order, so a list can be given `no-incremental` with an
 //! `.element:` comment on the line after it.
 
@@ -42,10 +51,6 @@ use crate::markdown::compat;
 
 /// The class that turns an element into a reveal.js fragment.
 const FRAGMENT: &str = "fragment";
-
-/// The id of the wrapper [`incremental_lists`] puts around the slide HTML, so that its
-/// selector can name the slide's top level (`lol_html` has no `:scope`).
-const ROOT_ID: &str = "__presenter_slide_root__";
 
 /// Whether a slide's top-level lists become incremental: the slide class `no-incremental`
 /// says no, else `incremental` says yes, else `slides.incremental_lists` (`config`) decides.
@@ -140,12 +145,85 @@ struct ElementComment {
     text: String,
 }
 
-/// One open element while scanning: its start-tag index (`None` for the top level) and the
-/// index of its latest child element that is not a `<br>`.
+/// One open element while scanning: its start-tag index (`None` for the top level), its tag
+/// name (lowercase; empty for the top level), the index of its latest child element that is
+/// not a `<br>` ([`element_attributes`]), and whether it is a top-level list whose items
+/// become fragments ([`incremental_lists`]).
 #[derive(Debug, Default)]
 struct Frame {
     element: Option<usize>,
+    tag: String,
     last_child: Option<usize>,
+    fragments: bool,
+}
+
+/// Closes the elements a browser closes implicitly before the start tag `tag`, which
+/// `lol_html` keeps open (it only pairs end tags with start tags): a block-level start tag
+/// closes an open `<p>` ([`closes_p`]), and `<li>` closes the open `<li>` of its list (HTML
+/// tree construction, "in body" insertion mode, simplified to the scopes below). So a list
+/// after a raw `<p>` without `</p>` is at the slide's top level, as the browser shows it.
+/// `stack[0]` is the top level and is never closed.
+fn close_implied(stack: &mut Vec<Frame>, tag: &str) {
+    if closes_p(tag)
+        && let Some(at) = open_in_scope(stack, |t| t == "p", is_button_scope_boundary)
+    {
+        stack.truncate(at);
+    }
+    if tag == "li" {
+        let li_boundary = |t: &str| is_special(t) && !matches!(t, "address" | "div" | "p");
+        if let Some(at) = open_in_scope(stack, |t| t == "li", li_boundary) {
+            stack.truncate(at);
+        }
+    }
+}
+
+/// The position of the innermost open element matching `target`, unless an element for which
+/// `boundary` holds is open inside it.
+fn open_in_scope(
+    stack: &[Frame],
+    target: impl Fn(&str) -> bool,
+    boundary: impl Fn(&str) -> bool,
+) -> Option<usize> {
+    for (at, frame) in stack.iter().enumerate().skip(1).rev() {
+        if target(&frame.tag) {
+            return Some(at);
+        }
+        if boundary(&frame.tag) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Start tags that close an open `<p>` (in button scope), space-separated.
+const CLOSES_P: &str = "address article aside blockquote center details dialog dir div dl dd \
+                        dt fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header \
+                        hgroup hr li listing main menu nav ol p plaintext pre search section \
+                        summary table ul xmp";
+
+/// Elements that end the button scope a `<p>` is looked for in, space-separated.
+const BUTTON_SCOPE: &str = "applet button caption html marquee object table td template th";
+
+/// HTML's other "special" elements that can have content, space-separated.
+const OTHER_SPECIAL: &str = "body colgroup iframe noembed noframes noscript script select \
+                             style tbody textarea tfoot thead title tr";
+
+/// Whether `tag` is one of the space-separated `names`.
+fn is_one_of(tag: &str, names: &str) -> bool {
+    names.split_ascii_whitespace().any(|name| name == tag)
+}
+
+fn closes_p(tag: &str) -> bool {
+    is_one_of(tag, CLOSES_P)
+}
+
+fn is_button_scope_boundary(tag: &str) -> bool {
+    is_one_of(tag, BUTTON_SCOPE)
+}
+
+/// HTML's "special" elements that can have content.
+fn is_special(tag: &str) -> bool {
+    closes_p(tag) || is_button_scope_boundary(tag) || is_one_of(tag, OTHER_SPECIAL)
 }
 
 /// What the scan has seen so far.
@@ -163,7 +241,8 @@ struct Scan {
 /// First pass: finds the `.element` comments and the element each applies to (reveal's rule:
 /// the latest preceding sibling element other than `<br>`, else the parent). Elements are
 /// numbered by start tag in document order, as [`apply_element_edits`] numbers them. An
-/// element closed implicitly (no end tag) stays open until an ancestor's end tag.
+/// element without an end tag stays open until a browser would close it ([`close_implied`])
+/// or an ancestor's end tag.
 fn scan_element_comments(html: &str) -> Result<Vec<ElementComment>> {
     let scan = Rc::new(RefCell::new(Scan {
         elements: 0,
@@ -174,11 +253,13 @@ fn scan_element_comments(html: &str) -> Result<Vec<ElementComment>> {
     let on_element = {
         let scan = Rc::clone(&scan);
         move |el: &mut Element<'_, '_>| -> HandlerResult {
+            let tag = el.tag_name();
             let index = {
                 let mut state = scan.borrow_mut();
                 let index = state.elements;
                 state.elements += 1;
-                if el.tag_name() != "br"
+                close_implied(&mut state.stack, &tag);
+                if tag != "br"
                     && let Some(parent) = state.stack.last_mut()
                 {
                     parent.last_child = Some(index);
@@ -188,7 +269,8 @@ fn scan_element_comments(html: &str) -> Result<Vec<ElementComment>> {
             if let Some(handlers) = el.end_tag_handlers() {
                 scan.borrow_mut().stack.push(Frame {
                     element: Some(index),
-                    last_child: None,
+                    tag,
+                    ..Frame::default()
                 });
                 let scan = Rc::clone(&scan);
                 handlers.push(Box::new(move |_end| {
@@ -287,44 +369,86 @@ fn apply_attrs(el: &mut Element<'_, '_>, attrs: &ParsedAttrs) -> HandlerResult {
     Ok(())
 }
 
-/// Adds the whitespace-separated `classes` the element does not have yet to its `class`.
+/// Adds the whitespace-separated `classes` (plain text) the element does not have yet to its
+/// `class`. The attribute's current value is kept byte for byte (`lol_html` gives it with its
+/// entities); only the added names are escaped (`&`; `lol_html` escapes `"`).
 fn add_classes(el: &mut Element<'_, '_>, classes: &str) -> HandlerResult {
-    let current = el.get_attribute("class").unwrap_or_default();
-    let mut all: Vec<&str> = current.split_whitespace().collect();
-    let before = all.len();
+    let mut value = el.get_attribute("class").unwrap_or_default();
+    let mut added: Vec<String> = Vec::new();
     for class in classes.split_whitespace() {
-        if !all.contains(&class) {
-            all.push(class);
+        let class = class.replace('&', "&amp;");
+        if !value.split_whitespace().any(|have| have == class) && !added.contains(&class) {
+            added.push(class);
         }
     }
-    if all.len() > before {
-        el.set_attribute("class", &all.join(" ").replace('&', "&amp;"))?;
+    if added.is_empty() {
+        return Ok(());
     }
+    if !value.is_empty() && !value.ends_with(|c: char| c.is_ascii_whitespace()) {
+        value.push(' ');
+    }
+    value.push_str(&added.join(" "));
+    el.set_attribute("class", &value)?;
     Ok(())
 }
 
+/// Whether `html` may contain a `<ul` or `<ol` start tag (ASCII case-insensitive).
+fn mentions_list(html: &str) -> bool {
+    html.as_bytes().windows(3).any(|w| {
+        w[0] == b'<'
+            && matches!(w[1].to_ascii_lowercase(), b'u' | b'o')
+            && w[2].eq_ignore_ascii_case(&b'l')
+    })
+}
+
 /// Adds the class `fragment` to the `<li>` children of the lists at the top level of `html`
-/// (a slide body), except lists with the class `no-incremental` (module docs). Returns `html`
-/// unchanged when it has no list. Errors as [`element_attributes`].
+/// (a slide body), except lists with the class `no-incremental` (module docs). The top level
+/// is tracked like the browser builds it: elements are opened by start tags and closed by
+/// their end tags or implicitly ([`close_implied`]); a stray end tag closes nothing. Returns
+/// `html` unchanged when it has no list. Errors as [`element_attributes`].
 pub fn incremental_lists(html: &str) -> Result<String> {
-    if !html.contains("<ul") && !html.contains("<ol") {
+    if !mentions_list(html) {
         return Ok(html.to_string());
     }
-    let open = format!("<div id=\"{ROOT_ID}\">");
-    let close = "</div>";
-    let wrapped = format!("{open}{html}{close}");
-    let selector = format!(
-        "#{ROOT_ID} > ul:not(.no-incremental) > li, #{ROOT_ID} > ol:not(.no-incremental) > li"
-    );
+    let stack = Rc::new(RefCell::new(vec![Frame::default()]));
+    let mut elements = 0;
+    let on_element = move |el: &mut Element<'_, '_>| -> HandlerResult {
+        let index = elements;
+        elements += 1;
+        let tag = el.tag_name();
+        let (item, top_level) = {
+            let mut open = stack.borrow_mut();
+            close_implied(&mut open, &tag);
+            // `open[1]` is a top-level element; an item of a top-level list has it as parent
+            (open.len() == 2 && open[1].fragments, open.len() == 1)
+        };
+        if tag == "li" && item {
+            add_classes(el, FRAGMENT)?;
+        }
+        let no_incremental = el
+            .get_attribute("class")
+            .is_some_and(|class| class.split_whitespace().any(|c| c == "no-incremental"));
+        let fragments = top_level && matches!(tag.as_str(), "ul" | "ol") && !no_incremental;
+        if let Some(handlers) = el.end_tag_handlers() {
+            stack.borrow_mut().push(Frame {
+                element: Some(index),
+                tag,
+                fragments,
+                ..Frame::default()
+            });
+            let stack = Rc::clone(&stack);
+            handlers.push(Box::new(move |_end| {
+                close_element(&mut stack.borrow_mut(), index);
+                Ok(())
+            }));
+        }
+        Ok(())
+    };
     let settings = RewriteStrSettings::new()
         .with_strict(false)
         .with_enable_esi_tags(false)
-        .append_element_content_handler(element!(&selector, |el| add_classes(el, FRAGMENT)));
-    let out = rewrite_str(&wrapped, settings).map_err(rewrite_error)?;
-    out.strip_prefix(&open)
-        .and_then(|rest| rest.strip_suffix(close))
-        .map(str::to_string)
-        .ok_or_else(|| Error::Other("incremental lists: the slide wrapper was rewritten".into()))
+        .append_element_content_handler(element!("*", on_element));
+    rewrite_str(html, settings).map_err(rewrite_error)
 }
 
 fn rewrite_error(err: lol_html::errors::RewritingError) -> Error {
@@ -424,6 +548,15 @@ mod tests {
                 "<div><p>a<p>b</div><!-- .element: class=z -->",
                 "<div class=\"z\"><p>a<p>b</div>",
             ),
+            // ... or until the browser closes it: `<li>` closes `<li>`, `<ul>` closes `<p>`
+            (
+                "<ul><li>a<li>b<!-- .element: class=y --></ul>",
+                "<ul><li>a<li class=\"y\">b</ul>",
+            ),
+            (
+                "<p>a<ul><li>b</li></ul><!-- .element: class=x -->",
+                "<p>a<ul class=\"x\"><li>b</li></ul>",
+            ),
         ];
         for (html, expected) in cases {
             assert_eq!(applied(html), *expected, "{html:?}");
@@ -479,13 +612,68 @@ mod tests {
                         <div class=\"columns\">\n<ul>\n<li>f</li>\n</ul>\n</div>\n\
                         <blockquote>\n<ol>\n<li>g</li>\n</ol>\n</blockquote>\n";
         assert_eq!(incremental_lists(html).unwrap(), expected);
-        for unchanged in [
-            "",
-            "<p>no lists</p>\n",
-            "<p>stray</div> <ul><li>x</li></ul>",
-        ] {
+        // no list; a list in an unclosed raw `<div>` is not at the top level
+        for unchanged in ["", "<p>no lists</p>\n", "<div>\n<ul>\n<li>x</li>\n</ul>\n"] {
             assert_eq!(incremental_lists(unchanged).unwrap(), unchanged);
         }
+    }
+
+    /// Raw author HTML: the top level is the one the browser builds.
+    #[test]
+    fn incremental_lists_follow_the_browser_tree_in_raw_html() {
+        let cases: &[(&str, &str)] = &[
+            // tag names in any case
+            (
+                "<UL>\n<LI>x</LI>\n</UL>\n",
+                "<UL>\n<LI class=\"fragment\">x</LI>\n</UL>\n",
+            ),
+            // a stray end tag closes nothing
+            (
+                "<p>stray</div> <ul><li>x</li></ul>",
+                "<p>stray</div> <ul><li class=\"fragment\">x</li></ul>",
+            ),
+            // a list closes an open `<p>`, as in the browser
+            (
+                "<p>open\n<ul>\n<li>x</li>\n</ul>\n",
+                "<p>open\n<ul>\n<li class=\"fragment\">x</li>\n</ul>\n",
+            ),
+            // items without end tags close each other; their nested lists stay nested
+            (
+                "<ol><li>a<li>b<ul><li>c</ul><li>d</ol>",
+                "<ol><li class=\"fragment\">a<li class=\"fragment\">b<ul><li>c</ul>\
+                 <li class=\"fragment\">d</ol>",
+            ),
+            // closing a `<p>` does not leave the container it is in
+            (
+                "<div><p>x<ul><li>a</li></ul></div>",
+                "<div><p>x<ul><li>a</li></ul></div>",
+            ),
+            // an `<li>` in a table cell does not close the item the table is in
+            (
+                "<ul><li><table><tr><td><li>in a cell</td></tr></table></li></ul>",
+                "<ul><li class=\"fragment\"><table><tr><td><li>in a cell</td></tr></table>\
+                 </li></ul>",
+            ),
+        ];
+        for (html, expected) in cases {
+            assert_eq!(incremental_lists(html).unwrap(), *expected, "{html:?}");
+        }
+    }
+
+    #[test]
+    fn added_classes_keep_the_existing_value_as_written() {
+        assert_eq!(
+            incremental_lists("<ul>\n<li class=\"a&amp;b\">x</li>\n</ul>\n").unwrap(),
+            "<ul>\n<li class=\"a&amp;b fragment\">x</li>\n</ul>\n"
+        );
+        assert_eq!(
+            applied("<p class=\"a&amp;b  \">t <!-- .element: class=\"f a&b\" --></p>"),
+            "<p class=\"a&amp;b  f\">t </p>"
+        );
+        assert_eq!(
+            applied("<p class=\"x\">t <!-- .element: class=\"c&d x c&d\" --></p>"),
+            "<p class=\"x c&amp;d\">t </p>"
+        );
     }
 
     #[test]

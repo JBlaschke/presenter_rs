@@ -34,8 +34,8 @@ expression: json
       "notes": null,
       "children": [],
       "span": {
-        "start_line": 22,
-        "end_line": 26,
+        "start_line": 27,
+        "end_line": 31,
         "cell": null
       }
     },
@@ -59,8 +59,8 @@ expression: json
       "notes": null,
       "children": [],
       "span": {
-        "start_line": 28,
-        "end_line": 35,
+        "start_line": 33,
+        "end_line": 40,
         "cell": null
       }
     },
@@ -101,15 +101,15 @@ expression: json
           "notes": null,
           "children": [],
           "span": {
-            "start_line": 45,
-            "end_line": 54,
+            "start_line": 50,
+            "end_line": 59,
             "cell": null
           }
         }
       ],
       "span": {
-        "start_line": 37,
-        "end_line": 43,
+        "start_line": 42,
+        "end_line": 48,
         "cell": null
       }
     },
@@ -125,11 +125,11 @@ expression: json
           "html": "<h2>Notes</h2>\n<p>Body text.</p>\n<p><strong>Note:</strong> emphasised, so this paragraph is content.</p>\n"
         }
       ],
-      "notes": "<p>Directive notes come first.</p>\n<p>These are <em>speaker notes</em>.</p>\n<ul>\n<li>they continue</li>\n<li>to the end of the slide</li>\n</ul>\n",
+      "notes": "<p>These are <em>speaker notes</em>.</p>\n<ul>\n<li>they continue</li>\n<li>to the end of the slide</li>\n</ul>\n<p>Directive notes come after the <code>Note:</code> part.</p>\n",
       "children": [],
       "span": {
-        "start_line": 56,
-        "end_line": 71,
+        "start_line": 61,
+        "end_line": 76,
         "cell": null
       }
     },
@@ -148,8 +148,32 @@ expression: json
       "notes": null,
       "children": [],
       "span": {
-        "start_line": 73,
-        "end_line": 87,
+        "start_line": 78,
+        "end_line": 92,
+        "cell": null
+      }
+    },
+    {
+      "id": "comment-first",
+      "layout": "default",
+      "classes": [
+        "wide"
+      ],
+      "attrs": {
+        "data-background-image": "asset:000000000001"
+      },
+      "title": "Comment first",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<!-- TODO: a plain comment first changes nothing on this slide -->\n<h2>Comment first</h2>\n<p>The heading's attributes are lifted and the <code>.slide:</code> comment under it is read.</p>\n<p>Note: an escaped colon keeps this paragraph on the slide.</p>\n<p>Inline comments are not read: <!-- .slide: class=\"inline\" --></p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 94,
+        "end_line": 105,
         "cell": null
       }
     }

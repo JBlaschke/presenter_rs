@@ -4,18 +4,23 @@
 #   - `<!-- .slide: … -->` as a slide's first node gives the slide attributes and is removed:
 #     keys are normalized like `--- {…}` keys (`data-background` stays verbatim, the
 #     `background=` shorthand expands), `class=` and `.class` add classes, `#id` sets the id;
+#     a `data-background` value that reveal takes for an image becomes `data-background-image`
+#     (registered as an asset);
+#   - plain comments are invisible: before the first heading they change nothing (the
+#     heading's attributes are lifted, a `.slide:` comment under it is read);
 #   - precedence: separator `{…}` < `.slide:` comment < heading `{…}` (later wins; classes
 #     accumulate);
-#   - the comment may also come right after the slide's first heading; anywhere else it
-#     stays a plain comment and is reported (`misplaced-slide-comment`);
+#   - the comment may also come right after the slide's first heading; anywhere else (also
+#     inline in a paragraph) it stays a plain comment and is reported
+#     (`misplaced-slide-comment`);
 #   - a top-level paragraph starting with `Note:` or `Notes:` ends the slide body: it
-#     (without the marker) and everything after it become notes, after the `:::notes`
-#     blocks written before it; `**Note:**` stays content;
+#     (without the marker) and everything after it become notes, before the notes of the
+#     `:::notes` blocks; `**Note:**` and `Note\:` stay content;
 #   - `<!-- .element: … -->` gives attributes to the element before it at the same level,
 #     or else to the enclosing one: the `<li>` of a list item, the `<img>` before it, the
 #     `<p>` of a paragraph's text, the `<ul>` before a comment on its own line; the
 #     comments are removed.
-# Expected shape: 5 horizontal slides; slide 3 has one child.
+# Expected shape: 6 horizontal slides; slide 3 has one child.
 title: Reveal compat
 ---
 
@@ -60,7 +65,7 @@ That one is not at the start of the slide: it stays a comment.
 Body text.
 
 :::notes
-Directive notes come first.
+Directive notes come after the `Note:` part.
 :::
 
 **Note:** emphasised, so this paragraph is content.
@@ -85,3 +90,16 @@ A paragraph with a class. <!-- .element: class="small" -->
 - even with incremental lists on
 
 <!-- .element: class="no-incremental" -->
+
+---
+
+<!-- TODO: a plain comment first changes nothing on this slide -->
+
+## Comment first {#comment-first .wide}
+<!-- .slide: data-background="images/ok.png" -->
+
+The heading's attributes are lifted and the `.slide:` comment under it is read.
+
+Note\: an escaped colon keeps this paragraph on the slide.
+
+Inline comments are not read: <!-- .slide: class="inline" -->

@@ -34,8 +34,8 @@ expression: json
       "notes": null,
       "children": [],
       "span": {
-        "start_line": 22,
-        "end_line": 22,
+        "start_line": 24,
+        "end_line": 24,
         "cell": null
       }
     },
@@ -68,8 +68,8 @@ expression: json
           "notes": null,
           "children": [],
           "span": {
-            "start_line": 26,
-            "end_line": 33,
+            "start_line": 28,
+            "end_line": 35,
             "cell": null
           }
         },
@@ -92,15 +92,15 @@ expression: json
           "notes": null,
           "children": [],
           "span": {
-            "start_line": 35,
-            "end_line": 39,
+            "start_line": 37,
+            "end_line": 41,
             "cell": null
           }
         }
       ],
       "span": {
-        "start_line": 24,
-        "end_line": 24,
+        "start_line": 26,
+        "end_line": 26,
         "cell": null
       }
     },
@@ -119,28 +119,30 @@ expression: json
       "notes": null,
       "children": [],
       "span": {
-        "start_line": 41,
-        "end_line": 43,
+        "start_line": 43,
+        "end_line": 45,
         "cell": null
       }
     },
     {
       "id": null,
       "layout": "default",
-      "classes": [],
+      "classes": [
+        "wide"
+      ],
       "attrs": {},
       "title": "After a rule",
       "blocks": [
         {
           "type": "html",
-          "html": "<h2>After a rule</h2>\n<p>A <code>---</code> line starts a horizontal slide; this heading joins it.</p>\n"
+          "html": "<!-- a plain comment between the rule and the heading changes nothing -->\n<h2>After a rule</h2>\n<p>A <code>---</code> line starts a horizontal slide; this heading joins it.</p>\n"
         }
       ],
       "notes": null,
       "children": [],
       "span": {
-        "start_line": 45,
-        "end_line": 49,
+        "start_line": 47,
+        "end_line": 53,
         "cell": null
       }
     },
@@ -159,8 +161,8 @@ expression: json
       "notes": null,
       "children": [],
       "span": {
-        "start_line": 51,
-        "end_line": 53,
+        "start_line": 55,
+        "end_line": 57,
         "cell": null
       }
     },
@@ -193,15 +195,15 @@ expression: json
           "notes": null,
           "children": [],
           "span": {
-            "start_line": 57,
-            "end_line": 61,
+            "start_line": 61,
+            "end_line": 65,
             "cell": null
           }
         }
       ],
       "span": {
-        "start_line": 55,
-        "end_line": 55,
+        "start_line": 59,
+        "end_line": 59,
         "cell": null
       }
     }
