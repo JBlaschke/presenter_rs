@@ -1,0 +1,68 @@
+# presenter.toml: settings for the decks in this directory and the directories below it.
+#
+# presenter finds this file by walking up from a deck's directory. Every setting is
+# optional. A line like `#lang = "en"` is switched off and shows the built-in default;
+# delete the `#` to change the value. A deck's front matter overrides this file, and
+# command-line flags override both.
+
+[deck]
+theme = "theme"            # this presentation's theme, in ./theme (it extends the built-in
+                           # "default" theme); a built-in theme name or a directory relative
+                           # to this file (built-in default: "default")
+#lang = "en"               # <html lang> when the front matter sets none
+#title = "My talk"         # title, author and date for decks whose front matter sets none
+#author = "Your Name"      # (not set by default)
+#date = "2026-01-31"
+
+[build]
+#out_dir = "dist"          # `presenter build slides.md` writes dist/slides.html
+#standalone = true         # one self-contained HTML file; false (like --site) writes a
+                           # directory instead: dist/slides/index.html + assets/
+#minify = false            # reserved; has no effect yet
+
+[slides]
+#split = "rules"           # "rules": a `---` line starts a slide and a `--` line a slide
+                           # below it; "headings": headings start slides
+#slide_level = 2           # "headings": headings of this level (##) start a slide below
+                           # the current one; headings with fewer # start the next slide
+#incremental_lists = false # true: list items appear one click at a time
+
+[markdown]
+#smart_punctuation = false # true: "straight quotes" and -- become typographic quotes and dashes
+#sourcepos = false         # true: tag HTML elements with their source line (data-sourcepos)
+
+# Options for Reveal.initialize: any reveal.js option (https://revealjs.com/config/).
+# The theme's theme.toml [reveal] table supplies defaults under these, and a deck's
+# `reveal:` front matter overrides them.
+[reveal]
+#hash = true               # keep the current slide in the URL (#/3/1), so a reload stays on it
+#slideNumber = false       # true or "c/t" shows the slide number
+#transition = "slide"      # none, fade, slide, convex, concave or zoom; a slide can set its own
+#controls = true           # navigation arrows
+#progress = true           # progress bar
+#center = true             # center slide content vertically
+#width = 1280              # slide size in pixels; reveal scales the slides to fit the window
+#height = 720
+#plugins = ["highlight", "notes", "zoom", "search"]   # reveal.js plugins to load; math needs
+                                                      # none (KaTeX is added when a deck has math)
+
+[math]
+#enabled = "auto"          # "auto": include KaTeX when the deck contains math; "always"; "never"
+#katex_options = {}        # KaTeX render options, e.g. { macros = { "\\R" = "\\mathbb{R}" } }
+
+# How notebooks (.ipynb) are rendered.
+[notebook]
+#mime_priority = [         # an output is shown as the first of these types it contains
+#  "text/html", "image/svg+xml", "image/png", "image/jpeg", "image/gif", "image/webp",
+#  "text/markdown", "text/latex", "application/json", "text/plain",
+#]
+#hide_input_tags = ["hide-input", "remove-input"]         # cell tags that hide the code
+#hide_output_tags = ["hide-output", "remove-output"]      # cell tags that hide the outputs
+#remove_cell_tags = ["remove-cell", "hide-cell", "skip"]  # cell tags that leave a cell out
+#split_markdown_cells = false  # true: `---` and `--` lines in markdown cells start slides
+#show_prompts = true           # show In [n] / Out [n] next to code cells
+
+[serve]
+#host = "127.0.0.1"        # address `presenter serve` listens on
+#port = 3000               # 0 picks a free port
+#open = false              # true: open the deck in the browser on start (like --open)

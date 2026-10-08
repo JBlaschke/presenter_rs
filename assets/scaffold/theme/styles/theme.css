@@ -1,0 +1,32 @@
+/*
+ * The stylesheet of this presentation's theme. presenter adds it after the default
+ * theme's stylesheets, so whatever is set here wins.
+ *
+ * Change the look through custom properties first and override rules only where no
+ * property exists. Two families are available:
+ *   --r-*  reveal.js's own (fonts, colors, sizes), e.g. --r-main-font, --r-main-color,
+ *          --r-background-color, --r-heading-font, --r-heading-text-transform
+ *   --p-*  the default theme's (spacing, columns, notebook cells), e.g. --p-cell-border
+ * The default theme documents its --p-* properties in its README.md and styles/theme.css;
+ * `presenter theme eject default ./default-theme` copies them next to this theme.
+ */
+:root {
+  /* Headings: a deep blue instead of reveal's near-black. */
+  --r-heading-color: #1c4e80;
+
+  /* Links, the navigation arrows and the progress bar (--r-link-color-hover sets the
+     color of a link under the mouse). */
+  --r-link-color: #c0392b;
+
+  /* Space between the columns of a ::::columns block. */
+  --p-column-gap: 2em;
+}
+
+/* The event line that templates/layouts/title.html adds to the title slide. */
+.reveal .layout-title .event {
+  margin-top: 1.5em;
+  font-size: 0.6em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}

@@ -1,0 +1,2 @@
+# Build output of `presenter build` (the default [build] out_dir).
+dist/
