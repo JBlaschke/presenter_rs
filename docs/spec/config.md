@@ -81,6 +81,13 @@ config struct.
 | `slides:`, `markdown:`, `math:`, `notebook:` (maps) | override the same `presenter.toml` tables for this deck |
 | anything else | `DeckMeta.vars` |
 
+> **Contract change (coordinator, 2026-10-08):** the `slides:`, `markdown:`, `math:` and
+> `notebook:` maps are stored in `DeckMeta.vars` like any other key (there is no other place
+> in the IR) and **stay there**. `Config::merge_front_matter(&DeckMeta)` reads them from
+> `meta.vars` (when they are objects), overlays only the keys present (unknown keys → error
+> with a "did you mean" hint), and merges `meta.reveal` over `config.reveal`. It is idempotent,
+> so both the frontend (on a clone) and the pipeline may call it.
+
 ## 4. Rust shape (`src/config.rs`)
 
 ```rust
@@ -100,6 +107,20 @@ impl Config {
     pub fn enabled_plugins(&self) -> Vec<PluginId>;            // from reveal.plugins, validated
 }
 ```
+
+> **Contract change (coordinator, 2026-10-08) — reveal defaults vs. theme defaults.**
+> The precedence list in §1 puts theme `[reveal]` values *above* built-in defaults, but a
+> `Config::default()` whose `reveal` map already contains `transition = "slide"` would make
+> "theme values only where the key is absent" a no-op. Therefore:
+> - `Config.reveal` holds only **explicitly configured** keys (from `presenter.toml`, then theme
+>   defaults filled in where absent, front matter over them). `Config::default().reveal` is empty,
+>   so `Config::default() == toml::from_str::<Config>("")` holds trivially.
+> - The §2 `[reveal]` values are returned by `Config::builtin_reveal_defaults() -> Map<String, Value>`
+>   (including `plugins`). `Config::effective_reveal()` = built-ins overlaid by `self.reveal`.
+> - `reveal_options_json()` serializes `effective_reveal()` minus `plugins`, keys sorted; for
+>   `Config::default()` it is exactly the string in T01's acceptance criteria.
+> - `enabled_plugins()` reads `plugins` from `effective_reveal()`.
+> - Final order: built-ins < theme `[reveal]` < `presenter.toml` `[reveal]` < front matter `reveal:`.
 
 Precedence is implemented by calling: defaults → `load/discover` → `merge_theme_reveal`
 (note: theme is *below* project config, so the renderer applies theme defaults by merging the

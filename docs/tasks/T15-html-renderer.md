@@ -85,3 +85,12 @@ Writing files to disk (T16), SCSS (T42), live-reload client (T22).
   `minijinja::value::Value::from_safe_string` for HTML results so autoescape does not touch them.
 - `Features`-gated plugin scripts: `highlight` 921 KB is the largest; include only when `features.code` or explicitly listed in `reveal.plugins` and the deck has code — keep it simple: include when `features.code`.
 - reveal 6 wants `Reveal.initialize({...})` after `dist/reveal.js` and plugin scripts; plugin globals are `RevealHighlight`, `RevealNotes`, `RevealZoom`, `RevealSearch`.
+
+## Amendments (coordinator, 2026-10-08)
+- The `markdown` filter cannot call T12's `render_fragment` yet (T12 runs in the same wave).
+  Implement it with `comrak::markdown_to_html` and options equivalent to markdown-dialect §1
+  (`render.r#unsafe = true`). T16 switches it to `markdown::render::render_fragment`.
+- `reveal_config_json` merge order: `Config::builtin_reveal_defaults()` ← `theme.reveal_defaults()`
+  ← `config.reveal` ← `meta.reveal` (right wins), `plugins` stripped, keys sorted, no trailing `.0`
+  on integers (config.md contract change).
+- `plugins()` uses `config.enabled_plugins()` (effective reveal map).

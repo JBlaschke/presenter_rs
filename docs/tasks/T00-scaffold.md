@@ -91,3 +91,21 @@ Any real functionality. Do not write IR types (T01) or theme files (T02).
 - `dist/theme/*.css` already inline their fonts as `data:font/woff;base64,…` — copy as-is.
 - rust-embed with `#[folder = "assets/"]` resolves relative to `CARGO_MANIFEST_DIR`. Debug builds read from disk at runtime; keep that (do **not** enable `debug-embed`) so theme editing live-reloads in `cargo run`.
 - `tar` in the npm tarball has a top-level `package/` directory.
+
+## Amendments (coordinator, 2026-10-08)
+- Create a stub file for **every** module the plan will ever need, so later tasks never edit
+  module declarations: everything in PLAN §3.2 *plus* `src/markdown/compat.rs`,
+  `src/markdown/postprocess.rs` (T43), `src/theme/styles.rs` (T42), `src/cli/report.rs` (T44),
+  `src/check.rs`, `src/pdf.rs`, and `src/cli/{mod,build,serve,init,theme,dump,check,export,report}.rs`.
+  Each `mod.rs` (and `lib.rs`) declares its submodules with `pub mod …;` and a `//!` doc comment.
+- `src/serve/watch.rs` additionally defines the shared contract type used by T20 and T21:
+  ```rust
+  /// What kind of rebuild a change batch requires (live-reload.md §2).
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+  #[serde(rename_all = "lowercase")]
+  pub enum ChangeKind { /// Only stylesheets/theme assets changed.
+      Css, /// Anything else.
+      Content }
+  ```
+- Add `examples/**/dist/` to `.gitignore`.
+- Do not edit `docs/tasks/README.md`; the coordinator maintains the status table.

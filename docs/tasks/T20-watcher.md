@@ -62,3 +62,6 @@ HTTP server, SSE, browser client (T21/T22/T23).
   `debouncer.watch(&path, RecursiveMode::Recursive)` or `debouncer.watcher().watch(...)` — check
   docs.rs for 0.7 before writing code; both forms have existed.
 - notify 8 on macOS defaults to FSEvents; events may arrive with paths that are symlink-resolved (`/private/tmp/...` vs `/tmp/...`): canonicalize both the watch set and incoming paths before comparing.
+
+## Amendments (coordinator, 2026-10-08)
+- `ChangeKind` already exists in `src/serve/watch.rs` (T00 contract stub); keep it as is.

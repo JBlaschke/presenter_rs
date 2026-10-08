@@ -72,3 +72,8 @@ Deciding *which* URLs are relative in Markdown (T12) or theme CSS lookup order (
 - `base64` 0.23: `use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bytes)`.
 - `mime_guess::from_path(p).first_or_octet_stream().essence_str()`.
 - Keep `blake3` default features (SIMD) — it is already fast; no need for `rayon`.
+
+## Amendments (coordinator, 2026-10-08)
+- T01 already implemented the ir.md §3 core of `registry.rs` (ids, `register_file`,
+  `register_bytes`, `get`, `iter`, `infos`, `placeholder`). Keep that API and its tests; add
+  `merge`, `len`, `is_empty`, `read` and implement `emit.rs`.

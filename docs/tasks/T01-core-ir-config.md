@@ -70,3 +70,20 @@ Parsing Markdown or YAML (T10/T11/T12), theme files (T02/T13).
   `preserve_order` so front-matter `vars` keep author order; for `reveal_options_json`
   sort explicitly by collecting into a `BTreeMap<String, Value>` first.
 - `toml` 1.x error `Display` already includes `at line N column M`; keep it.
+
+## Amendments (coordinator, 2026-10-08)
+- Contract changes in `docs/spec/ir.md` §3–§4 and `docs/spec/config.md` §3–§4 (read the
+  "Contract change" boxes) are part of this task:
+  - `src/ir.rs` also defines `pub struct Parsed { pub deck: Deck, pub assets: AssetRegistry, pub diagnostics: Diagnostics }`.
+  - **You also own `src/assets/registry.rs` for this task** and implement the full ir.md §3 API
+    (`AssetRegistry`, `Asset`, `AssetData`, `new`, `register_file`, `register_bytes`, `get`,
+    `iter`, `infos`, `placeholder`; `Default` too) with unit tests. T14 extends it later.
+    `infos` fills `origin` as `file:<path relative to base_dir>` (fall back to the absolute
+    path when not under `base_dir`) or `inline:<byte length>`. Iteration order is by id (BTreeMap).
+  - `Config.reveal` holds only explicit keys; add `Config::builtin_reveal_defaults()` and
+    `Config::effective_reveal()`; `reveal_options_json`/`enabled_plugins` use the effective map.
+  - `merge_front_matter` reads `slides/markdown/math/notebook` from `meta.vars` without removing
+    them, and is idempotent.
+- `Diagnostic` also derives `Deserialize` is **not** required (`code: &'static str`); add
+  `Diagnostics::into_vec`, `Diagnostics::len/is_empty`, and `impl IntoIterator`.
+- Do not edit `docs/tasks/README.md`; the coordinator maintains the status table.

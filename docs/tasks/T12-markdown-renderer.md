@@ -93,3 +93,11 @@ Heading-split mode, `Note:` compat, `<!-- .slide: -->`, incremental lists (T43).
 - comrak directive rendering: `:::foo bar` → `<div class="foo bar">` — children only, no attribute support; hence pass (b).
 - `render.r#unsafe = true` is required or your `HtmlBlock` replacements are escaped/clobbered.
 - Image attributes `{width=50%}`: check whether `format_html` writes `attrs` for `Image`; if not, convert the image to `HtmlInline("<img …>")` in pass (d).
+
+## Amendments (coordinator, 2026-10-08)
+- `parse` returns `Parsed { deck, assets, diagnostics }` (ir.md §4 contract change) and **never
+  fails on a missing image**: it renders with `missing_asset_is_error = false`, so missing images
+  become `missing-asset` warnings (with path + span) and keep their URL. `render_nodes` still
+  honours `ctx.missing_asset_is_error = true` by returning `Error::MissingAsset` (test both).
+- `parse` applies `merge_front_matter` to a clone of `config` before splitting/rendering.
+- Diagnostics from T11's `RawDeck` are forwarded into `Parsed.diagnostics`.

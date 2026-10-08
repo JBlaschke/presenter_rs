@@ -70,3 +70,19 @@ returning `Error::Other("notebook support arrives in T31")` — add that stub in
 ## Hints (verified)
 - `assert_cmd::Command::cargo_bin("presenter")`; use `predicates::str::contains`.
 - Keep `examples/basic/dist/` out of git (`.gitignore` in T00 covers `/dist`; add `examples/**/dist/`).
+
+## Amendments (coordinator, 2026-10-08)
+- `src/cli/mod.rs` defines the **complete** clap surface from `docs/spec/cli.md` (all seven
+  commands with all their flags, `theme` subcommands, `export pdf`). Each command lives in its
+  own module with `pub fn run(args: &<Cmd>Args, global: &GlobalArgs) -> anyhow::Result<std::process::ExitCode>`
+  (or an equivalent signature you choose and document at the top of `cli/mod.rs`). For commands
+  owned by later tasks (`serve` T23, `init` T40, `theme` T41, `check` T34, `export` T45) write a
+  stub `run` that prints `<command>: not implemented yet` to stderr and exits 2 — those tasks
+  replace the stub body only, so they never need to touch `cli/mod.rs`.
+- Switch T15's `markdown` template filter to `markdown::render::render_fragment` (additive edit
+  in `src/render/`).
+- `build_deck` escalates the first `missing-asset` diagnostic to `Error::MissingAsset` when
+  `opts.missing_asset_is_error` (ir.md §4 contract change); `build` sets it, `serve` will not.
+- Theme resolution: `cli.theme` → `meta.theme` → `config.deck.theme`; then
+  `config.merge_theme_reveal(&theme.reveal_defaults())`, then `config.merge_front_matter(&deck.meta)`,
+  then `config.apply_cli(...)`.

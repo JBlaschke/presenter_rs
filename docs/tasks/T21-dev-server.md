@@ -65,3 +65,6 @@ Watching files (T20), the client script (T22), CLI (T23).
   `axum::response::sse::{Sse, Event, KeepAlive}`; `tokio_stream::wrappers::BroadcastStream`
   needs the `tokio-stream` crate (`features = ["sync"]`) — add it as a dependency (additive `Cargo.toml` change).
 - `axum::serve(listener, router).with_graceful_shutdown(signal)`.
+
+## Amendments (coordinator, 2026-10-08)
+- Use `crate::serve::watch::ChangeKind` (defined by T00; T20 owns the rest of `watch.rs`).

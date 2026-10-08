@@ -181,7 +181,11 @@ pub struct AssetInfo {
    unrelated code changes. Use `BTreeMap`, never `HashMap`, in the IR.
 8. Line numbers in `SourceSpan` are 1-based, as editors show them.
 
-## 3. Asset placeholders and the registry (`src/assets/registry.rs`, owned by T14)
+## 3. Asset placeholders and the registry (`src/assets/registry.rs`)
+
+> **Contract change (coordinator, 2026-10-08):** the core registry API below is implemented
+> by **T01** (so wave-2 frontends can register assets without waiting for T14). T14 then owns
+> the file and adds `merge`, `len`, `is_empty`, `read` and everything in `src/assets/emit.rs`.
 
 Frontends never read image bytes or decide URLs. They *register* assets and write a
 placeholder; the emitter later rewrites placeholders to `data:` URIs (standalone) or
@@ -222,8 +226,8 @@ every occurrence inside attribute values of the rendered document (`src`, `href`
 ## 4. Frontend interface (implemented by T12 and T31; called by T16's pipeline)
 
 ```rust
-/// Output of any frontend.
-pub struct Parsed { pub deck: Deck, pub assets: AssetRegistry }
+/// Output of any frontend. Defined in `src/ir.rs` (T01).
+pub struct Parsed { pub deck: Deck, pub assets: AssetRegistry, pub diagnostics: Diagnostics }
 
 // src/markdown/mod.rs
 pub fn parse(source: &SourceInfo, text: &str, config: &Config) -> crate::error::Result<Parsed>;
@@ -234,6 +238,19 @@ pub fn parse(source: &SourceInfo, json: &str, config: &Config) -> crate::error::
 Both must be pure functions of their inputs (no reading other files except that the
 Markdown frontend may `stat` referenced images to decide between registering them and
 reporting `MissingAsset` — see dialect §6).
+
+> **Contract change (coordinator, 2026-10-08):**
+> - `Parsed` carries the frontend's `Diagnostics` (`crate::error::Diagnostics`): `empty-slide`,
+>   `orphan-vertical`, `unknown-slide-attr`, `missing-asset`, notebook warnings, … The pipeline
+>   and `check` read them from here.
+> - Frontends **never fail** on a missing local asset: they record a `Level::Warning`
+>   diagnostic with code `missing-asset` (path + span) and leave the URL as written. The
+>   pipeline (`pipeline::build_deck`, T16) turns the first such diagnostic into
+>   `Error::MissingAsset` when `BuildOptions.missing_asset_is_error` is set (`build`), keeps it
+>   a warning in `serve`, and `check` reports it as a lint.
+> - Front matter: frontends apply `Config::merge_front_matter(&deck.meta)` to a *clone* of the
+>   config they were given (so e.g. `slides.split` from front matter affects splitting). The
+>   pipeline applies it again to its own config after parsing; the call is idempotent.
 
 ## 5. Error type (`src/error.rs`, owned by T01)
 
