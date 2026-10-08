@@ -1,21 +1,25 @@
 //! T20: the file watcher (`presenter::serve::watch`) against the real OS backend (FSEvents
-//! on macOS, inotify on Linux), the watch sets of successful and failed builds, and
-//! `presenter build --watch` end to end.
+//! on macOS, inotify on Linux), the watch sets of successful and failed builds, the rebuild
+//! loop in process, and `presenter build --watch` end to end.
 //!
 //! Every test works in its own temporary directory. Timeouts are generous: FSEvents can
-//! take about a second to deliver, and a batch is sent only after the debounce (150 ms)
-//! and the settle time (150 ms).
+//! take about a second to deliver, and a batch is sent only once the changes have been
+//! quiet for the debounce time (150 ms).
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use presenter::pipeline::{self, BuildOptions};
 use presenter::serve::watch::{
-    ChangeBatch, ChangeKind, WatchSet, Watcher, canonical, watch_set_for, watch_set_for_failed,
+    ChangeBatch, ChangeKind, DEBOUNCE, WatchSet, WatchStatus, Watcher, canonical,
+    run_build_watch_with, watch_set_before_build, watch_set_for, watch_set_for_failed,
 };
 
 /// How long a batch may take to arrive.
@@ -31,6 +35,17 @@ fn write(path: &Path, text: &str) {
 fn append(path: &Path, text: &str) {
     let mut file = OpenOptions::new().append(true).open(path).unwrap();
     file.write_all(text.as_bytes()).unwrap();
+}
+
+/// Sets the modification time of `path` to now without writing to it, like `touch`.
+fn touch(path: &Path) {
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(SystemTime::now()).unwrap();
+}
+
+/// Longer than a batch takes to form, so that the next change is a batch of its own.
+fn pause() {
+    std::thread::sleep(DEBOUNCE + Duration::from_millis(1000));
 }
 
 /// A deck `a.md` and a theme `theme/` with `styles/x.css`, in a fresh temporary directory.
@@ -88,6 +103,14 @@ fn edits_produce_classified_batches_and_bursts_coalesce() {
     assert_eq!(drain(&rx, QUIET), vec![]);
 
     write(&css, "body { color: blue; }\n");
+    let batch = next(&rx, "writing x.css");
+    assert_eq!(batch.kind, ChangeKind::Css);
+    assert_eq!(batch.paths, vec![canonical(&css)]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    // `touch`: only the modification time changes (FSEvents: inode metadata; inotify:
+    // IN_ATTRIB).
+    touch(&css);
     let batch = next(&rx, "touching x.css");
     assert_eq!(batch.kind, ChangeKind::Css);
     assert_eq!(batch.paths, vec![canonical(&css)]);
@@ -184,6 +207,11 @@ fn update_watches_the_new_set() {
         watcher.watched_dirs(),
         vec![(root.clone(), false), (root.join("theme"), true)]
     );
+    // The update sends what changed since the last batch (here: since the start) in the
+    // inputs it now watches: the stylesheet written while the theme was not watched.
+    let batch = next(&rx, "updating the watch set");
+    assert_eq!(batch.paths, vec![canonical(&css)]);
+    assert_eq!(batch.kind, ChangeKind::Css);
     std::thread::sleep(Duration::from_millis(300));
 
     append(&deck, "\nno longer an input\n");
@@ -439,11 +467,13 @@ fn build_watch_rebuilds_on_every_change() {
     )
     .unwrap();
     std::fs::write(dir.path().join("fig.png"), png).unwrap();
+    // The output is written before its `Wrote` line is printed: wait for the line.
     process.wait_for(
         "the rebuild after adding the image",
         Duration::from_secs(15),
-        |_| contains(&out, "Marker two"),
+        |p| p.stdout().lines().count() == 3,
     );
+    assert!(contains(&out, "Marker two"));
 
     let stdout = process.stdout();
     let wrote: Vec<&str> = stdout.lines().collect();
@@ -461,4 +491,426 @@ fn build_watch_rebuilds_on_every_change() {
     );
     assert!(stderr.contains("Rebuilding (content): fig.png"), "{stderr}");
     assert!(stderr.contains("error: slides.md:"), "{stderr}");
+}
+
+/// Whether some batch of `batches` lists `path`.
+fn mentions(batches: &[ChangeBatch], path: &Path) -> bool {
+    batches
+        .iter()
+        .any(|batch| batch.paths.iter().any(|p| p == path))
+}
+
+#[test]
+fn a_recreated_directory_is_watched_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical(dir.path());
+    let deck = root.join("slides.md");
+    let figs = root.join("figs");
+    let png = figs.join("plot.png");
+    write(&deck, "# A\n");
+    write(&png, "v0");
+    let set = WatchSet::new([deck.clone(), png.clone()], []);
+    let (mut watcher, rx) = start(&set);
+    assert_eq!(
+        watcher.watched_dirs(),
+        vec![(root.clone(), false), (figs.clone(), false)]
+    );
+
+    std::fs::remove_dir_all(&figs).unwrap();
+    let batches = drain_at_least_one(&rx, "removing figs/");
+    assert!(
+        mentions(&batches, &figs) || mentions(&batches, &png),
+        "{batches:?}"
+    );
+    watcher.update(&set).unwrap();
+    // `figs/` is gone: the deck's directory (watched anyway) reports its return.
+    assert_eq!(watcher.watched_dirs(), vec![(root.clone(), false)]);
+
+    pause();
+    write(&png, "v1");
+    let batches = drain_at_least_one(&rx, "recreating figs/plot.png");
+    assert!(mentions(&batches, &figs), "{batches:?}");
+    watcher.update(&set).unwrap();
+    assert_eq!(
+        watcher.watched_dirs(),
+        vec![(root.clone(), false), (figs.clone(), false)]
+    );
+    // plot.png was written before that batch was sent: the rebuild for it reads it.
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    append(&png, "v2");
+    let batch = next(&rx, "editing the recreated figs/plot.png");
+    assert_eq!(batch.paths, vec![png]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+}
+
+#[test]
+fn the_decks_directory_can_be_removed_and_created_again() {
+    // `git checkout` of a branch without it, or a generator doing `rm -rf gen && …`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical(dir.path());
+    let gen_dir = root.join("gen");
+    let deck = gen_dir.join("slides.md");
+    write(&deck, "# Generated\n");
+    let set = WatchSet::new([deck.clone()], []);
+    let (mut watcher, rx) = start(&set);
+
+    std::fs::remove_dir_all(&gen_dir).unwrap();
+    drain_at_least_one(&rx, "removing gen/");
+    watcher.update(&set).unwrap();
+    assert_eq!(watcher.watched_dirs(), vec![(root.clone(), false)]);
+
+    // Longer than the batch window: the removal and the creation are separate batches.
+    pause();
+    write(&deck, "# Generated again\n");
+    let batches = drain_at_least_one(&rx, "creating gen/ again");
+    assert!(mentions(&batches, &gen_dir), "{batches:?}");
+    watcher.update(&set).unwrap();
+    assert_eq!(watcher.watched_dirs(), vec![(gen_dir, false)]);
+
+    append(&deck, "\nmore\n");
+    let batch = next(&rx, "editing the regenerated deck");
+    assert_eq!(batch.paths, vec![deck]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+}
+
+#[test]
+fn a_missing_file_two_directories_down_is_seen_when_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical(dir.path());
+    let deck = root.join("slides.md");
+    let png = root.join("figs/sub/plot.png");
+    write(&deck, "# A\n");
+    let set = WatchSet::new([deck.clone(), png.clone()], []);
+    let (mut watcher, rx) = start(&set);
+    assert_eq!(watcher.watched_dirs(), vec![(root.clone(), false)]);
+
+    // One directory at a time: each is a change, and each update watches one level deeper.
+    std::fs::create_dir(root.join("figs")).unwrap();
+    let batches = drain_at_least_one(&rx, "creating figs/");
+    assert!(mentions(&batches, &root.join("figs")), "{batches:?}");
+    watcher.update(&set).unwrap();
+    assert_eq!(
+        watcher.watched_dirs(),
+        vec![(root.clone(), false), (root.join("figs"), false)]
+    );
+
+    std::fs::create_dir(root.join("figs/sub")).unwrap();
+    let batches = drain_at_least_one(&rx, "creating figs/sub/");
+    assert!(mentions(&batches, &root.join("figs/sub")), "{batches:?}");
+    watcher.update(&set).unwrap();
+    assert_eq!(
+        watcher.watched_dirs(),
+        vec![(root.clone(), false), (root.join("figs/sub"), false)]
+    );
+
+    write(&png, "png");
+    let batch = next(&rx, "creating figs/sub/plot.png");
+    assert_eq!(batch.paths, vec![png.clone()]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    // All at once (`mkdir -p figs/sub && cp …`): one batch for the top directory.
+    std::fs::remove_dir_all(root.join("figs")).unwrap();
+    drain_at_least_one(&rx, "removing figs/");
+    watcher.update(&set).unwrap();
+    assert_eq!(watcher.watched_dirs(), vec![(root.clone(), false)]);
+    pause();
+    write(&png, "png again");
+    let batches = drain_at_least_one(&rx, "creating figs/sub/plot.png at once");
+    assert!(mentions(&batches, &root.join("figs")), "{batches:?}");
+}
+
+#[test]
+fn an_update_reports_what_changed_while_the_watches_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = canonical(dir.path());
+    let deck = root.join("slides.md");
+    let png = root.join("other/x.png");
+    write(&deck, "# A\n");
+    write(&png, "v0");
+    let (mut watcher, rx) = start(&WatchSet::new([deck.clone()], []));
+    // `other/` is not watched yet; a build reads x.png, which changes before the update
+    // that starts watching it.
+    write(&png, "v1");
+    assert_eq!(drain(&rx, QUIET), vec![]);
+    watcher
+        .update(&WatchSet::new([deck.clone(), png.clone()], []))
+        .unwrap();
+    let batch = next(&rx, "updating to a set with a changed file");
+    assert_eq!(batch.paths, vec![png.clone()]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    // An update that changes no watch reports nothing.
+    watcher
+        .update(&WatchSet::new([deck.clone(), png.clone()], []))
+        .unwrap();
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    // Nor do updates that change watches: x.png's change was reported already.
+    watcher.update(&WatchSet::new([deck.clone()], [])).unwrap();
+    assert_eq!(watcher.watched_dirs(), vec![(root.clone(), false)]);
+    watcher
+        .update(&WatchSet::new([deck.clone(), png.clone()], []))
+        .unwrap();
+    assert_eq!(watcher.watched_dirs().len(), 2);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    // A change while `other/` is unwatched is reported by the update that watches it.
+    watcher.update(&WatchSet::new([deck.clone()], [])).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    write(&png, "v2");
+    assert_eq!(drain(&rx, QUIET), vec![]);
+    watcher
+        .update(&WatchSet::new([deck, png.clone()], []))
+        .unwrap();
+    let batch = next(&rx, "watching other/ again");
+    assert_eq!(batch.paths, vec![png]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+}
+
+#[test]
+fn watch_set_of_a_failed_build_has_the_theme_that_does_not_resolve() {
+    let (dir, input) = project("# Hi\n");
+    let root = canonical(dir.path());
+    let mytheme = root.join("mytheme");
+    let opts = BuildOptions::new(&input);
+
+    // The theme's manifest is invalid TOML.
+    write(
+        &mytheme.join("theme.toml"),
+        "name = \"mytheme\"\nextends = \"default\"\nbogus = [\n",
+    );
+    assert!(pipeline::build_deck(&opts).is_err());
+    let set = watch_set_for_failed(&opts);
+    assert!(set.theme_dirs.contains(&mytheme), "{set:?}");
+    assert!(set.dirs_recursive.contains(&mytheme), "{set:?}");
+    assert!(set.files.contains(&root.join("presenter.toml")), "{set:?}");
+    assert!(watch_set_before_build(&opts).theme_dirs.contains(&mytheme));
+
+    // The parent it extends does not exist: the theme and where the parent is looked for.
+    write(
+        &mytheme.join("theme.toml"),
+        "name = \"mytheme\"\nextends = \"defualt\"\n",
+    );
+    assert!(pipeline::build_deck(&opts).is_err());
+    let set = watch_set_for_failed(&opts);
+    assert!(set.theme_dirs.contains(&mytheme), "{set:?}");
+    assert!(set.theme_dirs.contains(&mytheme.join("defualt")), "{set:?}");
+
+    // There is no theme directory yet: where it will be created.
+    std::fs::remove_dir_all(&mytheme).unwrap();
+    assert!(pipeline::build_deck(&opts).is_err());
+    let set = watch_set_for_failed(&opts);
+    assert!(set.theme_dirs.contains(&mytheme), "{set:?}");
+
+    // Front matter naming a theme that does not exist (the deck parses).
+    write(&input, "---\ntheme: other\n---\n\n# Hi\n");
+    let set = watch_set_for_failed(&opts);
+    assert!(set.theme_dirs.contains(&root.join("other")), "{set:?}");
+}
+
+/// What the rebuild loop reported, as text: `built <n>`, `failed: <error>`, `watching`,
+/// `changed: <kind> <file names>`.
+fn status_text(status: &WatchStatus<'_>) -> String {
+    match status {
+        WatchStatus::Built { build, .. } => format!("built {}", build.document.slide_count),
+        WatchStatus::Failed(failure) => format!("failed: {}", failure.error),
+        WatchStatus::Watching(_) => "watching".to_string(),
+        WatchStatus::Changed(batch) => {
+            let names: Vec<String> = batch
+                .paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            format!("changed: {:?} {}", batch.kind, names.join(","))
+        }
+    }
+}
+
+/// `run_build_watch_with` on a thread. Every status goes to the returned receiver as
+/// [`status_text`]; `on_status` runs first. The loop stops at the first status that
+/// arrives after `stop` was set (then `done` is sent): the flag is read before the status
+/// is sent, so setting it in reply to one status stops at the next.
+fn run_loop(
+    opts: BuildOptions,
+    out: PathBuf,
+    mut on_status: impl FnMut(&WatchStatus<'_>) + Send + 'static,
+) -> (Receiver<String>, Arc<AtomicBool>) {
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        let result = run_build_watch_with(&opts, &out, |status| {
+            let stop_now = thread_stop.load(Ordering::SeqCst);
+            on_status(&status);
+            let _ = tx.send(status_text(&status));
+            if stop_now {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        let _ = tx.send(format!("done {result:?}"));
+    });
+    (rx, stop)
+}
+
+/// The next status of [`run_loop`], within 30 s (a build is included).
+fn next_status(rx: &Receiver<String>, what: &str) -> String {
+    rx.recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|err| panic!("no status for {what}: {err}"))
+}
+
+#[test]
+fn a_change_saved_while_the_first_build_runs_is_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let deck = dir.path().join("slides.md");
+    write(&deck, "# One\n");
+    let out = dir.path().join("out.html");
+    let edited = deck.clone();
+    let mut builds = 0;
+    let (rx, stop) = run_loop(BuildOptions::new(&deck), out.clone(), move |status| {
+        if matches!(status, WatchStatus::Built { .. }) {
+            builds += 1;
+            if builds == 1 {
+                // The first build has read the deck: this save must not be lost.
+                append(&edited, "\n---\n\n## Saved during the build\n");
+            }
+        }
+    });
+    assert_eq!(next_status(&rx, "the first build"), "built 1");
+    assert_eq!(next_status(&rx, "watching"), "watching");
+    assert_eq!(
+        next_status(&rx, "the save during the first build"),
+        "changed: Content slides.md"
+    );
+    stop.store(true, Ordering::SeqCst);
+    assert_eq!(next_status(&rx, "the rebuild"), "built 2");
+    assert_eq!(next_status(&rx, "the end of the loop"), "done Ok(())");
+    assert!(contains(&out, "Saved during the build"));
+}
+
+#[test]
+fn writing_the_output_inside_a_watched_theme_does_not_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let theme = dir.path().join("theme");
+    write(
+        &theme.join("theme.toml"),
+        "name = \"t\"\nextends = \"default\"\n",
+    );
+    std::fs::create_dir(theme.join("styles")).unwrap();
+    let deck = dir.path().join("slides.md");
+    write(&deck, "# One\n");
+    let mut opts = BuildOptions::new(&deck);
+    opts.cli.theme = Some(theme.display().to_string());
+    // The build creates theme/build/sub/ for its output.
+    let out = theme.join("build/sub/out.html");
+    let (rx, stop) = run_loop(opts, out.clone(), |_| {});
+    assert_eq!(next_status(&rx, "the first build"), "built 1");
+    assert_eq!(next_status(&rx, "watching"), "watching");
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Err(RecvTimeoutError::Timeout) => {}
+        other => panic!("writing the output caused {other:?}"),
+    }
+    assert!(out.is_file());
+
+    // The theme itself is still watched.
+    stop.store(true, Ordering::SeqCst);
+    write(&theme.join("styles/extra.css"), "p { color: red; }\n");
+    assert_eq!(
+        next_status(&rx, "a stylesheet in the theme"),
+        "changed: Css extra.css"
+    );
+    assert_eq!(next_status(&rx, "the end of the loop"), "done Ok(())");
+}
+
+#[test]
+fn build_watch_waits_for_an_invalid_presenter_toml_to_be_fixed() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("presenter.toml"), "[deck\n");
+    write(&dir.path().join("slides.md"), "# Config test\n");
+    let mut process = WatchProcess::spawn(
+        dir.path(),
+        &["build", "slides.md", "--watch", "-o", "out.html"],
+    );
+    process.wait_for("the config error", Duration::from_secs(30), |p| {
+        p.stderr().contains("Watching for changes (Ctrl-C to stop)")
+    });
+    assert!(
+        process.stderr().starts_with("error: "),
+        "{}",
+        process.stderr()
+    );
+    assert_eq!(process.stdout(), "");
+
+    // Still broken: reported again.
+    write(&dir.path().join("presenter.toml"), "[deck]\ntheme = 3\n");
+    process.wait_for("the second config error", Duration::from_secs(15), |p| {
+        p.stderr().matches("error: ").count() == 2
+    });
+
+    write(&dir.path().join("presenter.toml"), "[deck]\n");
+    process.wait_for("the first build", Duration::from_secs(15), |p| {
+        p.stdout().starts_with("Wrote out.html (1 slide, ")
+    });
+    let stderr = process.stderr();
+    assert!(
+        stderr.contains("Rebuilding (content): presenter.toml"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Watching for changes").count(),
+        1,
+        "{stderr}"
+    );
+
+    // Watching goes on like after any first build.
+    append(&dir.path().join("slides.md"), "\n---\n\n## Two\n");
+    process.wait_for("the rebuild", Duration::from_secs(15), |p| {
+        p.stdout().contains("Wrote out.html (2 slides, ")
+    });
+}
+
+#[test]
+fn build_watch_follows_a_theme_being_created_and_fixed() {
+    // Theme authoring: presenter.toml names `mytheme`, which does not exist yet.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("presenter.toml"),
+        "[deck]\ntheme = \"mytheme\"\n",
+    );
+    write(&dir.path().join("slides.md"), "# Theme test\n");
+    let mut process = WatchProcess::spawn(
+        dir.path(),
+        &["build", "slides.md", "--watch", "-o", "out.html"],
+    );
+    process.wait_for("the first build", Duration::from_secs(30), |p| {
+        p.stderr().contains("Watching for changes (Ctrl-C to stop)")
+    });
+    assert!(
+        process.stderr().contains("not found"),
+        "{}",
+        process.stderr()
+    );
+
+    // Created with an invalid manifest: a rebuild reports it.
+    let manifest = dir.path().join("mytheme/theme.toml");
+    write(
+        &manifest,
+        "name = \"mytheme\"\nextends = \"default\"\nbogus = [\n",
+    );
+    process.wait_for("the invalid manifest", Duration::from_secs(15), |p| {
+        p.stderr().matches("error: ").count() == 2
+    });
+
+    // A missing parent theme, then fixed.
+    write(&manifest, "name = \"mytheme\"\nextends = \"defualt\"\n");
+    process.wait_for("the missing parent", Duration::from_secs(15), |p| {
+        p.stderr().matches("error: ").count() == 3
+    });
+    assert!(process.stderr().contains("defualt"), "{}", process.stderr());
+    write(&manifest, "name = \"mytheme\"\nextends = \"default\"\n");
+    process.wait_for("the fixed theme", Duration::from_secs(15), |p| {
+        p.stdout().starts_with("Wrote out.html (1 slide, ")
+    });
 }

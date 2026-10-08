@@ -14,20 +14,28 @@
 //! inputs ([`crate::serve::watch`]) until interrupted: each build prints exactly what a
 //! single build prints (a failed one prints its error and the loop goes on), and stderr gets
 //! `Watching for changes (Ctrl-C to stop)` after the first build and `Rebuilding (<kind>):
-//! <paths>` before every rebuild (neither with `-q`).
+//! <paths>` before every rebuild (neither with `-q`). A `presenter.toml` that cannot be
+//! loaded at startup is reported the same way and watched until it can (the output path
+//! and mode depend on it); then the first build runs.
 
 use std::io::Write as _;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc;
 
 use super::{
     BuildArgs, GlobalArgs, display_path, input_format, locate, print_stdout, report,
     report_diagnostics,
 };
 use crate::config::CliOverrides;
+use crate::error::Error;
 use crate::pipeline::{self, Build, BuildFailure, BuildOptions};
 use crate::render::BuildInfo;
-use crate::serve::watch::{self as watcher, ChangeBatch, ChangeKind, WatchStatus};
+use crate::serve::watch::{self as watcher, ChangeBatch, ChangeKind, WatchStatus, Watcher};
+
+/// The status line `build --watch` prints once watching has started.
+const WATCHING: &str = "Watching for changes (Ctrl-C to stop)";
 
 /// Runs `presenter build`.
 pub fn run(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
@@ -40,15 +48,60 @@ pub fn run(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
 }
 
 /// `presenter build --watch`: builds, then rebuilds on every change without serving
-/// ([`watcher::run_build_watch_with`]); runs until interrupted. Errors before the first
-/// build (input format, `presenter.toml`) end the command like a single build's; build
+/// ([`watcher::run_build_watch_with`]); runs until interrupted. An input whose format
+/// cannot be told ends the command like a single build's; a `presenter.toml` that cannot be
+/// loaded is reported and watched until it can be, then the first build runs; build
 /// errors are printed and watching goes on.
 pub fn watch(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
-    let (opts, out) = build_options(args, global)?;
+    let (opts, out, announced) = match build_options(args, global) {
+        Ok((opts, out)) => (opts, out, false),
+        Err(err) if is_config_error(&err) => {
+            let (opts, out) = wait_for_config(args, global, &err)?;
+            (opts, out, true)
+        }
+        Err(err) => return Err(err),
+    };
     watcher::run_build_watch_with(&opts, &out, |status| {
-        print_watch_status(status, &opts, &out, global);
+        // `Watching …` was printed while waiting for the config.
+        if !(announced && matches!(status, WatchStatus::Watching(_))) {
+            print_watch_status(status, &opts, &out, global);
+        }
+        ControlFlow::Continue(())
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `build --watch` with a `presenter.toml` that cannot be loaded before the first build:
+/// reports `err`, watches the source and the config file
+/// ([`watcher::watch_set_before_build`]) and, on every change, prints `Rebuilding …` and
+/// tries again (reporting each new error) until [`build_options`] succeeds.
+fn wait_for_config(
+    args: &BuildArgs,
+    global: &GlobalArgs,
+    err: &anyhow::Error,
+) -> anyhow::Result<(BuildOptions, PathBuf)> {
+    report::report_error(err);
+    let (tx, rx) = mpsc::channel();
+    let _watcher = Watcher::start(
+        &watcher::watch_set_before_build(&base_options(args, global)?),
+        tx,
+    )?;
+    status_line(WATCHING, global);
+    for batch in rx {
+        status_line(&rebuilding_line(&batch), global);
+        match build_options(args, global) {
+            Ok(found) => return Ok(found),
+            Err(err) if is_config_error(&err) => report::report_error(&err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(anyhow::anyhow!("file watcher stopped"))
+}
+
+/// Whether `err` is a `presenter.toml` problem ([`Error::Config`] anywhere in its chain).
+fn is_config_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| matches!(cause.downcast_ref::<Error>(), Some(Error::Config(_))))
 }
 
 /// Prints one [`WatchStatus`] of `build --watch` (module docs).
@@ -71,7 +124,7 @@ fn print_watch_status(
             report_diagnostics(&diagnostics, global);
             report::report_error(&locate(error, &opts.input));
         }
-        WatchStatus::Watching(_) => status_line("Watching for changes (Ctrl-C to stop)", global),
+        WatchStatus::Watching(_) => status_line(WATCHING, global),
         WatchStatus::Changed(batch) => status_line(&rebuilding_line(batch), global),
     }
 }
@@ -111,15 +164,7 @@ pub fn build_options(
     args: &BuildArgs,
     global: &GlobalArgs,
 ) -> anyhow::Result<(BuildOptions, PathBuf)> {
-    let mut opts = BuildOptions::new(&args.input);
-    opts.format = Some(input_format(&args.input, args.format)?);
-    opts.config_path = global.config.clone();
-    opts.cli = CliOverrides {
-        theme: args.theme.clone(),
-        out: args.out.clone(),
-        standalone: args.standalone_override(),
-        ..CliOverrides::default()
-    };
+    let mut opts = base_options(args, global)?;
     let (config, _) = pipeline::load_config(&opts)?;
     let standalone = config.build.standalone;
     let out = args
@@ -130,6 +175,21 @@ pub fn build_options(
     opts.build = BuildInfo::build(standalone);
     opts.missing_asset_is_error = true;
     Ok((opts, out))
+}
+
+/// The options of `args` that do not depend on `presenter.toml`: input and format,
+/// `--config` and the command-line overrides. Errors: an input whose format cannot be told.
+fn base_options(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<BuildOptions> {
+    let mut opts = BuildOptions::new(&args.input);
+    opts.format = Some(input_format(&args.input, args.format)?);
+    opts.config_path = global.config.clone();
+    opts.cli = CliOverrides {
+        theme: args.theme.clone(),
+        out: args.out.clone(),
+        standalone: args.standalone_override(),
+        ..CliOverrides::default()
+    };
+    Ok(opts)
 }
 
 /// Builds `opts`, prints its diagnostics, writes the output to `out` and prints the
