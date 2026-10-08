@@ -422,3 +422,41 @@ fn headings_mode_decks_report_lost_separators() {
         ]
     );
 }
+
+#[test]
+fn indented_dash_lines_rules_after_link_definitions_and_content_setext_headings_are_reported() {
+    // Each of these loses a slide (`dump` shows one slide per deck).
+    let indented = "# One\n\nSome text\n    --\n\nmore\n\nOther text\n    ---\n\nend\n\n\
+                    tabbed\n\t--\n";
+    let definition = "# One\n\ntext\n\n[x]: /u\n---\n\nAfter [x]\n";
+    let level_1 = "---\nslides: {split: headings, slide_level: 1}\n---\n\n# A\n\ntext\n\n\
+                   Title\n---\n\nmore\n";
+    let dir = project(&[
+        ("indented.md", indented),
+        ("definition.md", definition),
+        ("level-1.md", level_1),
+    ]);
+    let lost = |line: u64| ("separator-not-recognized".to_string(), Some(line));
+    let (code, entries) = check_json(dir.path(), &["indented.md"]);
+    assert_eq!(code, 0);
+    assert_eq!(codes_and_lines(&entries), [lost(4), lost(9), lost(14)]);
+    let message = entries[0]["message"].as_str().unwrap();
+    assert!(message.contains("remove its indentation"), "{message}");
+    let (_, entries) = check_json(dir.path(), &["definition.md"]);
+    assert_eq!(codes_and_lines(&entries), [lost(6)]);
+    let (_, entries) = check_json(dir.path(), &["level-1.md"]);
+    assert_eq!(codes_and_lines(&entries), [lost(10)]);
+    // With `--deny-warnings` they fail the check.
+    let (code, _, stderr) = run(
+        dir.path(),
+        &[
+            "check",
+            "--deny-warnings",
+            "indented.md",
+            "definition.md",
+            "level-1.md",
+        ],
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stderr.matches(": warning: `-").count(), 5, "{stderr}");
+}

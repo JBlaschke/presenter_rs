@@ -26,16 +26,18 @@
 //!
 //! - `separator-not-recognized` (dialect §2.2, §2.3 and §10): a raw source line that is `---`
 //!   or `--` (ignoring surrounding spaces and tabs) but did not open a slide, with the reason
-//!   and the fix (setext heading, indented code, part of a paragraph, a lazy continuation of
-//!   a list or quote, a table row, inside a directive, an unclosed fence or comment, …).
-//!   Whether a line opened a slide is decided as the splitter decides it: a top-level
-//!   thematic break, or a top-level paragraph ending in that line (`--`, possibly after
-//!   link reference definitions). Skipped: the front matter, closed fenced code blocks, closed
-//!   raw HTML (comments, `<pre>`/`<script>`/`<style>`/`<textarea>`, …), indented code blocks
-//!   with other lines than `---`/`--` (code meant to be shown), and lines the splitter
-//!   already reported. In headings mode (§2.3, where separators are still honored) the
-//!   underline of a setext heading (`Title` / `---`) is a real slide heading and is not
-//!   reported; every other pitfall is. In notebooks the markdown cells are scanned when
+//!   and the fix (setext heading, indented code, part of a paragraph, text after a link
+//!   reference definition, a lazy continuation of a list or quote, a table row, inside a
+//!   directive, an unclosed fence or comment, …). Whether a line opened a slide is the
+//!   splitter's own decision: the text is split with [`split_with_source`], as the frontend
+//!   splits it, and a line opened a slide when it is the line of a separator the splitter
+//!   took (a top-level node no slide holds). Skipped: the front matter, closed fenced code
+//!   blocks, closed raw HTML (comments, `<pre>`/`<script>`/`<style>`/`<textarea>`, …),
+//!   indented code blocks with other lines than `---`/`--` (code meant to be shown), and
+//!   lines the splitter already reported. In headings mode (§2.3, where separators are still
+//!   honored) the underline of a setext heading (`Title` / `---`, level 2) that is a slide
+//!   boundary (`slides.slide_level` 2 or more) is a real slide heading and is not reported;
+//!   every other pitfall is. In notebooks the markdown cells are scanned when
 //!   `[notebook] split_markdown_cells` is on (then `---`/`--` open slides there), except
 //!   speaker-notes cells.
 //! - `unknown-directive` (dialect §4): `:::include`, which is reserved and not implemented,
@@ -63,8 +65,9 @@ use crate::assets::registry::normalize_lexically;
 use crate::config::{Config, SlideSplit};
 use crate::error::{Diagnostic, Diagnostics, Error, Result};
 use crate::ir::{Block, Deck, Slide, SourceKind, SourceSpan};
+use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::split_front_matter;
-use crate::markdown::{comrak_options, split::source_lines};
+use crate::markdown::split::{SplitMode, source_lines, split_with_source};
 use crate::notebook::convert::codes::FRONT_MATTER_IGNORED;
 use crate::notebook::nbformat::{self, Cell, CellType, SlideType};
 use crate::pipeline::{self, BuildOptions};
@@ -348,9 +351,12 @@ fn source_lints(
 /// The source lints of a Markdown deck. `config` is the deck's (front matter merged),
 /// `frontend` the frontend's diagnostics.
 fn markdown_lints(text: &str, config: &Config, frontend: &Diagnostics) -> Vec<Diagnostic> {
+    // As the frontend splits it (`markdown::split_mode`).
     let split = match config.slides.split {
-        SlideSplit::Rules => Split::Rules,
-        SlideSplit::Headings => Split::Headings,
+        SlideSplit::Rules => SplitMode::Rules,
+        SlideSplit::Headings => SplitMode::Headings {
+            slide_level: config.slides.slide_level,
+        },
     };
     let options = comrak_options(&config.markdown);
     lint_text(text, &options, Origin::DECK, Some(split), frontend)
@@ -386,7 +392,7 @@ fn notebook_lints(
         });
         let (body, offset) = cell_markdown(cell, ignored || first_markdown == Some(index));
         let split =
-            (config.notebook.split_markdown_cells && !is_notes(cell)).then_some(Split::Rules);
+            (config.notebook.split_markdown_cells && !is_notes(cell)).then_some(SplitMode::Rules);
         let origin = Origin {
             cell: Some(index),
             offset,
@@ -462,23 +468,14 @@ impl Origin {
     }
 }
 
-/// How the text being scanned for separators is split into slides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Split {
-    /// By `---`/`--` lines (dialect §2.2; also split notebook cells).
-    Rules,
-    /// By headings (dialect §2.3): separators are still honored, and `Title` / `---` is a
-    /// real (setext) slide heading, not a pitfall.
-    Headings,
-}
-
-/// `unknown-directive` and, when `split` is given, `separator-not-recognized` for one
-/// Markdown text at `origin`.
+/// `unknown-directive` and, when `split` is given (the text is split into slides that way:
+/// the deck's mode, or rules mode for a split notebook cell), `separator-not-recognized` for
+/// one Markdown text at `origin`.
 fn lint_text(
     text: &str,
     options: &Options<'_>,
     origin: Origin,
-    split: Option<Split>,
+    split: Option<SplitMode>,
     frontend: &Diagnostics,
 ) -> Vec<Diagnostic> {
     let arena = Arena::new();
@@ -487,18 +484,79 @@ fn lint_text(
         .into_iter()
         .map(|line| origin.warning(codes::UNKNOWN_DIRECTIVE, line, INCLUDE_MESSAGE.into()))
         .collect();
-    if let Some(split) = split {
-        let lines = source_lines(text);
-        let reported = origin.reported(frontend);
-        found.extend(
-            unrecognized_separators(root, &lines, split, &reported)
-                .into_iter()
-                .map(|(line, message)| {
-                    origin.warning(codes::SEPARATOR_NOT_RECOGNIZED, line, message)
-                }),
-        );
-    }
+    let Some(split) = split else {
+        return found;
+    };
+    let lines = source_lines(text);
+    let Some(opened) = opened_lines(root, text, &lines, split) else {
+        return found;
+    };
+    let reported = origin.reported(frontend);
+    found.extend(
+        unrecognized_separators(root, &lines, split, &opened, &reported)
+            .into_iter()
+            .map(|(line, message)| origin.warning(codes::SEPARATOR_NOT_RECOGNIZED, line, message)),
+    );
     found
+}
+
+/// The lines on which a separator opened a slide when `text` (parsed as `root`, split into
+/// `lines` by [`source_lines`]) is split in `mode`: the splitter's own decision. Every
+/// top-level node that no slide holds was taken by the splitter (a separator, the front
+/// matter or a `.slide:` comment); a thematic break opened a slide on its line, a separator
+/// paragraph on its [`separator_line`].
+///
+/// `None` when the splitter fails (an unbalanced quote in a separator's `{…}` or a `.slide:`
+/// comment), which the frontend already failed on, so only if the input changed in between.
+fn opened_lines<'a>(
+    root: &'a AstNode<'a>,
+    text: &str,
+    lines: &[&str],
+    mode: SplitMode,
+) -> Option<BTreeSet<usize>> {
+    let deck = match split_with_source(root, text, mode) {
+        Ok(deck) => deck,
+        Err(err) => {
+            tracing::debug!("separator lint skipped, the text does not split: {err}");
+            return None;
+        }
+    };
+    let held: BTreeSet<*const AstNode<'a>> = deck
+        .slides
+        .iter()
+        .flat_map(|(slide, children)| std::iter::once(slide).chain(children))
+        .flat_map(|slide| slide.nodes.iter().map(|node| std::ptr::from_ref(*node)))
+        .collect();
+    let opened = root
+        .children()
+        .filter(|node| !held.contains(&std::ptr::from_ref(*node)))
+        .filter_map(|node| {
+            let (start, end) = lines_of(node);
+            match node.data().value {
+                NodeValue::ThematicBreak => Some(start),
+                NodeValue::Paragraph => Some(separator_line(lines, end)),
+                _ => None,
+            }
+        })
+        .collect();
+    Some(opened)
+}
+
+/// The line of a separator paragraph that ends on `end` (dialect §2.2, `--` or
+/// `^(---|--)\s*\{(.*)\}$` with the lines trimmed and joined by `\n`): the line before the
+/// last when the last one starts with `{` (`--` and `{…}` on two lines, as `\s*` allows),
+/// else the last one (`--`, or `-- {…}` on one line). Lines before the separator's own are
+/// link reference definitions.
+fn separator_line(lines: &[&str], end: usize) -> usize {
+    let last = end
+        .checked_sub(1)
+        .and_then(|index| lines.get(index))
+        .map_or("", |line| line.trim_matches([' ', '\t']));
+    if last.starts_with('{') && end > 1 {
+        end - 1
+    } else {
+        end
+    }
 }
 
 /// The `unknown-directive` message for `:::include`.
@@ -550,6 +608,9 @@ struct DashLine<'s> {
     mark: &'s str,
     /// The line as written.
     raw: &'s str,
+    /// It is indented by 4 or more columns (a tab counts to the next multiple of 4): it can
+    /// never be a separator, only a paragraph continuation line or code.
+    indented: bool,
     /// The line before it is blank, or there is none.
     blank_before: bool,
     /// The line after it is blank, or there is none.
@@ -566,9 +627,9 @@ impl DashLine<'_> {
         }
     }
 
-    /// How to make the line a separator of its own: a blank line before it when text is
-    /// above it, and for `--` (which must be a paragraph of its own) after it when text
-    /// follows.
+    /// How to make the line a separator of its own: no indentation of 4 or more columns, a
+    /// blank line before it when text is above it, and for `--` (which must be a paragraph
+    /// of its own) after it when text follows.
     fn advice(&self) -> String {
         let after = self.mark == "--" && !self.blank_after;
         let what = match (!self.blank_before, after) {
@@ -576,17 +637,39 @@ impl DashLine<'_> {
             (false, true) => "put a blank line after it",
             _ => "put blank lines around it",
         };
-        format!("{what} to start a {} slide", self.direction())
+        let unindent = if self.indented {
+            "remove its indentation and "
+        } else {
+            ""
+        };
+        format!("{unindent}{what} to start a {} slide", self.direction())
     }
 }
 
-/// `separator-not-recognized` for every raw `---`/`--` line of a Markdown text that did not
-/// open a slide (module docs), as `(line, message)` with lines of the text. `lines` are the
-/// text's lines ([`source_lines`]), `reported` the lines the splitter already reported.
+/// The columns of `raw`'s leading spaces and tabs, a tab advancing to the next multiple of
+/// 4 (CommonMark's tab stops).
+fn indent_columns(raw: &str) -> usize {
+    let mut columns = 0;
+    for c in raw.chars() {
+        match c {
+            ' ' => columns += 1,
+            '\t' => columns += 4 - columns % 4,
+            _ => break,
+        }
+    }
+    columns
+}
+
+/// `separator-not-recognized` for every raw `---`/`--` line of a Markdown text split in
+/// `split` that did not open a slide (module docs), as `(line, message)` with lines of the
+/// text. `lines` are the text's lines ([`source_lines`]), `opened` the lines on which a
+/// separator opened a slide ([`opened_lines`]), `reported` the lines the splitter already
+/// reported.
 fn unrecognized_separators<'a>(
     root: &'a AstNode<'a>,
     lines: &[&str],
-    split: Split,
+    split: SplitMode,
+    opened: &BTreeSet<usize>,
     reported: &BTreeSet<usize>,
 ) -> Vec<(usize, String)> {
     let skipped = Ranges::new(skipped_ranges(root));
@@ -596,22 +679,22 @@ fn unrecognized_separators<'a>(
     for (index, raw) in lines.iter().enumerate() {
         let line = index + 1;
         let mark = raw.trim_matches([' ', '\t']);
-        if !matches!(mark, "---" | "--") || reported.contains(&line) || skipped.find(line).is_some()
+        if !matches!(mark, "---" | "--")
+            || opened.contains(&line)
+            || reported.contains(&line)
+            || skipped.find(line).is_some()
         {
-            continue;
-        }
-        let top = tops.find(line);
-        if top.is_some_and(|node| is_separator_at(node, line)) {
             continue;
         }
         let dash = DashLine {
             line,
             mark,
             raw,
+            indented: indent_columns(raw) >= 4,
             blank_before: index == 0 || blank(index - 1),
             blank_after: blank(index + 1),
         };
-        if let Some(reason) = why_not_a_separator(root, top, &dash, split) {
+        if let Some(reason) = why_not_a_separator(root, tops.find(line), &dash, split) {
             found.push((line, format!("`{mark}` {reason}")));
         }
     }
@@ -686,19 +769,6 @@ fn raw_html_kind(block_type: u8, literal: &str) -> Option<(String, &'static str)
     })
 }
 
-/// True if the top-level `node` is a separator on `line`, as the splitter decides it
-/// (dialect §2.2): a thematic break there, or a paragraph that ends there (`--` alone,
-/// possibly after link reference definitions; any other paragraph text before a `--` line
-/// would make it a setext heading).
-fn is_separator_at<'a>(node: &'a AstNode<'a>, line: usize) -> bool {
-    let (start, end) = lines_of(node);
-    match node.data().value {
-        NodeValue::ThematicBreak => start == line,
-        NodeValue::Paragraph => end == line,
-        _ => false,
-    }
-}
-
 /// The innermost node below `node` whose lines contain `line` (`node` itself if none).
 fn deepest<'a>(node: &'a AstNode<'a>, line: usize) -> &'a AstNode<'a> {
     let contains = |child: &&'a AstNode<'a>| {
@@ -713,12 +783,12 @@ fn deepest<'a>(node: &'a AstNode<'a>, line: usize) -> &'a AstNode<'a> {
 }
 
 /// Why the dash line inside the top-level block `top` opened no slide, or `None` when that
-/// is right (the underline of a setext heading in headings mode).
+/// is right (the underline of a setext heading that starts a slide in headings mode).
 fn why_not_a_separator<'a>(
     root: &'a AstNode<'a>,
     top: Option<&'a AstNode<'a>>,
     dash: &DashLine<'_>,
-    split: Split,
+    split: SplitMode,
 ) -> Option<String> {
     if let Some(reason) = never_closed(deepest(top.unwrap_or(root), dash.line)) {
         return Some(reason);
@@ -730,7 +800,7 @@ fn why_not_a_separator<'a>(
     let advice = dash.advice();
     Some(match &top.data().value {
         NodeValue::Heading(heading) if heading.setext && dash.line == end => {
-            if split == Split::Headings {
+            if is_slide_boundary(heading.level, split) {
                 return None;
             }
             format!(
@@ -747,6 +817,14 @@ fn why_not_a_separator<'a>(
              starts here; remove the indentation to start a {} slide",
             dash.direction()
         ),
+        NodeValue::Paragraph if dash.line == end && opened < end && has_one_inline(top) => {
+            // The paragraph's text is this line alone: the lines above it are link
+            // reference definitions, which comrak removes from the paragraph.
+            format!(
+                "follows link reference definitions (from line {opened}) without a blank line, \
+                 so it is read as text and no slide starts here; {advice}"
+            )
+        }
         NodeValue::Paragraph => {
             format!("is part of a paragraph, so no slide starts here; {advice}")
         }
@@ -760,6 +838,21 @@ fn why_not_a_separator<'a>(
         ),
         value => nested(value, opened, dash),
     })
+}
+
+/// Whether a top-level heading of `level` is a slide boundary when the text is split in
+/// `split`: headings mode and `level <= slides.slide_level` (dialect §2.3; the splitter's
+/// rule). In rules mode, and for deeper headings, it is content.
+fn is_slide_boundary(level: u8, split: SplitMode) -> bool {
+    matches!(split, SplitMode::Headings { slide_level } if level <= slide_level)
+}
+
+/// Whether the block `node` has exactly one inline child. For a paragraph that ends on a
+/// raw `---`/`--` line this means its text is that line alone: inlines never span a line
+/// break without a delimiter on the next line, and such a line has none.
+fn has_one_inline<'a>(node: &'a AstNode<'a>) -> bool {
+    node.first_child()
+        .is_some_and(|child| child.next_sibling().is_none())
 }
 
 /// The reason for a dash line inside `leaf` when that is a fenced code block or a raw HTML
@@ -1042,6 +1135,185 @@ mod tests {
     }
 
     #[test]
+    fn indented_dash_lines_after_text_are_reported() {
+        // 4+ columns (or a tab) after text: a paragraph continuation line, never a setext
+        // underline or a separator, so all three slides are lost.
+        let text = "# One\n\nSome text\n    --\n\nmore\n\nOther text\n    ---\n\nend\n\n\
+                    tabbed\n\t--\n\nlast\n  \t--\nafter\n";
+        let warnings = separator_warnings(text);
+        let unindent = "is part of a paragraph, so no slide starts here; remove its \
+                        indentation and put a blank line before it to start a";
+        assert_warnings(
+            &warnings,
+            &[
+                (4, unindent),
+                (9, unindent),
+                (14, unindent),
+                (
+                    17,
+                    "remove its indentation and put blank lines around it to start a vertical",
+                ),
+            ],
+        );
+        assert!(warnings[1].1.ends_with("horizontal slide"), "{warnings:?}");
+        // Up to 3 columns it is a setext underline.
+        let warnings = separator_warnings("# One\n\nSome text\n   --\n\nmore\n");
+        assert_warnings(&warnings, &[(4, "under a line of text turns that text")]);
+        assert!(!warnings[0].1.contains("indentation"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_rule_right_after_a_link_definition_is_reported() {
+        let text = "# One\n\ntext\n\n[x]: /u\n---\n\nAfter [x]\n\n[y]: /v\n[z]: /w\n   ---\n";
+        let warnings = separator_warnings(text);
+        assert_eq!(
+            warnings,
+            [
+                (
+                    6,
+                    "`---` follows link reference definitions (from line 5) without a blank \
+                     line, so it is read as text and no slide starts here; put a blank line \
+                     before it to start a horizontal slide"
+                        .to_string()
+                ),
+                (
+                    12,
+                    "`---` follows link reference definitions (from line 10) without a blank \
+                     line, so it is read as text and no slide starts here; put a blank line \
+                     before it to start a horizontal slide"
+                        .to_string()
+                ),
+            ]
+        );
+        // `--` (also indented) after definitions is a separator, as is `---` after a blank
+        // line.
+        let text = "# One\n\n[x]: /u\n--\n\ntwo\n\n[y]: /v\n    --\n\nthree\n\n[z]: /w\n\n\
+                    ---\n\nfour\n";
+        assert_eq!(separator_warnings(text), vec![]);
+    }
+
+    #[test]
+    fn separators_with_attributes_on_the_next_line_are_not_reported() {
+        // `\s*` in `^(---|--)\s*\{(.*)\}$` spans the line break: both open slides.
+        let text = "# One\n\n--\n{.a}\n\ntwo\n\n[x]: /u\n---\n{.b}\n\nthree\n";
+        assert_eq!(separator_warnings(text), vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.md");
+        std::fs::write(&path, text).unwrap();
+        let deck = pipeline::parse_only(&BuildOptions::new(&path))
+            .unwrap()
+            .0
+            .deck;
+        assert_eq!(deck.slides.len(), 2);
+        assert_eq!(deck.slides[0].children.len(), 1);
+        assert_eq!(deck.slides[0].children[0].classes, ["a"]);
+        assert_eq!(deck.slides[1].classes, ["b"]);
+    }
+
+    /// The lines on which the splitter opened a slide with a separator, read from its slides:
+    /// the start line of every slide that starts inside a node it took as a separator.
+    fn splitter_separator_lines(text: &str) -> BTreeSet<usize> {
+        let arena = Arena::new();
+        let root = parse_document(&arena, text, &crate::markdown::split::dialect_options());
+        let deck = split_with_source(root, text, SplitMode::Rules).unwrap();
+        let held: Vec<_> = deck
+            .slides
+            .iter()
+            .flat_map(|(slide, children)| std::iter::once(slide).chain(children))
+            .flat_map(|slide| slide.nodes.clone())
+            .collect();
+        let taken: Vec<(usize, usize)> = root
+            .children()
+            .filter(|node| !held.iter().any(|held| std::ptr::eq(*held, *node)))
+            .filter(|node| {
+                matches!(
+                    node.data().value,
+                    NodeValue::Paragraph | NodeValue::ThematicBreak
+                )
+            })
+            .map(lines_of)
+            .collect();
+        deck.slides
+            .iter()
+            .flat_map(|(slide, children)| std::iter::once(slide).chain(children))
+            .map(|slide| slide.start_line)
+            .filter(|line| taken.iter().any(|(s, e)| s <= line && line <= e))
+            .collect()
+    }
+
+    #[test]
+    fn opened_lines_agree_with_the_splitters_slides() {
+        // Random documents from lines that make separators, pitfalls and link definitions
+        // (a fixed generator, so the test is deterministic).
+        const PIECES: &[&str] = &[
+            "--",
+            "---",
+            " --",
+            "   ---",
+            "    --",
+            "\t---",
+            "--  ",
+            "-- {.c}",
+            "--- {#i}",
+            "{.a}",
+            "{.b x=1}",
+            "text",
+            "Title",
+            "[x]: /u",
+            "[y]:",
+            "/v",
+            "\"title\"",
+            "- item",
+            "> quote",
+            "| a |",
+            "|---|",
+            "# H",
+            "```",
+            ":::note",
+            ":::",
+            "",
+            "",
+            "",
+            "[^1]: note",
+            "<!-- c -->",
+            "\\--",
+            "`--`",
+        ];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |n: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).unwrap() % n
+        };
+        for _ in 0..20_000 {
+            let count = 2 + next(10);
+            let text: String = (0..count)
+                .map(|_| format!("{}\n", PIECES[next(PIECES.len())]))
+                .collect();
+            let arena = Arena::new();
+            let root = parse_document(&arena, &text, &crate::markdown::split::dialect_options());
+            let lines = source_lines(&text);
+            let opened = opened_lines(root, &text, &lines, SplitMode::Rules).unwrap();
+            let expected = splitter_separator_lines(&text);
+            assert_eq!(opened, expected, "{text:?}");
+            // Every other `---`/`--` line outside code, raw HTML and the front matter is
+            // reported, and no line that opened a slide is.
+            let reported: BTreeSet<usize> =
+                unrecognized_separators(root, &lines, SplitMode::Rules, &opened, &BTreeSet::new())
+                    .into_iter()
+                    .map(|(line, _)| line)
+                    .collect();
+            let skipped = Ranges::new(skipped_ranges(root));
+            let lost: BTreeSet<usize> = (1..=lines.len())
+                .filter(|&line| matches!(lines[line - 1].trim_matches([' ', '\t']), "---" | "--"))
+                .filter(|line| !expected.contains(line) && skipped.find(*line).is_none())
+                .collect();
+            assert_eq!(reported, lost, "{text:?}");
+        }
+    }
+
+    #[test]
     fn crlf_sources_and_link_definitions_keep_line_numbers() {
         let text = "# One\r\n\r\nSome text\r\n--\r\n\r\n[x]: http://a\r\n--\r\n\r\nend\r\n";
         let warnings = separator_warnings(text);
@@ -1071,6 +1343,31 @@ mod tests {
         // The underline is still a pitfall in rules mode.
         let rules = text.replace("split: headings", "split: rules");
         assert_eq!(lines(&separator_warnings(&rules)), [18, 22, 26, 28]);
+    }
+
+    #[test]
+    fn headings_mode_exempts_only_underlines_of_slide_headings() {
+        // A `---` underline makes a level-2 heading: a slide boundary only from
+        // `slide_level: 2` on; below that it is content and the slide is lost.
+        let deck = |level: &str| {
+            format!(
+                "---\nslides: {{split: headings{level}}}\n---\n\n# A\n\ntext\n\nTitle\n---\n\n\
+                 more\n"
+            )
+        };
+        let underline = "`---` under a line of text turns that text into a heading (setext), so \
+                         no slide starts here; put a blank line before it to start a horizontal \
+                         slide";
+        for level in [", slide_level: 1", ", slide_level: 0"] {
+            assert_eq!(
+                separator_warnings(&deck(level)),
+                [(10, underline.to_string())],
+                "{level}"
+            );
+        }
+        for level in ["", ", slide_level: 2", ", slide_level: 3"] {
+            assert_eq!(separator_warnings(&deck(level)), vec![], "{level}");
+        }
     }
 
     #[test]
