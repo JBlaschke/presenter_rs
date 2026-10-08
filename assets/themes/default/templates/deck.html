@@ -1,0 +1,46 @@
+{#- Document shell (docs/spec/theme-format.md §7). A child theme can
+    {% extends "@default/deck.html" %} and override any of the blocks
+    head, styles, body_start, slides, scripts, body_end.
+    The theme stylesheet (theme_style()) must stay the last stylesheet in <head> (§5). -#}
+<!DOCTYPE html>
+<html lang="{{ meta.lang or config.deck.lang or 'en' }}">
+<head>
+{%- block head %}
+{% include "partials/head.html" %}
+{%- endblock %}
+{%- block styles %}
+{{ style("vendor/reveal/dist/reset.css") }}
+{{ style("vendor/reveal/dist/reveal.css") }}
+{%- if theme.reveal_theme and theme.reveal_theme != "none" %}
+{{ style("vendor/reveal/dist/theme/" ~ theme.reveal_theme ~ ".css") }}
+{%- endif %}
+{%- if features.code %}
+{%- if theme.highlight_style in ["monokai", "zenburn"] %}
+{{ style("vendor/reveal/dist/plugin/highlight/" ~ theme.highlight_style ~ ".css") }}
+{%- elif theme.highlight_style and theme.highlight_style != "none" %}
+{{ style(theme.highlight_style) }}
+{%- endif %}
+{%- endif %}
+{%- if config.math.enabled == "always" or (features.math and config.math.enabled != "never") %}
+{{ style("vendor/katex/katex.min.css") }}
+{%- endif %}
+{{ theme_style() }}
+{%- endblock %}
+</head>
+<body>
+{%- block body_start %}{% endblock %}
+<div class="reveal">
+<div class="slides">
+{%- block slides %}
+{%- for slide in slides %}
+{% include "slide.html" %}
+{%- endfor %}
+{%- endblock %}
+</div>
+</div>
+{%- block scripts %}
+{% include "partials/scripts.html" %}
+{%- endblock %}
+{%- block body_end %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,15 @@
+{#- Layout "title": the slide content (normally the deck heading), followed by
+    meta.subtitle, meta.author and meta.date when they are set. -#}
+{%- extends "layouts/default.html" %}
+{%- block content %}
+{{- super() }}
+{%- if meta.subtitle %}
+<p class="subtitle">{{ meta.subtitle }}</p>
+{%- endif %}
+{%- if meta.author %}
+<p class="author">{{ meta.author }}</p>
+{%- endif %}
+{%- if meta.date %}
+<p class="date">{{ meta.date }}</p>
+{%- endif %}
+{%- endblock %}
