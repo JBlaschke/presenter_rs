@@ -1,0 +1,51 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": null,
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Hello, presenter",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<!--\nminimal.md: dialect section 2 (document structure), the smallest deck.\nBehaviours:\n- no front matter and no separator: the whole document is exactly one slide;\n- this HTML comment is an ordinary HtmlBlock and passes through unchanged (section 9);\n- the first heading gives Slide.title \"Hello, presenter\";\n- a paragraph and a list render as plain HTML; no feature flags are set.\n-->\n<h1>Hello, presenter</h1>\n<p>A deck with a single slide.</p>\n<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 15,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": false,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

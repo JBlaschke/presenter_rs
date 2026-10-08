@@ -1,0 +1,223 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Separators",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Slide 1",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Slide 1</h1>\n<p>Content before the first separator is slide 1.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 22,
+        "end_line": 24,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Slide 2",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Slide 2</h2>\n<p>A <code>---</code> line (a thematic break) starts a new horizontal slide.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {},
+          "title": "Slide 2.1",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Slide 2.1</h2>\n<p>A paragraph that is exactly <code>--</code> starts a vertical slide: the first child of slide 2.</p>\n"
+            }
+          ],
+          "notes": null,
+          "children": [],
+          "span": {
+            "start_line": 32,
+            "end_line": 36,
+            "cell": null
+          }
+        },
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {},
+          "title": "Slide 2.2",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Slide 2.2</h2>\n<p>A second <code>--</code> adds another child to the same vertical stack.</p>\n"
+            }
+          ],
+          "notes": null,
+          "children": [],
+          "span": {
+            "start_line": 38,
+            "end_line": 42,
+            "cell": null
+          }
+        }
+      ],
+      "span": {
+        "start_line": 26,
+        "end_line": 30,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Slide 3",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Slide 3</h2>\n<p>The <code>---</code> above closed the vertical stack. None of the following are separators:</p>\n<pre><code class=\"language-text\" data-trim>---\n--</code></pre>\n<ul>\n<li>\n<p>a list item</p>\n<p>--</p>\n</li>\n<li>\n<p>another list item</p>\n</li>\n</ul>\n<blockquote>\n<p>A block quote</p>\n<hr />\n<p>still quoted</p>\n</blockquote>\n<div class=\"note\">\n<p>Inside a directive</p>\n<hr />\n<p>still inside</p>\n</div>\n<h2>Some text</h2>\n<p>The <code>--</code> line directly under &quot;Some text&quot; turned it into a setext heading.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 44,
+        "end_line": 78,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 80,
+        "end_line": 80,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Slide 5",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Slide 5</h2>\n<p>The two consecutive <code>---</code> above produced an empty slide 4.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 81,
+        "end_line": 85,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Slide 6",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Slide 6</h2>\n<p><code>***</code> is a thematic break, so it starts a horizontal slide too.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 87,
+        "end_line": 91,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [],
+      "notes": null,
+      "children": [
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {},
+          "title": "Slide 7.1",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Slide 7.1</h2>\n<p><code>--</code> directly after a horizontal separator (<code>___</code> here): slide 7 is empty and this is\nits first vertical child.</p>\n"
+            }
+          ],
+          "notes": null,
+          "children": [],
+          "span": {
+            "start_line": 95,
+            "end_line": 100,
+            "cell": null
+          }
+        }
+      ],
+      "span": {
+        "start_line": 93,
+        "end_line": 93,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": true,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

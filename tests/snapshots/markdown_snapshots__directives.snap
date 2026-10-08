@@ -1,0 +1,131 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Directives",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Directives",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Directives</h1>\n<p>Body text before and after the notes block stays on the slide.</p>\n"
+        }
+      ],
+      "notes": "<p>Notes from a <code>:::notes</code> block are removed from the body and become <em>Slide.notes</em>.</p>\n",
+      "children": [],
+      "span": {
+        "start_line": 23,
+        "end_line": 29,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Fragments",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Fragments</h2>\n<div class=\"fragment\">\n<p>Appears on click.</p>\n</div>\n<div class=\"fragment fade-up\" data-fragment-index=\"2\">\n<p>Second, fading up, with an explicit index.</p>\n</div>\n<div class=\"fragment highlight-red\" data-fragment-index=\"1\">\n<p>Shown first because of <code>index=1</code>.</p>\n</div>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 31,
+        "end_line": 45,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Columns",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Columns</h2>\n<div class=\"columns\" style=\"grid-template-columns: 1fr 2fr\">\n<div class=\"column\">\n<p>Left column.</p>\n</div>\n<div class=\"column\">\n<p>Right column, twice as wide.</p>\n</div>\n</div>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 47,
+        "end_line": 58,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Other names",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Other names</h2>\n<div class=\"center\">\n<p><code>:::center</code> → <code>&lt;div class=&quot;center&quot;&gt;</code>.</p>\n</div>\n<div class=\"warning large\">\n<p>Extra tokens become classes: <code>&lt;div class=&quot;warning large&quot;&gt;</code>.</p>\n</div>\n<div class=\"callout tip\" data-title=\"Hint\">\n<p>The unconsumed <code>title=Hint</code> becomes <code>data-title=&quot;Hint&quot;</code>.</p>\n</div>\n<div class=\"r-stack\">\n<p>reveal's own layout helper class <code>r-stack</code>.</p>\n</div>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 60,
+        "end_line": 78,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Reserved",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Reserved</h2>\n<div class=\"include other.md\">\n<p><code>:::include</code> is reserved and not implemented.</p>\n</div>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 80,
+        "end_line": 86,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": false,
+    "notes": true,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}
