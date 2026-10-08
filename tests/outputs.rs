@@ -129,18 +129,40 @@ fn pixel_id() -> String {
     AssetRegistry::new().register_bytes(STANDARD.decode(PIXEL_PNG).unwrap(), "image/png", "x")
 }
 
-/// Every cell of `outputs.ipynb`: exact outputs, `features.math` and warning codes.
-#[test]
-fn fixture_outputs_render_per_spec_table() {
+/// What one cell of `outputs.ipynb` renders to.
+struct FixtureCase {
+    id: &'static str,
+    outputs: Vec<CellOutput>,
+    /// `features.math`, the only feature `render_outputs` sets.
+    math: bool,
+    /// The warning codes, in order.
+    codes: Vec<&'static str>,
+}
+
+/// A fixture case whose outputs render without math and without warnings.
+fn plain_case(id: &'static str, outputs: Vec<CellOutput>) -> FixtureCase {
+    FixtureCase {
+        id,
+        outputs,
+        math: false,
+        codes: vec![],
+    }
+}
+
+/// The `text/html` payload of the `html-table` cell, joined.
+fn fixture_table_html() -> String {
+    let html_table = fixture_cell("html-table");
+    let Output::ExecuteResult { data, .. } = &html_table[0] else {
+        panic!("html-table is an execute_result");
+    };
+    serde_json::from_value::<Vec<String>>(data["text/html"].clone())
+        .unwrap()
+        .concat()
+}
+
+/// The fixture cells with markup outputs: HTML, images, LaTeX, Markdown.
+fn markup_cases() -> Vec<FixtureCase> {
     let pixel = format!("asset:{}", pixel_id());
-    let traceback = concat!(
-        "<span style='color:var(--red,#a00)'>---------------------------------------------------------------------------</span>\n",
-        "<span style='color:var(--red,#a00)'>ZeroDivisionError</span>                         Traceback (most recent call last)\n",
-        "Cell <span style='color:var(--green,#0a0)'>In[10], line 1</span>\n",
-        "<span style='color:var(--green,#0a0)'>----&gt; 1</span> <span style='color:#626262'><span style='background:var(--yellow,#a60)'>1/0</span></span>\n",
-        "\n",
-        "<span style='color:var(--red,#a00)'>ZeroDivisionError</span>: division by zero",
-    );
     let svg = concat!(
         "<figure class=\"output-image\">",
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 60\" width=\"120\" height=\"60\">\n",
@@ -148,32 +170,22 @@ fn fixture_outputs_render_per_spec_table() {
         "  <text x=\"60\" y=\"36\" text-anchor=\"middle\" fill=\"white\">SVG</text>\n",
         "</svg></figure>",
     );
-    let html_table = fixture_cell("html-table");
-    let Output::ExecuteResult { data, .. } = &html_table[0] else {
-        panic!("html-table is an execute_result");
-    };
-    let table: String = serde_json::from_value::<Vec<String>>(data["text/html"].clone())
-        .unwrap()
-        .concat();
-    let cases: Vec<(&str, Vec<CellOutput>, bool, Vec<&str>)> = vec![
-        ("title", vec![], false, vec![]),
-        (
+    let latex = r#"<div data-math-style="display">\int_0^1 x^2\,dx = \frac{1}{3}</div>"#;
+    vec![
+        plain_case("title", vec![]),
+        plain_case(
             "html-table",
-            vec![display_output("text/html", &table, Some(1))],
-            false,
-            vec![],
+            vec![display_output("text/html", &fixture_table_html(), Some(1))],
         ),
-        (
+        plain_case(
             "png",
             vec![display_output(
                 "image/png",
                 &format!(r#"<img class="output-image" src="{pixel}" alt="">"#),
                 None,
             )],
-            false,
-            vec![],
         ),
-        (
+        plain_case(
             "png-size",
             vec![display_output(
                 "image/png",
@@ -182,114 +194,103 @@ fn fixture_outputs_render_per_spec_table() {
                 ),
                 Some(3),
             )],
-            false,
-            vec![],
         ),
-        (
-            "svg",
-            vec![display_output("image/svg+xml", svg, None)],
-            false,
-            vec![],
-        ),
-        (
-            "latex",
-            vec![display_output(
-                "text/latex",
-                r#"<div data-math-style="display">\int_0^1 x^2\,dx = \frac{1}{3}</div>"#,
-                None,
-            )],
-            true,
-            vec![],
-        ),
-        (
+        plain_case("svg", vec![display_output("image/svg+xml", svg, None)]),
+        FixtureCase {
+            math: true,
+            ..plain_case("latex", vec![display_output("text/latex", latex, None)])
+        },
+        plain_case(
             "markdown",
             vec![display_output(
                 "text/markdown",
                 "**BOLD** AND *ITALIC* FROM `MARKDOWN()`",
                 None,
             )],
-            false,
-            vec![],
         ),
-        (
-            "json",
-            vec![display_output(
-                "application/json",
-                "<pre class=\"output-json\">{\n  \"name\": \"presenter\",\n  \"nested\": {\n    \"ok\": true\n  },\n  \"values\": [\n    1,\n    2,\n    3\n  ]\n}</pre>",
-                None,
-            )],
-            false,
-            vec![],
-        ),
-        (
-            "plain",
-            vec![display_output(
-                "text/plain",
-                r#"<pre class="output-text">&#39;&lt;b&gt;not bold&lt;/b&gt; &amp; co&#39;</pre>"#,
-                Some(8),
-            )],
-            false,
-            vec![],
-        ),
-        (
+    ]
+}
+
+/// The fixture cells with escaped text outputs: JSON, plain text, streams, tracebacks and
+/// widgets.
+fn text_cases() -> Vec<FixtureCase> {
+    let traceback = concat!(
+        "<span style='color:var(--red,#a00)'>---------------------------------------------------------------------------</span>\n",
+        "<span style='color:var(--red,#a00)'>ZeroDivisionError</span>                         Traceback (most recent call last)\n",
+        "Cell <span style='color:var(--green,#0a0)'>In[10], line 1</span>\n",
+        "<span style='color:var(--green,#0a0)'>----&gt; 1</span> <span style='color:#626262'><span style='background:var(--yellow,#a60)'>1/0</span></span>\n",
+        "\n",
+        "<span style='color:var(--red,#a00)'>ZeroDivisionError</span>: division by zero",
+    );
+    let json = "<pre class=\"output-json\">{\n  \"name\": \"presenter\",\n  \"nested\": {\n    \"ok\": true\n  },\n  \"values\": [\n    1,\n    2,\n    3\n  ]\n}</pre>";
+    let plain = r#"<pre class="output-text">&#39;&lt;b&gt;not bold&lt;/b&gt; &amp; co&#39;</pre>"#;
+    let stderr = "<span style='color:var(--red,#a00)'>red</span> warning: x &lt; y\n";
+    let stream = |name: &str, html: &str| CellOutput::Stream {
+        name: name.into(),
+        html: html.into(),
+    };
+    let widget = r#"<pre class="output-text">IntSlider(value=5)</pre>"#;
+    vec![
+        plain_case("json", vec![display_output("application/json", json, None)]),
+        plain_case("plain", vec![display_output("text/plain", plain, Some(8))]),
+        plain_case(
             "streams",
-            vec![
-                CellOutput::Stream {
-                    name: "stdout".into(),
-                    html: "a\nb\n".into(),
-                },
-                CellOutput::Stream {
-                    name: "stderr".into(),
-                    html: "<span style='color:var(--red,#a00)'>red</span> warning: x &lt; y\n"
-                        .into(),
-                },
-            ],
-            false,
-            vec![],
+            vec![stream("stdout", "a\nb\n"), stream("stderr", stderr)],
         ),
-        (
+        plain_case(
             "error",
             vec![CellOutput::Error {
                 ename: "ZeroDivisionError".into(),
                 evalue: "division by zero".into(),
                 html: traceback.into(),
             }],
-            false,
-            vec![],
         ),
-        (
-            "widget-only",
-            vec![CellOutput::Unsupported {
-                mimes: vec!["application/vnd.jupyter.widget-view+json".into()],
-            }],
-            false,
-            vec![codes::OUTPUT_UNSUPPORTED],
-        ),
-        (
-            "widget-plain",
-            vec![display_output(
-                "text/plain",
-                r#"<pre class="output-text">IntSlider(value=5)</pre>"#,
-                Some(12),
-            )],
-            false,
-            vec![],
-        ),
-    ];
-    for (id, expected, math, warning_codes) in cases {
+        FixtureCase {
+            codes: vec![codes::OUTPUT_UNSUPPORTED],
+            ..plain_case(
+                "widget-only",
+                vec![CellOutput::Unsupported {
+                    mimes: vec!["application/vnd.jupyter.widget-view+json".into()],
+                }],
+            )
+        },
+        FixtureCase {
+            codes: vec![codes::OUTPUT_WIDGET],
+            ..plain_case(
+                "widget-plain",
+                vec![display_output("text/plain", widget, Some(12))],
+            )
+        },
+    ]
+}
+
+/// Every cell of `outputs.ipynb`: exact outputs, `features.math` and warning codes.
+#[test]
+fn fixture_outputs_render_per_spec_table() {
+    let mut covered = Vec::new();
+    for case in markup_cases().into_iter().chain(text_cases()) {
+        let id = case.id;
         let run = render(&fixture_cell(id));
-        assert_eq!(run.outputs, expected, "{id}");
-        assert_eq!(run.features.math, math, "{id}");
+        assert_eq!(run.outputs, case.outputs, "{id}");
         assert_eq!(
             run.features,
             Features {
-                math,
+                math: case.math,
                 ..Features::default()
             },
             "{id}: only math is ever set"
         );
-        assert_eq!(run.codes(), warning_codes, "{id}");
+        assert_eq!(run.codes(), case.codes, "{id}");
+        covered.push(id);
     }
+    let path = fixture_path();
+    let (notebook, _) = parse_notebook(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
+    let ids: Vec<&str> = notebook
+        .cells
+        .iter()
+        .filter_map(|cell| cell.id.as_deref())
+        .collect();
+    assert_eq!(covered, ids, "every fixture cell has a case, in file order");
 }
 
 #[test]
@@ -584,6 +585,84 @@ fn ansi_conversion_never_fails() {
     ] {
         assert_eq!(ansi_to_html(text), "x &lt; y", "{text:?}");
     }
+    // Only the rejected sequence goes; the colors around it stay.
+    assert_eq!(
+        ansi_to_html("\u{1b}[31mred\u{1b}[56m < y\u{1b}[0m"),
+        "<span style='color:var(--red,#a00)'>red &lt; y</span>"
+    );
+}
+
+/// Sequences ansi-to-html passes through as text (`ESC` byte included) unless they are
+/// cleaned first: each renders as its text, with its styling when it is valid SGR.
+#[test]
+fn escape_sequences_the_converter_keeps_as_text_are_removed() {
+    let red = |text: &str| format!("<span style='color:var(--red,#a00)'>{text}</span>");
+    let cases = [
+        // SGR with an empty parameter (ECMA-48 default 0) or colon sub-parameters.
+        ("\u{1b}[;31mx", red("x")),
+        ("\u{1b}[1;;31mx", red("x")),
+        (
+            "\u{1b}[38:5:241mcolon",
+            "<span style='color:#626262'>colon</span>".into(),
+        ),
+        ("\u{1b}[4:3mcurly", "<u>curly</u>".into()),
+        // Private (xterm modifyOtherKeys), truncated, two-byte and lone escapes.
+        ("\u{1b}[>4;2mx", "x".into()),
+        ("\u{1b}[31", String::new()),
+        ("\u{1b}", String::new()),
+        ("tail\u{1b}", "tail".into()),
+        ("\u{1b}7save\u{1b}8", "save".into()),
+        ("\u{1b}Mreverse-index", "reverse-index".into()),
+        ("\u{1b}(Bplain", "plain".into()),
+        // OSC titles and hyperlinks, also next to a rejected code.
+        ("\u{1b}]0;title\u{7}after", "after".into()),
+        (
+            "\u{1b}]8;;http://x\u{1b}\\link\u{1b}]8;;\u{1b}\\",
+            "link".into(),
+        ),
+        (
+            "\u{1b}[38;5;999mbad\u{1b}]8;;http://x\u{1b}\\link",
+            "badlink".into(),
+        ),
+        ("\u{1b}]8;;x\u{1b}[31mred", red("red")),
+        // An OSC that never ends loses only its introducer.
+        ("a\u{1b}]8;;x < y", "a8;;x &lt; y".into()),
+    ];
+    for (text, expected) in cases {
+        let html = ansi_to_html(text);
+        assert_eq!(html, expected, "{text:?}");
+    }
+}
+
+/// Deterministic fuzzing: whatever the input, the HTML has no `ESC` byte and nothing but the
+/// converter's own tags is markup.
+#[test]
+fn ansi_html_never_contains_escapes_or_stray_markup() {
+    let fragments = [
+        "\u{1b}", "[", "]", ";", ":", "0", "1", "2", "3", "5", "8", "9", "m", "K", "?", ">", "(",
+        "B", "P", "\u{7}", "\\", "a", "é", "<", ">", "&", "'", "\"", "\n", "\r", " ", "38;5;",
+        "48:2:", "4:3", "999",
+    ];
+    let tags = regex::Regex::new(r"<(?:span|u) style='[^'<>]*'>|</?(?:span|b|i|u|s)>").unwrap();
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let len = next() % 24;
+        let text: String = (0..len)
+            .map(|_| fragments[(next() % fragments.len() as u64) as usize])
+            .collect();
+        let html = ansi_to_html(&text);
+        let rest = tags.replace_all(&html, "");
+        assert!(
+            !rest.contains(['\u{1b}', '<', '>', '\'', '"']),
+            "{text:?} -> {html:?}"
+        );
+    }
 }
 
 #[test]
@@ -622,6 +701,8 @@ fn latex_strips_one_delimiter_pair_and_sets_math() {
             json!("\\begin{align} a &= b \\end{align}"),
             "\\begin{align} a &amp;= b \\end{align}",
         ),
+        // A `$` inside `\text{}` does not keep the `$$` pair (KaTeX rejects a leftover `$$`).
+        (json!("$$\\text{a $b$ c}$$"), "\\text{a $b$ c}"),
     ];
     for (payload, tex) in cases {
         let run = render(&display(
@@ -683,6 +764,97 @@ fn widget_only_bundle_is_unsupported_with_a_warning() {
     let run = render(&display(json!({}), json!({})));
     assert_eq!(run.outputs, [CellOutput::Unsupported { mimes: vec![] }]);
     assert!(run.warnings()[0].1.contains("(found: none)"));
+}
+
+#[test]
+fn widget_rendered_through_a_fallback_warns() {
+    let widget = json!({ "model_id": "abc", "version_major": 2, "version_minor": 0 });
+    let cases = [
+        ("text/plain", json!("IntSlider(value=5)")),
+        ("text/html", json!("<b>5</b>")),
+    ];
+    for (fallback, payload) in cases {
+        let run = render(&display(
+            json!({ "application/vnd.jupyter.widget-view+json": widget, fallback: payload }),
+            json!({}),
+        ));
+        assert!(
+            matches!(&run.outputs[0], CellOutput::Display { mime, .. } if mime == fallback),
+            "{:?}",
+            run.outputs
+        );
+        assert_eq!(
+            run.warnings(),
+            [(
+                codes::OUTPUT_WIDGET,
+                format!(
+                    "output 0: interactive widget rendered as {fallback} \
+                     (widgets need a live kernel)"
+                )
+            )]
+        );
+    }
+    // Bundles without a widget view do not warn.
+    let run = render(&display(
+        json!({ "application/vnd.jupyter.widget-state+json": {}, "text/plain": "x" }),
+        json!({}),
+    ));
+    assert!(run.diags.is_empty(), "{:?}", run.diags);
+}
+
+#[test]
+fn only_markup_mentioning_math_sets_the_math_feature() {
+    let span = r#"<span data-math-style="inline">x</span>"#;
+    let cases = [
+        (json!({ "text/html": span }), true),
+        (
+            json!({ "image/svg+xml": format!("<svg><foreignObject>{span}</foreignObject></svg>") }),
+            true,
+        ),
+        // Escaped text that mentions the attribute is not a math element.
+        (json!({ "text/plain": span }), false),
+        (json!({ "text/plain": format!("'{span}'") }), false),
+        (
+            json!({ "application/json": { "html": "<span data-math-style='x'>" } }),
+            false,
+        ),
+    ];
+    for (data, math) in cases {
+        let run = render(&display(data.clone(), json!({})));
+        assert_eq!(run.features.math, math, "{data}");
+    }
+}
+
+/// `output <i>` counts the outputs nbformat kept, so after a skipped output it differs from
+/// the position in the `.ipynb` array (documented on `render_outputs`' module).
+#[test]
+fn diagnostic_index_counts_parsed_outputs() {
+    let notebook = json!({
+        "nbformat": 4, "nbformat_minor": 5, "metadata": {},
+        "cells": [{
+            "cell_type": "code", "source": "", "metadata": {}, "execution_count": 1,
+            "outputs": [
+                { "output_type": "bogus" },
+                { "output_type": "display_data", "metadata": {},
+                  "data": { "text/html": "<script>x()</script>" } }
+            ]
+        }]
+    });
+    let (notebook, parse_diags) =
+        parse_notebook(Path::new("nb.ipynb"), &notebook.to_string()).unwrap();
+    assert!(
+        parse_diags
+            .iter()
+            .any(|diag| diag.message.contains("output 0 (bogus) skipped")),
+        "{parse_diags:?}"
+    );
+    let run = render(&notebook.cells[0].outputs);
+    assert_eq!(
+        run.codes(),
+        [codes::OUTPUT_SCRIPT],
+        "the script output is in the file at index 1"
+    );
+    assert!(run.warnings()[0].1.starts_with("output 0: "));
 }
 
 #[test]

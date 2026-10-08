@@ -6,9 +6,9 @@
 //!
 //! - **Streams**: consecutive `stream` outputs with the same `name` are merged (Jupyter splits
 //!   them arbitrarily). Like nbconvert's `CoalesceStreamsPreprocessor`, a line's text up to its
-//!   last `\r` that is followed by more text is dropped (progress bars), then [`ansi_to_html`]
-//!   escapes the text and turns ANSI colors into `<span>`s.
-//! - **Errors**: the traceback lines joined with `\n`, through [`ansi_to_html`].
+//!   last `\r` that is followed by more text is dropped (progress bars), then
+//!   [`ansi_to_html()`] escapes the text and turns ANSI colors into `<span>`s.
+//! - **Errors**: the traceback lines joined with `\n`, through [`ansi_to_html()`].
 //! - **Rich outputs** (`display_data`, `execute_result`): [`choose_mime`] picks the first MIME
 //!   type of `[notebook] mime_priority` present in the bundle and [`render_display`] renders it
 //!   per the §4 table; `text/markdown` goes through the caller's Markdown closure instead.
@@ -17,11 +17,19 @@
 //!   MIME type of the priority list present in the bundle is tried, so a broken PNG falls back
 //!   to its `text/plain` repr exactly as a bundle without the PNG would. When nothing renders,
 //!   the output is [`CellOutput::Unsupported`] with every MIME type of the bundle and a
-//!   [`codes::OUTPUT_UNSUPPORTED`] warning.
+//!   [`codes::OUTPUT_UNSUPPORTED`] warning. A widget bundle rendered through a fallback type
+//!   gets a [`codes::OUTPUT_WIDGET`] warning.
 //!
 //! Diagnostics are pushed without `path` or `span` (this module does not know them); their
-//! messages start with `output <i>: ` (`i` is the 0-based index in the `outputs` slice). The
-//! caller attaches the notebook path and the cell span.
+//! messages start with `output <i>: `, where `i` is the 0-based position in the `outputs`
+//! slice. That slice holds the outputs `nbformat` could parse, so after an output it skipped
+//! (its `notebook-output-skipped` warning counts positions in the `.ipynb` array) `i` is
+//! smaller than the output's position in the file. The caller attaches the notebook path and
+//! the cell span.
+//!
+//! Known limitation (`docs/spec/ir.md` invariant 4): `text/html` is inserted verbatim, so a
+//! relative URL in it (`<img src="fig.png">`, IPython's `Video("clip.mp4")`) stays as written
+//! instead of becoming an `asset:<id>`; such a file is neither copied nor inlined.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -48,7 +56,14 @@ pub mod codes {
     /// One MIME type of a bundle could not be rendered (invalid base64, a payload that is not
     /// text, no renderer for a type listed in `mime_priority`); the next type was tried.
     pub const OUTPUT_INVALID: &str = "output-invalid";
+    /// A bundle with an interactive widget view
+    /// (`application/vnd.jupyter.widget-view+json`) was rendered through another MIME type,
+    /// usually its `text/plain` repr (spec §4: "interactive widget rendered as text").
+    pub const OUTPUT_WIDGET: &str = "output-widget";
 }
+
+/// The MIME type of an interactive widget view; never rendered, see [`codes::OUTPUT_WIDGET`].
+const WIDGET_VIEW: &str = "application/vnd.jupyter.widget-view+json";
 
 /// Renders the outputs of one code cell (spec §4).
 ///
@@ -58,8 +73,44 @@ pub mod codes {
 /// [`codes`]) are appended to `diags` without path or span, see the module docs.
 ///
 /// The returned [`Features`] only ever sets `math`: when a `text/latex` output was rendered
-/// or any `Display` HTML contains `data-math-style` (e.g. Markdown with `$x$`). The caller
-/// sets `notebook` and `code`.
+/// or the markup of a `text/html`, `text/markdown` or `image/svg+xml` output contains
+/// `data-math-style` (e.g. Markdown with `$x$`). Escaped text never sets it. The caller sets
+/// `notebook` and `code`.
+///
+/// # The Markdown closure
+/// `md` cannot borrow `assets` or `diags` itself (they are already mutably borrowed by this
+/// call), so a closure over T12's `render_fragment` renders into its own [`AssetRegistry`]
+/// and [`Diagnostics`], which the caller merges afterwards. Forgetting the merge leaves
+/// `asset:<id>` placeholders that the emitter cannot resolve. The closure returns only HTML:
+/// if the fragment's other results matter (`Features.code` for fenced code in a Markdown
+/// output, speaker notes), the closure must capture them; this function only infers `math`.
+///
+/// ```
+/// use presenter::assets::registry::AssetRegistry;
+/// use presenter::config::NotebookConfig;
+/// use presenter::error::{Diagnostics, Result};
+/// use presenter::notebook::nbformat::Output;
+/// use presenter::notebook::outputs::render_outputs;
+///
+/// # fn main() -> Result<()> {
+/// let outputs: Vec<Output> = Vec::new(); // a code cell's outputs
+/// let (mut assets, mut diags) = (AssetRegistry::new(), Diagnostics::new());
+/// let (mut md_assets, mut md_diags) = (AssetRegistry::new(), Diagnostics::new());
+/// let mut md = |text: &str| -> Result<String> {
+///     // A RenderCtx over `&mut md_assets` and `&mut md_diags` goes here.
+///     let _ = (&mut md_assets, &mut md_diags);
+///     Ok(text.to_owned())
+/// };
+/// let cfg = NotebookConfig::default();
+/// let (rendered, features) = render_outputs(&outputs, &cfg, &mut assets, &mut diags, &mut md)?;
+/// assets.merge(md_assets);
+/// diags.extend(md_diags);
+/// # assert!(rendered.is_empty() && !features.math);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// `text/html` URLs are not rewritten; see the module docs.
 ///
 /// # Errors
 /// Only the errors of `md`. Malformed payloads are warnings, never errors.
@@ -154,16 +205,11 @@ impl Renderer<'_> {
             let Some((html, sets_math)) = self.try_mime(index, mime, payload, metadata)? else {
                 continue;
             };
-            if mime == "text/html" && html.to_ascii_lowercase().contains("<script") {
-                self.diags.warn(
-                    codes::OUTPUT_SCRIPT,
-                    format!(
-                        "output {index}: text/html contains <script>; \
-                         it is kept and runs when the slides load"
-                    ),
-                );
-            }
-            self.features.math |= sets_math || html.contains("data-math-style");
+            self.check_rendered(index, data, mime, &html);
+            // Only markup can hold math elements; escaped text that mentions the attribute
+            // must not pull KaTeX into the deck.
+            let markup = matches!(mime, "text/html" | "text/markdown" | "image/svg+xml");
+            self.features.math |= sets_math || (markup && html.contains("data-math-style"));
             return Ok(CellOutput::Display {
                 mime: mime.to_owned(),
                 html,
@@ -184,6 +230,30 @@ impl Renderer<'_> {
             ),
         );
         Ok(CellOutput::Unsupported { mimes })
+    }
+
+    /// The warnings about a rendered output: scripts in `text/html`
+    /// ([`codes::OUTPUT_SCRIPT`]) and a widget shown through a fallback type
+    /// ([`codes::OUTPUT_WIDGET`]).
+    fn check_rendered(&mut self, index: usize, data: &MimeBundle, mime: &str, html: &str) {
+        if mime == "text/html" && html.to_ascii_lowercase().contains("<script") {
+            self.diags.warn(
+                codes::OUTPUT_SCRIPT,
+                format!(
+                    "output {index}: text/html contains <script>; \
+                     it is kept and runs when the slides load"
+                ),
+            );
+        }
+        if mime != WIDGET_VIEW && data.contains_key(WIDGET_VIEW) {
+            self.diags.warn(
+                codes::OUTPUT_WIDGET,
+                format!(
+                    "output {index}: interactive widget rendered as {mime} \
+                     (widgets need a live kernel)"
+                ),
+            );
+        }
     }
 
     /// Renders one MIME type; `None` (with an [`codes::OUTPUT_INVALID`] warning) when its
@@ -250,9 +320,10 @@ pub fn choose_mime<'a>(bundle: &'a MimeBundle, priority: &[String]) -> Option<&'
 /// | `image/png`, `image/jpeg`, `image/gif`, `image/webp` | base64-decoded (ASCII whitespace ignored, padding optional), registered as `output.<ext>`: `<img class="output-image" src="asset:<id>" alt="">` + `width`/`height` |
 /// | `text/latex` | one surrounding `$$…$$`, `$…$`, `\[…\]` or `\(…\)` stripped, trimmed: `<div data-math-style="display">` + escaped TeX |
 /// | `application/json` | `<pre class="output-json">` + pretty-printed, escaped JSON |
-/// | `text/plain` | `<pre class="output-text">` + [`ansi_to_html`] of the text (escaped; ANSI colors kept, as nbconvert does) |
+/// | `text/plain` | `<pre class="output-text">` + [`ansi_to_html()`] of the text (escaped; ANSI colors kept, as nbconvert does) |
 ///
-/// `text/markdown` needs the Markdown renderer, which only [`render_outputs`] has.
+/// `text/markdown` needs the Markdown renderer, which only [`render_outputs`] has. URLs in
+/// `text/html` are not rewritten (see the module docs).
 ///
 /// # Errors
 /// [`Error::Other`] for a payload that is not text (a string or list of strings) where text
@@ -367,8 +438,8 @@ fn svg_html(svg: &str, metadata: &Value, mime: &str) -> String {
     format!("<figure class=\"output-image\">{svg}</figure>")
 }
 
-/// The first `<svg` start tag (the root; an XML declaration, doctype or comments may precede
-/// it), parsed quote-aware: group `attrs` is its attribute list, the rest is `\s*/?>`.
+/// The root `<svg` start tag at the start of the haystack (see [`root_tag_start`]), parsed
+/// quote-aware: group `attrs` is its attribute list, the rest is `\s*/?>`.
 static SVG_ROOT_TAG: LazyLock<Regex> = LazyLock::new(|| {
     // A constant pattern covered by the unit tests: compiling it cannot fail.
     Regex::new(concat!(
@@ -385,19 +456,56 @@ static SVG_ATTR: LazyLock<Regex> = LazyLock::new(|| {
         .expect("SVG attribute regex is valid")
 });
 
-/// Where the root `<svg` start tag begins: `<svg` followed by whitespace, `/` or `>`.
-static SVG_OPEN: LazyLock<Regex> = LazyLock::new(|| {
-    // A constant pattern covered by the unit tests: compiling it cannot fail.
-    Regex::new(r"<svg[\s/>]").expect("SVG open regex is valid")
-});
+/// Where the root element's start tag begins: the first `<` that does not open a comment
+/// (`<!-- … -->`), a processing instruction (`<?xml … ?>`) or a declaration (`<!DOCTYPE …>`,
+/// internal subset included). `None` when one of those is not terminated or no tag follows.
+fn root_tag_start(svg: &str) -> Option<usize> {
+    let mut at = 0;
+    loop {
+        at += svg[at..].find('<')?;
+        let rest = &svg[at..];
+        let skipped = if let Some(comment) = rest.strip_prefix("<!--") {
+            comment
+                .find("-->")
+                .map(|end| "<!--".len() + end + "-->".len())
+        } else if rest.starts_with("<?") {
+            rest.find("?>").map(|end| end + "?>".len())
+        } else if rest.starts_with("<!") {
+            declaration_len(rest)
+        } else {
+            return Some(at);
+        };
+        at += skipped?;
+    }
+}
+
+/// The length of the `<!…>` declaration at the start of `text`: up to the first `>` outside
+/// quotes and outside an internal subset (`[…]`); `None` when it is not terminated.
+fn declaration_len(text: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut depth = 0usize;
+    for (at, byte) in text.bytes().enumerate() {
+        match (quote, byte) {
+            (Some(open), _) if byte == open => quote = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(byte),
+            (None, b'[') => depth += 1,
+            (None, b']') => depth = depth.saturating_sub(1),
+            (None, b'>') if depth == 0 => return Some(at + 1),
+            (None, _) => {}
+        }
+    }
+    None
+}
 
 /// Sets (replaces or appends) `attrs` on the root `<svg>` start tag. Best effort: when the
-/// root tag is not found or not well-formed, the SVG is returned unchanged.
+/// root element is not an `<svg>` start tag or that tag is not well-formed, the SVG is
+/// returned unchanged.
 fn set_root_svg_attrs<'a>(svg: &'a str, attrs: &[(&str, String)]) -> Cow<'a, str> {
-    let Some(open) = SVG_OPEN.find(svg) else {
+    let Some(start) = root_tag_start(svg) else {
         return Cow::Borrowed(svg);
     };
-    let tail = &svg[open.start()..];
+    let tail = &svg[start..];
     let Some(tag) = SVG_ROOT_TAG.captures(tail) else {
         return Cow::Borrowed(svg);
     };
@@ -422,15 +530,17 @@ fn set_root_svg_attrs<'a>(svg: &'a str, attrs: &[(&str, String)]) -> Cow<'a, str
     }
     rebuilt.push_str(&whole.as_str()[list.end()..]);
     let mut out = String::with_capacity(svg.len() + 32);
-    out.push_str(&svg[..open.start()]);
+    out.push_str(&svg[..start]);
     out.push_str(&rebuilt);
     out.push_str(&tail[whole.end()..]);
     Cow::Owned(out)
 }
 
 /// Trims `tex` and strips one surrounding `$$…$$`, `\[…\]`, `\(…\)` or `$…$` pair, then trims
-/// again. A pair is only stripped around non-blank content, and a `$`/`$$` pair only when the
-/// inside has no other unescaped `$`, so `$a$ and $b$` (text with two formulas) stays whole.
+/// again. A pair is only stripped around non-blank content; a `$$` pair only when the inside
+/// has no unescaped `$$` (`$$a$$ and $$b$$` stays whole, `$$\text{for all $x$}$$` is one
+/// formula), and a `$` pair only when the inside has no unescaped `$` at all (`$a$ and $b$`
+/// stays whole).
 fn strip_math_delimiters(tex: &str) -> &str {
     let tex = tex.trim();
     for (open, close) in [("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"), ("$", "$")] {
@@ -441,7 +551,13 @@ fn strip_math_delimiters(tex: &str) -> &str {
         else {
             continue;
         };
-        if inner.is_empty() || (open.starts_with('$') && has_dollar(inner)) {
+        let dollars = unescaped_dollars(inner);
+        let ambiguous = match open {
+            "$$" => dollars.windows(2).any(|pair| pair[1] == pair[0] + 1),
+            "$" => !dollars.is_empty(),
+            _ => false,
+        };
+        if inner.is_empty() || ambiguous {
             continue;
         }
         return inner;
@@ -449,17 +565,22 @@ fn strip_math_delimiters(tex: &str) -> &str {
     tex
 }
 
-/// True if `text` contains a `$` not preceded by a backslash.
-fn has_dollar(text: &str) -> bool {
+/// The byte positions of the `$` in `text` that a backslash does not escape.
+fn unescaped_dollars(text: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
     let mut escaped = false;
-    for c in text.chars() {
+    for (at, c) in text.char_indices() {
         match c {
-            '$' if !escaped => return true,
-            '\\' => escaped = !escaped,
-            _ => escaped = false,
+            '$' if !escaped => positions.push(at),
+            '\\' => {
+                escaped = !escaped;
+                continue;
+            }
+            _ => {}
         }
+        escaped = false;
     }
-    false
+    positions
 }
 
 /// nbconvert's carriage-return rule (`CoalesceStreamsPreprocessor`, regex `.*\r(?=[^\n])`):
@@ -482,34 +603,179 @@ fn apply_carriage_returns(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// CSI sequences other than SGR (`…m`): cursor movement, erase line, … nbconvert drops
-/// them; `ansi-to-html` would keep the ones it does not recognize as visible text.
-static NON_SGR_CSI: LazyLock<Regex> = LazyLock::new(|| {
-    // A constant pattern covered by the unit tests: compiling it cannot fail.
-    Regex::new(r"\x1b\[[0-?]*[ -/]*[@-ln-~]").expect("CSI regex is valid")
-});
-
-/// Every CSI sequence, for the fallback path of [`ansi_to_html`].
-static ANY_CSI: LazyLock<Regex> = LazyLock::new(|| {
-    // A constant pattern covered by the unit tests: compiling it cannot fail.
-    Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("CSI regex is valid")
-});
+/// The byte that starts every escape sequence.
+const ESC: u8 = 0x1b;
 
 /// Escapes `text` for HTML and turns ANSI SGR codes (colors, bold, …) into `<span>`/`<b>`/…
-/// tags via `ansi_to_html::convert`, which escapes `& < > " '` itself. Other CSI sequences
-/// (cursor movement, erase line) are dropped first, as nbconvert does.
+/// tags via `ansi_to_html::convert`, which escapes `& < > " '` itself.
 ///
-/// Never fails: when the converter rejects a code (e.g. `\x1b[38;5;999m`), all escape
-/// sequences are removed and the plain text is escaped with `html_escape::encode_text`.
+/// The converter passes sequences it does not parse through as text, `ESC` byte included, so
+/// the text is cleaned first. SGR sequences are rewritten into the form the converter parses
+/// (an empty parameter becomes `0`, the colon forms `38:5:n`/`38:2:r:g:b` (also `48`) and
+/// `4:n` become their `;` equivalents) and are dropped one by one when it rejects them (an
+/// 8-bit color above 255, SGR 56, private `ESC [>…m`), keeping the colors around them. Every
+/// other escape sequence (cursor movement, erase line, OSC hyperlinks and titles, character
+/// sets, two-byte escapes such as `ESC 7`) and every stray `ESC` is dropped, as nbconvert
+/// drops them. The result never contains an `ESC` byte.
+///
+/// Never fails: should the converter still return an error, the text is rendered without
+/// styling, escaped the same way (`& < > " '`).
 pub fn ansi_to_html(text: &str) -> String {
-    let text = NON_SGR_CSI.replace_all(text, "");
-    match ::ansi_to_html::convert(&text) {
+    let html = match ::ansi_to_html::convert(&sanitize_ansi(text, true)) {
         Ok(html) => html,
         Err(err) => {
             tracing::debug!(%err, "ANSI conversion failed; rendering the text without colors");
-            let plain = ANY_CSI.replace_all(&text, "").replace('\u{1b}', "");
-            html_escape::encode_text(&plain).into_owned()
+            ::ansi_to_html::Esc(sanitize_ansi(text, false)).to_string()
         }
+    };
+    // Unreachable (the converter only sees sequences it accepts); a cheap last guard.
+    if html.contains('\u{1b}') {
+        html.replace('\u{1b}', "")
+    } else {
+        html
+    }
+}
+
+/// `text` without escape sequences, except, when `keep_sgr`, the SGR sequences the
+/// converter accepts, normalized by [`normalize_sgr`]. See [`escape_sequence`] for how a
+/// sequence ends.
+fn sanitize_ansi(text: &str, keep_sgr: bool) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    if !bytes.contains(&ESC) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(offset) = bytes[at..].iter().position(|&byte| byte == ESC) {
+        let start = at + offset;
+        out.push_str(&text[at..start]);
+        let (end, sgr) = escape_sequence(text, start);
+        if let Some(sequence) = sgr.filter(|_| keep_sgr).and_then(normalize_sgr) {
+            out.push_str(&sequence);
+        }
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    Cow::Owned(out)
+}
+
+/// The end (exclusive) of the escape sequence that starts with the `ESC` at `start`, and the
+/// parameters of a complete SGR sequence (`ESC [ params m`).
+///
+/// A malformed or truncated sequence ends before the first byte that does not fit it, so
+/// that byte stays text; a lone `ESC` is a sequence of its own. A control string (OSC such as
+/// a hyperlink or a title, DCS, …) ends after its BEL or ST (`ESC \`) terminator or before
+/// any other `ESC` (which aborts it, as in a terminal); one that is still open at the end of
+/// the text loses only its two-byte introducer, so a stray `ESC ]` cannot hide output.
+/// Every returned index follows an ASCII byte or is the text's length: a char boundary.
+fn escape_sequence(text: &str, start: usize) -> (usize, Option<&str>) {
+    let bytes = text.as_bytes();
+    let next = start + 1;
+    match bytes.get(next).copied() {
+        // CSI: parameter bytes, intermediate bytes, one final byte.
+        Some(b'[') => {
+            let params_end = skip_bytes(bytes, next + 1, 0x30..=0x3f);
+            let end = skip_bytes(bytes, params_end, 0x20..=0x2f);
+            match bytes.get(end).copied() {
+                Some(b'm') if end == params_end => (end + 1, Some(&text[next + 1..params_end])),
+                Some(0x40..=0x7e) => (end + 1, None),
+                _ => (end, None),
+            }
+        }
+        // Control strings: OSC, DCS, SOS, PM, APC.
+        Some(b']' | b'P' | b'X' | b'^' | b'_') => (
+            control_string_end(bytes, next + 1).unwrap_or(next + 1),
+            None,
+        ),
+        // nF escapes such as `ESC ( B` (character set): intermediate bytes, one final byte.
+        Some(0x20..=0x2f) => {
+            let end = skip_bytes(bytes, next, 0x20..=0x2f);
+            match bytes.get(end).copied() {
+                Some(0x30..=0x7e) => (end + 1, None),
+                _ => (end, None),
+            }
+        }
+        // Two-byte escapes: `ESC 7`, `ESC 8`, `ESC M`, `ESC c`, …
+        Some(0x30..=0x7e) => (next + 1, None),
+        // A lone `ESC`: at the end of the text, or before a byte that cannot follow it.
+        _ => (next, None),
+    }
+}
+
+/// The index of the first byte at or after `from` that is not in `range`.
+fn skip_bytes(bytes: &[u8], from: usize, range: std::ops::RangeInclusive<u8>) -> usize {
+    bytes
+        .get(from..)
+        .and_then(|rest| rest.iter().position(|byte| !range.contains(byte)))
+        .map_or(bytes.len(), |offset| from + offset)
+}
+
+/// Where a control string whose content starts at `from` ends: after a BEL or ST (`ESC \`),
+/// or before another `ESC`. `None` when the text ends first.
+fn control_string_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let offset = bytes
+        .get(from..)?
+        .iter()
+        .position(|&byte| byte == 0x07 || byte == ESC)?;
+    let at = from + offset;
+    Some(match bytes[at] {
+        ESC if bytes.get(at + 1) == Some(&b'\\') => at + 2,
+        ESC => at,
+        _ => at + 1,
+    })
+}
+
+/// An SGR sequence (`ESC [ params m`) rewritten into the form `ansi-to-html` parses (numbers
+/// separated by single `;`), or `None` to drop it: when it is private (a `<`, `=`, `>` or `?`
+/// parameter byte, e.g. xterm's `ESC [>4;2m`), when no parameter is left, or when the
+/// converter rejects one of its codes.
+///
+/// Rewrites: an empty parameter becomes `0` (its ECMA-48 default; one trailing `;` is ignored,
+/// as the converter does); the colon forms `38:5:n` and `38:2:[cs:]r:g:b` (also `48`) become
+/// their `;` forms; the underline styles `4:0` (off), `4:2` (double) and other `4:n` become
+/// `24`, `21` and `4`; any other colon form is dropped.
+fn normalize_sgr(params: &str) -> Option<String> {
+    if params.is_empty() {
+        return Some("\u{1b}[m".to_owned());
+    }
+    if params.bytes().any(|byte| matches!(byte, b'<'..=b'?')) {
+        return None;
+    }
+    let params = params.strip_suffix(';').unwrap_or(params);
+    let fields: Vec<Cow<'_, str>> = params
+        .split(';')
+        .filter_map(|field| match field {
+            "" => Some(Cow::Borrowed("0")),
+            _ if field.contains(':') => colon_sgr(field).map(Cow::Owned),
+            _ => Some(Cow::Borrowed(field)),
+        })
+        .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    let sequence = format!("\u{1b}[{}m", fields.join(";"));
+    // Codes are parsed per sequence, so one the converter accepts alone it accepts anywhere.
+    ::ansi_to_html::convert(&sequence)
+        .is_ok()
+        .then_some(sequence)
+}
+
+/// One SGR parameter with `:` sub-parameters in its `;` form (see [`normalize_sgr`]); `None`
+/// for forms the converter has no equivalent for.
+fn colon_sgr(field: &str) -> Option<String> {
+    let number = |part: &&str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let parts: Vec<&str> = field.split(':').collect();
+    match parts.as_slice() {
+        [color @ ("38" | "48"), "5", index] if number(index) => Some(format!("{color};5;{index}")),
+        [color @ ("38" | "48"), "2", .., r, g, b]
+            if parts.len() <= 6 && [*r, *g, *b].iter().all(number) =>
+        {
+            Some(format!("{color};2;{r};{g};{b}"))
+        }
+        ["4", "0"] => Some("24".to_owned()),
+        ["4", "2"] => Some("21".to_owned()),
+        ["4", style] if number(style) => Some("4".to_owned()),
+        _ => None,
     }
 }
 
@@ -553,6 +819,14 @@ mod tests {
             ("$ $", "$ $"),
             ("$$\\$$$", "\\$"),
             ("\\begin{align}a\\end{align}", "\\begin{align}a\\end{align}"),
+            // A single `$` inside display math (`\text{…}` switches back to text mode).
+            ("$$\\text{a $b$ c}$$", "\\text{a $b$ c}"),
+            ("$$\\text{for all $x$}$$", "\\text{for all $x$}"),
+            // Two display formulas, or `$$` inside: ambiguous, kept whole.
+            ("$$a$$ and $$b$$", "$$a$$ and $$b$$"),
+            ("$$a $$ b$$", "$$a $$ b$$"),
+            // An escaped `$` next to an unescaped one is not `$$`.
+            ("$$\\$$x$$", "\\$$x"),
         ];
         for (input, expected) in cases {
             assert_eq!(strip_math_delimiters(input), expected, "{input:?}");
@@ -615,6 +889,20 @@ mod tests {
                 "<svg data-x=\"a>b\" width=1 >",
                 "<svg data-x=\"a>b\" width=\"12\" height=\"6\" >",
             ),
+            // An `<svg` inside a leading comment, PI or doctype subset is not the root.
+            (
+                "<!-- <svg width=\"1\"> --><svg viewBox=\"0 0 1 1\"></svg>",
+                "<!-- <svg width=\"1\"> --><svg viewBox=\"0 0 1 1\" width=\"12\" height=\"6\"></svg>",
+            ),
+            (
+                "<?xml version=\"1.0\"?><?note <svg x=\"1\"> ?>\n<!DOCTYPE svg [\n  <!ENTITY e \"<svg a='>'>\">\n]>\n<!-- Created with matplotlib -->\n<svg>",
+                "<?xml version=\"1.0\"?><?note <svg x=\"1\"> ?>\n<!DOCTYPE svg [\n  <!ENTITY e \"<svg a='>'>\">\n]>\n<!-- Created with matplotlib -->\n<svg width=\"12\" height=\"6\">",
+            ),
+            // Text before the root element is skipped (a byte-order mark, stray words).
+            (
+                "\u{feff}hi <svg>",
+                "\u{feff}hi <svg width=\"12\" height=\"6\">",
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -632,6 +920,12 @@ mod tests {
             "<svgx width=\"1\">",
             "<svg width=\"1></svg>",
             "",
+            // The root element is not an `<svg>`: nested ones are left alone.
+            "<div><svg width=\"1\"></svg></div>",
+            // An unterminated comment, PI or doctype hides everything after it.
+            "<!-- <svg>",
+            "<?xml <svg>",
+            "<!DOCTYPE svg [ <svg>",
         ] {
             assert_eq!(
                 set_root_svg_attrs(input, &sizes("12", "6")),
@@ -642,13 +936,80 @@ mod tests {
     }
 
     #[test]
-    fn non_sgr_sequences_are_dropped() {
-        assert_eq!(
-            ansi_to_html("\u{1b}[2K\u{1b}[1Aline\u{1b}[?25l"),
-            "line",
-            "erase line, cursor up, hide cursor"
-        );
-        assert!(NON_SGR_CSI.find("\u{1b}[31m").is_none());
-        assert!(ANY_CSI.find("\u{1b}[31m").is_some());
+    fn escape_sequences_end_where_terminals_end_them() {
+        let cases = [
+            // (text starting with ESC, end, SGR parameters)
+            ("\u{1b}[31mx", 5, Some("31")),
+            ("\u{1b}[mx", 3, Some("")),
+            ("\u{1b}[;4:3mx", 7, Some(";4:3")),
+            ("\u{1b}[>4;2mx", 7, Some(">4;2")),
+            ("\u{1b}[2Kx", 4, None),
+            ("\u{1b}[?25lx", 6, None),
+            ("\u{1b}[1 qx", 5, None),
+            // Truncated CSI: up to the first byte that does not fit.
+            ("\u{1b}[31", 4, None),
+            ("\u{1b}[31\nx", 4, None),
+            ("\u{1b}[31é", 4, None),
+            // Control strings.
+            ("\u{1b}]0;title\u{7}x", 10, None),
+            ("\u{1b}]8;;http://x\u{1b}\\x", 15, None),
+            ("\u{1b}]8;;é\u{1b}[31m", 7, None),
+            ("\u{1b}Pdata\u{1b}\\x", 8, None),
+            ("\u{1b}]8;;open", 2, None),
+            // nF, two-byte escapes, lone ESC.
+            ("\u{1b}(Bx", 3, None),
+            ("\u{1b}(", 2, None),
+            ("\u{1b}7x", 2, None),
+            ("\u{1b}Mx", 2, None),
+            ("\u{1b}", 1, None),
+            ("\u{1b}\u{1b}[31m", 1, None),
+            ("\u{1b}éx", 1, None),
+        ];
+        for (text, end, sgr) in cases {
+            assert_eq!(escape_sequence(text, 0), (end, sgr), "{text:?}");
+            assert!(text.is_char_boundary(end), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn sgr_parameters_are_normalized_or_dropped() {
+        let cases = [
+            ("", Some("\u{1b}[m")),
+            ("31", Some("\u{1b}[31m")),
+            ("0;", Some("\u{1b}[0m")),
+            (";31", Some("\u{1b}[0;31m")),
+            ("1;;31", Some("\u{1b}[1;0;31m")),
+            (";", Some("\u{1b}[0m")),
+            ("38:5:241", Some("\u{1b}[38;5;241m")),
+            ("1;48:2::10:20:30", Some("\u{1b}[1;48;2;10;20;30m")),
+            ("38:2:10:20:30", Some("\u{1b}[38;2;10;20;30m")),
+            ("4:3", Some("\u{1b}[4m")),
+            ("4:2", Some("\u{1b}[21m")),
+            ("4:0", Some("\u{1b}[24m")),
+            ("1;58:5:3", Some("\u{1b}[1m")),
+            // Nothing left, private, or rejected by the converter.
+            ("58:5:3", None),
+            ("38:5:", None),
+            ("38:2:1:2:3:4:5", None),
+            (">4;2", None),
+            ("?1", None),
+            ("38;5;999", None),
+            ("56", None),
+            ("1;300", None),
+        ];
+        for (params, expected) in cases {
+            assert_eq!(normalize_sgr(params).as_deref(), expected, "{params:?}");
+        }
+    }
+
+    #[test]
+    fn sanitizing_keeps_text_and_accepted_sgr_only() {
+        let text = "a\u{1b}[2Kb\u{1b}[;31mc\u{1b}]8;;u\u{7}d\u{1b}7e\u{1b}[56mf\u{1b}";
+        assert_eq!(sanitize_ansi(text, true), "ab\u{1b}[0;31mcdef");
+        assert_eq!(sanitize_ansi(text, false), "abcdef");
+        assert!(matches!(
+            sanitize_ansi("plain", true),
+            Cow::Borrowed("plain")
+        ));
     }
 }
