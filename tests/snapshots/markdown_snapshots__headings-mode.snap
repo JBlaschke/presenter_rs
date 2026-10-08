@@ -1,0 +1,221 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Headings mode",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {
+      "slides": {
+        "split": "headings"
+      }
+    }
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<p>Text before the first heading is an initial slide, because it is not blank.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 22,
+        "end_line": 22,
+        "cell": null
+      }
+    },
+    {
+      "id": "intro",
+      "layout": "section",
+      "classes": [],
+      "attrs": {},
+      "title": "Introduction",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Introduction</h1>\n"
+        }
+      ],
+      "notes": null,
+      "children": [
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {},
+          "title": "Motivation",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Motivation</h2>\n<p>Why we migrate from pandoc.</p>\n<h3>A level-3 heading is content</h3>\n<ul>\n<li>point one</li>\n<li>point two</li>\n</ul>\n"
+            }
+          ],
+          "notes": null,
+          "children": [],
+          "span": {
+            "start_line": 26,
+            "end_line": 33,
+            "cell": null
+          }
+        },
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [
+            "dark"
+          ],
+          "attrs": {
+            "data-transition": "fade"
+          },
+          "title": "Plan",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Plan</h2>\n<ol>\n<li>Parse</li>\n<li>Render</li>\n</ol>\n"
+            }
+          ],
+          "notes": null,
+          "children": [],
+          "span": {
+            "start_line": 35,
+            "end_line": 39,
+            "cell": null
+          }
+        }
+      ],
+      "span": {
+        "start_line": 24,
+        "end_line": 24,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Results",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Results</h1>\n<p>Some text.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 41,
+        "end_line": 43,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "After a rule",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>After a rule</h2>\n<p>A <code>---</code> line starts a horizontal slide; this heading joins it.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 45,
+        "end_line": 49,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Another",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Another</h2>\n<p>No <code>#</code> heading above it since the rule, so this slide is horizontal too.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 51,
+        "end_line": 53,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Summary",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Summary</h1>\n"
+        }
+      ],
+      "notes": null,
+      "children": [
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {},
+          "title": "Backup",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Backup</h2>\n<p>A <code>--</code> line starts a vertical slide; this heading joins it.</p>\n"
+            }
+          ],
+          "notes": null,
+          "children": [],
+          "span": {
+            "start_line": 57,
+            "end_line": 61,
+            "cell": null
+          }
+        }
+      ],
+      "span": {
+        "start_line": 55,
+        "end_line": 55,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": false,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

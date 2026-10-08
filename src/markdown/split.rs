@@ -1,9 +1,10 @@
 //! Slide splitter: `---` / `--` separators, slide attributes, heading lifting. Implemented by T11 (headings mode: T43).
 //!
-//! Contract: `docs/spec/markdown-dialect.md` §2.2 (separators, rules mode) and §3.2 (where
-//! slide attributes come from). Splitting is decided on the comrak AST, looking only at the
-//! `Document`'s direct children, so `---`/`--` inside code fences, lists, block quotes or
-//! directives are never separators. Nothing is rendered here (T12 renders each [`RawSlide`]).
+//! Contract: `docs/spec/markdown-dialect.md` §2.2 (separators, rules mode), §2.3 (headings
+//! mode) and §3.2 (where slide attributes come from). Splitting is decided on the comrak AST,
+//! looking only at the `Document`'s direct children, so `---`/`--` inside code fences, lists,
+//! block quotes or directives are never separators, and headings there never start slides.
+//! Nothing is rendered here (T12 renders each [`RawSlide`]).
 //!
 //! The entry points differ only in how a top-level `Paragraph` is read:
 //! - [`split_with_source`] (preferred; T12 calls it) also gets the Markdown text and reads the
@@ -52,8 +53,15 @@
 //! - Every slide without nodes is reported as `empty-slide` (two consecutive separators, a
 //!   `--` right after `---`, a trailing separator), also when it carries attributes.
 //! - A horizontal separator closes an open vertical stack.
-//! - Attributes on a slide's first node, when it is a heading, are lifted onto the slide
-//!   ([`lift_heading_attrs`]); they win over the separator's attributes.
+//! - A `<!-- .slide: … -->` comment (an HTML block that is exactly that comment, see
+//!   [`compat::slide_comment`]) as the slide's first node, or as the node right after the
+//!   slide's first heading, gives the slide attributes and is removed from its nodes; several
+//!   in a row are all read. One anywhere else among the slide's top-level nodes stays a plain
+//!   comment and is reported as `misplaced-slide-comment`. An unbalanced quote in it is an
+//!   `Error::Parse` on its line, as for separators.
+//! - Attributes on a slide's first node (once `.slide:` comments are removed), when it is a
+//!   heading, are lifted onto the slide ([`lift_heading_attrs`]). Precedence (§3.2, later
+//!   wins): separator, then `.slide:` comments, then the heading.
 //! - A line of an ordinary top-level paragraph that looks like an attribute separator
 //!   (`^---?\s*\{`) but is not one (no blank line around it, trailing text, or for
 //!   [`split_ast`] inline syntax) is reported as `separator-not-recognized`, so a slide
@@ -63,6 +71,29 @@
 //!   whose source range they are written in (they count for its span, and footnotes before
 //!   the first separator make slide 1). They stay last among its nodes, in comrak's order, as
 //!   comrak's HTML formatter expects.
+//!
+//! Headings mode ([`SplitMode::Headings`], `slides.split = "headings"`, dialect §2.3; both
+//! entry points) adds slide boundaries at top-level headings with `level <= slide_level`;
+//! everything above stays as it is (separators are still honored, mixed mode):
+//! - A heading with `level < slide_level` (a *section* heading, `#` by default) starts a new
+//!   horizontal slide.
+//! - A heading with `level == slide_level` (`##` by default) starts a new vertical slide under
+//!   the current horizontal slide when that slide's stack was started by a section heading
+//!   (`##` "under" a `#`). Otherwise there is nothing to go under, and it starts a horizontal
+//!   slide, as pandoc does for slide-level headings outside any section (and as an orphan
+//!   `--` is treated in rules mode). So a deck of `##` slides only is a row of horizontal
+//!   slides, and with `slide_level = 1` every `#` is one.
+//! - Deeper headings are ordinary content. The boundary heading stays the slide's first node,
+//!   so its `{…}` attributes are lifted as usual.
+//! - The open slide does not end at a boundary heading while it has no visible content yet:
+//!   nothing at all, or only HTML comments ([`compat::is_blank`]). Then the heading joins it
+//!   instead. That gives dialect §2.3's "content before the first heading becomes an initial
+//!   slide only if it is non-blank", and makes `---` (or `--`) directly followed by a heading,
+//!   possibly with a `<!-- .slide: -->` comment between them, one slide, as in rules mode:
+//!   the separator decides the direction and its attributes apply. A rules-mode deck whose
+//!   slides start with headings therefore keeps its shape in headings mode.
+//! - `---` starts a horizontal stack that no section heading started, so the `##` headings
+//!   after it start horizontal slides until the next section heading. `--` keeps the stack.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -72,16 +103,18 @@ use comrak::nodes::{AstNode, NodeValue};
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::SourceSpan;
 use crate::markdown::attrs::{ParsedAttrs, SlideAttrs, parse_attr_block};
+use crate::markdown::compat;
 
 /// How slide boundaries are found (`slides.split` in the config).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitMode {
     /// `---` / `--` separator lines (dialect §2.2); the default.
     Rules,
-    /// Heading-driven boundaries (dialect §2.3). Implemented in T43; [`split`] currently
-    /// returns `Error::Other("headings mode: T43")`.
+    /// Heading-driven boundaries (dialect §2.3), with separator lines still honored; see the
+    /// module docs.
     Headings {
-        /// Heading level that starts a vertical slide (`slides.slide_level`).
+        /// Heading level that starts a vertical slide (`slides.slide_level`); lower levels
+        /// start horizontal slides, higher ones are content. `0` makes every heading content.
         slide_level: u8,
     },
 }
@@ -89,10 +122,11 @@ pub enum SplitMode {
 /// One slide's top-level nodes, before rendering.
 #[derive(Debug)]
 pub struct RawSlide<'a> {
-    /// Separator attributes merged with the lifted first-heading attributes (heading wins).
+    /// Separator attributes merged with the `<!-- .slide: -->` comment attributes and the
+    /// lifted first-heading attributes (later wins, in that order).
     pub attrs: SlideAttrs,
-    /// The slide's top-level AST nodes in document order, separators excluded; footnote
-    /// definitions come last (in comrak's order).
+    /// The slide's top-level AST nodes in document order, separators and the `.slide:`
+    /// comments that were read excluded; footnote definitions come last (in comrak's order).
     pub nodes: Vec<&'a AstNode<'a>>,
     /// 1-based first line: the line of the separator that opened the slide; for a slide not
     /// opened by a separator (content before the first separator), its earliest node's first
@@ -128,8 +162,9 @@ impl RawSlide<'_> {
 pub struct RawDeck<'a> {
     /// `(horizontal slide, its vertical children)` in document order.
     pub slides: Vec<(RawSlide<'a>, Vec<RawSlide<'a>>)>,
-    /// `empty-slide`, `orphan-vertical`, `separator-not-recognized`, `unknown-slide-attr` and
-    /// `invalid-slide-attr` warnings, ordered by line (span set, `cell: None`, no path).
+    /// `empty-slide`, `orphan-vertical`, `separator-not-recognized`, `unknown-slide-attr`,
+    /// `invalid-slide-attr` and `misplaced-slide-comment` warnings, ordered by line (span
+    /// set, `cell: None`, no path).
     pub diagnostics: Diagnostics,
 }
 
@@ -143,9 +178,9 @@ pub struct RawDeck<'a> {
 /// Heading attributes that are lifted onto a slide are removed from the heading node
 /// (`attrs = None`), so the rendered `<h1>` is clean.
 ///
-/// Errors: `Error::Other("headings mode: T43")` for [`SplitMode::Headings`]; and
-/// `Error::Parse { path: <empty>, line: Some(separator line), .. }` when a separator's
-/// attribute block has an unbalanced quote. `split` does not know the file, so the caller
+/// Errors: `Error::Parse { path: <empty>, line: Some(line), .. }` when a separator's attribute
+/// block or a `<!-- .slide: -->` comment that is read has an unbalanced quote (the line is the
+/// separator's or the comment's first line). `split` does not know the file, so the caller
 /// fills in `path`.
 pub fn split<'a>(root: &'a AstNode<'a>, mode: SplitMode) -> Result<RawDeck<'a>> {
     split_ast(root, mode, false)
@@ -187,14 +222,11 @@ fn split_impl<'a>(
     mode: SplitMode,
     smart: bool,
 ) -> Result<RawDeck<'a>> {
-    if let SplitMode::Headings { .. } = mode {
-        return Err(Error::Other("headings mode: T43".into()));
-    }
-    let mut builder = Builder::new(root, lines, smart);
+    let mut builder = Builder::new(root, lines, smart, mode);
     for node in root.children() {
         builder.visit(node)?;
     }
-    Ok(builder.finish())
+    builder.finish()
 }
 
 /// If `nodes[0]` is a Heading with attributes, remove them from the node and return them.
@@ -395,23 +427,49 @@ fn unnumbered_lines<'a>(node: &'a AstNode<'a>) -> usize {
 /// `k` is the number of lines it removed; 0 when the paragraph cannot start with one (its
 /// first line does not start with `[`). The definitions themselves do not depend on the
 /// extensions, so the prefixes are parsed with comrak's default options.
+///
+/// Only the prefixes [`definition_candidates`] lists are parsed (largest first), so the work
+/// stays linear in the paragraph for ordinary input: a long multi-line link title is parsed
+/// once or not at all, not once per line.
 fn definition_lines(block: &[&str], limit: usize) -> usize {
-    let label_first = block
-        .first()
-        .is_some_and(|line| line.trim_start_matches([' ', '\t']).starts_with('['));
-    if !label_first {
-        return 0;
-    }
     let options = comrak::Options::default();
-    let most = limit.min(block.len().saturating_sub(1));
-    (1..=most)
-        .rev()
+    definition_candidates(block, limit)
         .find(|&k| {
             let arena = comrak::Arena::new();
             let root = comrak::parse_document(&arena, &block[..k].join("\n"), &options);
             root.first_child().is_none()
         })
         .unwrap_or(0)
+}
+
+/// The line counts `k` (largest first, `k <= limit`, `k < block.len()`) for which the first `k`
+/// lines can be nothing but link reference definitions, by a necessary condition that needs no
+/// parsing: the first line starts with `[`, some line up to `k` holds the `]:` that ends a
+/// label, and line `k` (the last one) can end a definition. comrak reads a definition as a
+/// label (ending in `]:` on one line), a destination on that line or the next one, an optional
+/// title (closed by `"`, `'` or `)`) and then only spaces up to the line end. So the last line
+/// holds a `]:`, follows a line that does, or ends (trailing spaces and tabs aside) with a
+/// title's closing character. Every `k` for which [`definition_lines`]' parse can succeed is
+/// listed; most others are not.
+fn definition_candidates<'b>(block: &'b [&str], limit: usize) -> impl Iterator<Item = usize> + 'b {
+    let label_first = block
+        .first()
+        .is_some_and(|line| line.trim_start_matches([' ', '\t']).starts_with('['));
+    let most = if label_first {
+        limit.min(block.len().saturating_sub(1))
+    } else {
+        0
+    };
+    let first_label_end = block[..most].iter().position(|line| line.contains("]:"));
+    let lowest = first_label_end.map_or(usize::MAX, |at| at + 1);
+    (lowest..=most).rev().filter(move |&k| {
+        let last = block[k - 1];
+        last.contains("]:")
+            || (k >= 2 && block[k - 2].contains("]:"))
+            || last
+                .trim_end_matches([' ', '\t'])
+                .ends_with(['"', '\'', ')'])
+    })
 }
 
 /// Whether comrak numbered every line ending of a paragraph's inlines, so that
@@ -616,6 +674,11 @@ struct Builder<'a, 's> {
     lines: Option<&'s [&'s str]>,
     /// comrak's `parse.smart`, for paragraphs read from their inlines.
     smart: bool,
+    /// Rules or headings mode.
+    mode: SplitMode,
+    /// Headings mode: the open horizontal stack was started by a section heading (level below
+    /// `slide_level`), so a slide-level heading starts a vertical slide under it.
+    section: bool,
     /// Finished horizontal slides with their children.
     done: Vec<(RawSlide<'a>, Vec<RawSlide<'a>>)>,
     /// The open horizontal slide and its children; nodes go to its last child, if any.
@@ -630,7 +693,12 @@ struct Builder<'a, 's> {
 }
 
 impl<'a, 's> Builder<'a, 's> {
-    fn new(root: &'a AstNode<'a>, lines: Option<&'s [&'s str]>, smart: bool) -> Self {
+    fn new(
+        root: &'a AstNode<'a>,
+        lines: Option<&'s [&'s str]>,
+        smart: bool,
+        mode: SplitMode,
+    ) -> Self {
         let footnotes: Vec<&'a AstNode<'a>> = root
             .children()
             .filter(|node| matches!(node.data().value, NodeValue::FootnoteDefinition(_)))
@@ -646,6 +714,8 @@ impl<'a, 's> Builder<'a, 's> {
         Builder {
             lines,
             smart,
+            mode,
+            section: false,
             done: Vec::new(),
             current: (RawSlide::empty(1), Vec::new()),
             implicit: true,
@@ -672,6 +742,10 @@ impl<'a, 's> Builder<'a, 's> {
             }
         };
         self.flush_footnotes(start);
+        if let Some(section) = self.boundary(node) {
+            self.heading(node, section, start, end);
+            return Ok(());
+        }
         let Some(separator) = separator(node, self.lines, self.smart) else {
             self.report_lookalikes(node);
             self.push(node, start, end);
@@ -695,8 +769,48 @@ impl<'a, 's> Builder<'a, 's> {
             start_line: start,
             end_line: end,
         };
+        if separator.direction == Direction::Horizontal {
+            self.section = false;
+        }
         self.open(separator.direction, slide);
         Ok(())
+    }
+
+    /// Headings mode: for a top-level heading that is a slide boundary
+    /// (`level <= slide_level`), whether it is a section heading (`level < slide_level`);
+    /// `None` for anything else and in rules mode.
+    fn boundary(&self, node: &'a AstNode<'a>) -> Option<bool> {
+        let SplitMode::Headings { slide_level } = self.mode else {
+            return None;
+        };
+        match node.data().value {
+            NodeValue::Heading(heading) if heading.level <= slide_level => {
+                Some(heading.level < slide_level)
+            }
+            _ => None,
+        }
+    }
+
+    /// Headings mode: a boundary heading (a section heading when `section`) starts a slide
+    /// (see the module docs) and becomes its first node, or joins the open slide while that
+    /// has no visible content yet.
+    fn heading(&mut self, node: &'a AstNode<'a>, section: bool, start: usize, end: usize) {
+        let open = self.current.1.last().unwrap_or(&self.current.0);
+        if open.nodes.iter().all(|node| compat::is_blank(node)) {
+            if section && self.current.1.is_empty() {
+                self.section = true;
+            }
+            self.push(node, start, end);
+            return;
+        }
+        let direction = if !section && self.section {
+            Direction::Vertical
+        } else {
+            self.section = section;
+            Direction::Horizontal
+        };
+        self.open(direction, RawSlide::empty(start));
+        self.push(node, start, end);
     }
 
     /// Starts the slide a separator opened.
@@ -783,7 +897,7 @@ impl<'a, 's> Builder<'a, 's> {
         }
     }
 
-    fn finish(mut self) -> RawDeck<'a> {
+    fn finish(mut self) -> Result<RawDeck<'a>> {
         self.flush_footnotes(usize::MAX);
         let Builder {
             mut done,
@@ -794,36 +908,42 @@ impl<'a, 's> Builder<'a, 's> {
         } = self;
         done.push(current);
         for (i, (slide, children)) in done.iter_mut().enumerate() {
-            finish_slide(slide, &(i + 1).to_string(), &footnotes, &mut diagnostics);
+            finish_slide(slide, &(i + 1).to_string(), &footnotes, &mut diagnostics)?;
             for (j, child) in children.iter_mut().enumerate() {
                 let label = format!("{}.{}", i + 1, j + 1);
-                finish_slide(child, &label, &footnotes, &mut diagnostics);
+                finish_slide(child, &label, &footnotes, &mut diagnostics)?;
             }
         }
         let mut diagnostics = diagnostics.into_vec();
         diagnostics.sort_by_key(|d| d.span.as_ref().map(|span| span.start_line));
-        RawDeck {
+        Ok(RawDeck {
             slides: done,
             diagnostics: diagnostics.into(),
-        }
+        })
     }
 }
 
-/// Moves footnote definitions to the end (in comrak's order), lifts the first heading's
-/// attributes and reports `empty-slide`, `unknown-slide-attr` and `invalid-slide-attr`.
+/// Moves footnote definitions to the end (in comrak's order), applies the slide's
+/// `<!-- .slide: -->` comments and then the first heading's attributes, and reports
+/// `empty-slide`, `unknown-slide-attr`, `invalid-slide-attr` and `misplaced-slide-comment`.
+/// Errors: `Error::Parse` for an unbalanced quote in a `.slide:` comment.
 fn finish_slide<'a>(
     slide: &mut RawSlide<'a>,
     label: &str,
     footnotes: &[&'a AstNode<'a>],
     diagnostics: &mut Diagnostics,
-) {
+) -> Result<()> {
     // stable: other nodes (`None`) keep their order, footnotes follow by comrak's order
     slide
         .nodes
         .sort_by_key(|node| footnotes.iter().position(|f| std::ptr::eq(*f, *node)));
+    if let Some(comments) = take_slide_comments(&mut slide.nodes)? {
+        slide.attrs.merge(comments);
+    }
     if let Some(lifted) = lift_heading_attrs(&slide.nodes) {
         slide.attrs.merge(SlideAttrs::from_parsed(lifted));
     }
+    report_misplaced_slide_comments(&slide.nodes, label, diagnostics);
     let span = slide.span();
     let mut warn = |code: &'static str, message: String| {
         diagnostics.warn(code, message).span = Some(span.clone());
@@ -847,6 +967,75 @@ fn finish_slide<'a>(
             "invalid-slide-attr",
             format!("`{key}` on slide {label} is not a valid attribute name (dropped)"),
         );
+    }
+    Ok(())
+}
+
+/// Removes the `<!-- .slide: -->` comments the slide's attributes come from and returns their
+/// attributes merged in order: the consecutive comments that start the slide, then those right
+/// after the heading that is then the first node. `None` when there are none.
+fn take_slide_comments<'a>(nodes: &mut Vec<&'a AstNode<'a>>) -> Result<Option<SlideAttrs>> {
+    let mut attrs: Option<SlideAttrs> = None;
+    take_slide_comments_at(nodes, 0, &mut attrs)?;
+    if nodes
+        .first()
+        .is_some_and(|node| matches!(node.data().value, NodeValue::Heading(_)))
+    {
+        take_slide_comments_at(nodes, 1, &mut attrs)?;
+    }
+    Ok(attrs)
+}
+
+/// Removes the consecutive `.slide:` comments at `nodes[at..]`, merging their attributes into
+/// `attrs` in order.
+fn take_slide_comments_at<'a>(
+    nodes: &mut Vec<&'a AstNode<'a>>,
+    at: usize,
+    attrs: &mut Option<SlideAttrs>,
+) -> Result<()> {
+    while let Some(text) = nodes
+        .get(at)
+        .and_then(|node| compat::slide_comment_node(node))
+    {
+        let line = nodes[at].data().sourcepos.start.line;
+        let parsed = parse_attr_block(&text).map_err(|err| Error::Parse {
+            path: PathBuf::new(),
+            line: Some(line),
+            message: format!("<!-- .slide: --> comment: {err}"),
+        })?;
+        attrs
+            .get_or_insert_with(SlideAttrs::default)
+            .merge(SlideAttrs::from_parsed(parsed));
+        nodes.remove(at);
+    }
+    Ok(())
+}
+
+/// Reports every top-level HTML block left among a slide's nodes that holds a `.slide:`
+/// comment: it is not where the slide's attributes are read, so it stays a plain comment.
+fn report_misplaced_slide_comments<'a>(
+    nodes: &[&'a AstNode<'a>],
+    label: &str,
+    diagnostics: &mut Diagnostics,
+) {
+    for node in nodes {
+        let data = node.data();
+        let NodeValue::HtmlBlock(block) = &data.value else {
+            continue;
+        };
+        if !compat::mentions_slide_comment(&block.literal) {
+            continue;
+        }
+        let message = format!(
+            "`<!-- .slide: … -->` on slide {label} is ignored (kept as a plain comment): it is \
+             read only as the slide's first node or right after the slide's first heading, \
+             alone in its HTML block"
+        );
+        diagnostics.warn("misplaced-slide-comment", message).span = Some(SourceSpan {
+            start_line: data.sourcepos.start.line,
+            end_line: data.sourcepos.end.line,
+            cell: None,
+        });
     }
 }
 
@@ -1639,20 +1828,447 @@ mod tests {
         }
     }
 
+    fn run_mode<'a>(arena: &'a Arena<'a>, text: &str, via: Via, mode: SplitMode) -> RawDeck<'a> {
+        let root = parse(arena, text);
+        let deck = match via {
+            Via::Ast => split(root, mode),
+            Via::Source => split_with_source(root, text, mode),
+        };
+        deck.unwrap_or_else(|e| panic!("{via:?} {mode:?} {text:?}: {e}"))
+    }
+
+    fn headings(slide_level: u8) -> SplitMode {
+        SplitMode::Headings { slide_level }
+    }
+
     #[test]
-    fn headings_mode_is_not_implemented_yet() {
-        let arena = Arena::new();
-        let root = parse(&arena, "# A\n");
-        for result in [
-            split(root, SplitMode::Headings { slide_level: 2 }),
-            split_with_source(root, "# A\n", SplitMode::Headings { slide_level: 2 }),
+    fn headings_mode_splits_as_specified() {
+        const SECTIONS: &str = "# A\n\n## A.1\n\n### deeper\n\n## A.2\n\n# B\n";
+        let cases: &[(&str, &str, u8, &str, Diags)] = &[
+            (
+                "`#` horizontal, `##` vertical, `###` content",
+                SECTIONS,
+                2,
+                "1-1 [3-5, 7-7] | 9-9",
+                &[],
+            ),
+            (
+                "slide_level 3: `#` and `##` horizontal, `###` vertical",
+                SECTIONS,
+                3,
+                "1-1 | 3-3 [5-5] | 7-7 | 9-9",
+                &[],
+            ),
+            (
+                "slide_level 1: every `#` is a horizontal slide",
+                SECTIONS,
+                1,
+                "1-7 | 9-9",
+                &[],
+            ),
+            (
+                "slide_level 0: headings are content",
+                SECTIONS,
+                0,
+                "1-9",
+                &[],
+            ),
+            (
+                "`##` slides without any `#` are horizontal (pandoc)",
+                "## A\n\ntext\n\n## B\n\n### c\n",
+                2,
+                "1-3 | 5-7",
+                &[],
+            ),
+            (
+                "consecutive headings",
+                "# A\n## B\n## C\n",
+                2,
+                "1-1 [2-2, 3-3]",
+                &[],
+            ),
+            (
+                "content before the first heading is slide 1",
+                "Intro\n\n# A\n",
+                2,
+                "1-1 | 3-3",
+                &[],
+            ),
+            (
+                "comments alone before the first heading are not a slide",
+                "<!-- licence -->\n\n<!-- more -->\n\n# A\n\ntext\n",
+                2,
+                "1-7",
+                &[],
+            ),
+            (
+                "front matter is not content",
+                "---\ntitle: x\n---\n\n# A\n",
+                2,
+                "5-5",
+                &[],
+            ),
+            (
+                "an empty document is one empty slide",
+                "",
+                2,
+                "1-1",
+                &[("empty-slide", 1)],
+            ),
+            (
+                "mixed: `---` + heading is one slide; `##` after `---` is horizontal",
+                "# A\n\n---\n\n## B\n\n## C\n\n# D\n\n--\n\n## E\n",
+                2,
+                "1-1 | 3-5 | 7-7 | 9-9 [11-13]",
+                &[],
+            ),
+            (
+                "mixed: content after `---` keeps the next `##` horizontal",
+                "# A\n\n---\n\ntext\n\n## B\n",
+                2,
+                "1-1 | 3-5 | 7-7",
+                &[],
+            ),
+            (
+                "mixed: `--` opens a vertical slide, a later `##` another one",
+                "# A\n\ntext\n\n--\n\nmore\n\n## B\n",
+                2,
+                "1-3 [5-7, 9-9]",
+                &[],
+            ),
+            (
+                "mixed: a leading separator still opens slide 1",
+                "---\n\n# A\n\n## B\n",
+                2,
+                "1-3 [5-5]",
+                &[],
+            ),
+            (
+                "mixed: a trailing separator is an empty slide",
+                "# A\n\n---\n",
+                2,
+                "1-1 | 3-3",
+                &[("empty-slide", 3)],
+            ),
+            (
+                "setext headings count",
+                "A\n===\n\nB\n---\n\ntext\n",
+                2,
+                "1-2 [4-7]",
+                &[],
+            ),
+            (
+                "headings in containers are content",
+                "# A\n\n> # quoted\n\n- # item\n\n:::note\n# inside\n:::\n",
+                2,
+                "1-9",
+                &[],
+            ),
+        ];
+        for (what, text, slide_level, expected_shape, expected_diags) in cases {
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run_mode(&arena, text, via, headings(*slide_level));
+                assert_eq!(shape(&deck), *expected_shape, "{what} ({via:?})");
+                assert_eq!(diags(&deck), *expected_diags, "{what} ({via:?})");
+                // a boundary heading only follows comments on its slide
+                for slide in flatten(&deck) {
+                    for (i, node) in slide.nodes.iter().enumerate() {
+                        if let NodeValue::Heading(h) = node.data().value
+                            && h.level <= *slide_level
+                        {
+                            let before = &slide.nodes[..i];
+                            assert!(before.iter().all(|n| compat::is_blank(n)), "{what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn headings_mode_lifts_boundary_heading_attributes() {
+        let text = "# A {#a layout=section}\n\n## B {.dark background=\"navy\"}\n\n\
+                    --- {.sep data-x=\"1\"}\n\n## C {data-x=\"2\"}\n";
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run_mode(&arena, text, via, headings(2));
+            assert_eq!(shape(&deck), "1-1 [3-3] | 5-7", "{via:?}");
+            let slides = flatten(&deck);
+            assert_eq!(slides[0].attrs.id.as_deref(), Some("a"));
+            assert_eq!(slides[0].attrs.layout.as_deref(), Some("section"));
+            assert_eq!(slides[1].attrs.classes, ["dark"]);
+            assert_eq!(
+                slides[1].attrs.attrs["data-background-color"], "navy",
+                "{via:?}"
+            );
+            // the separator's attributes apply, the joining heading's win
+            assert_eq!(slides[2].attrs.classes, ["sep"]);
+            assert_eq!(slides[2].attrs.attrs["data-x"], "2");
+            for slide in &slides {
+                assert!(slide.nodes[0].data().attrs.is_none(), "lifted: {via:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn headings_mode_fixture_shapes() {
+        let text = fixture("headings-mode.md");
+        // the fixture's own front matter sets `split: headings`; `parse` applies it, this
+        // test passes the mode directly
+        for (level, expected) in [
+            (
+                2,
+                "22-22 | 24-24 [26-33, 35-39] | 41-43 | 45-49 | 51-53 | 55-55 [57-61]",
+            ),
+            (
+                3,
+                "22-22 | 24-24 | 26-28 [30-33] | 35-39 | 41-43 | 45-49 | 51-53 | 55-55 [57-61]",
+            ),
         ] {
-            let err = result.unwrap_err();
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run_mode(&arena, &text, via, headings(level));
+                assert_eq!(shape(&deck), expected, "slide_level {level} ({via:?})");
+                assert_eq!(diags(&deck), [], "slide_level {level} ({via:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn slide_comments_set_attributes_with_precedence() {
+        let text = "\
+--- {.sep data-a=\"sep\" data-b=\"sep\" data-c=\"sep\"}
+
+<!-- .slide: data-b=\"comment\" data-c=\"comment\" class=\"x\" #cid -->
+<!-- .slide: background=navy -->
+
+# T {data-c=\"heading\"}
+
+---
+
+# U {.u}
+<!-- .slide: data-background=\"#f00\" .v -->
+
+text
+";
+        for mode in [SplitMode::Rules, headings(2)] {
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run_mode(&arena, text, via, mode);
+                let label = format!("{mode:?} {via:?}");
+                assert_eq!(shape(&deck), "1-6 | 8-13", "{label}");
+                assert_eq!(diags(&deck), [], "{label}");
+                let slides = flatten(&deck);
+                let first = &slides[0].attrs;
+                assert_eq!(first.classes, ["sep", "x"], "{label}");
+                assert_eq!(first.id.as_deref(), Some("cid"));
+                assert_eq!(
+                    first.attrs,
+                    BTreeMap::from([
+                        ("data-a".to_string(), "sep".to_string()),
+                        ("data-b".to_string(), "comment".to_string()),
+                        ("data-background-color".to_string(), "navy".to_string()),
+                        ("data-c".to_string(), "heading".to_string()),
+                    ]),
+                    "{label}"
+                );
+                // the comments are gone, the heading is first and clean
+                assert_eq!(slides[0].nodes.len(), 1, "{label}");
+                assert!(slides[0].nodes[0].data().attrs.is_none());
+                // right after the first heading: also read
+                let second = &slides[1].attrs;
+                // classes accumulate in precedence order: comment, then heading
+                assert_eq!(second.classes, ["v", "u"], "{label}");
+                assert_eq!(second.attrs["data-background"], "#f00", "{label}");
+                assert_eq!(slides[1].nodes.len(), 2, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn misplaced_or_malformed_slide_comments() {
+        // (text, shape, diagnostics, classes of the last slide)
+        let cases: &[(&str, &str, Diags, &[&str])] = &[
+            (
+                "# A\n\ntext\n\n<!-- .slide: class=\"late\" -->\n",
+                "1-5",
+                &[("misplaced-slide-comment", 5)],
+                &[],
+            ),
+            (
+                "<!-- .slide: class=\"a\" --> trailing text\n\n# A\n",
+                "1-3",
+                &[("misplaced-slide-comment", 1)],
+                &[],
+            ),
+            (
+                "- item\n\n  <!-- .slide: class=\"nested\" -->\n",
+                "1-3",
+                &[],
+                &[],
+            ),
+            (
+                "# A\n\n---\n\n<!-- .slide: class=\"only\" -->\n",
+                "1-1 | 3-5",
+                &[("empty-slide", 3)],
+                &["only"],
+            ),
+            (
+                "# A\n\n<!-- .slide: data-k=v -->\n\n<!-- .slide: data-j=w -->\n\n\
+                 <!-- .slide: data-x=y -->\n\npara\n\n<!-- .slide: class=\"no\" -->\n",
+                "1-11",
+                &[("misplaced-slide-comment", 11)],
+                &[],
+            ),
+        ];
+        for (text, expected_shape, expected_diags, classes) in cases {
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run(&arena, text, via);
+                assert_eq!(shape(&deck), *expected_shape, "{text:?} {via:?}");
+                assert_eq!(diags(&deck), *expected_diags, "{text:?} {via:?}");
+                let last = flatten(&deck).pop().unwrap();
+                assert_eq!(last.attrs.classes, *classes, "{text:?} {via:?}");
+            }
+        }
+        // two comments right after a heading are both read
+        let arena = Arena::new();
+        let deck = run(
+            &arena,
+            "# A\n\n<!-- .slide: data-k=v -->\n\n<!-- .slide: data-j=w -->\n\npara\n",
+            Via::Source,
+        );
+        assert_eq!(deck.slides[0].0.attrs.attrs.len(), 2);
+        // an unbalanced quote is a parse error on the comment's line
+        for via in BOTH {
+            let text = "# A\n\n---\n\n<!-- .slide: title=\"open -->\n\n# B\n";
+            let arena = Arena::new();
+            let root = parse(&arena, text);
+            let result = match via {
+                Via::Ast => split(root, SplitMode::Rules),
+                Via::Source => split_with_source(root, text, SplitMode::Rules),
+            };
             assert!(
-                matches!(&err, Error::Other(m) if m == "headings mode: T43"),
-                "{err:?}"
+                matches!(&result, Err(Error::Parse { line: Some(5), message, .. })
+                    if message.contains("unbalanced")),
+                "{via:?}: {result:?}"
             );
         }
+    }
+
+    /// A paragraph whose first line starts with `[` and that hides many line endings (a link
+    /// title over thousands of lines) used to re-parse every prefix of itself: quadratic.
+    /// Only prefixes that can end a link reference definition are parsed now.
+    #[test]
+    fn long_link_titles_are_not_parsed_once_per_line() {
+        let n = 20_000;
+        let lines = |head: &str, tail: &str| -> Vec<String> {
+            let mut out = vec![head.to_string()];
+            out.extend(std::iter::repeat_n("t".to_string(), n));
+            out.push(tail.to_string());
+            out
+        };
+        // no `]:` anywhere: nothing to parse
+        let block = lines("[l](u \"t", "t\")");
+        let block: Vec<&str> = block.iter().map(String::as_str).collect();
+        assert_eq!(definition_candidates(&block, n + 1).count(), 0);
+        // a definition, then such a link: two short prefixes
+        let mut with_def = vec!["[x]: http://a".to_string()];
+        with_def.extend(lines("[l](u \"t", "t\")"));
+        let with_def: Vec<&str> = with_def.iter().map(String::as_str).collect();
+        assert_eq!(
+            definition_candidates(&with_def, n + 1).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(definition_lines(&with_def, n + 1), 1);
+        // a definition whose title spans the lines: the whole prefix, parsed once
+        let long_title = lines("[x]: http://a \"t", "t\"");
+        let mut long_title: Vec<&str> = long_title.iter().map(String::as_str).collect();
+        long_title.push("text");
+        assert_eq!(
+            definition_candidates(&long_title, n + 2).next(),
+            Some(n + 2)
+        );
+        assert_eq!(definition_lines(&long_title, n + 2), n + 2);
+        // end to end (would take minutes if quadratic)
+        for text in [
+            format!(
+                "# A\n\n[l](u \"t{}\")\n\n--- {{.x}}\n\n# B\n",
+                "\nt".repeat(n)
+            ),
+            format!("# A\n\n[x]: http://a\n[l](u \"t{}\")\n", "\nt".repeat(n)),
+        ] {
+            let arena = Arena::new();
+            let root = parse(&arena, &text);
+            let deck = split_with_source(root, &text, SplitMode::Rules).unwrap();
+            assert!(!deck.slides.is_empty());
+        }
+    }
+
+    /// The candidates never skip a prefix that is all definitions: compare with trying every
+    /// prefix, over the paragraphs of the tests above and some definition shapes.
+    #[test]
+    fn definition_candidates_keep_every_possible_prefix() {
+        let blocks: &[&[&str]] = &[
+            &["[x]: http://a", "--- {.a}"],
+            &["[x]: http://a", "[y]: http://b", "-- {.a}"],
+            &["[x]:", "  http://a", "  \"t\"", "-- {.a}"],
+            &["[x]: http://a 'title'  ", "text"],
+            &["[x]: http://a (title)\t", "text"],
+            &["[x]: http://a", "\"title", "over lines\"", "text"],
+            &["[foo", "bar]: /url", "text"],
+            &["[x]: <http://a>", "[y]:", "<b> \"t\"", "text"],
+            &["[x]: http://a", "text", "[y]: http://b"],
+            &["[l](u \"t", "t\")", "[x]: y"],
+        ];
+        let options = comrak::Options::default();
+        for block in blocks {
+            let limit = block.len();
+            let brute = (1..block.len())
+                .rev()
+                .find(|&k| {
+                    let arena = Arena::new();
+                    parse_document(&arena, &block[..k].join("\n"), &options)
+                        .first_child()
+                        .is_none()
+                })
+                .unwrap_or(0);
+            let brute = if block[0].starts_with('[') { brute } else { 0 };
+            assert_eq!(definition_lines(block, limit), brute, "{block:?}");
+        }
+    }
+
+    #[test]
+    fn headings_mode_example_parses_without_warnings() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/headings-mode");
+        let config = crate::config::Config::load(&dir.join("presenter.toml")).unwrap();
+        assert_eq!(config.slides.split, crate::config::SlideSplit::Headings);
+        let path = dir.join("slides.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let source = SourceInfo {
+            path,
+            kind: SourceKind::Markdown,
+            base_dir: dir,
+        };
+        let parsed = crate::markdown::parse(&source, &text, &config).unwrap();
+        assert_eq!(
+            parsed.diagnostics.iter().count(),
+            0,
+            "{:?}",
+            parsed.diagnostics
+        );
+        assert_eq!(parsed.deck.invariant_violations(), Vec::<String>::new());
+        let shape: Vec<usize> = parsed
+            .deck
+            .slides
+            .iter()
+            .map(|s| s.children.len())
+            .collect();
+        assert!(
+            shape.len() >= 4 && shape.iter().any(|&n| n > 0),
+            "{shape:?}"
+        );
     }
 
     fn footnote_names(slide: &RawSlide<'_>) -> Vec<String> {

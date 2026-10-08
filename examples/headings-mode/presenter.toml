@@ -1,0 +1,9 @@
+# A pandoc-style deck: slides start at headings, not at `---` / `--` lines
+# (docs/spec/markdown-dialect.md §2.3, docs/spec/config.md `[slides]`).
+#
+#   presenter build examples/headings-mode/slides.md
+
+[slides]
+split = "headings"       # `#` starts a horizontal slide, `##` a vertical slide under it
+slide_level = 2          # the heading level of an ordinary slide (`###` and deeper are content)
+incremental_lists = true # top-level list items appear one by one (`.no-incremental` opts out)
