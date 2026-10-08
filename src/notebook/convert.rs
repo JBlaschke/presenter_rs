@@ -9,16 +9,30 @@
 //!   merged into the config ([`Config::merge_front_matter`]) *before* the cells are converted,
 //!   so `notebook:` tag lists, `markdown:` options, … from the notebook take effect. The
 //!   config tables (`slides`, `markdown`, `math`, `notebook`) of the layers are merged key by
-//!   key, `reveal` too. A first markdown cell that holds nothing but front matter is deck
-//!   metadata only: it opens no slide and adds no content (like front matter in a Markdown
-//!   file). A `---` block at the start of any *other* markdown cell is ordinary Markdown
-//!   (what Jupyter shows), with a [`codes::FRONT_MATTER_IGNORED`] warning.
+//!   key, `reveal` too; an invalid table names the layer it came from. First-cell front
+//!   matter whose lines are only YAML comments (`---\n# Intro\n---`) sets nothing and is
+//!   not shown: [`codes::FRONT_MATTER_EMPTY`] says so. A `---` block at the start of any
+//!   *other* markdown cell that sets deck metadata (a [`DeckMeta`] field, `reveal` or a
+//!   config table) is not deck metadata either: it is removed from that cell, with a
+//!   [`codes::FRONT_MATTER_IGNORED`] warning (as the `frontmatter.ipynb` fixture expects).
+//!   Any other `---` block there (prose such as `Note: this matters` between rules) is
+//!   Markdown.
 //! - **Removal** (§3): a cell tagged with one of `[notebook] remove_cell_tags`, a `skip`
-//!   slide type and an unrecognized `cell_type` (already reported by `nbformat`) are ignored.
+//!   slide type and an unrecognized `cell_type` (already reported by `nbformat`) are ignored:
+//!   they open no slide.
 //! - **Structure** (§2): `slide` opens a top-level slide, `subslide` a vertical child of the
 //!   current top-level slide (or a top-level slide when there is none yet). Anything before
 //!   the first slide marker lands on slide 1, which the first such cell creates. The
 //!   *current slide* (`cur`) is the last child of the last top-level slide, else that slide.
+//! - **Contentless cells** add nothing to any slide: the first markdown cell when it holds
+//!   only front matter (deck metadata, like front matter in a Markdown file), a code cell
+//!   that is both `hide_input` and `hide_output` (§2: "omitted entirely") and a raw cell
+//!   that is not shown. Their slide type counts once a slide exists (a `slide` cell opens an
+//!   empty slide the next cells fill, as in nbconvert) and their `metadata.presenter`
+//!   applies to the slide they open (ignored with a warning otherwise). Before the first
+//!   slide they open nothing, like a leading separator in a Markdown file (a hidden setup
+//!   cell at the top adds no empty slide 1): the next cell creates slide 1, and their
+//!   `metadata.presenter` applies to that slide.
 //! - **Placement**: a `notes` slide type or tag appends the rendered cell to `cur.notes`;
 //!   everything else appends blocks to `cur`, as a fragment for a `fragment` slide type or
 //!   tag. Tags and slide types combine: a `slide` cell tagged `fragment` opens a slide whose
@@ -35,17 +49,24 @@
 //! - **Code cells**: [`Block::Cell`] with the outputs of [`render_outputs`] (T32); relative
 //!   `src`/`poster` URLs in `text/html` outputs go through T12's raw-HTML asset rewriting.
 //!   `hide_input` / `hide_output` come from the configured tag lists and
-//!   `metadata.jupyter.source_hidden` / `outputs_hidden`; a cell with both is omitted.
+//!   `metadata.jupyter.source_hidden` / `outputs_hidden` (a cell with both is contentless,
+//!   see above). `:::notes` in a `text/markdown` output go to `cur.notes` unless the outputs
+//!   are hidden.
 //! - **Raw cells**: `raw_mimetype` (or `format`) `text/html` → the source as a
 //!   [`Block::Html`], relative URLs rewritten like raw HTML in Markdown; any other raw cell
-//!   is skipped with a [`codes::RAW_CELL_SKIPPED`] warning.
+//!   is skipped with a [`codes::RAW_CELL_SKIPPED`] warning (and is contentless).
 //! - **Per-cell `metadata.presenter`** (`{ "layout", "classes", "attrs" }`) goes through the
 //!   slide-attribute normalization of Markdown separators (`SlideAttrs`, so shorthands such
 //!   as `background` work) and applies to the slide the cell opens (a `slide`/`subslide`
-//!   cell, or the cell that creates slide 1); on any other cell it is ignored with a
-//!   [`codes::OVERRIDE_IGNORED`] warning. A lifted heading attribute wins over it, as a
-//!   heading wins over a separator in Markdown.
-//! - **Titles**: a slide's title is the first heading of its Markdown-rendered HTML blocks.
+//!   cell, or the cell that creates slide 1; in a split markdown cell that opens no slide
+//!   itself, the first slide one of its separators opens); on any other cell it is ignored
+//!   with a [`codes::OVERRIDE_IGNORED`] warning. A separator's or a lifted heading's
+//!   attributes win over it, as a heading wins over a separator in Markdown.
+//! - **Titles** (§2): a slide's title is the plain text of the first heading in the slide's
+//!   first [`Block::Html`]: by the Markdown rule for a Markdown cell, the first `<h1>`–`<h6>`
+//!   element for a raw HTML cell (found by T12's HTML tokenizer: headings in comments,
+//!   raw-text elements such as `<script>` and `<template>` content do not count). A slide
+//!   whose first HTML block has no heading has none.
 //! - **Spans**: a slide's span is the whole source of the cell that opened it
 //!   (`cell: Some(index)`); a slide opened by a separator inside a split cell spans the
 //!   separator's lines.
@@ -76,8 +97,9 @@ use crate::markdown::attrs::{ParsedAttrs, SlideAttrs};
 use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::{meta_from_json, parse_front_matter, split_front_matter};
 use crate::markdown::render::{
-    RenderCtx, RenderMode, Rendered, has_math_markup, render_fragment, render_fragment_with_lift,
-    render_nodes, rewrite_html_assets, rewrite_slide_assets,
+    RenderCtx, RenderMode, Rendered, has_math_markup, html_start_tags, percent_decode,
+    render_fragment, render_fragment_with_lift, render_nodes, rewrite_html_assets,
+    rewrite_slide_assets,
 };
 use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
 use crate::notebook::nbformat::{self, Cell, CellType, MultilineString, Notebook, SlideType};
@@ -102,9 +124,13 @@ pub mod codes {
     pub const RAW_CELL_SKIPPED: &str = "raw-cell-skipped";
     /// An `attachment:NAME` URL whose name is not among the cell's attachments.
     pub const MISSING_ATTACHMENT: &str = "missing-attachment";
-    /// A `---` front matter block at the start of a markdown cell that is not the first
-    /// markdown cell; it is rendered as Markdown.
+    /// A `---` front matter block that sets deck metadata at the start of a markdown cell
+    /// that is not the first markdown cell; it is removed from the cell and does not change
+    /// the deck metadata.
     pub const FRONT_MATTER_IGNORED: &str = "front-matter-ignored";
+    /// Front matter of the first markdown cell that sets nothing although it has text (only
+    /// YAML comments, e.g. `# Intro` between `---` lines); that text is not shown.
+    pub const FRONT_MATTER_EMPTY: &str = "front-matter-empty";
 }
 
 /// The tag that makes a cell a fragment (spec §3; not configurable).
@@ -118,10 +144,24 @@ const SEPARATOR_NOT_RECOGNIZED: &str = "separator-not-recognized";
 /// The splitter's report of a leading `--`, which in a cell opens a vertical slide.
 const ORPHAN_VERTICAL: &str = "orphan-vertical";
 
-/// `src`, `href` or `poster` values that still point at an attachment after rewriting.
+/// `src`, `href` or `poster` values (double- or single-quoted) that still point at an
+/// attachment after rewriting; the name is group 1 or 2, as written in the HTML.
 static ATTACHMENT_URL: LazyLock<Regex> = LazyLock::new(|| {
     // A constant pattern covered by the unit tests: compiling it cannot fail.
-    Regex::new(r#"(?:src|href|poster)="attachment:([^"]*)""#).expect("attachment URL regex")
+    Regex::new(r#"(?i:src|href|poster)\s*=\s*(?:"attachment:([^"]*)"|'attachment:([^']*)')"#)
+        .expect("attachment URL regex")
+});
+
+/// An HTML comment, possibly unclosed (for the plain text of a heading).
+static HTML_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
+    // A constant pattern covered by the unit tests: compiling it cannot fail.
+    Regex::new(r"(?s)<!--.*?(?:-->|\z)").expect("HTML comment regex")
+});
+
+/// An HTML tag (for the plain text of a heading).
+static HTML_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    // A constant pattern covered by the unit tests: compiling it cannot fail.
+    Regex::new(r"<[^>]*>").expect("HTML tag regex")
 });
 
 /// Converts a parsed notebook into a [`Deck`] (see the module docs).
@@ -132,8 +172,9 @@ static ATTACHMENT_URL: LazyLock<Regex> = LazyLock::new(|| {
 /// to `diags` with the notebook path and cell spans.
 ///
 /// # Errors
-/// [`Error::FrontMatter`] for invalid `metadata.presenter` or first-cell front matter (the
-/// message names its origin), or front matter the config rejects; [`Error::Parse`] for a
+/// [`Error::FrontMatter`] for invalid `metadata.presenter` or first-cell front matter,
+/// including config tables or a `reveal.plugins` list the config rejects (the message
+/// starts with its origin: `metadata.presenter: ` or `cell N: `); [`Error::Parse`] for a
 /// separator with an unbalanced quote in a split markdown cell.
 pub fn convert(
     nb: &Notebook,
@@ -143,8 +184,11 @@ pub fn convert(
     diags: &mut Diagnostics,
 ) -> Result<Deck> {
     let front = find_front_matter(nb);
-    let meta = deck_meta(nb, front.as_ref())?;
-    config.merge_front_matter(&meta)?;
+    let (meta, layers) = deck_meta(nb, front.as_ref())?;
+    merge_config(config, &meta, &layers)?;
+    if let Some(warning) = front.as_ref().and_then(empty_front_matter) {
+        diags.push(warning.with_path(&source.path));
+    }
     let mut converter = Converter::new(nb, source, config, front, assets, diags);
     for (index, cell) in nb.cells.iter().enumerate() {
         converter.cell(index, cell)?;
@@ -188,23 +232,51 @@ fn find_front_matter(nb: &Notebook) -> Option<FrontMatter<'_>> {
     })
 }
 
-/// Deck metadata from the three notebook layers of spec §5 (later wins).
-fn deck_meta(nb: &Notebook, front: Option<&FrontMatter<'_>>) -> Result<DeckMeta> {
+/// One layer of deck metadata and where it came from (`metadata.presenter`, `cell N`).
+type Layer = (String, DeckMeta);
+
+/// Deck metadata from the three notebook layers of spec §5 (later wins), and the two layers
+/// that may carry config tables, with their origin.
+fn deck_meta(nb: &Notebook, front: Option<&FrontMatter<'_>>) -> Result<(DeckMeta, Vec<Layer>)> {
+    let mut layers = Vec::new();
+    if let Some(presenter) = nb.presenter_meta() {
+        let context = "metadata.presenter".to_owned();
+        let layer = meta_from_json(presenter).map_err(|err| in_context(err, &context))?;
+        layers.push((context, layer));
+    }
+    if let Some(front) = front {
+        let context = format!("cell {}", front.cell);
+        let layer = parse_front_matter(front.yaml).map_err(|err| {
+            let hint = "(a `---` block at the start of the first markdown cell is read as \
+                        YAML front matter)";
+            match in_context(err, &context) {
+                Error::FrontMatter(message) => Error::FrontMatter(format!("{message} {hint}")),
+                other => other,
+            }
+        })?;
+        layers.push((context, layer));
+    }
     let mut meta = DeckMeta {
         title: nb.title().map(str::to_owned),
         ..DeckMeta::default()
     };
-    if let Some(presenter) = nb.presenter_meta() {
-        let layer =
-            meta_from_json(presenter).map_err(|err| in_context(err, "metadata.presenter"))?;
-        overlay(&mut meta, layer);
+    for (_, layer) in &layers {
+        overlay(&mut meta, layer.clone());
     }
-    if let Some(front) = front {
-        let layer = parse_front_matter(front.yaml)
-            .map_err(|err| in_context(err, &format!("cell {}", front.cell)))?;
-        overlay(&mut meta, layer);
+    Ok((meta, layers))
+}
+
+/// Merges the deck metadata into `config`. Every layer is first merged on its own, in
+/// order, into a scratch copy, so that an invalid config table or `reveal.plugins` list
+/// names the layer it came from.
+fn merge_config(config: &mut Config, meta: &DeckMeta, layers: &[Layer]) -> Result<()> {
+    let mut scratch = config.clone();
+    for (context, layer) in layers {
+        scratch
+            .merge_front_matter(layer)
+            .map_err(|err| in_context(err, context))?;
     }
-    Ok(meta)
+    config.merge_front_matter(meta)
 }
 
 /// Prefixes a front matter error message with where the metadata came from.
@@ -213,6 +285,50 @@ fn in_context(err: Error, context: &str) -> Error {
         Error::FrontMatter(message) => Error::FrontMatter(format!("{context}: {message}")),
         other => other,
     }
+}
+
+/// A [`codes::FRONT_MATTER_EMPTY`] warning (without path) when the first markdown cell's
+/// front matter sets nothing and has YAML comments: Jupyter shows them as Markdown (`# Intro`
+/// between two rules), here they would otherwise vanish silently.
+fn empty_front_matter(front: &FrontMatter<'_>) -> Option<Diagnostic> {
+    let comments = front
+        .yaml
+        .lines()
+        .any(|line| line.trim_start().starts_with('#'));
+    if !comments || !parse_front_matter(front.yaml).is_ok_and(|meta| meta == DeckMeta::default()) {
+        return None;
+    }
+    let message = "the `---` block at the start of the first markdown cell is read as YAML \
+                   front matter and sets nothing; its text (YAML comments, such as `# …` \
+                   lines) is not shown";
+    let span = SourceSpan {
+        start_line: 1,
+        end_line: front.consumed,
+        cell: Some(front.cell),
+    };
+    Some(Diagnostic::warning(codes::FRONT_MATTER_EMPTY, message).with_span(span))
+}
+
+/// Front matter that sets deck metadata: a [`DeckMeta`] field, `reveal` options or a config
+/// table. Unknown keys alone do not count: `Note: this matters` between two `---` rules in
+/// a later cell is prose.
+fn sets_deck_metadata(meta: &DeckMeta) -> bool {
+    let DeckMeta {
+        title,
+        subtitle,
+        author,
+        date,
+        description,
+        lang,
+        theme,
+        reveal,
+        vars,
+    } = meta;
+    [title, subtitle, author, date, description, lang, theme]
+        .iter()
+        .any(|field| field.is_some())
+        || !reveal.is_empty()
+        || CONFIG_TABLES.iter().any(|table| vars.contains_key(*table))
 }
 
 /// Lays `later` over `meta`: set string fields replace, `reveal` keys replace, `vars` keys
@@ -281,6 +397,11 @@ struct Converter<'a> {
     top: Option<Slide>,
     /// The cell being converted opened (or created) the current slide.
     opened_here: bool,
+    /// `metadata.presenter` of contentless cells before slide 1, for slide 1.
+    pending: Vec<(SourceSpan, &'a Value)>,
+    /// `metadata.presenter` of the split markdown cell being converted, for the first slide
+    /// one of its separators opens.
+    deferred: Option<(SourceSpan, &'a Value)>,
     features: Features,
 }
 
@@ -304,6 +425,8 @@ impl<'a> Converter<'a> {
             done: Vec::new(),
             top: None,
             opened_here: false,
+            pending: Vec::new(),
+            deferred: None,
             features: Features::default(),
         }
     }
@@ -315,40 +438,79 @@ impl<'a> Converter<'a> {
         if cell.cell_type == CellType::Unknown
             || slide_type == SlideType::Skip
             || has_any(&tags, &self.config.notebook.remove_cell_tags)
-            || self.is_front_matter_only(index)
         {
             return Ok(());
         }
-        self.opened_here = false;
-        match slide_type {
-            SlideType::Slide => self.open(false, cell.span(index)),
-            SlideType::Subslide => self.open(true, cell.span(index)),
-            _ => {}
+        let hidden = self.hidden(cell, &tags);
+        let contentless = self.is_contentless(index, cell, hidden);
+        self.structure(index, cell, slide_type, contentless);
+        let notes = slide_type == SlideType::Notes || has_tag(&tags, NOTES_TAG);
+        let split = cell.cell_type == CellType::Markdown
+            && !notes
+            && !contentless
+            && self.config.notebook.split_markdown_cells;
+        self.overrides(index, cell, contentless, split);
+        if contentless {
+            // Only a skipped raw cell's warning is left to give.
+            if cell.cell_type == CellType::Raw {
+                self.raw_html(index, cell)?;
+            }
+            return Ok(());
         }
-        if self.top.is_none() {
-            // ensure_first_slide: content before the first slide marker is slide 1.
-            self.open(false, cell.span(index));
-        }
-        self.apply_overrides(index, cell);
-        if slide_type == SlideType::Notes || has_tag(&tags, NOTES_TAG) {
+        if notes {
             return self.notes_cell(index, cell);
         }
         let fragment = slide_type == SlideType::Fragment || has_tag(&tags, FRAGMENT_TAG);
         match cell.cell_type {
             CellType::Markdown => self.markdown_cell(index, cell, fragment),
-            CellType::Code => self.code_cell(index, cell, tags, fragment),
+            CellType::Code => self.code_cell(index, cell, tags, hidden, fragment),
             CellType::Raw => self.raw_cell(index, cell, fragment),
             CellType::Unknown => Ok(()),
         }
     }
 
-    /// The first markdown cell holds front matter and nothing else.
-    fn is_front_matter_only(&self, index: usize) -> bool {
-        self.front
-            .is_some_and(|front| front.cell == index && front.rest.trim().is_empty())
+    /// `(hide_input, hide_output)` of a code cell (spec §3: the configured tag lists and
+    /// `metadata.jupyter`).
+    fn hidden(&self, cell: &Cell, tags: &[String]) -> (bool, bool) {
+        let config = &self.config.notebook;
+        (
+            cell.is_hidden_source() || has_any(tags, &config.hide_input_tags),
+            cell.is_hidden_outputs() || has_any(tags, &config.hide_output_tags),
+        )
     }
 
-    /// Opens a top-level slide, or a vertical child of the current top-level slide.
+    /// The cell adds nothing to any slide: the first markdown cell holding only front
+    /// matter, a code cell whose input and output are both hidden (`hidden`, §2: "omitted
+    /// entirely") or a raw cell that is not shown (module docs).
+    fn is_contentless(&self, index: usize, cell: &Cell, hidden: (bool, bool)) -> bool {
+        match cell.cell_type {
+            CellType::Markdown => self
+                .front
+                .is_some_and(|front| front.cell == index && front.rest.trim().is_empty()),
+            CellType::Code => hidden == (true, true),
+            CellType::Raw => !is_html_raw(cell),
+            CellType::Unknown => false,
+        }
+    }
+
+    /// The structure step of §2: `slide` opens a top-level slide, `subslide` a vertical
+    /// child, and any cell creates slide 1 when there is none yet (ensure_first_slide). A
+    /// contentless cell before the first slide opens nothing (module docs).
+    fn structure(&mut self, index: usize, cell: &Cell, slide_type: SlideType, contentless: bool) {
+        self.opened_here = false;
+        if contentless && self.top.is_none() {
+            return;
+        }
+        match slide_type {
+            SlideType::Slide => self.open(false, cell.span(index)),
+            SlideType::Subslide => self.open(true, cell.span(index)),
+            _ if self.top.is_none() => self.open(false, cell.span(index)),
+            _ => {}
+        }
+    }
+
+    /// Opens a top-level slide, or a vertical child of the current top-level slide. Slide 1
+    /// receives the overrides of the contentless cells before it.
     fn open(&mut self, vertical: bool, span: SourceSpan) {
         let slide = Slide {
             span: Some(span),
@@ -360,6 +522,14 @@ impl<'a> Converter<'a> {
             self.done.push(previous);
         }
         self.opened_here = true;
+        self.apply_pending();
+    }
+
+    /// Applies the overrides waiting for slide 1 (the current slide).
+    fn apply_pending(&mut self) {
+        for (span, value) in std::mem::take(&mut self.pending) {
+            self.apply_presenter(value, &span);
+        }
     }
 
     /// The slide receiving content: the last child of the open top-level slide, else that
@@ -413,27 +583,50 @@ impl<'a> Converter<'a> {
         attrs.apply_to(self.cur());
     }
 
-    /// Per-cell `metadata.presenter` (spec §3).
-    fn apply_overrides(&mut self, index: usize, cell: &Cell) {
+    /// Per-cell `metadata.presenter` (spec §3): applied to the slide the cell opened, kept
+    /// for slide 1 (a contentless cell before it) or for the first slide a separator of a
+    /// `split` cell opens, else ignored with a warning.
+    fn overrides(&mut self, index: usize, cell: &'a Cell, contentless: bool, split: bool) {
+        self.deferred = None;
         let Some(value) = cell.presenter_overrides() else {
             return;
         };
         let span = cell.span(index);
-        if !self.opened_here {
-            let message = "metadata.presenter only applies to the slide a cell opens \
-                           (slide_type `slide` or `subslide`); this cell opens none, ignored";
-            self.warn(codes::OVERRIDE_IGNORED, message, &span);
-            return;
+        if self.opened_here {
+            self.apply_presenter(value, &span);
+        } else if contentless && self.top.is_none() {
+            self.pending.push((span, value));
+        } else if split {
+            self.deferred = Some((span, value));
+        } else {
+            self.override_ignored(&span, false);
         }
+    }
+
+    fn override_ignored(&mut self, span: &SourceSpan, split: bool) {
+        let opens = if split {
+            "slide_type `slide` or `subslide`, or a separator in a split markdown cell"
+        } else {
+            "slide_type `slide` or `subslide`"
+        };
+        let message = format!(
+            "metadata.presenter only applies to the slide a cell opens ({opens}); this cell \
+             opens none, ignored"
+        );
+        self.warn(codes::OVERRIDE_IGNORED, message, span);
+    }
+
+    /// Applies one cell's `metadata.presenter` to the current slide.
+    fn apply_presenter(&mut self, value: &Value, span: &SourceSpan) {
         let (parsed, problems) = presenter_attrs(value);
         for problem in problems {
             self.warn(
                 codes::OVERRIDE_INVALID,
                 format!("metadata.presenter: {problem}"),
-                &span,
+                span,
             );
         }
-        self.apply_attrs(SlideAttrs::from_parsed(parsed), &span);
+        self.apply_attrs(SlideAttrs::from_parsed(parsed), span);
     }
 
     /// Runs `f` with a notebook-mode [`RenderCtx`]; its diagnostics get the notebook path
@@ -465,54 +658,69 @@ impl<'a> Converter<'a> {
     /// Adds a rendered Markdown fragment to the current slide.
     fn push_rendered(&mut self, rendered: Rendered, fragment: bool) {
         self.features.merge(rendered.features);
-        let cur = self.cur();
         if !rendered.html.is_empty() {
-            if cur.title.is_none() {
-                cur.title = rendered.title;
-            }
-            cur.blocks
-                .push(Block::html(wrap_fragment(rendered.html, fragment)));
+            self.push_html(rendered.html, rendered.title, fragment);
         }
         if let Some(notes) = rendered.notes {
-            append_notes(cur, &notes);
+            append_notes(self.cur(), &notes);
         }
     }
 
-    /// The Markdown source of a cell (front matter removed from the first markdown cell)
-    /// with attachments rewritten, and the number of lines removed before it.
+    /// Adds an HTML block to the current slide; `title` (the heading of this block) is the
+    /// slide's title when this is the slide's first HTML block (§2).
+    fn push_html(&mut self, html: String, title: Option<String>, fragment: bool) {
+        let cur = self.cur();
+        if !cur
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Html { .. }))
+        {
+            cur.title = title;
+        }
+        cur.blocks.push(Block::html(wrap_fragment(html, fragment)));
+    }
+
+    /// The Markdown source of a cell (front matter removed) with attachments rewritten, and
+    /// the number of lines removed before it.
     fn markdown_text(&mut self, index: usize, cell: &'a Cell) -> (Cow<'a, str>, usize) {
         let front = self.front.filter(|front| front.cell == index);
         let (text, offset) = match front {
             Some(front) => (front.rest, front.consumed),
-            None => {
-                self.check_ignored_front_matter(index, cell);
-                (cell.source.as_str(), 0)
-            }
+            None => self.without_ignored_front_matter(index, cell),
         };
         (self.with_attachments(index, cell, text), offset)
     }
 
-    /// Warns about a `---` block that would be front matter in the first markdown cell.
-    fn check_ignored_front_matter(&mut self, index: usize, cell: &Cell) {
-        let Some((yaml, _, consumed)) = split_front_matter(cell.source.as_str()) else {
-            return;
+    /// The source of a markdown cell other than the first one, without a leading `---` block
+    /// that sets deck metadata ([`sets_deck_metadata`]): such a block is not deck metadata
+    /// (§5) and is removed with a warning. Other `---` blocks are Markdown.
+    fn without_ignored_front_matter(&mut self, index: usize, cell: &'a Cell) -> (&'a str, usize) {
+        let source = cell.source.as_str();
+        let Some((yaml, rest, consumed)) = split_front_matter(source) else {
+            return (source, 0);
         };
-        if parse_front_matter(yaml).is_ok_and(|meta| meta != DeckMeta::default()) {
-            let message = "front matter is only read from the first markdown cell; this \
-                           `---` block is rendered as Markdown";
-            let span = SourceSpan {
-                start_line: 1,
-                end_line: consumed,
-                cell: Some(index),
-            };
-            self.warn(codes::FRONT_MATTER_IGNORED, message, &span);
+        if !parse_front_matter(yaml).is_ok_and(|meta| sets_deck_metadata(&meta)) {
+            return (source, 0);
         }
+        let message = "front matter is only read from the first markdown cell; this `---` \
+                       block is ignored and not shown";
+        let span = SourceSpan {
+            start_line: 1,
+            end_line: consumed,
+            cell: Some(index),
+        };
+        self.warn(codes::FRONT_MATTER_IGNORED, message, &span);
+        (rest, consumed)
     }
 
     fn markdown_cell(&mut self, index: usize, cell: &'a Cell, fragment: bool) -> Result<()> {
         let (text, offset) = self.markdown_text(index, cell);
         if self.config.notebook.split_markdown_cells {
-            return self.split_cell(index, cell, &text, offset, fragment);
+            self.split_cell(index, cell, &text, offset, fragment)?;
+            if let Some((span, _)) = self.deferred.take() {
+                self.override_ignored(&span, true);
+            }
+            return Ok(());
         }
         let lift = self.cur_is_empty();
         let span = cell.span(index);
@@ -593,7 +801,9 @@ impl<'a> Converter<'a> {
 
     /// A slide opened by a separator inside a split markdown cell. A separator that starts
     /// the cell which just opened an empty slide opens nothing new (as a leading separator
-    /// opens slide 1 itself in a Markdown deck); its attributes go to that slide.
+    /// opens slide 1 itself in a Markdown deck); its attributes go to that slide. The first
+    /// slide a separator opens receives the cell's deferred `metadata.presenter` (before
+    /// the separator's own attributes, which win).
     fn open_part<'n>(
         &mut self,
         part: &Part<'n, '_>,
@@ -608,6 +818,9 @@ impl<'a> Converter<'a> {
         };
         if !(leading && self.opened_here && self.cur_is_empty()) {
             self.open(vertical, span.clone());
+            if let Some((at, value)) = self.deferred.take() {
+                self.apply_presenter(value, &at);
+            }
         }
         self.apply_attrs(raw.attrs, &span);
         self.render_part(part, &raw.nodes, &span)
@@ -628,20 +841,18 @@ impl<'a> Converter<'a> {
         Ok(())
     }
 
+    /// A code cell (never both hidden: that cell is contentless) → [`Block::Cell`];
+    /// `:::notes` of its Markdown outputs go to the slide's notes unless the outputs are
+    /// hidden.
     fn code_cell(
         &mut self,
         index: usize,
         cell: &Cell,
         tags: Vec<String>,
+        (hide_input, hide_output): (bool, bool),
         fragment: bool,
     ) -> Result<()> {
-        let config = &self.config.notebook;
-        let hide_input = cell.is_hidden_source() || has_any(&tags, &config.hide_input_tags);
-        let hide_output = cell.is_hidden_outputs() || has_any(&tags, &config.hide_output_tags);
-        if hide_input && hide_output {
-            return Ok(());
-        }
-        let outputs = self.outputs(index, cell)?;
+        let (outputs, notes) = self.outputs(index, cell)?;
         self.features.code = true;
         let block = Block::Cell(NotebookCell {
             index,
@@ -656,17 +867,25 @@ impl<'a> Converter<'a> {
             tags,
             metadata: cell.metadata.clone(),
         });
-        self.cur().blocks.push(block);
+        let cur = self.cur();
+        cur.blocks.push(block);
+        if let Some(notes) = notes.filter(|_| !hide_output) {
+            append_notes(cur, &notes);
+        }
         Ok(())
     }
 
-    /// The cell's outputs (T32), with `text/html` URLs rewritten to assets.
-    fn outputs(&mut self, index: usize, cell: &Cell) -> Result<Vec<CellOutput>> {
+    /// The cell's outputs (T32), with `text/html` URLs rewritten to assets, and the
+    /// `:::notes` of its `text/markdown` outputs.
+    fn outputs(&mut self, index: usize, cell: &Cell) -> Result<(Vec<CellOutput>, Option<String>)> {
         let span = cell.span(index);
         let mut local = Diagnostics::new();
-        // `text/markdown` outputs render into their own registry (see `render_outputs`).
+        // `text/markdown` outputs render into their own registry (see `render_outputs`) and
+        // their notes and features are collected here.
         let mut md_assets = AssetRegistry::new();
         let mut md_diags = Diagnostics::new();
+        let mut md_notes: Option<String> = None;
+        let mut md_features = Features::default();
         let (opts, base_dir) = (&self.opts, self.source.base_dir.as_path());
         let mut md = |text: &str| -> Result<String> {
             let mut ctx = RenderCtx {
@@ -676,7 +895,12 @@ impl<'a> Converter<'a> {
                 diagnostics: &mut md_diags,
                 missing_asset_is_error: false,
             };
-            render_fragment(text, opts, &mut ctx).map(|rendered| rendered.html)
+            let rendered = render_fragment(text, opts, &mut ctx)?;
+            md_features.merge(rendered.features);
+            if let Some(notes) = rendered.notes {
+                md_notes.get_or_insert_with(String::new).push_str(&notes);
+            }
+            Ok(rendered.html)
         };
         let (mut outputs, features) = render_outputs(
             &cell.outputs,
@@ -687,6 +911,9 @@ impl<'a> Converter<'a> {
         )?;
         self.assets.merge(md_assets);
         local.extend(md_diags);
+        // `notes` follows the slides' notes (`finish_slide`), which hidden outputs skip.
+        md_features.notes = false;
+        self.features.merge(md_features);
         let mut ctx = RenderCtx {
             assets: &mut *self.assets,
             base_dir,
@@ -708,14 +935,13 @@ impl<'a> Converter<'a> {
                 .into_iter()
                 .map(|d| d.with_path(path).with_span(span.clone())),
         );
-        Ok(outputs)
+        Ok((outputs, md_notes))
     }
 
     fn raw_cell(&mut self, index: usize, cell: &'a Cell, fragment: bool) -> Result<()> {
         if let Some(html) = self.raw_html(index, cell)? {
-            self.cur()
-                .blocks
-                .push(Block::html(wrap_fragment(html, fragment)));
+            let title = html_heading_text(&html);
+            self.push_html(html, title, fragment);
         }
         Ok(())
     }
@@ -728,8 +954,8 @@ impl<'a> Converter<'a> {
             return Ok(None);
         }
         let span = cell.span(index);
-        let mimetype = cell.raw_mimetype();
-        if !mimetype.is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html")) {
+        if !is_html_raw(cell) {
+            let mimetype = cell.raw_mimetype();
             let why = match mimetype {
                 Some(mime) => format!("its raw_mimetype is `{mime}`"),
                 None => "it has no raw_mimetype".to_owned(),
@@ -796,7 +1022,8 @@ impl<'a> Converter<'a> {
     }
 
     /// Registers one attachment (the first MIME type in `mime_priority`, else the first
-    /// one) by its bytes; `None` with a warning when its payload cannot be decoded.
+    /// one) by its bytes; `None` with a warning when it has no data or its payload cannot
+    /// be decoded.
     fn register_attachment(
         &mut self,
         index: usize,
@@ -805,12 +1032,16 @@ impl<'a> Converter<'a> {
         bundle: &BTreeMap<String, MultilineString>,
     ) -> Option<String> {
         let priority = &self.config.notebook.mime_priority;
-        let (mime, payload) = priority
+        let chosen = priority
             .iter()
             .find_map(|mime| bundle.get_key_value(mime))
-            .or_else(|| bundle.iter().next())?;
-        match decode_attachment(payload.as_str()) {
-            Ok(bytes) => Some(self.assets.register_bytes(bytes, mime, name)),
+            .or_else(|| bundle.iter().next());
+        let decoded = match chosen {
+            Some((mime, payload)) => decode_attachment(payload.as_str()).map(|bytes| (mime, bytes)),
+            None => Err("no data".to_owned()),
+        };
+        match decoded {
+            Ok((mime, bytes)) => Some(self.assets.register_bytes(bytes, mime, name)),
             Err(reason) => {
                 let message = format!("attachment '{name}' skipped: {reason}");
                 self.warn(
@@ -823,12 +1054,19 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Warns about `attachment:` URLs left in rendered HTML whose name the cell lacks.
+    /// Warns about `attachment:` URLs left in rendered HTML whose name the cell lacks. The
+    /// name is compared and reported as written in the source (HTML entities and percent
+    /// escapes decoded); one whose attachment exists was already reported as skipped.
     fn check_attachments(&mut self, html: &str, cell: &Cell, span: &SourceSpan) {
         let missing: Vec<String> = ATTACHMENT_URL
             .captures_iter(html)
-            .map(|caps| caps[1].to_owned())
-            .filter(|name| !cell.attachments.contains_key(name))
+            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)))
+            .filter_map(|written| {
+                let written = written.as_str();
+                let decoded = percent_decode(&html_escape::decode_html_entities(written));
+                let known = |name: &str| cell.attachments.contains_key(name);
+                (!known(written) && !known(&decoded)).then_some(decoded)
+            })
             .collect();
         for name in missing {
             let message = format!("`attachment:{name}`: the cell has no attachment `{name}`");
@@ -836,14 +1074,16 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Closes the walk: one empty slide for a notebook without content, slide background
-    /// assets, `empty-slide` warnings and the derived features.
+    /// Closes the walk: one empty slide for a notebook without content (it receives the
+    /// overrides of contentless cells), slide background assets, `empty-slide` warnings and
+    /// the derived features.
     fn finish(mut self) -> Result<(Vec<Slide>, Features)> {
+        if self.top.is_none() {
+            self.top = Some(Slide::new());
+            self.apply_pending();
+        }
         if let Some(top) = self.top.take() {
             self.done.push(top);
-        }
-        if self.done.is_empty() {
-            self.done.push(Slide::new());
         }
         let mut slides = std::mem::take(&mut self.done);
         for (i, slide) in slides.iter_mut().enumerate() {
@@ -932,6 +1172,70 @@ fn holds<'n>(slide: &RawSlide<'n>, node: &'n AstNode<'n>) -> bool {
 
 fn has_tag(tags: &[String], tag: &str) -> bool {
     tags.iter().any(|t| t == tag)
+}
+
+/// A raw cell that is shown: `raw_mimetype` (or `format`) `text/html` (§2).
+fn is_html_raw(cell: &Cell) -> bool {
+    cell.raw_mimetype()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+}
+
+/// The heading elements, for raw HTML titles.
+const HEADINGS: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
+
+/// Plain text of the first `<h1>`–`<h6>` element of raw HTML, found by T12's HTML tokenizer
+/// ([`html_start_tags`]): headings inside comments, raw-text elements (`<script>`,
+/// `<textarea>`, …) and `<template>` content do not count. The element ends at the first
+/// `</h1>`–`</h6>` (as in an HTML parser); comments and tags in it are removed (`<br>` → a
+/// space), entities decoded, white space collapsed. `None` when there is no heading, it is
+/// not closed or it is blank.
+fn html_heading_text(html: &str) -> Option<String> {
+    let mut inert_until = 0;
+    for (name, end) in html_start_tags(html) {
+        if end <= inert_until {
+            continue;
+        }
+        if name == "template" {
+            inert_until = end_tag(html, end, &["template"]).unwrap_or(html.len());
+        } else if HEADINGS.contains(&name.as_str()) {
+            let close = end_tag(html, end, &HEADINGS)?;
+            return plain_text(&html[end..close]);
+        }
+    }
+    None
+}
+
+/// Byte offset of the first end tag (`</name`, ASCII case-insensitive) of one of `names` at
+/// or after byte `from`.
+fn end_tag(html: &str, from: usize, names: &[&str]) -> Option<usize> {
+    let bytes = html.as_bytes();
+    html.get(from..)?
+        .match_indices("</")
+        .map(|(offset, _)| from + offset)
+        .find(|&lt| {
+            let after = &bytes[lt + 2..];
+            names.iter().any(|name| {
+                after.len() >= name.len()
+                    && after[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+                    && after
+                        .get(name.len())
+                        .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b'/' | b'>'))
+            })
+        })
+}
+
+/// The text of an HTML fragment: comments and tags removed (`<br>` → a space), entities
+/// decoded, white space collapsed; `None` when blank.
+fn plain_text(html: &str) -> Option<String> {
+    let html = HTML_COMMENT.replace_all(html, "");
+    let text = HTML_TAG.replace_all(&html, |caps: &regex::Captures<'_>| {
+        let tag = caps[0].to_ascii_lowercase();
+        let br = tag.starts_with("<br") && !tag[3..].starts_with(|c: char| c.is_alphanumeric());
+        if br { " " } else { "" }
+    });
+    let text = html_escape::decode_html_entities(&text);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
 }
 
 fn has_any(tags: &[String], configured: &[String]) -> bool {
@@ -1202,7 +1506,95 @@ mod tests {
         assert_eq!(decode_attachment("<svg/>").unwrap(), b"<svg/>");
         assert!(decode_attachment("  ").is_err());
         assert!(decode_attachment("!!!").is_err());
-        assert!(ATTACHMENT_URL.is_match("<img src=\"attachment:x.png\" />"));
+        let names: Vec<&str> = ATTACHMENT_URL
+            .captures_iter(
+                "<img src=\"attachment:x.png\" /> <img src='attachment:y z.png'> \
+                 <a HREF = \"attachment:w.svg\"> src=\"other:attachment:no\"",
+            )
+            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)))
+            .map(|name| name.as_str())
+            .collect();
+        assert_eq!(names, ["x.png", "y z.png", "w.svg"]);
+        assert_eq!(percent_decode("my%20plot.png"), "my plot.png");
+        assert_eq!(percent_decode("%C3%BC.png"), "ü.png");
+        // T12's decoder (shared with missing-asset resolution): exactly two hex digits.
+        assert_eq!(percent_decode("100%.png"), "100%.png");
+        assert_eq!(percent_decode("%+F%4"), "%+F%4");
+        assert_eq!(percent_decode("a%+Fb.png"), "a%+Fb.png");
+        assert_eq!(percent_decode("%-1%2f"), "%-1/");
+        assert_eq!(percent_decode("%FF"), "%FF", "not UTF-8: unchanged");
+    }
+
+    #[test]
+    fn raw_html_heading_text() {
+        let text = |html: &str| html_heading_text(html);
+        assert_eq!(text("<h1>A</h1>").as_deref(), Some("A"));
+        assert_eq!(
+            text("<p>x</p><H2 id=\"t\">Hello <b>big</b><br>world &lt;3</H2><h1>no</h1>").as_deref(),
+            Some("Hello big world <3")
+        );
+        assert_eq!(
+            text("<h3>a<span>b</span><BR />c</h3>").as_deref(),
+            Some("ab c")
+        );
+        assert_eq!(text("<header>x</header><hr><p>y</p>"), None);
+        assert_eq!(text("<h2> <img src=x> </h2>"), None);
+        assert_eq!(text("<h2>unclosed"), None);
+        // Headings that are not shown do not count.
+        assert_eq!(
+            text("<!-- <h1>old</h1> --><h2>New</h2>").as_deref(),
+            Some("New")
+        );
+        assert_eq!(text("<!-- <h1>Not</h1> --><p>x</p>"), None);
+        assert_eq!(
+            text("<script>document.write('<h1>js</h1>')</script><h3>Shown</h3>").as_deref(),
+            Some("Shown")
+        );
+        assert_eq!(
+            text("<TEXTAREA><h1>t</h1></textarea><style>h1{}</style><h4>S</h4>").as_deref(),
+            Some("S")
+        );
+        assert_eq!(
+            text("<template><h1>tpl</h1></Template ><h5>After</h5>").as_deref(),
+            Some("After")
+        );
+        assert_eq!(text("<template><h1>tpl</h1>"), None);
+        // Comments inside the heading and a closing tag of another level.
+        assert_eq!(
+            text("<h1 class='a>b'>One<!-- two --> three</h2>").as_deref(),
+            Some("One three")
+        );
+        assert_eq!(text("<h1>a<!-- </h1> -->").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn deck_metadata_predicates() {
+        let meta = |yaml: &str| parse_front_matter(yaml).unwrap();
+        assert!(sets_deck_metadata(&meta("title: x")));
+        assert!(sets_deck_metadata(&meta("lang: de")));
+        assert!(sets_deck_metadata(&meta("reveal: {controls: false}")));
+        assert!(sets_deck_metadata(&meta("notebook:")));
+        assert!(!sets_deck_metadata(&meta("Note: this matters")));
+        assert!(!sets_deck_metadata(&meta("# a comment")));
+        let front = |yaml| FrontMatter {
+            cell: 2,
+            yaml,
+            rest: "",
+            consumed: 3,
+        };
+        let warning = empty_front_matter(&front("# Intro to Pandas")).unwrap();
+        assert_eq!(warning.code, codes::FRONT_MATTER_EMPTY);
+        assert_eq!(
+            warning.span,
+            Some(SourceSpan {
+                start_line: 1,
+                end_line: 3,
+                cell: Some(2)
+            })
+        );
+        assert!(empty_front_matter(&front("")).is_none());
+        assert!(empty_front_matter(&front("{}")).is_none());
+        assert!(empty_front_matter(&front("# commented\ntitle: x")).is_none());
     }
 
     #[test]

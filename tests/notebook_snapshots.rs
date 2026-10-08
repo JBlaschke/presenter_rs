@@ -341,10 +341,142 @@ fn frontmatter_precedence_and_removal() {
     assert_eq!(cell_indices(first), [2]);
     let second = &deck.slides[1];
     assert_eq!(second.span.as_ref().and_then(|s| s.cell), Some(3));
-    // Only the first markdown cell's front matter is read: cell 3's `---` block is Markdown
-    // (what Jupyter shows), reported as front-matter-ignored.
-    assert!(html(&second.blocks[0]).contains("<h2>Second slide</h2>"));
+    // Only the first markdown cell's front matter is read: cell 3's `---` block is removed
+    // without changing the metadata (the fixture's expected shape), reported as
+    // front-matter-ignored.
+    assert_eq!(second.title.as_deref(), Some("Second slide"));
+    assert_eq!(
+        html(&second.blocks[0]),
+        "<h2>Second slide</h2>\n<p>Only the first markdown cell may carry front matter.</p>\n"
+    );
     assert_eq!(codes(&parsed), [("front-matter-ignored", Some(3), 1)]);
+    // Cell 0 (skip) is nowhere.
+    let all: Vec<usize> = deck.slides.iter().flat_map(cell_indices).collect();
+    assert_eq!(all, [2]);
+}
+
+/// notebook-mapping.md §5 without front matter: metadata.presenter > metadata.title.
+#[test]
+fn presenter_title_beats_the_notebook_title() {
+    let title = |metadata: Value| {
+        let parsed = parse_inline(
+            &notebook(json!([md("text", json!({}))]), metadata),
+            &Config::default(),
+        )
+        .unwrap();
+        parsed.deck.meta.title
+    };
+    let both = title(json!({"title": "A", "presenter": {"title": "B"}}));
+    assert_eq!(both.as_deref(), Some("B"));
+    assert_eq!(title(json!({"title": "A"})).as_deref(), Some("A"));
+    assert_eq!(
+        title(json!({"presenter": {"title": "B"}})).as_deref(),
+        Some("B")
+    );
+    // A presenter object without a title keeps metadata.title.
+    let other = title(json!({"title": "A", "presenter": {"author": "X"}}));
+    assert_eq!(other.as_deref(), Some("A"));
+    // A front matter block in a later markdown cell changes nothing.
+    let parsed = parse_inline(
+        &notebook(
+            json!([md("x", json!({})), md("---\ntitle: C\n---\n# Y", json!({}))]),
+            json!({"title": "A", "presenter": {"title": "B"}}),
+        ),
+        &Config::default(),
+    )
+    .unwrap();
+    assert_eq!(parsed.deck.meta.title.as_deref(), Some("B"));
+    assert_eq!(html(&parsed.deck.slides[0].blocks[1]), "<h1>Y</h1>\n");
+    assert_eq!(codes(&parsed), [("front-matter-ignored", Some(1), 1)]);
+}
+
+#[test]
+fn front_matter_blocks_that_are_not_metadata_stay_markdown() {
+    // In a later cell, `---` + a line that sets no deck metadata + `---` is a rule and a
+    // setext heading, as Jupyter shows it: a scalar, a key that is no DeckMeta field nor a
+    // config table (prose such as `Note: …`), or nothing at all.
+    let parsed = inline(json!([
+        md("x", json!({})),
+        md("---\nJust a heading\n---\n\ntext", json!({})),
+        md("---\n\n---\n", json!({})),
+        md("---\nNote: this matters\n---\n\nbody", json!({})),
+        md("---\n# commented: out\n---\n", json!({})),
+    ]));
+    let slide = &parsed.deck.slides[0];
+    assert_eq!(
+        html(&slide.blocks[1]),
+        "<hr />\n<h2>Just a heading</h2>\n<p>text</p>\n"
+    );
+    assert_eq!(html(&slide.blocks[2]), "<hr />\n<hr />\n");
+    assert_eq!(
+        html(&slide.blocks[3]),
+        "<hr />\n<h2>Note: this matters</h2>\n<p>body</p>\n"
+    );
+    assert_eq!(
+        html(&slide.blocks[4]),
+        "<hr />\n<h1>commented: out</h1>\n<hr />\n"
+    );
+    assert!(parsed.deck.meta.vars.is_empty());
+    assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+
+    // Blocks that do set deck metadata (a field, reveal options, a config table) are removed
+    // from a later cell, with a warning; they change nothing.
+    let parsed = inline(json!([
+        md("x", json!({})),
+        md("---\nreveal: {controls: false}\n---\nA", json!({})),
+        md(
+            "---\nnotebook: {show_prompts: false}\nevent: X\n---\nB",
+            json!({})
+        ),
+        md("---\nauthor: Me\n---\nC", json!({})),
+    ]));
+    let blocks: Vec<&str> = parsed.deck.slides[0].blocks[1..].iter().map(html).collect();
+    assert_eq!(blocks, ["<p>A</p>\n", "<p>B</p>\n", "<p>C</p>\n"]);
+    let meta = &parsed.deck.meta;
+    assert!(meta.reveal.is_empty() && meta.vars.is_empty() && meta.author.is_none());
+    assert_eq!(
+        codes(&parsed),
+        [
+            ("front-matter-ignored", Some(1), 1),
+            ("front-matter-ignored", Some(2), 1),
+            ("front-matter-ignored", Some(3), 1),
+        ]
+    );
+}
+
+/// Spec §5 reads a first-cell `---` block exactly like Markdown front matter. One that holds
+/// only YAML comments sets nothing; its text (a Markdown heading in Jupyter) is not shown,
+/// with a warning. One that is no mapping is an error naming the cell, with a hint.
+#[test]
+fn first_cell_front_matter_that_sets_nothing_or_is_no_mapping() {
+    let parsed = inline(json!([
+        md("---\n# Intro to Pandas\n---\n", slide_type("slide")),
+        md("# One", slide_type("slide")),
+    ]));
+    let deck = &parsed.deck;
+    assert_eq!(deck.meta, Default::default());
+    assert_eq!(deck.slides.len(), 1);
+    assert_eq!(deck.slides[0].title.as_deref(), Some("One"));
+    assert_eq!(codes(&parsed), [("front-matter-empty", Some(0), 1)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(message.contains("is not shown"), "{message}");
+    // Real front matter with a commented-out key is not reported.
+    let parsed = inline(json!([md(
+        "---\n# author: X\ntitle: T\n---\n# One",
+        json!({})
+    )]));
+    assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+
+    for yaml in ["Welcome to the talk!", "**Intro**"] {
+        let source = format!("---\n{yaml}\n---\n\n# Agenda");
+        let cells = json!([md(&source, json!({}))]);
+        let err = parse_inline(&notebook(cells, python()), &Config::default()).unwrap_err();
+        assert!(
+            matches!(&err, Error::FrontMatter(message)
+                if message.starts_with("cell 0: ") && message.ends_with("is read as YAML front matter)")),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -523,6 +655,97 @@ fn front_matter_only_cell_is_metadata_only() {
 }
 
 #[test]
+fn front_matter_only_cell_keeps_its_slide_structure() {
+    // After other content, a front-matter-only `slide` cell opens slide 2 (spec §2), which
+    // the next cell fills; its metadata.presenter applies to that slide.
+    let fm_slide =
+        |kind: &str| json!({"slideshow": {"slide_type": kind}, "presenter": {"classes": ["x"]}});
+    let parsed = inline(json!([
+        code("setup()", slide_type("slide"), json!([])),
+        md("---\ntitle: Deck\n---\n", fm_slide("slide")),
+        md("# Next", json!({})),
+    ]));
+    let deck = &parsed.deck;
+    assert_eq!(deck.meta.title.as_deref(), Some("Deck"));
+    assert_eq!(deck.slides.len(), 2);
+    assert_eq!(cell_indices(&deck.slides[0]), [0]);
+    let next = &deck.slides[1];
+    assert_eq!(next.span.as_ref().and_then(|s| s.cell), Some(1));
+    assert_eq!(next.classes, ["x"]);
+    assert_eq!(next.title.as_deref(), Some("Next"));
+    assert_eq!(next.blocks, [Block::html("<h1>Next</h1>\n".into())]);
+    assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+
+    // A `subslide` one opens a vertical child.
+    let parsed = inline(json!([
+        code("setup()", slide_type("slide"), json!([])),
+        md("---\ntitle: Deck\n---\n", fm_slide("subslide")),
+        md("# Next", json!({})),
+    ]));
+    let deck = &parsed.deck;
+    assert_eq!(deck.slides.len(), 1);
+    let child = &deck.slides[0].children[0];
+    assert_eq!(child.span.as_ref().and_then(|s| s.cell), Some(1));
+    assert_eq!(
+        (child.title.as_deref(), child.classes.as_slice()),
+        (Some("Next"), &["x".to_string()][..])
+    );
+
+    // A `-` one opens nothing: its override is ignored, with a warning.
+    let parsed = inline(json!([
+        code("setup()", slide_type("slide"), json!([])),
+        md("---\ntitle: Deck\n---\n", fm_slide("-")),
+        md("# Next", json!({})),
+    ]));
+    assert_eq!(parsed.deck.slides.len(), 1);
+    assert!(parsed.deck.slides[0].classes.is_empty());
+    assert_eq!(codes(&parsed), [("presenter-override-ignored", Some(1), 1)]);
+}
+
+#[test]
+fn front_matter_only_first_cell_overrides_slide_one() {
+    // Before any slide, the cell opens nothing (whatever its slide type); its override
+    // goes to slide 1, which the next cell creates or opens.
+    for (kind, next) in [
+        ("slide", "-"),
+        ("slide", "slide"),
+        ("-", "slide"),
+        ("subslide", "-"),
+    ] {
+        let parsed = inline(json!([
+            md(
+                "---\ntitle: T\n---\n",
+                json!({"slideshow": {"slide_type": kind}, "presenter": {"layout": "title"}})
+            ),
+            md("# A", slide_type(next)),
+            md("# B", slide_type("slide")),
+        ]));
+        let deck = &parsed.deck;
+        assert_eq!(deck.slides.len(), 2, "{kind} {next}");
+        let first = &deck.slides[0];
+        assert_eq!(first.layout, "title", "{kind} {next}");
+        assert_eq!(first.title.as_deref(), Some("A"));
+        assert_eq!(first.span.as_ref().and_then(|s| s.cell), Some(1));
+        assert_eq!(deck.slides[1].layout, "default");
+        assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+    }
+    // The only cell: the deck's one empty slide gets the override.
+    let parsed = inline(json!([md(
+        "---\ntitle: T\n---\n",
+        json!({"presenter": {"layout": "title", "classes": [1]}})
+    )]));
+    assert_eq!(parsed.deck.slides.len(), 1);
+    assert_eq!(parsed.deck.slides[0].layout, "title");
+    assert_eq!(
+        codes(&parsed),
+        [
+            ("empty-slide", None, 0),
+            ("presenter-override-invalid", Some(0), 1)
+        ]
+    );
+}
+
+#[test]
 fn notebook_metadata_overrides_the_config() {
     let metadata = json!({
         "kernelspec": {"language": "python"},
@@ -572,14 +795,38 @@ fn invalid_deck_metadata_is_an_error() {
         matches!(&err, Error::FrontMatter(message) if message.starts_with("cell 1: ") && message.contains("line 2")),
         "{err}"
     );
-    let bad_table = notebook(
-        json!([md("---\nnotebook: {hide_inputs: []}\n---\n", json!({}))]),
+    // Config tables and reveal.plugins name the layer they came from.
+    let starts = |cells: Value, metadata: Value, prefix: &str| {
+        let err = parse_inline(&notebook(cells, metadata), &Config::default()).unwrap_err();
+        assert!(
+            matches!(&err, Error::FrontMatter(message) if message.starts_with(prefix)),
+            "{err} does not start with {prefix}"
+        );
+    };
+    let fm_table = json!([
+        code("x", json!({}), json!([])),
+        md("---\nnotebook: {hide_inputs: []}\n---\n", json!({}))
+    ]);
+    starts(
+        fm_table,
         json!({}),
+        "cell 1: notebook: unknown field `hide_inputs`",
     );
-    assert!(matches!(
-        parse_inline(&bad_table, &Config::default()),
-        Err(Error::FrontMatter(_))
-    ));
+    let presenter_table = json!({"presenter": {"notebook": {"hide_inputs": []}}});
+    starts(
+        json!([]),
+        presenter_table,
+        "metadata.presenter: notebook: unknown field `hide_inputs`",
+    );
+    let presenter_plugins = json!({"presenter": {"reveal": {"plugins": ["nope"]}}});
+    starts(json!([]), presenter_plugins, "metadata.presenter: ");
+    // The presenter layer is valid, the front matter layer is not.
+    let both = json!({"presenter": {"notebook": {"show_prompts": false}}});
+    starts(
+        json!([md("---\nmath: {engine: 1}\n---\n", json!({}))]),
+        both,
+        "cell 0: math: ",
+    );
 }
 
 #[test]
@@ -623,11 +870,14 @@ fn slide_types_and_tags_combine() {
 fn empty_slides_are_reported() {
     let parsed = inline(json!([
         md("# A", json!({})),
+        // Hidden input and output: the cell is omitted, but its `slide` opens slide 2
+        // (spec §2 structure), which the next cell does not fill.
         code(
             "setup()",
             json!({"slideshow": {"slide_type": "slide"}, "tags": ["hide-input", "hide-output"]}),
             json!([])
         ),
+        md("", slide_type("slide")),
         md(
             "",
             json!({"slideshow": {"slide_type": "subslide"}, "presenter": {"classes": ["x"]}})
@@ -635,10 +885,11 @@ fn empty_slides_are_reported() {
         md("# B", slide_type("slide")),
     ]));
     let deck = &parsed.deck;
-    // A hidden-everything cell still opens its slide (spec §2 structure), with no content.
-    assert_eq!(deck.slides.len(), 3);
-    assert!(deck.slides[1].blocks.is_empty());
-    assert_eq!(deck.slides[1].children[0].classes, ["x"]);
+    // An empty `slide` cell opens its slide (spec §2 structure), with no content.
+    assert_eq!(deck.slides.len(), 4);
+    assert_eq!(deck.slides[0].blocks.len(), 1);
+    assert!(deck.slides[1].blocks.is_empty() && deck.slides[2].blocks.is_empty());
+    assert_eq!(deck.slides[2].children[0].classes, ["x"]);
     let messages: Vec<&str> = parsed
         .diagnostics
         .iter()
@@ -648,13 +899,135 @@ fn empty_slides_are_reported() {
         messages,
         [
             "slide 2 is empty",
-            "slide 2.1 is empty (it only has attributes)"
+            "slide 3 is empty",
+            "slide 3.1 is empty (it only has attributes)"
         ]
     );
     assert_eq!(
         codes(&parsed),
-        [("empty-slide", Some(1), 1), ("empty-slide", Some(2), 1)]
+        [
+            ("empty-slide", Some(1), 1),
+            ("empty-slide", Some(2), 1),
+            ("empty-slide", Some(3), 1)
+        ]
     );
+}
+
+/// Spec §2/§3: a code cell with hidden input and output is omitted entirely, but its slide
+/// type still structures the deck (as in nbconvert): between slides a hidden `slide` cell
+/// opens a slide the next cells fill. Before the first slide it opens nothing, so a hidden
+/// setup cell at the top adds no empty slide 1; a raw cell that is not shown behaves the
+/// same.
+#[test]
+fn hidden_and_skipped_cells_add_no_slides() {
+    let hidden_both = [
+        json!({"tags": ["hide-input", "hide-output"]}),
+        json!({"jupyter": {"source_hidden": true, "outputs_hidden": true}}),
+        json!({"tags": ["remove-input"], "jupyter": {"outputs_hidden": true}, "slideshow": {"slide_type": "slide"}}),
+    ];
+    for metadata in hidden_both {
+        let parsed = inline(json!([
+            code("import numpy", metadata.clone(), json!([])),
+            md("# Title", slide_type("slide")),
+        ]));
+        let deck = &parsed.deck;
+        assert_eq!(deck.slides.len(), 1, "{metadata}");
+        assert_eq!(deck.slides[0].title.as_deref(), Some("Title"));
+        assert_eq!(deck.slides[0].span.as_ref().and_then(|s| s.cell), Some(1));
+        assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+    }
+    // Before the first slide, its metadata.presenter goes to slide 1.
+    let parsed = inline(json!([
+        code(
+            "import numpy",
+            json!({"tags": ["hide-input", "hide-output"], "presenter": {"layout": "title"}}),
+            json!([])
+        ),
+        md("# Title", json!({})),
+    ]));
+    assert_eq!(parsed.deck.slides.len(), 1);
+    assert_eq!(parsed.deck.slides[0].layout, "title");
+    assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+
+    // Between slides, a hidden `slide` cell opens its slide; its metadata.presenter applies
+    // to it and the following content lands there (not on the previous slide).
+    let hidden_slide = |presenter: Value| json!({"slideshow": {"slide_type": "slide"}, "tags": ["hide-input", "hide-output"], "presenter": presenter});
+    let parsed = inline(json!([
+        md("# A", json!({})),
+        code("x", hidden_slide(json!({"layout": "title"})), json!([])),
+        md("after", json!({})),
+    ]));
+    let deck = &parsed.deck;
+    assert_eq!(deck.slides.len(), 2);
+    assert_eq!(deck.slides[0].blocks.len(), 1);
+    let second = &deck.slides[1];
+    assert_eq!(second.span.as_ref().and_then(|s| s.cell), Some(1));
+    assert_eq!(second.layout, "title");
+    assert_eq!(second.blocks, [Block::html("<p>after</p>\n".into())]);
+    assert!(!deck.features.code, "the hidden cell is not emitted");
+    assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+
+    // Collapsed in JupyterLab (metadata.jupyter) is the same; a hidden `subslide` cell opens
+    // a vertical slide whose title comes from the next cell.
+    let collapsed = json!({"slideshow": {"slide_type": "slide"}, "jupyter": {"source_hidden": true, "outputs_hidden": true}});
+    let mut collapsed_sub = collapsed.clone();
+    collapsed_sub["slideshow"]["slide_type"] = json!("subslide");
+    let parsed = inline(json!([
+        md("# A", slide_type("slide")),
+        code("plot()", collapsed, json!([])),
+        md("## Results\n\nB content", json!({})),
+        code("more()", collapsed_sub, json!([])),
+        md("## Details", json!({})),
+    ]));
+    let deck = &parsed.deck;
+    let titles: Vec<Option<&str>> = deck.slides.iter().map(|s| s.title.as_deref()).collect();
+    assert_eq!(titles, [Some("A"), Some("Results")]);
+    assert_eq!(
+        html(&deck.slides[1].blocks[0]),
+        "<h2>Results</h2>\n<p>B content</p>\n"
+    );
+    assert_eq!(deck.slides[1].children.len(), 1);
+    assert_eq!(deck.slides[1].children[0].title.as_deref(), Some("Details"));
+    assert!(codes(&parsed).is_empty(), "{:?}", codes(&parsed));
+
+    // A hidden `-` cell opens nothing: its metadata.presenter is ignored, with a warning.
+    let parsed = inline(json!([
+        md("# A", json!({})),
+        code(
+            "x",
+            json!({"tags": ["hide-input", "hide-output"], "presenter": {"layout": "title"}}),
+            json!([])
+        ),
+        md("more", json!({})),
+    ]));
+    assert_eq!(parsed.deck.slides.len(), 1);
+    assert_eq!(parsed.deck.slides[0].blocks.len(), 2);
+    assert_eq!(parsed.deck.slides[0].layout, "default");
+    assert_eq!(codes(&parsed), [("presenter-override-ignored", Some(1), 1)]);
+
+    // A Quarto-style raw front matter cell (no raw_mimetype) at the top.
+    let parsed = inline(json!([
+        raw(
+            "---\ntitle: Q\n---",
+            json!({"presenter": {"classes": ["r"]}})
+        ),
+        md("# T", slide_type("slide")),
+    ]));
+    let deck = &parsed.deck;
+    assert_eq!(deck.slides.len(), 1);
+    assert_eq!(deck.slides[0].classes, ["r"]);
+    assert_eq!(codes(&parsed), [("raw-cell-skipped", Some(0), 1)]);
+    // Once a slide exists, a skipped raw `slide` cell still opens one (§2 structure).
+    let parsed = inline(json!([
+        md("# A", json!({})),
+        raw("\\newpage", slide_type("slide")),
+        md("more", json!({})),
+    ]));
+    let deck = &parsed.deck;
+    assert_eq!(deck.slides.len(), 2);
+    assert_eq!(deck.slides[1].span.as_ref().and_then(|s| s.cell), Some(1));
+    assert_eq!(html(&deck.slides[1].blocks[0]), "<p>more</p>\n");
+    assert_eq!(codes(&parsed), [("raw-cell-skipped", Some(1), 1)]);
 }
 
 #[test]
@@ -679,8 +1052,57 @@ fn heading_attributes_lift_only_onto_an_empty_slide() {
         html(&second.blocks[1]),
         "<h2 class=\"c\">After a cell</h2>\n"
     );
-    // The title is the first heading of the slide's Markdown blocks, also after a cell.
+    // The title is the first heading of the slide's first HTML block, also after a cell.
     assert_eq!(second.title.as_deref(), Some("After a cell"));
+}
+
+/// Spec §2: "plain text of the first heading in the slide's first HTML block".
+#[test]
+fn slide_titles_come_from_the_first_html_block() {
+    let html_raw = |source: &str, kind: &str| {
+        raw(
+            source,
+            json!({"raw_mimetype": "text/html", "slideshow": {"slide_type": kind}}),
+        )
+    };
+    let parsed = inline(json!([
+        html_raw(
+            "<h2 class=\"t\">Raw <em>x</em><br/>y &amp; z</h2><p>p</p>",
+            "slide"
+        ),
+        md("## Md", json!({})),
+        md("intro text", slide_type("slide")),
+        md("## Later heading", json!({})),
+        html_raw("<p>no heading</p>", "slide"),
+        md("## After raw", json!({})),
+        md("", slide_type("slide")),
+        md(":::notes\nn\n:::", json!({})),
+        md("## First block", json!({})),
+        code("x", slide_type("slide"), json!([])),
+        html_raw("<header><h3>\n  In   a header\n</h3></header>", "-"),
+        // A commented-out heading is not shown, so it is no title.
+        html_raw("<!-- <h1>old</h1> --><p>x</p><!-- <h2>", "slide"),
+        md("## Later", json!({})),
+        html_raw("<!-- <h1>old</h1> --><h2>New</h2>", "slide"),
+    ]));
+    let titles: Vec<Option<&str>> = parsed
+        .deck
+        .slides
+        .iter()
+        .map(|s| s.title.as_deref())
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            Some("Raw x y & z"),
+            None,
+            None,
+            Some("First block"),
+            Some("In a header"),
+            None,
+            Some("New")
+        ]
+    );
 }
 
 #[test]
@@ -854,6 +1276,78 @@ fn attachments_become_inline_assets() {
 }
 
 #[test]
+fn attachment_diagnostics_name_the_attachment_as_written() {
+    let attachments = json!({
+        "my plot.png": {"image/png": "!!!"},
+        "empty.png": {},
+    });
+    let source = "![a](attachment:my%20plot.png) ![b](attachment:empty.png) \
+                  ![c](attachment:ü.png) ![d](attachment:a&b.png)";
+    let cell = json!({"cell_type": "markdown", "metadata": {}, "source": source, "attachments": attachments});
+    let raw_cell = json!({
+        "cell_type": "raw",
+        "metadata": {"raw_mimetype": "text/html"},
+        "source": "<img src='attachment:single.png'> <IMG SRC = \"attachment:upper.png\">",
+    });
+    let parsed = inline(json!([cell, raw_cell]));
+    let first = html(&parsed.deck.slides[0].blocks[0]);
+    assert!(first.contains("src=\"attachment:empty.png\""), "{first}");
+    assert_eq!(
+        codes(&parsed),
+        [
+            ("notebook-attachment-skipped", Some(0), 1),
+            ("notebook-attachment-skipped", Some(0), 1),
+            ("missing-attachment", Some(0), 1),
+            ("missing-attachment", Some(0), 1),
+            ("missing-attachment", Some(1), 1),
+            ("missing-attachment", Some(1), 1),
+        ]
+    );
+    let messages: Vec<&str> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect();
+    // Attachments are tried in name order: "empty.png" before "my plot.png".
+    assert_eq!(messages[0], "attachment 'empty.png' skipped: no data");
+    assert!(messages[1].starts_with("attachment 'my plot.png' skipped: invalid base64"));
+    assert_eq!(
+        messages[2..],
+        [
+            "`attachment:ü.png`: the cell has no attachment `ü.png`",
+            "`attachment:a&b.png`: the cell has no attachment `a&b.png`",
+            "`attachment:single.png`: the cell has no attachment `single.png`",
+            "`attachment:upper.png`: the cell has no attachment `upper.png`",
+        ]
+    );
+}
+
+#[test]
+fn notes_in_markdown_outputs_are_speaker_notes() {
+    let outputs = json!([
+        {"output_type": "display_data", "metadata": {},
+         "data": {"text/markdown": "hi\n\n:::notes\nsecret\n:::\n"}},
+    ]);
+    let parsed = inline(json!([code("show()", json!({}), outputs.clone())]));
+    let deck = &parsed.deck;
+    let slide = &deck.slides[0];
+    assert!(matches!(
+        &cell(&slide.blocks[0]).outputs[..],
+        [CellOutput::Display { html, .. }] if html == "<p>hi</p>\n"
+    ));
+    assert_eq!(slide.notes.as_deref(), Some("<p>secret</p>\n"));
+    assert!(deck.features.notes);
+    // Hidden outputs: their notes are not added.
+    let parsed = inline(json!([code(
+        "show()",
+        json!({"tags": ["hide-output"]}),
+        outputs
+    )]));
+    assert_eq!(parsed.deck.slides[0].notes, None);
+    assert!(!parsed.deck.features.notes);
+}
+
+#[test]
 fn unknown_cells_are_skipped_and_indices_stay_aligned() {
     let parsed = inline(json!([
         {"cell_type": "future", "metadata": {}, "source": "?"},
@@ -1010,6 +1504,49 @@ fn split_markdown_cells_from_front_matter_and_errors() {
     assert!(
         matches!(&err, Error::Parse { line: None, message, .. } if message.starts_with("cell 0, line 3: ")),
         "{err}"
+    );
+}
+
+#[test]
+fn split_cells_give_their_overrides_to_the_first_slide_they_open() {
+    let config = Config::from_toml_str("[notebook]\nsplit_markdown_cells = true\n").unwrap();
+    let overrides = |presenter: Value| json!({"presenter": presenter});
+    let cells = json!([
+        md("# A", json!({})),
+        // A leading separator opens slide 2: the override goes there.
+        md("---\n\n# B", overrides(json!({"classes": ["x"]}))),
+        // The first part continues slide 2; the first separator opens slide 3, whose own
+        // attributes win over the override.
+        md(
+            "more\n\n--- {layout=title}\n\n# C\n\n---\n\n# D",
+            overrides(json!({"layout": "section", "classes": ["y"]}))
+        ),
+        // No separator: nothing opened, ignored with a warning.
+        md("plain", overrides(json!({"classes": ["z"]}))),
+    ]);
+    let parsed = parse_inline(&notebook(cells, python()), &config).unwrap();
+    let deck = &parsed.deck;
+    let slides: Vec<(Option<&str>, &str, Vec<String>)> = deck
+        .slides
+        .iter()
+        .map(|s| (s.title.as_deref(), s.layout.as_str(), s.classes.clone()))
+        .collect();
+    assert_eq!(
+        slides,
+        [
+            (Some("A"), "default", vec![]),
+            (Some("B"), "default", vec!["x".to_string()]),
+            (Some("C"), "title", vec!["y".to_string()]),
+            (Some("D"), "default", vec![]),
+        ]
+    );
+    assert_eq!(cell_indices(&deck.slides[3]), Vec::<usize>::new());
+    assert_eq!(deck.slides[3].blocks.len(), 2, "cell 3 continues slide D");
+    assert_eq!(codes(&parsed), [("presenter-override-ignored", Some(3), 1)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.contains("or a separator in a split markdown cell"),
+        "{message}"
     );
 }
 

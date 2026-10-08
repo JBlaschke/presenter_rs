@@ -56,11 +56,11 @@ expression: json
       "layout": "default",
       "classes": [],
       "attrs": {},
-      "title": "title: must be ignored",
+      "title": "Second slide",
       "blocks": [
         {
           "type": "html",
-          "html": "<hr />\n<h2>title: must be ignored</h2>\n<h2>Second slide</h2>\n<p>Only the first markdown cell may carry front matter.</p>\n"
+          "html": "<h2>Second slide</h2>\n<p>Only the first markdown cell may carry front matter.</p>\n"
         }
       ],
       "notes": null,
