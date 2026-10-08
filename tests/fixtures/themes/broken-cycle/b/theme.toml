@@ -1,0 +1,3 @@
+# Test fixture (T13): cycle-b extends cycle-a, closing the inheritance cycle.
+name = "cycle-b"
+extends = "../a"

@@ -1,0 +1,3 @@
+# Test fixture (T13): cycle-a extends cycle-b, which extends cycle-a again.
+name = "cycle-a"
+extends = "../b"

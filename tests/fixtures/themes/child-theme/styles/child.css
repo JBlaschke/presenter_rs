@@ -1,0 +1,10 @@
+/* child-theme fixture: concatenated after the default theme's styles/theme.css. */
+:root {
+  --child-accent: #2a76dd;
+}
+
+.reveal section.child-title .child-accent {
+  height: 0.25em;
+  margin-bottom: 1em;
+  background: var(--child-accent);
+}
