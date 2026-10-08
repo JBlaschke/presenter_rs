@@ -1,0 +1,73 @@
+# Task board
+
+Each file in this directory is one unit of work sized for a single agent. Read
+[`../../PLAN.md`](../../PLAN.md) §3, §4 and §6 first, then your task file, then the spec
+sections it lists. Specs in `../spec/` are contracts: implement them, do not reinterpret them.
+
+## How to pick up a task
+1. Check the status table below and the dependency column. Only take a task whose
+   dependencies are **done** (merged to `main`).
+2. Set the status to `in progress (<your handle>)` in a tiny PR, or coordinate out of band.
+3. Branch `task/Txx-slug`. Edit only the files your task owns; additive changes elsewhere
+   must be called out in the PR.
+4. Done means: every acceptance criterion has a test or a documented manual check,
+   `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+   `cargo test` pass, the status table says `done`, and the PR description lists any
+   criterion you could not meet.
+
+## Status
+
+| ID | Task | Milestone | Size | Depends on | Status |
+|---|---|---|---|---|---|
+| T00 | Repository scaffold, CI, vendoring, embedded assets | M0 | M | — | todo |
+| T01 | Core IR, config, error types, fixture corpus | M0 | M | T00 | todo |
+| T02 | Default theme skeleton against the IR fixture | M0 | M | T01 | todo |
+| T10 | Front matter → DeckMeta and config overrides | M1 | S | T01 | todo |
+| T11 | Slide splitter and attribute parsing | M1 | M | T01 | todo |
+| T12 | Markdown block renderer | M1 | L | T01, T10, T11 | todo |
+| T13 | Theme discovery, manifest, chain, template environment | M1 | M | T01 | todo |
+| T14 | Asset registry and emitter | M1 | M | T01 | todo |
+| T15 | HTML renderer, context, helpers, reveal config | M1 | M | T13, T14 | todo |
+| T16 | Pipeline, `build` and `dump` CLI, example deck, e2e snapshots | M1 | M | T10–T15 | todo |
+| T17 | Default theme v1 | M1 | L | T02, T16 | todo |
+| T20 | File watcher and rebuild loop | M2 | M | T16 | todo |
+| T21 | Dev server with SSE | M2 | M | T16 | todo |
+| T22 | Live-reload client script | M2 | M | — (protocol only) | todo |
+| T23 | `serve` CLI and integration tests | M2 | S | T20, T21, T22 | todo |
+| T24 | Headless-browser smoke tests (opt-in) | M2 | S | T16 | todo |
+| T30 | nbformat model and notebook fixtures | M3 | M | T01 | todo |
+| T31 | Cells → slides | M3 | M | T30, T12 | todo |
+| T32 | Output rendering | M3 | M | T30, T14 | todo |
+| T33 | Notebook theming and executed example notebook | M3 | M | T32, T17 | todo |
+| T34 | `check` command and lints | M3 | M | T16, T31 | todo |
+| T40 | `init` scaffold | M4 | S | T16 | todo |
+| T41 | `theme list/eject/new/check` | M4 | S | T13 | todo |
+| T42 | SCSS themes via grass, reveal template imports, CSS asset inlining | M4 | M | T14, T17 | todo |
+| T43 | Heading-split mode, incremental lists, reveal compat comments | M4 | M | T11, T12 | todo |
+| T44 | Diagnostics quality | M4 | S | T16, T22 | todo |
+| T45 | PDF export via headless Chrome | M4 | S | T16 | todo |
+| T46 | User documentation | M4 | M | M1–M3 | todo |
+| T47 | Release builds | M4 | S | T16 | todo |
+
+## Order of execution (suggested waves)
+
+| wave | tasks | parallelism |
+|---|---|---|
+| 0 | T00 | 1 |
+| 1 | T01 | 1 |
+| 2 | T02, T10, T11, T13, T14, T30 | 6 |
+| 3 | T12, T15, T32 | 3 |
+| 4 | T16 | 1 (integration) |
+| 5 | T17, T20, T21, T22, T24, T31, T40, T41, T45, T47 | up to 10 |
+| 6 | T23, T33, T34, T42, T43, T44 | 6 |
+| 7 | T46 | 1 |
+
+## PR description template
+
+```
+Task: Txx — <title>
+Spec sections implemented: …
+Acceptance criteria: [x] … [x] … [ ] <not met: reason>
+Files outside my ownership touched (additive): …
+Manual checks performed: …
+```
