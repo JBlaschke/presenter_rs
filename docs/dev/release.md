@@ -13,9 +13,10 @@ holds one archive per platform and a `SHA256SUMS` file.
 | `aarch64-unknown-linux-gnu` (glibc, built on Ubuntu 22.04) | `ubuntu-22.04-arm` | `presenter-v0.1.0-aarch64-unknown-linux-gnu.tar.gz` |
 
 Each archive holds one directory with the archive's name. That directory contains the
-`presenter` binary, `LICENSE` and `README.md`. The binary is self-contained: the themes,
-reveal.js and KaTeX are embedded. It needs only the system's own libraries. On macOS
-those are `libSystem` and `libiconv` (checked with `otool -L`). On Linux they are glibc and
+`presenter` binary, `LICENSE`, `README.md` and `THIRD-PARTY-LICENSES/` (see
+[Third-party licenses](#third-party-licenses)). The binary is self-contained: the themes,
+reveal.js and KaTeX are embedded. It needs only the system's own libraries. On macOS those
+are `libSystem` and `libiconv` (checked with `otool -L`). On Linux they are glibc and
 `libgcc_s`, as for any Rust binary.
 
 ## Checklist
@@ -38,7 +39,8 @@ those are `libSystem` and `libiconv` (checked with `otool -L`). On Linux they ar
    ```
 
    The tag must be annotated. `git describe` ignores lightweight tags, so the binary would
-   show a commit hash instead of `v0.1.0`, and the workflow's smoke test rejects that.
+   show a commit hash instead of `v0.1.0`. The workflow's first job rejects a lightweight
+   tag before anything is built.
    A suffix such as `v0.2.0-rc.1` makes a pre-release. `Cargo.toml` must then say
    `0.2.0-rc.1`.
 6. Watch the "Release" run on the Actions tab. When it succeeds, check the release page:
@@ -60,13 +62,34 @@ those are `libSystem` and `libiconv` (checked with `otool -L`). On Linux they ar
 
 | job | checks |
 |---|---|
-| `label` | On a tag push, the tag is exactly `v` + the `Cargo.toml` version. |
-| `build` (×4) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. |
+| `label` | On a tag push, the tag is exactly `v` + the `Cargo.toml` version, and it is annotated. |
+| `build` (×4) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. |
 | `release` | All four archives exist. `gh release create --verify-tag` publishes them with `SHA256SUMS`. |
 
 The release job runs only after all four builds succeed, so a release is never partial.
+The `label` job checks the tag first, so a wrong or lightweight tag fails in seconds
+instead of after four release builds.
 The build jobs use no cache: release binaries start from a clean slate. A cache restored
 from another branch would also be a supply-chain risk.
+
+## Third-party licenses
+
+The binary contains other people's work, and their licenses (MIT, Apache-2.0, OFL, MPL-2.0
+and others) ask that their notices travel with it. The workflow's "third-party licenses"
+step fills `THIRD-PARTY-LICENSES/` in each archive:
+
+- `assets/`: the license files of the web assets embedded from `assets/vendor`
+  (reveal.js, KaTeX, and the Source Sans Pro and League Gothic fonts), at their paths
+  there, and `VERSIONS.toml` with their versions and sources.
+- `crates.txt`: every crate linked into the binary for that target, with its version,
+  license expression and crates.io page (where the source of, for example, the MPL-2.0
+  `selectors` crate is available).
+- `crates/<name>-<version>/`: those crates' own license files. Two crates ship none
+  (`ansi-to-html`, `selectors`); `crates.txt` names their licenses.
+
+"Linked" means the normal dependencies for the target (`cargo tree -e normal,no-proc-macro`):
+build scripts, proc-macros and dev-dependencies run only at build time and are not
+distributed. The step fails when a linked crate is missing from `cargo metadata`.
 
 ## Dry runs
 
@@ -81,9 +104,10 @@ There are two ways to try the workflow without publishing a real release.
 
 ## Troubleshooting
 
-- **The tag does not match `Cargo.toml`, or the tag is lightweight.** Delete the tag
-  locally and on GitHub with `git tag -d v0.1.0 && git push --delete origin v0.1.0`. Fix
-  the problem, then tag and push again.
+- **The tag does not match `Cargo.toml`, or the tag is lightweight.** The `label` job
+  fails. Delete the tag locally and on GitHub with
+  `git tag -d v0.1.0 && git push --delete origin v0.1.0`. Fix the problem, then tag and
+  push again.
 - **One target failed.** Fix the cause, or use "Re-run failed jobs" for a flaky failure.
   Nothing has been published yet.
 - **A release with that tag exists already.** This happens when the release job is re-run
@@ -113,21 +137,44 @@ the first of these that applies:
    `git --no-optional-locks status`, because `describe --dirty` would rewrite
    `.git/index` during the build.
 3. `unknown`, when git is not installed or fails, or when the crate directory is not the
-   root of a git checkout. The build never fails because of git. Git does not search
-   above the crate directory, so a source archive unpacked inside another repository
-   gets `unknown`, not that repository's commit.
+   root of a git checkout. The build never fails because of git. When the crate
+   directory is a checkout and git still fails (git missing, no commit yet, or git
+   refusing a directory owned by another user), Cargo prints a warning. Git does not
+   search above the crate directory, so a source archive unpacked inside another
+   repository gets `unknown`, not that repository's commit.
 
-The build script reruns when any of these change:
+A build id contains only ASCII letters, digits, `.`, `+` and `-`. `build.rs` replaces any
+other character with `-` and prints a Cargo warning: the tag `release/v1_0` becomes
+`release-v1-0`, and the override `0.1.0~rc1` becomes `0.1.0-rc1`. `tests/cli_version.rs`
+and `tests/cli_build.rs` check the same character set, so `cargo test` passes with any
+override.
 
-- `HEAD`;
-- the checked-out branch;
-- `packed-refs` or the tags;
-- `PRESENTER_GIT_SHA`.
+The build script reruns, and the crate is recompiled, when one of these changes:
 
-It does not rerun on every edit, so in a development build `-dirty` shows the state of the
-tree when the script last ran. Release builds come from a fresh checkout and are exact.
-`tests/build_script.rs` tests this logic on scratch repositories. It compiles `build.rs`
-as a module.
+- `src/`, `Cargo.toml`, `Cargo.lock` or `build.rs`, and in release builds `assets/`. These
+  are the edits that recompile the crate anyway, so `-dirty` is checked again whenever
+  the binary changes.
+- `HEAD` or the HEAD reflog (`logs/HEAD`), which change on every commit, checkout and
+  reset.
+- The checked-out branch's ref file. After `git gc` or `git pack-refs` the branch lives in
+  `packed-refs`, and the script watches `packed-refs` and the directory where the next
+  commit writes the ref file.
+- The tags (`refs/tags`, `packed-refs`).
+- In a reftable repository (`git init --ref-format=reftable`), the reftable stacks.
+- The `PRESENTER_GIT_SHA` environment variable.
+
+All git paths come from `git rev-parse --git-path`, so linked worktrees watch their own
+`HEAD`. Edits to other files, such as tests and docs, do not rerun the script. They do not
+change the binary, but they count for `-dirty`: a development build may show `-dirty` for
+a docs edit made before its last rerun, or miss one made after it. Release builds come
+from a fresh checkout and are exact.
+
+`tests/build_script.rs` tests this logic on scratch repositories, including packed refs,
+reftable and linked worktrees. It compiles `build.rs` as a module. `build.rs` also sets
+`PRESENTER_BUILD_ID_SOURCE` (`override`, `git` or `unknown`). With it,
+`tests/cli_build.rs` checks that a build from a git checkout names `HEAD` and did not
+fall back to `unknown`. Cargo passes build-script variables to test processes too, so the
+test cannot use the runtime environment to tell an override apart.
 
 ## Release profile and measurements
 
@@ -194,12 +241,16 @@ the first release. Checks done so far, on 2026-10-08:
   action versions, and rejects `macos-13`.
 - The run steps were extracted from the YAML and run locally against a clone with an
   annotated `v0.1.0` tag:
-  - The label passes for `v0.1.0` and fails for `v0.2.0`.
+  - The label passes for `v0.1.0` and fails for `v0.2.0`, and for a lightweight
+    `v0.1.0`.
   - The native target check passes for this host and fails with a clear message for a
     wrong target.
   - The smoke test passes with an annotated tag (`presenter 0.1.0 (v0.1.0)`). It fails
     with a lightweight tag (`presenter 0.1.0 (419e02d)`).
-  - Packaging creates the expected three files and no `._*` entries.
+  - Packaging creates the expected files and no `._*` entries. The third-party licenses
+    step, run for `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`, accounted for
+    all 142 and 147 linked crates, and copied the four license files of `assets/vendor`.
+    A macOS archive is 5.9 MB.
   - The checksum step requires four archives, and `sha256sum -c` verifies its output.
   - The notes step extracts only the version's changelog section, or warns when the
     section is missing.
@@ -212,3 +263,8 @@ the first release. Checks done so far, on 2026-10-08:
 - A release binary built `examples/basic/slides.md`, and the deck opened in Chrome over
   CDP: `Reveal.isReady()` was true, with 15 slides, 4 KaTeX formulas and no console
   errors.
+- The build id followed the checkout in a clone (debug builds, `--version` after each
+  step): after `git pack-refs --all` and two commits; after a `src/` edit (`-dirty`) and
+  its revert; on the annotated tag (`v0.1.0`, then `v0.1.0-dirty` after an edit); after
+  `git gc` and a commit; and in a reftable clone after a commit. A `tests/` edit left the
+  crate fresh.

@@ -2,8 +2,9 @@
 #
 # Pushing a tag `v<version>` (the version in Cargo.toml, e.g. `v0.1.0` or `v0.2.0-rc.1`)
 # tests and builds `presenter` natively on one runner per target, packages each binary as
-# `presenter-<tag>-<target>.tar.gz` (the binary, LICENSE and README.md in a directory of
-# the same name) and publishes a GitHub Release with the four archives and `SHA256SUMS`.
+# `presenter-<tag>-<target>.tar.gz` (the binary, LICENSE, README.md and the
+# THIRD-PARTY-LICENSES of what it embeds and links, in a directory of the same name) and
+# publishes a GitHub Release with the four archives and `SHA256SUMS`.
 #
 # Running the workflow by hand ("Run workflow", any branch) builds the same archives,
 # named `presenter-v<version>-dev.<sha>-<target>`, as artifacts of the run and publishes
@@ -39,6 +40,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # As in the build jobs, so the tag is fetched as itself (annotated or not).
+          fetch-depth: 0
           persist-credentials: false
       - id: label
         name: archive label
@@ -52,6 +55,12 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then
             if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
               echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version (expected v$version)"
+              exit 1
+            fi
+            # Fail before four builds: `git describe`, and so --version, ignores
+            # lightweight tags, and the build jobs' smoke test would reject them.
+            if [[ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" != tag ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not annotated; push one made with git tag -a (see docs/dev/release.md)"
               exit 1
             fi
             label=$GITHUB_REF_NAME
@@ -118,13 +127,65 @@ jobs:
               exit 1
             fi
           fi
+      - name: third-party licenses
+        run: |
+          export LC_ALL=C
+          if ! command -v jq >/dev/null; then
+            echo "::error::jq is not installed on $RUNNER_LABEL"
+            exit 1
+          fi
+          notices="dist/$ARCHIVE/THIRD-PARTY-LICENSES"
+          mkdir -p "$notices/assets" "$notices/crates"
+          # The web assets embedded from assets/vendor (reveal.js, KaTeX, their fonts): the
+          # license files, at their paths there, and the versions.
+          cp assets/vendor/VERSIONS.toml "$notices/assets/"
+          (cd assets/vendor && find . -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' \)) \
+            | while IFS= read -r file; do
+                mkdir -p "$notices/assets/$(dirname "$file")"
+                cp "assets/vendor/$file" "$notices/assets/$file"
+              done
+          # The crates linked into the binary: the normal dependencies for this target,
+          # without proc-macros (they only run at compile time). Their license expression
+          # and source in crates.txt, and their license files.
+          cargo tree --locked -e normal,no-proc-macro --target "$TARGET" --prefix none --format '{p}' \
+            | sed -E 's/ \(.*$//' | sort -u > "$RUNNER_TEMP/linked.txt"
+          cargo metadata --locked --format-version 1 --filter-platform "$TARGET" \
+            | jq -r '.resolve.root as $root | .packages[] | select(.id != $root)
+                | [.name, .version, (.license // "see the license files"), (.source // "path"),
+                   (.manifest_path | rtrimstr("/Cargo.toml"))]
+                | @tsv' \
+            | sort > "$RUNNER_TEMP/packages.tsv"
+          found=0
+          while IFS=$'\t' read -r name version license source dir; do
+            grep -qxF "$name v$version" "$RUNNER_TEMP/linked.txt" || continue
+            found=$((found + 1))
+            if [[ "$source" == *crates.io-index ]]; then
+              source="https://crates.io/crates/$name/$version"
+            fi
+            echo "$name $version: $license ($source)" >> "$notices/crates.txt"
+            mkdir -p "$notices/crates/$name-$version"
+            find "$dir" -maxdepth 1 -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' -o -iname 'unlicense*' \) \
+              -exec cp {} "$notices/crates/$name-$version/" \;
+            if [[ -z "$(ls -A "$notices/crates/$name-$version")" ]]; then
+              rmdir "$notices/crates/$name-$version"
+              echo "note: $name $version has no license file; crates.txt names its license"
+            fi
+          done < "$RUNNER_TEMP/packages.tsv"
+          # Every linked crate but presenter itself is accounted for.
+          expected=$(($(wc -l < "$RUNNER_TEMP/linked.txt") - 1))
+          if [[ "$found" -ne "$expected" ]]; then
+            echo "::error::found $found of the $expected linked crates in cargo metadata"
+            exit 1
+          fi
+          echo "$found crates"
       - name: package
         run: |
           mkdir -p "dist/$ARCHIVE"
           cp target/release/presenter LICENSE README.md "dist/$ARCHIVE/"
           # COPYFILE_DISABLE: no AppleDouble (._*) entries from macOS tar.
           COPYFILE_DISABLE=1 tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
-          tar -tzvf "dist/$ARCHIVE.tar.gz"
+          # The contents, without the ~140 crate license directories.
+          tar -tzvf "dist/$ARCHIVE.tar.gz" | grep -v "/THIRD-PARTY-LICENSES/crates/."
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE }}

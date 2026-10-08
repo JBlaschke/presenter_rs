@@ -39,4 +39,5 @@ publishes that section as the GitHub Release notes (see
   precedence (`docs/spec/config.md`).
 - Release builds. `presenter --version` names the exact build as
   `presenter 0.1.0 (<git describe>)`. Pushing a `v*` tag publishes binaries for macOS
-  (arm64, x86_64) and Linux (x86_64, arm64), with SHA-256 checksums.
+  (arm64, x86_64) and Linux (x86_64, arm64), with SHA-256 checksums and the license
+  notices of the third-party code they contain.
