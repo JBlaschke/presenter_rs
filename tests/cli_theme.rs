@@ -526,3 +526,224 @@ fn check_fails_on_manifest_and_chain_errors() {
         .code(1)
         .stderr(contains("line 4"));
 }
+
+// --- Fix round 1 -----------------------------------------------------------------------
+
+#[test]
+fn list_says_when_presenter_toml_leaves_the_theme_to_the_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(tmp.path(), &[("presenter.toml", "[deck]\ntitle = \"x\"\n")]);
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "list"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains(
+            "Theme 'default' for this directory (the default; presenter.toml has no [deck] theme):\n  chain: default\n"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("[deck] theme = "), "{stdout}");
+    // An invalid presenter.toml is a usage error (exit 2), after the built-in list.
+    write_files(tmp.path(), &[("presenter.toml", "[deck]\ntheme = 1\n")]);
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "list"]);
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    assert!(stdout.starts_with("Built-in themes:"), "{stdout}");
+}
+
+#[test]
+fn printed_commands_quote_directories_for_the_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "eject", "default", "full copy"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("  presenter build slides.md --theme 'full copy'\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("theme = \"full copy\""), "{stdout}");
+    assert!(
+        stdout.contains("presenter theme check 'full copy'"),
+        "{stdout}"
+    );
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "new", "my theme"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains(
+            "  presenter build slides.md --theme 'my theme'  # or [deck] theme = \"my theme\""
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("presenter theme check 'my theme'"),
+        "{stdout}"
+    );
+    // Plain names stay plain.
+    let (_, stdout, _) = run(tmp.path(), &["theme", "new", "plain-name"]);
+    assert!(
+        stdout.contains("presenter theme check plain-name\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn new_and_eject_take_dir_lexically_and_never_overwrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    let precious = [
+        ("theme.toml", "name = \"mine\"\n"),
+        ("styles/theme.css", "MY PRECIOUS CSS"),
+    ];
+    write_files(&work, &precious);
+    fs::create_dir(work.join("empty")).unwrap();
+    // `ghost/..` is `work`, which exists and is not empty.
+    let (code, _, stderr) = run(&work, &["theme", "new", "ghost/.."]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("ghost/.. (that is ")
+            && stderr.contains("exists and is not an empty directory"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = run(&work, &["theme", "eject", "default", "newdir/.."]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert!(!work.join("ghost").exists());
+    assert!(!work.join("newdir").exists());
+    for (path, contents) in precious {
+        assert_eq!(fs::read_to_string(work.join(path)).unwrap(), contents);
+    }
+    // `empty/sub/..` is the empty directory `empty`: the theme goes there, no `sub`.
+    let (code, _, stderr) = run(&work, &["theme", "new", "empty/sub/.."]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(manifest(&work.join("empty")).name, "empty");
+    assert!(!work.join("empty/sub").exists());
+}
+
+#[test]
+fn new_lists_what_it_can_when_a_parent_stylesheet_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(
+        tmp.path(),
+        &[(
+            "base/theme.toml",
+            "name = \"base\"\nextends = \"default\"\n[styles]\nentries = [\"styles/missing.css\"]\n",
+        )],
+    );
+    let (code, _, stderr) = run(tmp.path(), &["theme", "new", "kid", "--extends", "base"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("theme 'base': the style entry 'styles/missing.css' cannot be read"),
+        "{stderr}"
+    );
+    let css = fs::read_to_string(tmp.path().join("kid/styles/theme.css")).unwrap();
+    assert!(css.contains("/* --r-background-color: "), "{css}");
+    assert_eq!(
+        manifest(&tmp.path().join("kid")).extends.as_deref(),
+        Some("../base")
+    );
+    // `check` reports the parent's problem.
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "check", "kid"]);
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert!(
+        stderr.contains("theme.toml:4: error: [styles] entry 'styles/missing.css' is not found"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn new_refuses_a_parent_whose_chain_is_full_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(tmp.path(), &["theme", "new", "t1"]);
+    assert_eq!(code, 0, "{stderr}");
+    for level in 2..=7 {
+        let (dir, parent) = (format!("t{level}"), format!("t{}", level - 1));
+        let (code, _, stderr) = run(tmp.path(), &["theme", "new", &dir, "--extends", &parent]);
+        assert_eq!(code, 0, "{dir}: {stderr}");
+    }
+    // t7 → … → t1 → default is 8 themes, the most a chain may have.
+    let (code, _, stderr) = run(tmp.path(), &["theme", "new", "t8", "--extends", "t7"]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("--extends t7: its chain already has 8 themes (t7 → t6"),
+        "{stderr}"
+    );
+    assert!(!tmp.path().join("t8").exists());
+}
+
+#[test]
+fn check_points_at_the_entry_not_at_a_commented_example() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(tmp.path(), &["-q", "theme", "new", "hint"]);
+    assert_eq!(code, 0, "{stderr}");
+    let path = tmp.path().join("hint/theme.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    // The scaffold has the same entry as a commented example.
+    assert!(
+        text.contains("# entries = [\"scripts/extra.js\"]"),
+        "{text}"
+    );
+    text.push_str("\n[scripts]\nentries = [\"scripts/extra.js\"]\n");
+    fs::write(&path, &text).unwrap();
+    let line = text
+        .lines()
+        .position(|l| l == "entries = [\"scripts/extra.js\"]")
+        .unwrap()
+        + 1;
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "check", "hint"]);
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    let expected =
+        format!("theme.toml:{line}: error: [scripts] entry 'scripts/extra.js' is not found");
+    assert!(stderr.contains(&expected), "{expected:?} in {stderr}");
+}
+
+#[test]
+fn check_checks_the_directory_never_a_builtin_theme_of_that_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A wrongly named manifest: on a case-insensitive file system `default/theme.toml`
+    // "exists", but resolution must not fall back to the built-in `default`.
+    write_files(
+        tmp.path(),
+        &[(
+            "default/Theme.toml",
+            "name = \"default\"\n[styles]\nentries = [\"styles/missing.css\"]\n",
+        )],
+    );
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "check", "default"]);
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(
+            "default has no theme.toml (it has Theme.toml, but the name must be theme.toml exactly)"
+        ),
+        "{stderr}"
+    );
+    // A real `default` directory is checked as that directory.
+    fs::remove_dir_all(tmp.path().join("default")).unwrap();
+    let (code, _, stderr) = run(tmp.path(), &["-q", "theme", "eject", "default", "default"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "check", "default"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("  chain: default\n"), "{stdout}");
+    assert!(!stdout.contains("built-in"), "{stdout}");
+}
+
+#[test]
+fn new_without_extends_uses_the_builtin_default_even_next_to_a_default_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run(tmp.path(), &["-q", "theme", "eject", "default", "default"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = run(tmp.path(), &["theme", "new", "other"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        manifest(&tmp.path().join("other")).extends.as_deref(),
+        Some("default")
+    );
+    assert!(stdout.contains("    default  built-in"), "{stdout}");
+    // An explicit --extends resolves as theme-format.md §3 says: the directory first.
+    let (code, _, stderr) = run(
+        tmp.path(),
+        &["theme", "new", "local", "--extends", "default"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        manifest(&tmp.path().join("local")).extends.as_deref(),
+        Some("../default")
+    );
+}

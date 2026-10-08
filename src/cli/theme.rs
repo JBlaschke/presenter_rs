@@ -3,8 +3,10 @@
 //!
 //! - `list` prints the built-in themes with their `description`, then, when a
 //!   `presenter.toml` is found from the current directory (or given with `--config`), the
-//!   theme its `[deck] theme` resolves to: the chain child → root and where each theme
-//!   lives. The theme is searched in that file's directory, then the current directory.
+//!   theme `build` would use there: [`pipeline::resolve_theme`] for a deck without front
+//!   matter in the current directory, so `[deck] theme` (or the default) searched in that
+//!   file's directory, then the current directory. It prints the chain child → root and
+//!   where each theme lives.
 //! - `eject NAME DIR` copies every embedded file of the built-in theme `NAME` into `DIR`,
 //!   which must not exist. The copy is named after the directory: `name` in `theme.toml`
 //!   (with a comment line on top saying where it came from) and the `@NAME/` template names
@@ -14,23 +16,38 @@
 //!   empty or not exist): `theme.toml` (`name` from the directory, `extends`, `[styles]
 //!   entries`), `styles/theme.css` listing the parent's tokens (the CSS custom properties
 //!   that its reveal theme and its stylesheets set on `:root`) as comments, and
-//!   `templates/.gitkeep`. `--extends` (default `default`) is a built-in theme name or a
-//!   theme directory relative to the current directory; a directory is written to
-//!   `theme.toml` relative to the new theme, as theme-format.md §2 requires.
-//! - `check DIR` resolves the theme in `DIR` ([`theme::resolve()`]) and prints its chain,
-//!   then reports every problem on stderr as `path:line: error: message`: style and script
-//!   entries and a `highlight_style` file that do not exist, `[layouts]` entries without a
-//!   template file in the chain, templates of the chain's directories that do not compile,
-//!   and an invalid `[reveal] plugins` list. What resolution itself rejects (no
-//!   `theme.toml`, unknown manifest keys, an invalid theme name, a missing parent, a cycle,
-//!   required templates missing from the root theme) fails the command with that error.
+//!   `templates/.gitkeep`. `--extends` is a theme directory relative to the current
+//!   directory or a built-in theme name, as theme-format.md §3 resolves it; a directory is
+//!   written to `theme.toml` relative to the new theme, as §2 requires. Without
+//!   `--extends` the parent is the built-in `default`, even next to a `default/` directory.
+//!   Stylesheets of the parent that cannot be read are left out of the token list (with a
+//!   warning); `check` reports them.
+//! - `check DIR` resolves the theme in `DIR` ([`theme::resolve()`], as an absolute path, so
+//!   it is always that directory, never a built-in theme of the same name) and prints its
+//!   chain, then reports every problem on stderr as `path:line: error: message`: style and
+//!   script entries and a `highlight_style` file that do not exist, `[layouts]` entries
+//!   without a template file in the chain, templates of the chain's directories that do
+//!   not compile, and an invalid `[reveal] plugins` list. What resolution itself rejects
+//!   (no `theme.toml`, unknown manifest keys, an invalid theme name, a missing parent, a
+//!   cycle, required templates missing from the root theme) fails the command with that
+//!   error.
+//!
+//! `eject` and `new` take `DIR` lexically (`a/..` is the current directory) for both the
+//! checks and the writes. They validate everything before they write; if writing or the
+//! final resolution of the new theme still fails, they remove the files and directories
+//! they created, so a retry is not refused.
 //!
 //! Exit codes: 0 on success; 1 when `check` finds problems, for theme errors and I/O
-//! failures; 2 for usage errors (`eject` of a theme that is not built in, an existing
+//! failures; 2 for usage errors: `eject` of a theme that is not built in, an existing
 //! `eject` directory, a non-empty `new` directory, a directory name that cannot be a theme
-//! name). With `-q`, `eject`, `new` and `check` print nothing on stdout.
+//! name or that a theme of the parent chain already has (`theme new default`), a `new`
+//! parent whose chain already has the most themes a chain may have, and an invalid
+//! `presenter.toml` or `--config` file in `list`. With `-q`, `eject`, `new` and `check`
+//! print nothing on stdout.
 
 use std::fmt::Write as _;
+use std::fs;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -43,14 +60,15 @@ use super::{
 use crate::assets::registry::normalize_lexically;
 use crate::config::Config;
 use crate::error::{Diagnostic, Diagnostics, Error};
-use crate::ir::SourceSpan;
+use crate::ir::{Deck, DeckMeta, Features, SourceInfo, SourceKind, SourceSpan};
+use crate::pipeline::{self, BuildOptions};
 use crate::theme::manifest::check_theme_name;
-use crate::theme::resolve::MANIFEST_FILE;
+use crate::theme::resolve::{MANIFEST_FILE, MAX_CHAIN_LEN};
 use crate::theme::{
     self, Theme, ThemeDir, ThemeManifest, ThemeSource, is_layout_name, normalize_rel,
 };
 
-/// The parent of `presenter theme new` without `--extends`.
+/// The parent of `presenter theme new` without `--extends` (always the built-in theme).
 const DEFAULT_PARENT: &str = "default";
 
 /// `highlight_style` values that name a bundled style rather than a file.
@@ -85,23 +103,55 @@ fn list(global: &GlobalArgs) -> anyhow::Result<ExitCode> {
         print_stdout("\nNo presenter.toml in the current directory or its parents.")?;
         return Ok(ExitCode::SUCCESS);
     };
-    let spec = &config.deck.theme;
     let shown_path = display_path(&config_path);
-    let mut roots: Vec<&Path> = Vec::with_capacity(2);
-    if let Some(dir) = config_path.parent() {
-        roots.push(dir);
-    }
-    roots.push(&cwd);
-    let theme = theme::resolve(spec, &roots)
+    let theme = project_theme(&cwd, &config, &config_path)
         .with_context(|| format!("{}: [deck] theme", shown_path.display()))?;
+    let origin = if sets_deck_theme(&config_path) {
+        format!(
+            "[deck] theme = {} in {}",
+            toml_string(&config.deck.theme),
+            shown_path.display()
+        )
+    } else {
+        format!("the default; {} has no [deck] theme", shown_path.display())
+    };
     print_stdout(&format!(
-        "\nTheme '{}' for this directory ([deck] theme = {} in {}):\n{}",
+        "\nTheme '{}' for this directory ({origin}):\n{}",
         theme.name(),
-        toml_string(spec),
-        shown_path.display(),
         chain_lines(&theme)
     ))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The theme `build` would use in `cwd` with `config` (from `config_path`):
+/// [`pipeline::resolve_theme`], so the same precedence and search roots, for a deck
+/// without front matter whose source directory is `cwd` (`theme list` has no deck).
+fn project_theme(cwd: &Path, config: &Config, config_path: &Path) -> crate::error::Result<Theme> {
+    let deck = Deck {
+        meta: DeckMeta::default(),
+        slides: Vec::new(),
+        features: Features::default(),
+        source: SourceInfo {
+            path: cwd.to_path_buf(),
+            kind: SourceKind::Markdown,
+            base_dir: cwd.to_path_buf(),
+        },
+        assets: Vec::new(),
+    };
+    pipeline::resolve_theme(&BuildOptions::new(cwd), &deck, config, Some(config_path))
+}
+
+/// True if the TOML file at `path` sets `[deck] theme` (rather than leaving the default).
+fn sets_deck_theme(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|table| {
+            table
+                .get("deck")
+                .and_then(|deck| deck.get("theme"))
+                .is_some()
+        })
 }
 
 /// `Built-in themes:` and one `  <name>  <description>` line per built-in theme.
@@ -146,51 +196,71 @@ fn chain_lines(theme: &Theme) -> String {
 
 /// `theme eject NAME DIR`.
 fn eject(args: &ThemeEjectArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
+    let ejected = eject_builtin(&args.name, &args.dir)?;
+    if !global.quiet {
+        print_stdout(&eject_message(&args.name, &args.dir, &ejected))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Copies the built-in theme `name` into the new directory `dir` as a theme named after
+/// the directory, and returns the copy, resolved (`theme eject`; `init --full-theme` can
+/// use it too). The copy builds exactly like the built-in theme (see the module docs).
+/// Nothing is left behind when it fails.
+///
+/// Errors: [`UsageError`] when `name` is not a built-in theme, `dir` exists, or the
+/// directory's name cannot be a theme name or is the name of a theme the copy extends;
+/// theme and I/O errors otherwise.
+pub(crate) fn eject_builtin(name: &str, dir: &Path) -> anyhow::Result<Theme> {
     let builtins = theme::builtin_names();
-    if !builtins.contains(&args.name) {
+    if !builtins.iter().any(|builtin| builtin == name) {
         return Err(UsageError(format!(
-            "theme eject: '{}' is not a built-in theme (built-in themes: {})",
-            args.name,
+            "theme eject: '{name}' is not a built-in theme (built-in themes: {})",
             builtins.join(", ")
         ))
         .into());
     }
-    if std::fs::symlink_metadata(&args.dir).is_ok() {
+    let target = absolute_target(dir)?;
+    if fs::symlink_metadata(&target).is_ok() {
         return Err(UsageError(format!(
             "theme eject: {} already exists; name a directory that does not exist",
-            args.dir.display()
+            describe(dir, &target)
         ))
         .into());
     }
-    let (name, spec) = name_and_spec(&args.dir)?;
-    let source = theme::resolve(&args.name, &[])?;
-    check_name_is_free(&name, &source.chain[1..], &args.dir)?;
-    let builtin = &source.chain[0];
-    let files = builtin.list("");
-    for rel in &files {
+    let (new_name, spec) = name_and_spec(&target, dir)?;
+    let source = theme::resolve(name, &[])?;
+    check_name_is_free(&new_name, &source.chain[1..], dir)?;
+    let files = ejected_files(&source.chain[0], &new_name)?;
+    let ejected = create_theme(&target, &files, &spec)?;
+    tracing::info!(theme = name, dir = %dir.display(), files = files.len(), "ejected theme");
+    Ok(ejected)
+}
+
+/// Every file of the built-in theme `builtin` as the files of its copy named `name`:
+/// `theme.toml` renamed ([`renamed_manifest`]) under a provenance comment, templates
+/// retargeted ([`retarget_template`]), everything else as is.
+fn ejected_files(builtin: &ThemeDir, name: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for rel in builtin.list("") {
         let bytes = builtin
-            .read(rel)?
+            .read(&rel)?
             .ok_or_else(|| anyhow!("built-in theme '{}': cannot read {rel}", builtin.name))?;
         let bytes = if rel == MANIFEST_FILE {
-            let renamed = renamed_manifest(&String::from_utf8(bytes)?, &name)?;
+            let renamed = renamed_manifest(&String::from_utf8(bytes)?, name)?;
             format!(
                 "# Ejected from the built-in theme '{}' by `presenter theme eject`.\n{renamed}",
-                args.name
+                builtin.name
             )
             .into_bytes()
         } else if rel.starts_with("templates/") {
-            retarget_template(bytes, &args.name, &name)
+            retarget_template(bytes, &builtin.name, name)
         } else {
             bytes
         };
-        write_file(&args.dir, rel, &bytes)?;
+        files.push((rel, bytes));
     }
-    let ejected = theme::resolve(&spec, &[])?;
-    tracing::info!(theme = %args.name, dir = %args.dir.display(), files = files.len(), "ejected theme");
-    if !global.quiet {
-        print_stdout(&eject_message(args, builtin, &ejected, files.len()))?;
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(files)
 }
 
 /// `manifest` (the text of a `theme.toml`) with its top-level `name = …` line replaced by
@@ -240,26 +310,23 @@ fn retarget_template(bytes: Vec<u8>, old: &str, new: &str) -> Vec<u8> {
 }
 
 /// What `eject` prints: what was copied and how to use it.
-fn eject_message(
-    args: &ThemeEjectArgs,
-    builtin: &ThemeDir,
-    ejected: &Theme,
-    files: usize,
-) -> String {
-    let dir = args.dir.display().to_string();
-    let name = ejected.name();
-    let kind = match &builtin.manifest.extends {
+fn eject_message(builtin: &str, dir: &Path, ejected: &Theme) -> String {
+    let root = &ejected.chain[0];
+    let files = root.list("").len();
+    let shown = dir.display().to_string();
+    let word = shell_word(&shown);
+    let kind = match &root.manifest.extends {
         None => "It is a root theme (no `extends`) with every template: edit any file.".to_string(),
         Some(parent) => format!("It extends '{parent}', like the built-in theme."),
     };
     format!(
-        "Ejected the built-in theme '{}' to {dir} as theme '{name}' ({files} files).\n\
+        "Ejected the built-in theme '{builtin}' to {shown} as theme '{}' ({files} files).\n\
          {kind}\n\
-         Use it with:\n  presenter build slides.md --theme {dir}\n\
+         Use it with:\n  presenter build slides.md --theme {word}\n\
          or in presenter.toml (a path relative to that file):\n  [deck]\n  theme = {}\n\
-         Check it after editing: presenter theme check {dir}",
-        builtin.name,
-        toml_string(&dir)
+         Check it after editing: presenter theme check {word}",
+        ejected.name(),
+        toml_string(&shown)
     )
 }
 
@@ -268,22 +335,25 @@ fn eject_message(
 
 /// `theme new DIR [--extends NAME]`.
 fn new(args: &ThemeNewArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
-    check_empty_or_absent(&args.dir)?;
-    let (name, spec) = name_and_spec(&args.dir)?;
-    let parent_spec = args.extends.as_deref().unwrap_or(DEFAULT_PARENT);
-    let cwd = std::env::current_dir().context("cannot read the current directory")?;
-    let parent = theme::resolve(parent_spec, &[&cwd])
-        .with_context(|| format!("theme new: --extends {parent_spec}"))?;
+    let target = absolute_target(&args.dir)?;
+    check_empty_or_absent(&target, &args.dir)?;
+    let (name, spec) = name_and_spec(&target, &args.dir)?;
+    let (parent_spec, parent) = new_parent(args.extends.as_deref())?;
     check_name_is_free(&name, &parent.chain, &args.dir)?;
-    std::fs::create_dir_all(&args.dir)
-        .with_context(|| format!("cannot create {}", args.dir.display()))?;
-    let extends = extends_value(&args.dir, parent_spec, &parent.chain[0])?;
-    let manifest = new_manifest(&name, &extends);
-    let css = new_stylesheet(&name, &parent)?;
-    write_file(&args.dir, MANIFEST_FILE, manifest.as_bytes())?;
-    write_file(&args.dir, "styles/theme.css", css.as_bytes())?;
-    write_file(&args.dir, "templates/.gitkeep", b"")?;
-    let created = theme::resolve(&spec, &[])?;
+    check_chain_room(&parent, parent_spec)?;
+    let extends = extends_value(&target, parent_spec, &parent.chain[0])?;
+    let files = [
+        (
+            MANIFEST_FILE.to_string(),
+            new_manifest(&name, &extends).into_bytes(),
+        ),
+        (
+            "styles/theme.css".to_string(),
+            new_stylesheet(&name, &parent).into_bytes(),
+        ),
+        ("templates/.gitkeep".to_string(), Vec::new()),
+    ];
+    let created = create_theme(&target, &files, &spec)?;
     tracing::info!(theme = %name, dir = %args.dir.display(), "created theme");
     if !global.quiet {
         print_stdout(&new_message(&args.dir, &created, &parent))?;
@@ -291,13 +361,28 @@ fn new(args: &ThemeNewArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `dir` must not exist or be an empty directory.
-fn check_empty_or_absent(dir: &Path) -> anyhow::Result<()> {
-    if std::fs::symlink_metadata(dir).is_err() {
+/// The parent of a new theme and the spec it was resolved from: `--extends` (a theme
+/// directory relative to the current directory, else a built-in name), or without it the
+/// built-in [`DEFAULT_PARENT`], never a `default/` directory that happens to be here.
+fn new_parent(extends: Option<&str>) -> anyhow::Result<(&str, Theme)> {
+    let Some(spec) = extends else {
+        let parent = theme::resolve(DEFAULT_PARENT, &[])
+            .with_context(|| format!("theme new: the built-in theme '{DEFAULT_PARENT}'"))?;
+        return Ok((DEFAULT_PARENT, parent));
+    };
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    let parent =
+        theme::resolve(spec, &[&cwd]).with_context(|| format!("theme new: --extends {spec}"))?;
+    Ok((spec, parent))
+}
+
+/// `target` (where `dir` points) must not exist or be an empty directory.
+fn check_empty_or_absent(target: &Path, dir: &Path) -> anyhow::Result<()> {
+    if fs::symlink_metadata(target).is_err() {
         return Ok(());
     }
-    let empty = dir.is_dir()
-        && std::fs::read_dir(dir)
+    let empty = target.is_dir()
+        && fs::read_dir(target)
             .with_context(|| format!("cannot read {}", dir.display()))?
             .next()
             .is_none();
@@ -306,19 +391,35 @@ fn check_empty_or_absent(dir: &Path) -> anyhow::Result<()> {
     }
     Err(UsageError(format!(
         "theme new: {} exists and is not an empty directory",
-        dir.display()
+        describe(dir, target)
     ))
     .into())
 }
 
-/// The `extends` value for a new theme in `dir` whose parent `spec` resolved to `parent`:
-/// the built-in name, or the parent's directory relative to `dir` (`/`-separated).
-fn extends_value(dir: &Path, spec: &str, parent: &ThemeDir) -> anyhow::Result<String> {
+/// A child of `parent` (resolved from `spec`) must not make the chain longer than
+/// [`MAX_CHAIN_LEN`], or it would never resolve.
+fn check_chain_room(parent: &Theme, spec: &str) -> anyhow::Result<()> {
+    if parent.chain.len() < MAX_CHAIN_LEN {
+        return Ok(());
+    }
+    let names: Vec<&str> = parent.chain.iter().map(|dir| dir.name.as_str()).collect();
+    Err(UsageError(format!(
+        "theme new: --extends {spec}: its chain already has {} themes ({}), the most a chain \
+         may have, so a child of it would not resolve",
+        parent.chain.len(),
+        names.join(" → ")
+    ))
+    .into())
+}
+
+/// The `extends` value for a new theme at `target` (absolute; it may not exist yet) whose
+/// parent `spec` resolved to `parent`: the built-in name, or the parent's directory
+/// relative to the new theme's (`/`-separated).
+fn extends_value(target: &Path, spec: &str, parent: &ThemeDir) -> anyhow::Result<String> {
     let ThemeSource::Disk { dir: parent_dir } = &parent.source else {
         return Ok(spec.to_string());
     };
-    let dir =
-        std::fs::canonicalize(dir).with_context(|| format!("cannot open {}", dir.display()))?;
+    let dir = canonical_destination(target)?;
     match relative_path(&dir, parent_dir) {
         Some(relative) => Ok(relative),
         None => parent_dir
@@ -326,6 +427,21 @@ fn extends_value(dir: &Path, spec: &str, parent: &ThemeDir) -> anyhow::Result<St
             .map(str::to_string)
             .ok_or_else(|| anyhow!("{} is not a valid UTF-8 path", parent_dir.display())),
     }
+}
+
+/// `path` (absolute and normalized; it or some of its last components may not exist yet)
+/// with its deepest existing ancestor canonicalized: the canonical path the directory
+/// will have, as [`theme::resolve()`] names theme directories (symbolic links resolved).
+fn canonical_destination(path: &Path) -> anyhow::Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        if ancestor.exists() {
+            let base = fs::canonicalize(ancestor)
+                .with_context(|| format!("cannot open {}", ancestor.display()))?;
+            let rest = path.strip_prefix(ancestor)?;
+            return Ok(base.join(rest));
+        }
+    }
+    Ok(path.to_path_buf())
 }
 
 /// `to` relative to `from` (both absolute and normalized), `/`-separated, or `None` when
@@ -380,7 +496,7 @@ entries = ["styles/theme.css"]
 }
 
 /// The `styles/theme.css` of a new theme: the parent's tokens as comments.
-fn new_stylesheet(name: &str, parent: &Theme) -> anyhow::Result<String> {
+fn new_stylesheet(name: &str, parent: &Theme) -> String {
     let mut css = format!(
         "/*\n * Stylesheet of the theme '{name}', loaded after the stylesheets of '{}', so a\n \
          * plain rule here wins. Prefer overriding tokens (CSS custom properties) to overriding\n \
@@ -390,8 +506,7 @@ fn new_stylesheet(name: &str, parent: &Theme) -> anyhow::Result<String> {
     );
     // Nothing may end the comments early.
     let safe = |text: &str| text.replace("*/", "* /");
-    let groups = token_groups(parent)?;
-    for (index, (label, tokens)) in groups.iter().enumerate() {
+    for (index, (label, tokens)) in token_groups(parent).iter().enumerate() {
         if index > 0 {
             css.push('\n');
         }
@@ -401,7 +516,7 @@ fn new_stylesheet(name: &str, parent: &Theme) -> anyhow::Result<String> {
         }
     }
     css.push_str("\n}\n");
-    Ok(css)
+    css
 }
 
 /// A CSS custom property and its value: `("--p-accent", "#2a76dd")`.
@@ -413,21 +528,39 @@ type TokenGroup = (String, Vec<Token>);
 /// The tokens a theme's documents get: those its reveal theme sets on `:root`, then those
 /// of each stylesheet entry (parent-first), each group labelled. A token appears once,
 /// in the last group that sets it (that value wins in the cascade); empty groups are left
-/// out.
-fn token_groups(theme: &Theme) -> anyhow::Result<Vec<TokenGroup>> {
+/// out. A stylesheet that cannot be read (a parent still being edited) is skipped with a
+/// warning: the listing is a convenience, and `theme check` reports the problem.
+fn token_groups(theme: &Theme) -> Vec<TokenGroup> {
     let mut groups = Vec::new();
     let reveal_theme = theme.reveal_theme();
     if reveal_theme != "none" {
-        let css = crate::vendor::get_str(&format!("vendor/reveal/dist/theme/{reveal_theme}.css"))?;
-        groups.push((
-            format!("reveal.js theme '{reveal_theme}'"),
-            root_tokens(&css),
-        ));
+        match crate::vendor::get_str(&format!("vendor/reveal/dist/theme/{reveal_theme}.css")) {
+            Ok(css) => groups.push((
+                format!("reveal.js theme '{reveal_theme}'"),
+                root_tokens(&css),
+            )),
+            Err(err) => tracing::warn!(
+                "the tokens of the reveal.js theme '{reveal_theme}' are not listed: {err}"
+            ),
+        }
     }
-    for file in theme.style_entries()? {
-        let css = String::from_utf8_lossy(&file.bytes);
-        let label = format!("theme '{}': {}", file.theme, file.rel_path);
-        groups.push((label, root_tokens(&css)));
+    for dir in theme.chain.iter().rev() {
+        for entry in &dir.manifest.styles.entries {
+            let bytes = match path_problem(dir, entry) {
+                Some(_) => None,
+                None => dir.read(entry).ok().flatten(),
+            };
+            let Some(bytes) = bytes else {
+                tracing::warn!(
+                    "theme '{}': the style entry '{entry}' cannot be read, so its tokens are \
+                     not listed (`presenter theme check` says why)",
+                    dir.name
+                );
+                continue;
+            };
+            let label = format!("theme '{}': {entry}", dir.name);
+            groups.push((label, root_tokens(&String::from_utf8_lossy(&bytes))));
+        }
     }
     let later: Vec<Vec<String>> = (0..groups.len())
         .map(|index| {
@@ -441,7 +574,7 @@ fn token_groups(theme: &Theme) -> anyhow::Result<Vec<TokenGroup>> {
         tokens.retain(|(token, _)| !later.contains(token));
     }
     groups.retain(|(_, tokens)| !tokens.is_empty());
-    Ok(groups)
+    groups
 }
 
 /// The custom properties (`--name: value`) declared in the `:root { … }` rules of `css`,
@@ -492,6 +625,7 @@ fn strip_css_comments(css: &str) -> String {
 /// What `new` prints: the files, the chain and the next steps.
 fn new_message(dir: &Path, created: &Theme, parent: &Theme) -> String {
     let shown = dir.display().to_string();
+    let word = shell_word(&shown);
     let parent_name = parent.name();
     let files = [
         (
@@ -523,13 +657,14 @@ fn new_message(dir: &Path, created: &Theme, parent: &Theme) -> String {
     if matches!(parent.chain[0].source, ThemeSource::Embedded { .. }) {
         let _ = write!(
             text,
-            "\n  presenter theme eject {parent_name} <dir>  # a full copy of the parent to look at"
+            "\n  presenter theme eject {} <dir>  # a full copy of the parent to look at",
+            shell_word(parent_name)
         );
     }
     let _ = write!(
         text,
-        "\n  presenter build slides.md --theme {shown}  # or [deck] theme = {} in presenter.toml\
-         \n  presenter theme check {shown}",
+        "\n  presenter build slides.md --theme {word}  # or [deck] theme = {} in presenter.toml\
+         \n  presenter theme check {word}",
         toml_string(&shown)
     );
     text
@@ -541,25 +676,28 @@ fn new_message(dir: &Path, created: &Theme, parent: &Theme) -> String {
 /// `theme check DIR`.
 fn check(args: &ThemeCheckArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let dir = &args.dir;
-    if !dir.join(MANIFEST_FILE).is_file() {
-        let why = if dir.is_dir() {
-            format!("has no {MANIFEST_FILE}")
-        } else if std::fs::symlink_metadata(dir).is_ok() {
-            "is not a directory".to_string()
-        } else {
-            "does not exist".to_string()
-        };
+    // Absolute, so that resolution finds this directory or fails: a relative spec that is
+    // not a theme directory would fall back to the built-in theme of that name.
+    let absolute = std::path::absolute(dir)
+        .map_err(|err| UsageError(format!("theme check: {}: {err}", dir.display())))?;
+    if let Some(why) = manifest_problem(&absolute) {
         return Err(anyhow!(
             "theme check: {} {why}; a theme is a directory with a {MANIFEST_FILE} \
              (`presenter theme new <dir>` creates one)",
             dir.display()
         ));
     }
-    let spec = dir
+    let spec = absolute
         .to_str()
         .ok_or_else(|| anyhow!("theme check: {} is not a valid UTF-8 path", dir.display()))?;
-    let cwd = std::env::current_dir().context("cannot read the current directory")?;
-    let theme = theme::resolve(spec, &[&cwd])?;
+    let theme = theme::resolve(spec, &[])?;
+    if !matches!(theme.chain[0].source, ThemeSource::Disk { .. }) {
+        // Cannot happen: an absolute spec is never a built-in theme name.
+        return Err(anyhow!(
+            "theme check: {} resolved to a built-in theme",
+            dir.display()
+        ));
+    }
     if !global.quiet {
         let header = format!("Theme '{}' in {}:", theme.name(), dir.display());
         print_stdout(&format!("{header}\n{}", chain_lines(&theme)))?;
@@ -579,6 +717,41 @@ fn check(args: &ThemeCheckArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode>
     } else {
         ExitCode::from(EXIT_BUILD_ERROR)
     })
+}
+
+/// Why `dir` is not a theme directory (an `is …`/`has …` clause), if it is not: it does
+/// not exist, is not a directory, or has no file named exactly `theme.toml` (the rule
+/// resolution applies on every platform; a `Theme.toml` is named in the message).
+fn manifest_problem(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        let why = if fs::symlink_metadata(dir).is_ok() {
+            "is not a directory"
+        } else {
+            "does not exist"
+        };
+        return Some(why.to_string());
+    }
+    let names: Vec<String> = match fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .collect(),
+        Err(err) => return Some(format!("cannot be read ({err})")),
+    };
+    if names.iter().any(|name| name == MANIFEST_FILE) && dir.join(MANIFEST_FILE).is_file() {
+        return None;
+    }
+    let mut why = format!("has no {MANIFEST_FILE}");
+    let variant = names
+        .iter()
+        .filter(|name| *name != MANIFEST_FILE && name.eq_ignore_ascii_case(MANIFEST_FILE))
+        .min();
+    if let Some(variant) = variant {
+        let _ = write!(
+            why,
+            " (it has {variant}, but the name must be {MANIFEST_FILE} exactly)"
+        );
+    }
+    Some(why)
 }
 
 /// Every problem of a resolved theme (see the module docs), chain order.
@@ -639,30 +812,42 @@ impl<'a> ManifestFile<'a> {
         }
     }
 
-    /// The first line that contains `value` as a quoted TOML string.
-    fn line_of_value(&self, value: &str) -> Option<usize> {
+    /// The line where `value` is written as a quoted TOML string in the value of `key` in
+    /// `[table]` (an array may span several lines), comments ignored. When it is not
+    /// written that way (a dotted key, an inline table), the first line that has it
+    /// outside a comment.
+    fn line_of_value(&self, table: &str, key: &str, value: &str) -> Option<usize> {
         let quoted = [format!("\"{value}\""), format!("'{value}'")];
-        line_where(&self.text, |line| {
-            quoted.iter().any(|q| line.contains(q.as_str()))
-        })
+        let has_value = |code: &str| quoted.iter().any(|q| code.contains(q.as_str()));
+        let mut current: Option<String> = None;
+        let mut in_value = false;
+        let scoped = line_where(&self.text, |line| {
+            let code = toml_code(line).trim();
+            if let Some(header) = table_header(code) {
+                current = Some(header);
+                in_value = false;
+                return false;
+            }
+            if let Some((name, rest)) = split_key(code) {
+                in_value = current.as_deref() == Some(table) && is_key(name, key);
+                return in_value && has_value(rest);
+            }
+            in_value && has_value(code)
+        });
+        scoped.or_else(|| line_where(&self.text, |line| has_value(toml_code(line))))
     }
 
     /// The line of `key = …` (bare or quoted key) in the table `[table]`.
     fn line_of_key(&self, table: &str, key: &str) -> Option<usize> {
-        let header = format!("[{table}]");
-        let mut current = String::new();
-        let keys = [key.to_string(), format!("\"{key}\""), format!("'{key}'")];
+        let mut current: Option<String> = None;
         line_where(&self.text, |line| {
-            let line = line.trim();
-            if line.starts_with('[') {
-                current = line.split('#').next().unwrap_or("").replace(' ', "");
+            let code = toml_code(line).trim();
+            if let Some(header) = table_header(code) {
+                current = Some(header);
                 return false;
             }
-            current == header
-                && keys.iter().any(|k| {
-                    line.strip_prefix(k.as_str())
-                        .is_some_and(|rest| rest.trim_start().starts_with('='))
-                })
+            current.as_deref() == Some(table)
+                && split_key(code).is_some_and(|(name, _)| is_key(name, key))
         })
     }
 }
@@ -670,6 +855,61 @@ impl<'a> ManifestFile<'a> {
 /// The 1-based number of the first line of `text` for which `matches` is true.
 fn line_where(text: &str, matches: impl FnMut(&str) -> bool) -> Option<usize> {
     text.lines().position(matches).map(|index| index + 1)
+}
+
+/// `line` without its comment: the text before the first `#` outside a TOML string.
+fn toml_code(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, c) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => return &line[..index],
+            None => {}
+        }
+    }
+    line
+}
+
+/// The table a header line (comment removed, trimmed) opens, without brackets or spaces:
+/// `[ styles ]` → `styles`. `None` for any other line.
+fn table_header(code: &str) -> Option<String> {
+    let inner = code.strip_prefix('[')?.strip_suffix(']')?;
+    let inner = inner.trim_start_matches('[').trim_end_matches(']');
+    Some(inner.chars().filter(|c| !c.is_whitespace()).collect())
+}
+
+/// A `key = value` line (comment removed) split at its first `=` outside a string: the
+/// trimmed key and the rest. `None` for a line without one (an array continuation line).
+fn split_key(code: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, c) in code.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '=' => return Some((code[..index].trim(), &code[index + 1..])),
+            None => {}
+        }
+    }
+    None
+}
+
+/// True if the written key `name` (bare, `"quoted"` or `'quoted'`) is `key`.
+fn is_key(name: &str, key: &str) -> bool {
+    name == key
+        || [('"', '"'), ('\'', '\'')].iter().any(|(open, close)| {
+            name.strip_prefix(*open)
+                .and_then(|rest| rest.strip_suffix(*close))
+                .is_some_and(|inner| inner == key)
+        })
 }
 
 /// A one-line span.
@@ -685,18 +925,15 @@ fn line_span(line: usize) -> SourceSpan {
 fn entry_problems(manifest: &ManifestFile<'_>, found: &mut Diagnostics) {
     let theme = &manifest.dir.manifest;
     let lists = [
-        ("[styles] entry", "theme-style-entry", &theme.styles.entries),
-        (
-            "[scripts] entry",
-            "theme-script-entry",
-            &theme.scripts.entries,
-        ),
+        ("styles", "theme-style-entry", &theme.styles.entries),
+        ("scripts", "theme-script-entry", &theme.scripts.entries),
     ];
-    for (label, code, entries) in lists {
+    for (table, code, entries) in lists {
         for entry in entries {
             if let Some(problem) = path_problem(manifest.dir, entry) {
-                let message = format!("{label} '{entry}' {problem}");
-                found.push(manifest.problem(code, message, manifest.line_of_value(entry)));
+                let message = format!("[{table}] entry '{entry}' {problem}");
+                let line = manifest.line_of_value(table, "entries", entry);
+                found.push(manifest.problem(code, message, line));
             }
         }
     }
@@ -707,7 +944,7 @@ fn entry_problems(manifest: &ManifestFile<'_>, found: &mut Diagnostics) {
         let message = format!(
             "[styles] highlight_style '{style}' (not monokai, zenburn or none, so a CSS file) {problem}"
         );
-        let line = manifest.line_of_value(style);
+        let line = manifest.line_of_value("styles", "highlight_style", style);
         found.push(manifest.problem("theme-highlight-style", message, line));
     }
 }
@@ -784,8 +1021,12 @@ fn template_problems(env: &minijinja::Environment<'_>, dir: &ThemeDir, found: &m
     }
 }
 
-/// An invalid merged `[reveal] plugins` list, reported on the theme that sets it (the
-/// check `build` makes).
+/// An invalid merged `[reveal] plugins` list, reported on the theme that sets it.
+///
+/// This is the check `build` makes in `pipeline::check_theme_plugins` (private to
+/// src/pipeline.rs), which returns the first failure as an error instead of a located
+/// diagnostic: keep the two in step. Follow-up: one `pub(crate)` probe in the pipeline
+/// for both (pipeline.rs is not this module's file).
 fn plugin_problems(theme: &Theme, found: &mut Diagnostics) {
     let probe = Config {
         reveal: theme.reveal_defaults(),
@@ -813,12 +1054,29 @@ fn plugin_problems(theme: &Theme, found: &mut Diagnostics) {
 // ---------------------------------------------------------------------------------------
 // shared
 
-/// The theme name for a new theme directory (its last component) and the directory as an
-/// absolute path string (the spec to resolve it with). Usage errors when the name cannot
-/// be a theme name ([`check_theme_name`]) or the path is not UTF-8.
-fn name_and_spec(dir: &Path) -> anyhow::Result<(String, String)> {
-    let absolute = normalize_lexically(&std::path::absolute(dir)?);
-    let name = absolute
+/// `dir` as the directory `new` and `eject` check and write: absolute and lexically
+/// normalized (`a/..` is the current directory, whether or not `a` exists), so that the
+/// checks and the writes see the same directory.
+fn absolute_target(dir: &Path) -> anyhow::Result<PathBuf> {
+    let absolute =
+        std::path::absolute(dir).map_err(|err| UsageError(format!("{}: {err}", dir.display())))?;
+    Ok(normalize_lexically(&absolute))
+}
+
+/// `dir` (as given) for a message about `target`, the directory it names, with the
+/// directory added when they differ in more than being relative (`a/..`).
+fn describe(dir: &Path, target: &Path) -> String {
+    match std::path::absolute(dir) {
+        Ok(absolute) if absolute == target => dir.display().to_string(),
+        _ => format!("{} (that is {})", dir.display(), target.display()),
+    }
+}
+
+/// The theme name for a new theme directory `target` ([`absolute_target`] of `dir`): its
+/// last component; and `target` as a string (the spec to resolve it with). Usage errors
+/// when the name cannot be a theme name ([`check_theme_name`]) or the path is not UTF-8.
+fn name_and_spec(target: &Path, dir: &Path) -> anyhow::Result<(String, String)> {
+    let name = target
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
@@ -833,7 +1091,7 @@ fn name_and_spec(dir: &Path) -> anyhow::Result<(String, String)> {
             dir.display()
         ))
     })?;
-    let spec = absolute
+    let spec = target
         .to_str()
         .ok_or_else(|| UsageError(format!("{} is not a valid UTF-8 path", dir.display())))?;
     Ok((name.to_string(), spec.to_string()))
@@ -853,16 +1111,102 @@ fn check_name_is_free(name: &str, parents: &[ThemeDir], dir: &Path) -> anyhow::R
     .into())
 }
 
-/// Writes `bytes` to `dir/rel` (`/`-separated), creating parent directories.
-fn write_file(dir: &Path, rel: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    let path = rel
-        .split('/')
-        .fold(dir.to_path_buf(), |path, part| path.join(part));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
+/// Writes `files` (`/`-separated paths relative to `dir`, with their contents) into the
+/// new theme directory `dir` (absolute; absent, or an empty directory), then resolves the
+/// theme there (`spec` is `dir` as a string). On any failure it removes what it wrote
+/// ([`Written::undo`]) before returning the error, so `dir` is as it was and a retry is
+/// not refused. It never replaces an existing file.
+fn create_theme(dir: &Path, files: &[(String, Vec<u8>)], spec: &str) -> anyhow::Result<Theme> {
+    let mut written = Written::default();
+    let result =
+        write_theme_files(dir, files, &mut written).and_then(|()| Ok(theme::resolve(spec, &[])?));
+    if result.is_err() {
+        written.undo();
     }
-    std::fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))
+    result
+}
+
+/// The writing part of [`create_theme`], recording what it creates in `written`.
+fn write_theme_files(
+    dir: &Path,
+    files: &[(String, Vec<u8>)],
+    written: &mut Written,
+) -> anyhow::Result<()> {
+    written.create_dirs(dir)?;
+    for (rel, bytes) in files {
+        let path = rel
+            .split('/')
+            .fold(dir.to_path_buf(), |path, part| path.join(part));
+        if let Some(parent) = path.parent() {
+            written.create_dirs(parent)?;
+        }
+        written.create_file(&path, bytes)?;
+    }
+    Ok(())
+}
+
+/// The files and directories [`create_theme`] created, to remove them if it fails.
+#[derive(Debug, Default)]
+struct Written {
+    /// Files it created.
+    files: Vec<PathBuf>,
+    /// Directories it created (or was about to create).
+    dirs: Vec<PathBuf>,
+}
+
+impl Written {
+    /// Creates the directory `dir` and its missing ancestors, recording them first.
+    fn create_dirs(&mut self, dir: &Path) -> anyhow::Result<()> {
+        let missing = dir
+            .ancestors()
+            .take_while(|ancestor| fs::symlink_metadata(ancestor).is_err());
+        self.dirs.extend(missing.map(Path::to_path_buf));
+        fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))
+    }
+
+    /// Creates the file `path`, which must not exist, with `bytes`.
+    fn create_file(&mut self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        self.files.push(path.to_path_buf());
+        file.write_all(bytes)
+            .with_context(|| format!("cannot write {}", path.display()))
+    }
+
+    /// Removes the recorded files, then the recorded directories that are empty, deepest
+    /// first. Best effort: what cannot be removed is left (and logged).
+    fn undo(mut self) {
+        for file in &self.files {
+            if let Err(err) = fs::remove_file(file) {
+                tracing::warn!("cannot remove {}: {err}", file.display());
+            }
+        }
+        self.dirs
+            .sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+        for dir in &self.dirs {
+            if let Err(err) = fs::remove_dir(dir) {
+                tracing::debug!("not removing {}: {err}", dir.display());
+            }
+        }
+    }
+}
+
+/// `text` as one word of a printed shell command: unchanged when it only has characters
+/// that common shells do not treat specially, else in single quotes (a `'` written as
+/// `'\''`, the POSIX way).
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text.chars().all(|c| {
+            c.is_ascii_alphanumeric() || "-_./,:@%+".contains(c) || (cfg!(windows) && c == '\\')
+        });
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
 }
 
 /// `value` as a TOML string literal (quoted and escaped).
@@ -922,6 +1266,57 @@ mod tests {
     }
 
     #[test]
+    fn eject_builtin_writes_a_resolvable_copy_and_refuses_existing_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("nested").join("copy");
+        let ejected = eject_builtin("default", &dir).unwrap();
+        assert_eq!(ejected.name(), "copy");
+        assert!(matches!(ejected.chain[0].source, ThemeSource::Disk { .. }));
+        let builtin = theme::resolve("default", &[]).unwrap();
+        assert_eq!(ejected.chain[0].list(""), builtin.chain[0].list(""));
+        let err = eject_builtin("default", &dir).unwrap_err();
+        assert!(err.is::<UsageError>(), "{err:#}");
+        let err = eject_builtin("nope", &tmp.path().join("other")).unwrap_err();
+        assert!(err.is::<UsageError>(), "{err:#}");
+    }
+
+    #[test]
+    fn create_theme_removes_what_it_wrote_when_it_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = |rel: &str, text: &str| (rel.to_string(), text.as_bytes().to_vec());
+        // A write fails (a file where a directory must go): the new directory and its
+        // missing parent are gone again.
+        let dir = tmp.path().join("parent").join("theme");
+        let spec = dir.to_str().unwrap().to_string();
+        let files = [file("a.txt", "x"), file("a.txt/b.txt", "y")];
+        assert!(create_theme(&dir, &files, &spec).is_err());
+        assert!(!tmp.path().join("parent").exists());
+        // The theme does not resolve (a root theme without templates): an empty directory
+        // that was there stays, empty.
+        let dir = tmp.path().join("empty");
+        fs::create_dir(&dir).unwrap();
+        let spec = dir.to_str().unwrap().to_string();
+        let files = [
+            file(MANIFEST_FILE, "name = \"empty\"\n"),
+            file("styles/x.css", ""),
+        ];
+        let err = create_theme(&dir, &files, &spec).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("missing required files"),
+            "{err:#}"
+        );
+        assert!(dir.is_dir());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        // It never replaces a file.
+        let dir = tmp.path().join("taken");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "mine").unwrap();
+        let spec = dir.to_str().unwrap().to_string();
+        assert!(create_theme(&dir, &[file("a.txt", "theirs")], &spec).is_err());
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "mine");
+    }
+
+    #[test]
     fn root_tokens_reads_custom_properties_of_root_rules() {
         let css = "/* :root { --commented: 1; } */\n\
                    :root {\n  --a: 1em; /* note: x */\n  --b:  \"Source Sans\",\n    serif;\n  color: red;\n}\n\
@@ -943,7 +1338,7 @@ mod tests {
     #[test]
     fn token_groups_list_each_token_once_where_it_wins() {
         let default = theme::resolve("default", &[]).unwrap();
-        let groups = token_groups(&default).unwrap();
+        let groups = token_groups(&default);
         let reveal_theme = default.reveal_theme();
         assert_eq!(groups[0].0, format!("reveal.js theme '{reveal_theme}'"));
         let all: Vec<&str> = groups
@@ -970,18 +1365,42 @@ mod tests {
     }
 
     #[test]
+    fn canonical_destination_keeps_the_missing_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(tmp.path()).unwrap();
+        let path = tmp.path().join("new").join("theme");
+        assert_eq!(
+            canonical_destination(&path).unwrap(),
+            canonical.join("new").join("theme")
+        );
+        assert_eq!(canonical_destination(tmp.path()).unwrap(), canonical);
+    }
+
+    fn manifest_file<'a>(dir: &'a ThemeDir, text: &str) -> ManifestFile<'a> {
+        ManifestFile {
+            dir,
+            path: None,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
     fn manifest_lines_are_found_by_value_and_by_key() {
         let dir = theme::resolve("default", &[]).unwrap().chain[0].clone();
-        let manifest = ManifestFile {
-            dir: &dir,
-            path: None,
-            text: "name = \"t\"\n[styles]\nentries = ['a.css', \"b.css\"]\n[layouts]\n\
-                   \"quote\" = \"q\"\ntitle= \"t\"\n[vars]\ntitle = 1\n"
-                .to_string(),
-        };
-        assert_eq!(manifest.line_of_value("b.css"), Some(3));
-        assert_eq!(manifest.line_of_value("a.css"), Some(3));
-        assert_eq!(manifest.line_of_value("c.css"), None);
+        let manifest = manifest_file(
+            &dir,
+            "name = \"t\"\n[styles]\nentries = ['a.css', \"b.css\"]\n[layouts]\n\
+             \"quote\" = \"q\"\ntitle= \"t\"\n[vars]\ntitle = 1\n",
+        );
+        assert_eq!(
+            manifest.line_of_value("styles", "entries", "b.css"),
+            Some(3)
+        );
+        assert_eq!(
+            manifest.line_of_value("styles", "entries", "a.css"),
+            Some(3)
+        );
+        assert_eq!(manifest.line_of_value("styles", "entries", "c.css"), None);
         assert_eq!(manifest.line_of_key("layouts", "quote"), Some(5));
         assert_eq!(manifest.line_of_key("layouts", "title"), Some(6));
         assert_eq!(manifest.line_of_key("vars", "title"), Some(8));
@@ -989,5 +1408,59 @@ mod tests {
         // Built-in themes have no path: the message names the theme, no line.
         let problem = manifest.problem("x", "boom".into(), Some(3));
         assert_eq!(problem.to_string(), "error: built-in theme 'default': boom");
+    }
+
+    #[test]
+    fn manifest_lines_skip_comments_and_follow_tables_and_keys() {
+        let dir = theme::resolve("default", &[]).unwrap().chain[0].clone();
+        let manifest = manifest_file(
+            &dir,
+            "# entries = [\"x.js\"]\n\
+             [styles]\n\
+             entries = [\"a.css\"]  # not \"x.js\"\n\
+             highlight_style = \"x.js\"\n\
+             [ scripts ]  # the scripts\n\
+             # entries = [\"x.js\"]\n\
+             other = \"x.js\"\n\
+             entries = [\n\
+             \x20 \"y.js\",  # \"x.js\" = 1\n\
+             \x20 'x.js',\n\
+             ]\n\
+             [vars]\n\
+             \"a#b\" = \"x.js\"\n",
+        );
+        assert_eq!(
+            manifest.line_of_value("scripts", "entries", "x.js"),
+            Some(10)
+        );
+        assert_eq!(
+            manifest.line_of_value("scripts", "entries", "y.js"),
+            Some(9)
+        );
+        assert_eq!(
+            manifest.line_of_value("styles", "highlight_style", "x.js"),
+            Some(4)
+        );
+        // Not in the table (a dotted key, say): the first line that has it as code.
+        assert_eq!(manifest.line_of_value("reveal", "plugins", "x.js"), Some(4));
+        assert_eq!(manifest.line_of_key("scripts", "other"), Some(7));
+        assert_eq!(manifest.line_of_key("vars", "a#b"), Some(13));
+        assert_eq!(toml_code("a = \"#\" # c"), "a = \"#\" ");
+        assert_eq!(toml_code("a = 'x\\' # c"), "a = 'x\\' ");
+        assert_eq!(toml_code("a = \"x\\\"#\" # c"), "a = \"x\\\"#\" ");
+        assert_eq!(table_header("[[ a.b ]]").as_deref(), Some("a.b"));
+        assert_eq!(table_header("\"x\","), None);
+        assert_eq!(split_key("\"a = b\","), None);
+        assert_eq!(split_key("'k' = 1"), Some(("'k'", " 1")));
+    }
+
+    #[test]
+    fn shell_words_are_quoted_when_needed() {
+        assert_eq!(shell_word("themes/my-theme_2.0"), "themes/my-theme_2.0");
+        assert_eq!(shell_word("full copy"), "'full copy'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("$HOME"), "'$HOME'");
+        assert_eq!(shell_word("~/x"), "'~/x'");
+        assert_eq!(shell_word(""), "''");
     }
 }
