@@ -13,9 +13,9 @@
 //! extension) is reported as an error-level diagnostic of that input
 //! ([`crate::check::error_diagnostic`]).
 //!
-//! Exit codes: 2 when an input has an unknown extension or a configuration error (as for
-//! every command, [`exit_code_for`]); otherwise 1 when there is an error, or a warning with
-//! `--deny-warnings`; otherwise 0.
+//! Exit codes (cli.md `check`): 1 when there is an error of any kind (also an unknown
+//! extension or an invalid `presenter.toml`, which other commands exit 2 for), or a warning
+//! with `--deny-warnings`; otherwise 0. Only clap's own argument errors exit 2.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,8 +23,8 @@ use std::process::ExitCode;
 use serde::Serialize;
 
 use super::{
-    CheckArgs, CheckFormat, EXIT_BUILD_ERROR, EXIT_OK, EXIT_USAGE, GlobalArgs, display_path,
-    exit_code_for, input_kind, print_stdout, report_diagnostics,
+    CheckArgs, CheckFormat, EXIT_BUILD_ERROR, EXIT_OK, GlobalArgs, display_path, input_kind,
+    print_stdout, report_diagnostics,
 };
 use crate::check;
 use crate::error::{Diagnostic, Diagnostics, Error, Level};
@@ -33,34 +33,26 @@ use crate::pipeline::BuildOptions;
 /// Runs `presenter check`.
 pub fn run(args: &CheckArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let mut all = Diagnostics::new();
-    let mut usage_error = false;
     for input in &args.inputs {
         match check_input(input, args, global) {
             Ok(diagnostics) => all.extend(diagnostics),
-            Err((diagnostic, usage)) => {
-                usage_error |= usage;
-                all.push(diagnostic);
-            }
+            Err(diagnostic) => all.push(diagnostic),
         }
     }
     match args.format {
         CheckFormat::Text => report_diagnostics(&all, global),
         CheckFormat::Json => print_stdout(&json_report(&all)?)?,
     }
-    Ok(ExitCode::from(exit_code(
-        &all,
-        usage_error,
-        args.deny_warnings,
-    )))
+    Ok(ExitCode::from(exit_code(&all, args.deny_warnings)))
 }
 
 /// The diagnostics of one input, or the failure that stopped its check as an error
-/// diagnostic plus whether that failure is a usage or configuration error (exit 2).
+/// diagnostic.
 fn check_input(
     input: &Path,
     args: &CheckArgs,
     global: &GlobalArgs,
-) -> Result<Diagnostics, (Diagnostic, bool)> {
+) -> Result<Diagnostics, Diagnostic> {
     let kind = input_kind(input).map_err(|err| {
         // The message starts with the input's name, which the diagnostic's path already gives.
         let message = err.to_string();
@@ -69,7 +61,7 @@ fn check_input(
             .strip_prefix(&prefix)
             .unwrap_or(&message)
             .to_string();
-        (check::error_diagnostic(&Error::Other(message), input), true)
+        check::error_diagnostic(&Error::Other(message), input)
     })?;
     let mut opts = BuildOptions {
         config_path: global.config.clone(),
@@ -78,18 +70,12 @@ fn check_input(
         ..BuildOptions::new(input)
     };
     opts.cli.theme = args.theme.clone();
-    check::run(&opts).map_err(|err| {
-        let diagnostic = check::error_diagnostic(&err, input);
-        let usage = exit_code_for(&anyhow::Error::new(err)) == EXIT_USAGE;
-        (diagnostic, usage)
-    })
+    check::run(&opts).map_err(|err| check::error_diagnostic(&err, input))
 }
 
 /// The exit code for `diagnostics` (see the module docs).
-fn exit_code(diagnostics: &Diagnostics, usage_error: bool, deny_warnings: bool) -> u8 {
-    if usage_error {
-        EXIT_USAGE
-    } else if diagnostics.has_errors() || (deny_warnings && !diagnostics.is_empty()) {
+fn exit_code(diagnostics: &Diagnostics, deny_warnings: bool) -> u8 {
+    if diagnostics.has_errors() || (deny_warnings && !diagnostics.is_empty()) {
         EXIT_BUILD_ERROR
     } else {
         EXIT_OK
@@ -144,12 +130,12 @@ mod tests {
             Diagnostic::warning("empty-slide", "x"),
             Diagnostic::error("io-error", "y"),
         ]);
-        assert_eq!(exit_code(&none, false, false), EXIT_OK);
-        assert_eq!(exit_code(&none, false, true), EXIT_OK);
-        assert_eq!(exit_code(&warned, false, false), EXIT_OK);
-        assert_eq!(exit_code(&warned, false, true), EXIT_BUILD_ERROR);
-        assert_eq!(exit_code(&failed, false, false), EXIT_BUILD_ERROR);
-        assert_eq!(exit_code(&failed, true, false), EXIT_USAGE);
+        assert_eq!(exit_code(&none, false), EXIT_OK);
+        assert_eq!(exit_code(&none, true), EXIT_OK);
+        assert_eq!(exit_code(&warned, false), EXIT_OK);
+        assert_eq!(exit_code(&warned, true), EXIT_BUILD_ERROR);
+        assert_eq!(exit_code(&failed, false), EXIT_BUILD_ERROR);
+        assert_eq!(exit_code(&failed, true), EXIT_BUILD_ERROR);
     }
 
     #[test]
@@ -192,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_extensions_are_usage_errors_and_other_inputs_are_still_checked() {
+    fn unknown_extensions_are_errors_and_other_inputs_are_still_checked() {
         let dir = tempfile::tempdir().unwrap();
         let deck = dir.path().join("deck.md");
         std::fs::write(&deck, "# One\n\nSome text\n--\n").unwrap();
@@ -205,8 +191,8 @@ mod tests {
             theme: None,
         };
         let global = GlobalArgs::default();
-        let (diagnostic, usage) = check_input(&notes, &args, &global).unwrap_err();
-        assert!(usage);
+        let diagnostic = check_input(&notes, &args, &global).unwrap_err();
+        assert_eq!(diagnostic.level, Level::Error);
         assert_eq!(diagnostic.code, check::codes::ERROR);
         assert!(
             diagnostic
@@ -219,8 +205,7 @@ mod tests {
         let codes: Vec<&str> = found.iter().map(|d| d.code).collect();
         assert_eq!(codes, ["separator-not-recognized"]);
         let missing = dir.path().join("missing.md");
-        let (diagnostic, usage) = check_input(&missing, &args, &global).unwrap_err();
-        assert!(!usage);
+        let diagnostic = check_input(&missing, &args, &global).unwrap_err();
         assert_eq!(diagnostic.code, check::codes::IO_ERROR);
     }
 }

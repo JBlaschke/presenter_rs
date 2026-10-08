@@ -224,7 +224,8 @@ fn every_input_is_checked_and_errors_win() {
 }
 
 #[test]
-fn unknown_extensions_and_config_errors_exit_2() {
+fn unknown_extensions_and_config_errors_exit_1() {
+    // cli.md `check`: "1 on errors", whatever the error (other commands exit 2 for these).
     let dir = project(&[
         ("notes.txt", "hello"),
         ("ok.md", "# One\n"),
@@ -232,14 +233,21 @@ fn unknown_extensions_and_config_errors_exit_2() {
         ("broken/slides.md", "# One\n"),
     ]);
     let (code, _, stderr) = run(dir.path(), &["check", "ok.md", "notes.txt"]);
-    assert_eq!(code, 2, "{stderr}");
+    assert_eq!(code, 1, "{stderr}");
     assert!(
         stderr.starts_with("notes.txt: error: cannot tell the input format"),
         "{stderr}"
     );
     let (code, _, stderr) = run(dir.path(), &["check", "broken/slides.md"]);
-    assert_eq!(code, 2, "{stderr}");
+    assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("presenter.toml"), "{stderr}");
+    let (code, entries) = check_json(dir.path(), &["broken/slides.md"]);
+    assert_eq!(code, 1);
+    assert_eq!(entries[0]["code"], "config-error");
+    let (code, _, stderr) = run(dir.path(), &["--config", "nope.toml", "check", "ok.md"]);
+    assert_eq!(code, 1, "{stderr}");
+    // clap's own usage errors keep exit 2.
+    assert_eq!(run(dir.path(), &["check", "--format", "xml", "ok.md"]).0, 2);
 }
 
 #[test]
@@ -312,5 +320,105 @@ fn notebook_lints_are_reported_by_cell() {
             "tests/fixtures/ipynb/minimal.ipynb: warning: the notebook's code cell has no outputs"
         ),
         "{stderr}"
+    );
+}
+
+/// A notebook with `cells` (JSON objects).
+fn notebook(cells: &[Value]) -> String {
+    serde_json::json!({"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": cells})
+        .to_string()
+}
+
+#[test]
+fn script_outputs_and_unknown_slide_types_are_reported_by_cell() {
+    use serde_json::json;
+    let cells = [
+        json!({"cell_type": "markdown", "source": "# One",
+               "metadata": {"slideshow": {"slide_type": "slidee"}}}),
+        json!({"cell_type": "code", "source": "show()", "metadata": {}, "execution_count": 1,
+               "outputs": [{"output_type": "display_data", "metadata": {},
+                            "data": {"text/html": "<div id=\"x\"></div><script>draw()</script>"}}]}),
+    ];
+    let dir = project(&[("nb.ipynb", &notebook(&cells))]);
+    let (code, entries) = check_json(dir.path(), &["nb.ipynb"]);
+    assert_eq!(code, 0);
+    let found: Vec<(&str, &str, Option<u64>)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["level"].as_str().unwrap(),
+                e["code"].as_str().unwrap(),
+                e["cell"].as_u64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("warning", "unknown-slide-type", Some(0)),
+            ("warning", "output-script", Some(1)),
+        ]
+    );
+    assert_eq!(
+        run(dir.path(), &["check", "--deny-warnings", "nb.ipynb"]).0,
+        1
+    );
+}
+
+#[test]
+fn split_markdown_cells_are_linted_for_separators() {
+    let cells = [serde_json::json!({
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": "# One\n\n---\n\n## Two\n\nSome text\n--\n\nmore\n\n:::include x.md\n:::\n",
+    })];
+    let nb = notebook(&cells);
+    let dir = project(&[
+        ("plain/n.ipynb", &nb),
+        ("split/n.ipynb", &nb),
+        (
+            "split/presenter.toml",
+            "[notebook]\nsplit_markdown_cells = true\n",
+        ),
+    ]);
+    let found = |path: &str| -> Vec<(String, Option<u64>, Option<u64>)> {
+        let (code, entries) = check_json(dir.path(), &[path]);
+        assert_eq!(code, 0);
+        entries
+            .iter()
+            .map(|e| {
+                (
+                    e["code"].as_str().unwrap().to_string(),
+                    e["cell"].as_u64(),
+                    e["line"].as_u64(),
+                )
+            })
+            .collect()
+    };
+    let include = ("unknown-directive".to_string(), Some(0), Some(12));
+    assert_eq!(found("plain/n.ipynb"), std::slice::from_ref(&include));
+    assert_eq!(
+        found("split/n.ipynb"),
+        [
+            ("separator-not-recognized".to_string(), Some(0), Some(8)),
+            include
+        ]
+    );
+}
+
+#[test]
+fn headings_mode_decks_report_lost_separators() {
+    let deck = "---\nslides: {split: headings}\n---\n\n# Section\n\nIntro text.\n\n---\n\n\
+                More intro on a new slide.\n\n    ---\n\nThird part\n\n--\nfourth\n\n\
+                A title\n---\n\ntext\n";
+    let dir = project(&[("h.md", deck)]);
+    let (code, entries) = check_json(dir.path(), &["h.md"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        codes_and_lines(&entries),
+        [
+            ("separator-not-recognized".to_string(), Some(13)),
+            ("separator-not-recognized".to_string(), Some(17)),
+        ]
     );
 }
