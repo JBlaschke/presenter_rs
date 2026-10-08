@@ -1,0 +1,52 @@
+[package]
+name = "presenter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"  # comrak 0.56 requires 1.89 (edition 2024 alone would need 1.85)
+description = "Turn Markdown files and Jupyter notebooks into reveal.js presentations"
+license = "MIT"
+readme = "README.md"
+authors = ["Johannes Blaschke"]
+publish = false
+
+[lib]
+name = "presenter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "presenter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
+serde = { version = "1", features = ["derive"] }
+# IR uses BTreeMap/Map; preserve_order keeps front-matter key order in `vars`.
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "1.1"
+serde_norway = "0.9"
+comrak = { version = "0.56", default-features = false, features = ["attributes"] }
+minijinja = { version = "2.24", features = ["loader", "json", "loop_controls"] }
+rust-embed = { version = "8.13", features = ["include-exclude"] }
+notify = "8.2"
+notify-debouncer-full = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "fs"] }
+axum = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.23"
+blake3 = "1"
+mime_guess = "2"
+html-escape = "0.2"
+ansi-to-html = "0.2"
+regex = "1"
+walkdir = "2"
+open = "5"
+
+[dev-dependencies]
+insta = { version = "1.49", features = ["json", "filters", "redactions"] }
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+ureq = "3"
