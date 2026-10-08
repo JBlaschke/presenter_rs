@@ -53,3 +53,8 @@ Converting the default theme to SCSS (deliberately kept plain CSS); Sass `@impor
 ## Hints (verified)
 - `grass` 0.13.4 CLI compiled reveal 6's `white.scss` unchanged (7 KB output). It supports `@use … with (…)`, `sass:color`, `color.scale`, and passes `@import url(...)` through verbatim.
 - `grass::Options::fs(&dyn grass::Fs)`; `grass::Fs` has `fn is_dir(&self, path: &Path) -> bool; fn is_file(&self, path: &Path) -> bool; fn read(&self, path: &Path) -> io::Result<Vec<u8>>`.
+
+## Amendments (coordinator, 2026-10-08)
+- reveal 6.0.2's theme fonts are vendored as `.woff` (vendored-assets.md contract change), so the
+  second acceptance criterion reads: standalone output contains `data:font/woff` (reveal fonts
+  via the example's `@use "reveal/theme/..."`) and no `url(fonts/` / `url(./fonts/`.

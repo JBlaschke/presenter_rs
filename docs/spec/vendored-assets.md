@@ -29,6 +29,13 @@ css/theme/template/{settings,theme,mixins}.scss      (for SCSS themes, T42)
 css/theme/*.scss                                      (stock theme sources, T42)
 css/theme/fonts/**                                    (league-gothic, source-sans-pro; woff2 + the .css that declares them; drop .ttf/.woff if present)
 ```
+> **Contract change (coordinator, 2026-10-08, from T00):** reveal.js 6.0.2 ships the
+> `css/theme/fonts/**` fonts as `.woff` only (no `.woff2`), and their `.css` files reference
+> `./*.woff`. `scripts/vendor.sh` therefore keeps `LICENSE`, `*.css`, `*.woff2` **and** `*.woff`
+> there, and drops `.ttf/.eot/.otf/.svg`. Inlined reveal theme fonts appear as `data:font/woff`.
+> KaTeX fonts are unaffected (woff2). `vendor::get` normalizes paths (see `src/vendor.rs`), and
+> OS/editor junk (`.DS_Store`, `*.swp`, `*~`, …) is excluded from embedding.
+
 Not copied: `dist/plugin/markdown.js` (we render Markdown ourselves), `dist/plugin/math.js`
 (loads from CDN; we ship our own KaTeX init), `*.mjs`, `*.d.ts`, `index.html`, `demo.html`,
 `js/`, `css/print/*` (reveal.css already contains print rules), source maps.
