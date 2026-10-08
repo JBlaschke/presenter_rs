@@ -1,0 +1,92 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Notes",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Notes",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Notes</h1>\n<p>The slide body continues after a notes block.</p>\n<p>More body text.</p>\n"
+        }
+      ],
+      "notes": "<p>First block, with <em>emphasis</em> and a list:</p>\n<ul>\n<li>point one</li>\n<li>point two</li>\n</ul>\n<p>Second block, appended after the first, with <code>inline code</code>.</p>\n<p>Third block, at the very end of the slide.</p>\n",
+      "children": [],
+      "span": {
+        "start_line": 15,
+        "end_line": 34,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "No notes",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>No notes</h2>\n<p>This slide has no notes.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {},
+          "title": "Notes on a vertical slide",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Notes on a vertical slide</h2>\n<p>Vertical body.</p>\n"
+            }
+          ],
+          "notes": "<p>Notes work on vertical children too.</p>\n",
+          "children": [],
+          "span": {
+            "start_line": 42,
+            "end_line": 50,
+            "cell": null
+          }
+        }
+      ],
+      "span": {
+        "start_line": 36,
+        "end_line": 40,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": false,
+    "notes": true,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

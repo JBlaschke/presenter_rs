@@ -1,0 +1,179 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Images",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Local image",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Local image</h2>\n<p><img src=\"asset:000000000001\" alt=\"A local image\" title=\"Local file\" /></p>\n<p><img src=\"asset:000000000001\" alt=\"Dot-relative spelling\" /> and <img src=\"asset:000000000001\" alt=\"parent-relative spelling\" /></p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 22,
+        "end_line": 26,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Missing image",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Missing image</h2>\n<p><img src=\"images/missing.png\" alt=\"Missing image\" /></p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 28,
+        "end_line": 32,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Remote and absolute",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Remote and absolute</h2>\n<p><img src=\"https://example.org/logo.png\" alt=\"Remote\" />\n<img src=\"//example.org/logo.png\" alt=\"Protocol-relative\" />\n<img src=\"/abs.png\" alt=\"Root-absolute\" />\n<img src=\"data:image/gif;base64,R0lGODlhAQABAAAAACw=\" alt=\"Data URI\" /></p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 34,
+        "end_line": 41,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Image attributes",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Image attributes</h2>\n<p><img src=\"asset:000000000001\" alt=\"Half width\" width=\"50%\" /></p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 43,
+        "end_line": 47,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Raw HTML",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Raw HTML</h2>\n<img src=\"asset:000000000001\" alt=\"raw html block\">\n<p>Inline <img src=\"asset:000000000001\" alt=\"raw inline\" width=\"16\"> and a video\n<video src=\"https://example.org/clip.mp4\" poster=\"asset:000000000001\"></video> with a local poster.</p>\n<img src=\"https://example.org/remote.png\" alt=\"remote raw html\">\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 49,
+        "end_line": 58,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Links are not assets",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Links are not assets</h2>\n<p><a href=\"handout.pdf\">The handout</a> stays a plain link.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 60,
+        "end_line": 64,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {
+        "data-background-image": "asset:000000000001"
+      },
+      "title": "Background image",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Background image</h2>\n<p>The slide background is the local <code>images/ok.png</code>.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 66,
+        "end_line": 70,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": false,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": [
+    {
+      "id": "000000000001",
+      "mime": "image/png",
+      "origin": "file:images/ok.png"
+    }
+  ]
+}

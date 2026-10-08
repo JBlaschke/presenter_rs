@@ -1,0 +1,244 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Attributes",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Attributes",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Attributes</h1>\n<p>A plain first slide: no separator attributes, and its heading has none to lift.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 27,
+        "end_line": 29,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "title",
+      "classes": [
+        "dark"
+      ],
+      "attrs": {
+        "data-background-color": "#111"
+      },
+      "title": "Separator attributes",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Separator attributes</h1>\n<p><code>.dark</code> → class, <code>background=#111</code> → <code>data-background-color</code>, <code>layout=title</code> → layout.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 31,
+        "end_line": 35,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {
+        "data-background-image": "bg.png"
+      },
+      "title": "Image background",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Image background</h2>\n<p>A <code>background</code> value that is not a colour becomes <code>data-background-image</code>.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {
+            "data-auto-animate": ""
+          },
+          "title": "Bare key",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Bare key</h2>\n<p><code>{auto-animate}</code> in the separator form → <code>data-auto-animate=&quot;&quot;</code>.</p>\n"
+            }
+          ],
+          "notes": null,
+          "children": [],
+          "span": {
+            "start_line": 43,
+            "end_line": 47,
+            "cell": null
+          }
+        }
+      ],
+      "span": {
+        "start_line": 37,
+        "end_line": 41,
+        "cell": null
+      }
+    },
+    {
+      "id": "intro",
+      "layout": "default",
+      "classes": [
+        "big"
+      ],
+      "attrs": {
+        "k": "v"
+      },
+      "title": "T",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>T</h1>\n<p>Heading lifting: id <code>intro</code>, class <code>big</code>, unknown key <code>k</code> kept verbatim.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 49,
+        "end_line": 53,
+        "cell": null
+      }
+    },
+    {
+      "id": "merged",
+      "layout": "default",
+      "classes": [
+        "a",
+        "shared",
+        "b"
+      ],
+      "attrs": {
+        "data-auto-animate": "",
+        "data-state-note": "from separator",
+        "data-transition": "zoom"
+      },
+      "title": "Merged",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Merged</h2>\n<p>Classes accumulate (<code>a shared b</code>); the heading wins for <code>id</code> and <code>transition</code>.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 55,
+        "end_line": 59,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {
+        "aria-label": "Single quoted",
+        "data-background-color": "rgba(0, 0, 0, 0.5)",
+        "data-background-opacity": "0.4"
+      },
+      "title": "Colours and verbatim keys",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Colours and verbatim keys</h2>\n<p><code>rgba(…)</code> is a colour; <code>background-opacity</code> gets a <code>data-</code> prefix; <code>aria-label</code> is verbatim.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 61,
+        "end_line": 65,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {
+        "data-background-color": "navy",
+        "data-background-size": "contain",
+        "data-state": "calm",
+        "data-transition-speed": "fast",
+        "data-visibility": "uncounted"
+      },
+      "title": "Keyword colour and more shorthands",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Keyword colour and more shorthands</h2>\n<p><code>navy</code> is a CSS colour keyword.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 67,
+        "end_line": 71,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "section",
+      "classes": [
+        "x"
+      ],
+      "attrs": {},
+      "title": "Lifted layout",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Lifted layout</h2>\n<p>The first heading's <code>layout=section</code> is lifted to the slide.</p>\n<h3 id=\"kept\" class=\"muted\">Not the first node</h3>\n<p>This heading keeps its attributes, as do <a href=\"https://example.org\" class=\"button\" target=\"_blank\">links</a>\nand inline code <code class=\"python\">x = 1</code>.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 73,
+        "end_line": 82,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": false,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

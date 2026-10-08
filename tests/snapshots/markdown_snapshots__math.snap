@@ -1,0 +1,71 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Math",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Inline and display",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Inline and display</h2>\n<p>Inline <span data-math-style=\"inline\">E = mc^2</span>, and escaped TeX <span data-math-style=\"inline\">a &lt; b</span>.</p>\n<p><span data-math-style=\"display\">\n\\int_0^1 x^2 \\, dx = \\frac{1}{3}\n</span></p>\n<p>The cup costs $5, not <span data-math-style=\"inline\">5</span> dollars.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 15,
+        "end_line": 23,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Math in other blocks",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Math in other blocks</h2>\n<ul>\n<li>a list item with <span data-math-style=\"inline\">\\alpha + \\beta</span></li>\n<li>display in a list: <span data-math-style=\"display\">\\sum_i x_i</span></li>\n</ul>\n<table>\n<thead>\n<tr>\n<th>quantity</th>\n<th>formula</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>area</td>\n<td><span data-math-style=\"inline\">\\pi r^2</span></td>\n</tr>\n</tbody>\n</table>\n<div data-math-style=\"display\">\\nabla \\cdot \\mathbf{E} = \\frac{\\rho}{\\varepsilon_0}</div>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 25,
+        "end_line": 38,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": true,
+    "code": false,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

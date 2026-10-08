@@ -1,0 +1,251 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Code blocks",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Language and escaping",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Language and escaping</h2>\n<pre><code class=\"language-python\" data-trim>def greet(name):\n    return f\"&lt;b&gt;{name}&lt;/b&gt; &amp; co\"</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 22,
+        "end_line": 27,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "No language",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>No language</h2>\n<pre><code data-trim>plain text without an info string</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 29,
+        "end_line": 35,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Line steps",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Line steps</h2>\n<pre><code class=\"language-python\" data-trim data-line-numbers=\"1-2|4\">import polars as pl\ndf = pl.read_csv(\"data.csv\")\n\nprint(df.describe())</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 37,
+        "end_line": 46,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Numbered",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Numbered</h2>\n<pre><code class=\"language-rust\" data-trim data-line-numbers=\"\">fn main() {\n    println!(\"every line numbered\");\n}</code></pre>\n<pre><code class=\"language-rust\" data-trim data-line-numbers=\"2\">fn main() {\n    println!(\"lines= wins over .numbered\");\n}</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 48,
+        "end_line": 62,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Start",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Start</h2>\n<pre><code class=\"language-js\" data-trim data-line-numbers=\"1|2\" data-ln-start-from=\"10\">const a = 1;\nconst b = 2;</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 64,
+        "end_line": 71,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "No trim",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>No trim</h2>\n<pre><code class=\"language-text\">    the first line keeps its indentation</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 73,
+        "end_line": 79,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Unescaped",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Unescaped</h2>\n<pre><code class=\"language-html\" data-trim data-noescape><p>Some <mark>highlighted</mark> text &amp; an entity, kept as written.</p></code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 81,
+        "end_line": 87,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Plain",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Plain</h2>\n<pre><code class=\"nohighlight\" data-trim>print(\"not highlighted\")</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 89,
+        "end_line": 95,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Pre id and classes",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Pre id and classes</h2>\n<pre id=\"pre-id\" class=\"big wide\"><code class=\"language-python\" data-trim>x = 1</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 97,
+        "end_line": 103,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Extra keys",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Extra keys</h2>\n<pre><code class=\"language-python\" data-trim data-foo=\"bar\" data-title=\"Example\">y = 2</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 105,
+        "end_line": 111,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Everything at once",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Everything at once</h2>\n<pre id=\"snippet\" class=\"big\"><code class=\"language-python\" data-line-numbers=\"1-2|4\" data-ln-start-from=\"10\" data-noescape>import polars as pl\ndf = pl.read_csv(\"data.csv\")\n\nprint(df.<mark>describe</mark>())</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 113,
+        "end_line": 122,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": true,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}
