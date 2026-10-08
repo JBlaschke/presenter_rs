@@ -3,8 +3,8 @@
 //! Contract: `docs/spec/ir.md` §3. Frontends never read image bytes or decide URLs: they
 //! register an asset and write the placeholder `asset:<id>` (exactly 12 `[0-9a-f]`) into
 //! their HTML; the emitter (`assets::emit`, T14) later rewrites every placeholder into a
-//! `data:` URI, a site-mode file or a dev-server route. Implemented by T01; T14 adds
-//! `merge`, `len`, `is_empty` and `read`.
+//! `data:` URI, a site-mode file or a dev-server route. Implemented by T01; T14 added
+//! `merge`, `len`, `is_empty` and `read` (the only place that reads a file asset's bytes).
 //!
 //! Ids are content-derived and therefore stable across runs: the first 12 hex chars of the
 //! BLAKE3 hash of the absolute path (files) or of the bytes (in-memory assets). Registering
@@ -13,9 +13,12 @@
 //! exists, so symlinks are followed exactly as the OS does; otherwise normalized lexically),
 //! so `/talk/./img.png`, `/talk/sub/../img.png` and `/talk/img.png` are one asset.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use crate::error::{Error, Result};
 use crate::ir::AssetInfo;
 
 /// Number of hex characters in an asset id.
@@ -129,6 +132,64 @@ impl AssetRegistry {
     pub fn placeholder(id: &str) -> String {
         format!("asset:{id}")
     }
+
+    /// Moves every asset of `other` into `self`. Ids are content-derived, so an id present
+    /// in both registries names the same asset; the existing registration is kept, exactly
+    /// as when the same path or bytes are registered twice.
+    pub fn merge(&mut self, other: AssetRegistry) {
+        for (id, asset) in other.assets {
+            self.assets.entry(id).or_insert(asset);
+        }
+    }
+
+    /// Number of registered assets.
+    pub fn len(&self) -> usize {
+        self.assets.len()
+    }
+
+    /// True if nothing is registered.
+    pub fn is_empty(&self) -> bool {
+        self.assets.is_empty()
+    }
+
+    /// The bytes of asset `id`: borrowed for [`AssetData::Bytes`], read from disk now for
+    /// [`AssetData::File`] (registration never reads files).
+    ///
+    /// Errors: an unregistered id is [`Error::Other`] naming the id; a file that no longer
+    /// exists (deleted between parsing and emitting) is
+    /// [`Error::MissingAsset`]` { path, span: None }`; any other read failure is
+    /// [`Error::Io`] with the path prepended to the message (same [`std::io::ErrorKind`]).
+    pub fn read(&self, id: &str) -> Result<Cow<'_, [u8]>> {
+        let asset = self.get(id).ok_or_else(|| unknown_id(id))?;
+        match &asset.data {
+            AssetData::Bytes(bytes) => Ok(Cow::Borrowed(bytes)),
+            AssetData::File(path) => match std::fs::read(path) {
+                Ok(bytes) => Ok(Cow::Owned(bytes)),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    Err(Error::MissingAsset {
+                        path: path.clone(),
+                        span: None,
+                    })
+                }
+                Err(err) => Err(Error::Io(io::Error::new(
+                    err.kind(),
+                    format!("{}: {err}", path.display()),
+                ))),
+            },
+        }
+    }
+}
+
+/// The error for an id that is not registered: [`Error::Other`] naming the id.
+pub(crate) fn unknown_id(id: &str) -> Error {
+    Error::Other(format!(
+        "unknown asset id '{id}': the placeholder 'asset:{id}' does not name a registered asset"
+    ))
 }
 
 /// First [`ID_LEN`] lowercase hex chars of the BLAKE3 hash of `bytes`.
@@ -401,6 +462,113 @@ mod tests {
     fn default_equals_new() {
         assert_eq!(AssetRegistry::default(), AssetRegistry::new());
         assert_eq!(AssetRegistry::new().iter().count(), 0);
+    }
+
+    #[test]
+    fn len_and_is_empty_count_distinct_ids() {
+        let mut reg = AssetRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+        reg.register_file(Path::new("/abs/a.png"));
+        reg.register_file(Path::new("/abs/./a.png"));
+        reg.register_bytes(vec![1], "image/png", "x.png");
+        reg.register_bytes(vec![1], "image/png", "y.png");
+        assert!(!reg.is_empty());
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn merge_adds_new_ids_and_keeps_existing_registrations() {
+        let mut deck = AssetRegistry::new();
+        let shared = deck.register_bytes(vec![7, 7], "image/png", "deck.png");
+        let only_deck = deck.register_file(Path::new("/abs/deck.svg"));
+
+        let mut theme = AssetRegistry::new();
+        assert_eq!(
+            theme.register_bytes(vec![7, 7], "image/x-other", "theme.png"),
+            shared
+        );
+        let only_theme = theme.register_file(Path::new("/abs/theme/bg.jpg"));
+
+        deck.merge(theme);
+        assert_eq!(deck.len(), 3);
+        let ids: Vec<&str> = deck.iter().map(|a| a.id.as_str()).collect();
+        let mut expected = vec![shared.as_str(), only_deck.as_str(), only_theme.as_str()];
+        expected.sort();
+        assert_eq!(ids, expected);
+        // The first registration of a shared id wins.
+        assert_eq!(deck.get(&shared).unwrap().file_name_hint, "deck.png");
+        assert_eq!(deck.get(&shared).unwrap().mime, "image/png");
+        assert_eq!(deck.get(&only_theme).unwrap().mime, "image/jpeg");
+
+        deck.merge(AssetRegistry::new());
+        assert_eq!(deck.len(), 3);
+    }
+
+    #[test]
+    fn read_borrows_bytes_and_reads_files_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.png");
+        let mut reg = AssetRegistry::new();
+        // Registered before it exists: registration never touches the file.
+        let file_id = reg.register_file(&path);
+        std::fs::write(&path, b"written after registration").unwrap();
+        assert_eq!(&*reg.read(&file_id).unwrap(), b"written after registration");
+        assert!(matches!(reg.read(&file_id).unwrap(), Cow::Owned(_)));
+
+        let bytes_id = reg.register_bytes(b"inline".to_vec(), "image/png", "o.png");
+        let bytes = reg.read(&bytes_id).unwrap();
+        assert!(matches!(bytes, Cow::Borrowed(b"inline")));
+    }
+
+    #[test]
+    fn read_of_a_deleted_file_is_missing_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone.png");
+        std::fs::write(&path, b"png").unwrap();
+        let mut reg = AssetRegistry::new();
+        let id = reg.register_file(&path);
+        let AssetData::File(stored) = reg.get(&id).unwrap().data.clone() else {
+            panic!("expected a file asset");
+        };
+        std::fs::remove_file(&path).unwrap();
+        match reg.read(&id) {
+            Err(Error::MissingAsset { path, span }) => {
+                assert_eq!(path, stored);
+                assert_eq!(span, None);
+            }
+            other => panic!("expected MissingAsset, got {other:?}"),
+        }
+        // A parent that became a regular file is missing too.
+        let nested = dir.path().join("dir/img.png");
+        let nested_id = reg.register_file(&nested);
+        std::fs::write(dir.path().join("dir"), b"not a directory").unwrap();
+        assert!(matches!(
+            reg.read(&nested_id),
+            Err(Error::MissingAsset { .. })
+        ));
+    }
+
+    #[test]
+    fn read_failures_other_than_missing_are_io_errors_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = AssetRegistry::new();
+        // Reading a directory fails with an I/O error that is not "not found".
+        let id = reg.register_file(dir.path());
+        let err = reg.read(&id).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        let resolved = resolve_path(dir.path());
+        assert!(
+            err.to_string().contains(&*resolved.to_string_lossy()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn read_of_an_unknown_id_names_the_id() {
+        let err = AssetRegistry::new().read("0123456789ab").unwrap_err();
+        assert!(matches!(err, Error::Other(_)), "{err:?}");
+        assert!(err.to_string().contains("0123456789ab"), "{err}");
     }
 
     #[cfg(unix)]
