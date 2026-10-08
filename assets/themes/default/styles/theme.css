@@ -47,10 +47,11 @@
   --p-border: color-mix(in srgb, currentColor 22%, transparent);   /* hairlines */
   --p-radius: 0.25em;                                              /* corner radius of boxes */
   --p-slide-padding: 40px 60px;                                    /* space inside every slide */
-  --p-code-bg: #272822;                                            /* code block background (monokai) */
-  --p-code-color: #f8f8f2;                                         /* code block text before highlighting */
+  --p-code-bg: #272822;                                            /* unhighlighted code background */
+  --p-code-color: #f8f8f2;                                         /* unhighlighted code text */
   --p-code-font-size: 0.6em;                                       /* code block size, relative to the text */
   --p-code-max-height: 520px;                                      /* longer code blocks scroll */
+  --p-code-dim-opacity: 0.5;                                       /* lines a line step dims */
   --p-inline-code-bg: color-mix(in srgb, currentColor 9%, transparent); /* `code` in text */
   --p-table-font-size: 0.75em;                                     /* tables, relative to the text */
   --p-image-max-height: 480px;                                     /* images (r-stretch excepted) */
@@ -245,21 +246,29 @@
   box-shadow: none;
   font-size: var(--p-code-font-size);
   line-height: 1.4;
+  text-align: left;
   word-wrap: normal;
 }
 
 /* Long lines scroll sideways instead of wrapping (data-trim only trims blank lines). */
 .reveal pre code {
+  display: block;
   box-sizing: border-box;
   max-height: var(--p-code-max-height);
   padding: 0.75em 1em;
   overflow: auto;
   border-radius: var(--p-radius);
   white-space: pre;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, currentColor 35%, transparent) transparent;
+}
+
+/* Colours of the code blocks the highlight style leaves alone (`.plain` blocks,
+   `highlight_style = "none"`). No specificity, so the chosen highlight_style's own `.hljs`
+   background and text colour win wherever it applies. */
+:where(.reveal pre) code {
   color: var(--p-code-color);
   background: var(--p-code-bg);
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--p-code-color) 35%, transparent) transparent;
 }
 
 .reveal pre.r-stretch code,
@@ -267,16 +276,17 @@
   max-height: 100%;
 }
 
-/* Line numbers (data-line-numbers): readable on the dark code background. */
+/* Line numbers (data-line-numbers): a fainter shade of the code's text colour, so they stay
+   readable on any highlight style's background. */
 .reveal .hljs-ln-numbers {
   opacity: 1;
-  color: color-mix(in srgb, var(--p-code-color) 45%, transparent);
+  color: color-mix(in srgb, currentColor 50%, transparent);
   user-select: none;
 }
 
 /* Line steps (lines="1|3-4"): the other lines are dimmed, never hidden. */
 .reveal .hljs.has-highlights tr:not(.highlight-line) {
-  opacity: 0.35;
+  opacity: var(--p-code-dim-opacity);
 }
 
 .reveal :not(pre) > code {
@@ -296,8 +306,12 @@
   max-width: 100%;
 }
 
-.reveal img:not(.r-stretch, .stretch),
-.reveal video:not(.r-stretch, .stretch) {
+/* Every image and video fits under a heading, except the `.r-stretch` ones that reveal
+   sizes itself: those that are direct children of the slide. reveal lifts the caps of every
+   `.r-stretch` element, so a Markdown image (wrapped in a paragraph, which reveal does not
+   stretch) gets them back here. */
+.reveal :is(img, video):not(section > .r-stretch, section > .stretch) {
+  max-width: 100%;
   max-height: var(--p-image-max-height);
   object-fit: contain;
 }
@@ -307,26 +321,45 @@
   vertical-align: middle;
 }
 
-/* A paragraph holding just an image is a figure: centred. */
-.reveal p:has(> img:only-child) {
-  margin: var(--r-block-margin) 0;
-  text-align: center;
-}
-
 .reveal iframe {
   border: 1px solid var(--p-border);
   border-radius: var(--p-radius);
+}
+
+/* reveal's layout helpers measure the whole slide, padding included; keep their results
+   inside the padding. `.r-stretch`: reveal makes a stretched element as wide as the slide
+   (images and videos keep their aspect ratio inside the capped box). `.r-fit-text`: the
+   text is fitted to the width of its parent including the padding, so a slide that holds
+   fit text directly drops its side padding (the text spans the slide, as in reveal). */
+.reveal .slides section > :is(.r-stretch, .stretch) {
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+.reveal .slides section > :is(img, video):is(.r-stretch, .stretch) {
+  object-fit: contain;
+}
+
+.reveal .slides section:not(.stack):has(> .r-fit-text) {
+  padding-left: 0;
+  padding-right: 0;
 }
 
 /* ------------------------------------------------------------------------------------
  * Tables: smaller text, zebra rows
  * ------------------------------------------------------------------------------------ */
 
-/* (not the line-number tables highlight.js builds inside code blocks) */
+/* (not the line-number tables highlight.js builds inside code blocks). A table wider than
+   the slide scrolls sideways inside its own box, like code and display math. */
 .reveal table:not(.hljs-ln) {
+  display: block;
+  width: max-content;
+  max-width: 100%;
   margin: var(--r-block-margin) 0;
+  overflow-x: auto;
   font-size: var(--p-table-font-size);
   border-collapse: collapse;
+  scrollbar-width: thin;
 }
 
 .reveal table:not(.hljs-ln) :is(th, td) {
@@ -467,7 +500,7 @@
 
 /* default: heading at the top, content left-aligned. A short accent rule under the
    slide's first heading (centred on a `.center` slide). */
-.reveal .slides section:not(.stack, .layout-title, .layout-section, .layout-blank) > :is(h1, h2):first-child::after {
+.reveal .slides section:not(.stack, .layout-title, .layout-section, .layout-blank) > :is(h1, h2):not(.r-fit-text):first-child::after {
   content: "";
   display: block;
   width: 1.4em;
@@ -568,19 +601,22 @@
   color: var(--p-on-accent);
 }
 
-/* blank: no padding; a lone image, video or iframe fills the slide (fitted inside it;
-   use a `background=` for an image that covers the slide edge to edge). */
+/* blank: no padding. When the slide's only content (speaker notes aside) is an image, a
+   video or an iframe, or a paragraph whose only element is one (a Markdown image), that
+   element fills the slide, fitted inside it; use a `background=` for an image that covers
+   the slide edge to edge. CSS cannot see text, so a paragraph of text with one inline image
+   counts too when it is all the slide holds. */
 .reveal .slides section.layout-blank {
   padding: 0;
 }
 
-.reveal .slides section.layout-blank > p:only-of-type:has(> img:only-child) {
+.reveal .slides section.layout-blank > p:first-child:is(:last-child, :has(+ aside.notes:last-child)):has(> :is(img, video):only-child) {
   height: 100%;
   margin: 0;
 }
 
-.reveal .slides section.layout-blank > :is(img, video, iframe),
-.reveal .slides section.layout-blank > p:only-of-type > img:only-child {
+.reveal .slides section.layout-blank > :is(img, video, iframe):first-child:is(:last-child, :has(+ aside.notes:last-child)),
+.reveal .slides section.layout-blank > p:first-child:is(:last-child, :has(+ aside.notes:last-child)) > :is(img, video):only-child {
   display: block;
   width: 100%;
   height: 100%;
@@ -590,6 +626,16 @@
   border: 0;
   border-radius: 0;
   object-fit: contain;
+}
+
+/* Overview (Esc): every thumbnail is one slide high, the centred ones too (reveal pins
+   every slide to the top there, so their content is centred inside the slide instead). */
+.reveal.overview .slides section:not(.stack) {
+  height: var(--slide-height, 100%);
+}
+
+.reveal.overview .slides section.center:not(.stack) {
+  align-content: center;
 }
 
 /* ------------------------------------------------------------------------------------
@@ -685,4 +731,9 @@ html.reveal-print .reveal .slides section:not(.stack) {
 
 html.reveal-print .reveal .slides section.layout-blank {
   padding: 0 !important;
+}
+
+html.reveal-print .reveal .slides section:not(.stack):has(> .r-fit-text) {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
 }

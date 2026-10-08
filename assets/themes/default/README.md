@@ -15,7 +15,7 @@ default/
     ├── slide.html             one slide or vertical stack; picks the layout
     ├── block.html, cell.html  one content block, one notebook code cell
     ├── layouts/*.html         default, title, section, blank
-    └── partials/head.html, partials/scripts.html
+    └── partials/head.html, partials/scripts.html, partials/logo.html (the title slide's logo)
 ```
 
 The output never downloads anything: fonts are system font stacks, and the stylesheet has
@@ -32,18 +32,27 @@ Pick a layout per slide with `layout=NAME` on the separator or the first heading
 | `default` | `templates/layouts/default.html` | Heading at the top, content left-aligned, a short accent rule under the slide's first heading. The fallback for unknown names. |
 | `title` | `templates/layouts/title.html` | Centred both ways. An optional logo, the first block (the deck heading), then `subtitle`, `author` and `date` from the front matter (author and date fall back to `presenter.toml` `[deck]`), then the rest. |
 | `section` | `templates/layouts/section.html` | A section divider: big centred heading, text in `--p-on-accent` on a full-bleed `--p-accent` background. A `background=` on the slide still wins. |
-| `blank` | `templates/layouts/blank.html` | No padding and no heading rule. A lone image, video or iframe fills the whole slide (fitted inside it; for an image that covers the slide edge to edge use `background=`). |
+| `blank` | `templates/layouts/blank.html` | No padding and no heading rule. When the slide holds nothing but one image, video or iframe (a Markdown image `![](plot.png)` counts; speaker notes may follow), it fills the whole slide, fitted inside it; for an image that covers the slide edge to edge use `background=`. CSS cannot see text, so a lone paragraph of text with exactly one inline image would be filled the same way. |
 
 `title` and `section` add the class `center` to the slide, which makes reveal centre it
 vertically whatever the deck's `center` option says. Every other slide is exactly one slide
 high, so it starts at the top even with reveal's default `center: true`. Add `{.center}` to
-any slide to centre it both ways.
+any slide to centre it both ways. In the overview (<kbd>Esc</kbd>) every thumbnail is one
+slide high, with the content of centred slides centred inside it.
 
 **Logo.** The title layout shows a logo when the front matter sets `logo:` or the theme's
 `theme.toml` sets `[vars] logo`. The value is a path that `asset()` resolves: a file in a
 theme's `assets/` directory (`logo: logo.svg` finds `mytheme/assets/logo.svg`), or
 `@mytheme/<path>` relative to that theme's directory. `logo: false` in the front matter hides
-a theme's logo. In a standalone build the logo is inlined like every other asset.
+a theme's logo, `logo: true` keeps it, and a value that is not a string is ignored. In a
+standalone build the logo is inlined like every other asset. `templates/partials/logo.html`
+renders it; override that file to place the logo differently.
+
+A logo file next to the deck is **not supported yet**: `logo: img/logo.png` beside
+`slides.md` fails the build with `asset("img/logo.png"): unknown path`, reported from
+`partials/logo.html`. Put the file in a child theme's `assets/` directory instead
+(`mytheme/assets/logo.png` and `logo: logo.png`, see [Extending it](#extending-it)), or show
+it in the slide itself with `![](img/logo.png)`, which resolves next to the deck.
 
 A layout is one file. To add one, create `templates/layouts/<name>.html` in your theme; most
 layouts extend the default one and override its two blocks:
@@ -72,13 +81,14 @@ is relative to the surrounding text.
 | `--p-border` | `color-mix(in srgb, currentColor 22%, transparent)` | Hairlines: table rows, quotes, footnote rule, iframes. |
 | `--p-radius` | `0.25em` | Corner radius of code blocks, inline code, alerts and keys. |
 | `--p-slide-padding` | `40px 60px` | Space inside every slide (not `blank`); kept in PDF export. |
-| `--p-code-bg` | `#272822` | Code block background (monokai's). Set it, and `--p-code-color`, when you change `highlight_style`. |
-| `--p-code-color` | `#f8f8f2` | Code block text before highlighting (`.plain` blocks, `highlight_style = "none"`); line numbers are a fainter shade of it. |
+| `--p-code-bg` | `#272822` | Background of the code blocks the highlight style does not colour (`.plain` blocks, `highlight_style = "none"`); monokai's. Highlighted blocks take their background from `highlight_style`. |
+| `--p-code-color` | `#f8f8f2` | Text colour of those code blocks. Line numbers are a fainter shade of each block's text colour. |
 | `--p-code-font-size` | `0.6em` | Code block text size, relative to the slide text. |
 | `--p-code-max-height` | `520px` | Taller code blocks scroll (long lines always scroll sideways; they never wrap). |
+| `--p-code-dim-opacity` | `0.5` | Opacity of the lines a line step (`lines="1\|3-4"`) does not highlight; they are dimmed, never hidden (reveal's own value is 0.4). |
 | `--p-inline-code-bg` | `color-mix(in srgb, currentColor 9%, transparent)` | Background of `code` in running text. |
 | `--p-table-font-size` | `0.75em` | Table text size. |
-| `--p-image-max-height` | `480px` | Images and videos are at most this tall so a figure fits under a heading (`.r-stretch` images are exempt). |
+| `--p-image-max-height` | `480px` | Images and videos are at most this tall so a figure fits under a heading. Exempt: `.r-stretch` images and videos that reveal sizes itself (direct children of the slide, see below). |
 | `--p-column-gap` | `1.25em` | Gap between the columns of `:::columns`. |
 | `--p-columns` | unset | Number of columns of `:::columns`. Unset: one equal column per `:::column`. Set it (e.g. `2`) to wrap more columns into rows. A `widths="1fr 2fr"` argument overrides both. |
 | `--p-alert-note` | `color-mix(in oklab, #2563eb 75%, currentColor)` | `> [!NOTE]` alerts: border, title and tint. |
@@ -116,22 +126,33 @@ overrides these:
 |---|---|---|
 | `section.layout-<name>` | every slide | see Layouts |
 | `.columns > .column` | `::::columns` / `:::column` | CSS grid, `--p-columns`, `--p-column-gap` |
-| `pre > code` | code fences | the code tokens; line numbers and dimmed (never hidden) lines of `lines="1\|3-4"` steps |
+| `pre > code` | code fences | colours from `highlight_style` (the code tokens for blocks it leaves alone), size and scrolling tokens; line numbers and dimmed (never hidden) lines of `lines="1\|3-4"` steps |
 | `code` | `` `inline` `` | `--p-inline-code-bg` |
-| `table` | GitHub tables | `--p-table-font-size`, zebra rows |
+| `table` | GitHub tables | `--p-table-font-size`, zebra rows; a table wider than the slide scrolls sideways |
 | `blockquote` | `> quote` | rule on the left, italic |
 | `.markdown-alert.markdown-alert-{note,tip,important,warning,caution}` | `> [!NOTE]` … | tinted box in the alert colours |
 | `.footnotes`, `sup.footnote-ref` | `[^1]` | small, muted, under a rule |
 | `.small`, `.large`, `.center` | `:::small`, `{.center}` on a slide, … | 0.7×, 1.3× text; centred text (and the whole slide when on a slide) |
 | `kbd`, `mark` | `<kbd>S</kbd>`, `<mark>` | key caps, highlighter |
-| `img`, `video`, `iframe` | images, raw HTML | fit the slide; a paragraph with just an image is centred; `.r-stretch` works as in reveal |
+| `img`, `video`, `iframe` | images, raw HTML | fit the slide and keep the alignment of the text around them (`:::center` centres a figure); `.r-stretch` see below |
 | `[data-math-style]` | `$…$`, `$$…$$` | KaTeX; wide display math scrolls instead of overflowing |
 | `section.has-dark-background`, `section.has-light-background` | `background=` colours | white or dark text, and every derived token with it |
 | `aside.notes` | `:::notes` | hidden on the slide (reveal); shown in the speaker view (<kbd>S</kbd>) |
 | `.cell`, `.cell-*`, `.output*` | notebooks | structural rules only (framing, hidden parts) |
 
-reveal's own layout helpers (`r-stack`, `r-fit-text`, `r-stretch`, `r-hstack`, `r-vstack`)
-are left alone.
+reveal's own layout helpers work with the slide padding:
+
+- `.r-stretch` (or `.stretch`) on an element that is a **direct child of the slide** fills the
+  height left over, as in reveal, and at most the width inside the padding (images and
+  videos keep their aspect ratio). That covers raw HTML on a line of its own, e.g.
+  `<img class="r-stretch" src="plot.png">`, an `<iframe class="r-stretch">` or a fenced code
+  block with `{.r-stretch}`. A Markdown image `![](plot.png){.r-stretch}` is wrapped in a
+  paragraph, which reveal does not stretch: it stays an ordinary image, capped at
+  `--p-image-max-height`.
+- `.r-fit-text` text is fitted to its parent's width including the padding, so a slide that
+  holds fit text directly drops its side padding and the text spans the slide, as in
+  reveal.
+- `r-stack`, `r-hstack` and `r-vstack` are left alone.
 
 ## Print and PDF
 
@@ -168,7 +189,9 @@ complete `mytheme/styles/theme.css`:
 - **Dark slides:** set `reveal_theme = "black"` under `[styles]` in `mytheme/theme.toml`; the
   tokens follow the text colour, so nothing else has to change.
 - **Another code style:** `highlight_style = "zenburn"` (or a path to a highlight.js CSS file)
-  plus `--p-code-bg` and `--p-code-color` set to that style's background and text colours.
+  under `[styles]`; highlighted blocks take that style's background and text colours. Set
+  `--p-code-bg` and `--p-code-color` as well to colour the blocks it leaves alone (`.plain`)
+  to match.
 - **Templates:** put a file with the same name in `mytheme/templates/` to replace one, or
   extend the original: `{% extends "@default/layouts/title.html" %}`.
 - **A complete copy** to edit freely: `presenter theme eject default ./mytheme`.

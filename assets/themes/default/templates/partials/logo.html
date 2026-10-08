@@ -1,0 +1,7 @@
+{#- The title slide's logo; included by layouts/title.html with `logo` set to a string: the
+    front matter's `logo:`, else theme.toml [vars] logo. The path goes through asset(), so it
+    names a file in the assets/ directory of a theme in the chain (`logo.svg`) or a file of
+    one theme (`@mytheme/img/logo.svg`). A path next to the deck is not supported yet: it
+    fails the build here with "unknown path". Override this file to place the logo
+    differently. No `set` here (it would leak into the including template). -#}
+<img class="logo" src="{{ asset(logo) }}" alt="">
