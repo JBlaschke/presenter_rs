@@ -3,20 +3,32 @@
 
 Python 3 standard library only. Serves a reveal.js deck built from the vendored assets with
 the routes of docs/spec/live-reload.md §1 (GET /, /__presenter/theme.css,
-/__presenter/asset/{vendor,presenter}/..., /__presenter/live-reload.js,
-/__presenter/events (SSE), /__presenter/state) plus control routes to fake rebuilds:
+/__presenter/asset/..., /__presenter/live-reload.js, /__presenter/events (SSE),
+/__presenter/state) and the §2 events, plus control routes to fake rebuilds:
 
   POST /__mock/slides           body = new inner HTML of <div class="slides"> (no event);
                                 GET returns the current one
   POST /__mock/css              body = new theme CSS (no event)
   POST /__mock/head             body = extra HTML appended to <head> (no event)
+  POST /__mock/body             body = HTML put before <div class="reveal">, like deck.html's
+                                body_start block (no event)
+  POST /__mock/asset?path=P     body = a theme-chain file served at /__presenter/asset/P
+                                (e.g. P = extra.css or @corporate/styles/hl.css; no event)
   GET  /__mock/title?t=...      set the <title> (no event)
+  GET  /__mock/lang?l=...       set <html lang> (no event)
   GET  /__mock/emit?kind=css|content|error[&message=..&file=..&line=..][&nodoc=1]
                                 next build_id; broadcast a `build` event (an ok build makes
-                                the current slides/CSS/title the served document; an error
-                                with nodoc=1 serves the "no successful build yet" page)
+                                the current slides/CSS/title/head/body/assets the served
+                                document; an error with nodoc=1 serves the "no successful
+                                build yet" page, whose overlay is pre-populated as in §1)
   GET  /__mock/down?ms=N        drop SSE clients and answer /__presenter/events with 503 for N ms
-  GET  /__mock/restart          like a restarted server: build_id back to 1, SSE clients dropped
+  GET  /__mock/restart          like a restarted server: SSE clients dropped, and a first good
+                                build with build_id 1 of the current slides/CSS/... is served
+  GET  /__mock/failroot?on=1|0  make GET / answer 503 (the event stream stays up)
+  GET  /__mock/hello-error?on=1|0
+                                also send the `error` object in `hello` (a proposed addition to
+                                §2; off by default, so hello is {"build_id", "status"} only)
+  GET  /__mock/frames           a page with the two deck iframes of reveal's speaker view
   GET  /__mock/reset            restore the initial deck, CSS and build_id 1
   GET  /__mock/log              JSON list of requests since the last call (then cleared)
 
@@ -25,10 +37,11 @@ Usage (from the repository root):
 then open http://127.0.0.1:8765/ and drive it with curl, e.g.
   curl -X POST --data-binary @slides.html http://127.0.0.1:8765/__mock/slides
   curl 'http://127.0.0.1:8765/__mock/emit?kind=content'
-The QA procedure using it is docs/dev/live-reload-qa.md.
+The QA procedure using it is docs/dev/live-reload-qa.md; qa.mjs next to this file runs it.
 """
 
 import argparse
+import html
 import json
 import mimetypes
 import threading
@@ -65,14 +78,24 @@ MATH_FALLBACK = """if (!window.__presenterRenderMath) {
   window.__presenterRenderMath(document);
 }"""
 
-# What the server sends while no build has succeeded yet (live-reload.md §1).
+# What the server sends while no build has succeeded yet: "a minimal page with the error
+# overlay pre-populated" (live-reload.md §1).
 FALLBACK = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><title>Build failed</title></head>
-<body><script src="/__presenter/live-reload.js"></script></body></html>
+<body><pre id="presenter-overlay">{text}</pre>
+<script src="/__presenter/live-reload.js"></script></body></html>
+"""
+
+# The two iframes of reveal's speaker view (plugin/notes.js setupIframes).
+FRAMES = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Speaker view frames</title></head><body>
+<iframe id="current" width="640" height="360" src="/?receiver&progress=false&history=false&transition=none&autoSlide=0&backgroundTransition=none&scrollActivationWidth=false&postMessageEvents=true#/3/0"></iframe>
+<iframe id="upcoming" width="640" height="360" src="/?receiver&progress=false&history=false&transition=none&autoSlide=0&backgroundTransition=none&scrollActivationWidth=false&controls=false#/4/0"></iframe>
+</body></html>
 """
 
 PAGE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="{lang}">
 <head>
 <meta charset="utf-8">
 <title>{title}</title>
@@ -83,7 +106,7 @@ PAGE = """<!DOCTYPE html>
 <link rel="stylesheet" href="/__presenter/asset/vendor/katex/katex.min.css">{head}
 <link id="presenter-theme" rel="stylesheet" href="/__presenter/theme.css?v={build_id}">
 </head>
-<body>
+<body>{body}
 <div class="reveal">
 <div class="slides">{slides}</div>
 </div>
@@ -111,14 +134,18 @@ class Mock:
     def reset(self):
         self.build_id = 1
         self.status, self.error = "ok", None
-        self.slides, self.css, self.title, self.head = INITIAL_SLIDES, INITIAL_CSS, INITIAL_TITLE, ""
+        self.slides, self.css, self.title, self.lang = INITIAL_SLIDES, INITIAL_CSS, INITIAL_TITLE, "en"
+        self.head, self.body, self.assets = "", "", {}
         self.served = self.snapshot()
         self.events = []  # data of the `build` events, in order
         self.down_until = 0.0
+        self.fail_root = self.hello_error = False
         self.log = []
 
     def snapshot(self):
-        return dict(slides=self.slides, css=self.css, title=self.title, head=self.head)
+        """The document of the current build (?v= in it is that build's id)."""
+        return dict(slides=self.slides, css=self.css, title=self.title, lang=self.lang,
+                    head=self.head, body=self.body, assets=dict(self.assets), build_id=self.build_id)
 
     def emit(self, kind, query):
         self.build_id += 1
@@ -150,6 +177,14 @@ class Mock:
 MOCK = Mock()
 
 
+def overlay_text(error):
+    """The fallback page's pre-rendered overlay text (what T21's server shows)."""
+    if not error:
+        return "build failed"
+    where = f"{error['file']}:{error['line']}" if error.get("file") else ""
+    return "\n".join(filter(None, [f"build error ({error['kind']})", error["message"], where]))
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"  # one request per connection; SSE streams until closed
 
@@ -168,11 +203,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlsplit(self.path).path
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
-        field = {"/__mock/slides": "slides", "/__mock/css": "css", "/__mock/head": "head"}.get(path)
+        fields = {"/__mock/slides": "slides", "/__mock/css": "css", "/__mock/head": "head",
+                  "/__mock/body": "body", "/__mock/asset": "assets"}
+        field = fields.get(path)
         if field is None:
             return self.do_GET()
         with MOCK.cond:
-            setattr(MOCK, field, body)
+            if path == "/__mock/asset":
+                MOCK.assets[parse_qs(urlsplit(self.path).query)["path"][0]] = body
+            else:
+                setattr(MOCK, field, body)
         self.send(200, "ok", "text/plain")
 
     def do_GET(self):
@@ -188,10 +228,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/favicon.ico":  # keep the browser console free of 404 noise
             return self.send(204, "", "image/x-icon")
         with MOCK.cond:
-            served, build_id = MOCK.served, MOCK.build_id
-            state = {"build_id": build_id, "status": MOCK.status, "error": MOCK.error}
+            served, fail_root = MOCK.served, MOCK.fail_root
+            state = {"build_id": MOCK.build_id, "status": MOCK.status, "error": MOCK.error}
         if path == "/":
-            page = PAGE.format(build_id=build_id, math=MATH_FALLBACK, **served) if served else FALLBACK
+            if fail_root:
+                return self.send(503, "failroot", "text/plain")
+            if served:
+                fields = {k: v for k, v in served.items() if k != "assets"}
+                page = PAGE.format(math=MATH_FALLBACK, **fields)
+            else:
+                page = FALLBACK.format(text=html.escape(overlay_text(state["error"])))
             return self.send(200, page, "text/html; charset=utf-8")
         if path == "/__presenter/theme.css":
             return self.send(200, served["css"] if served else "", "text/css; charset=utf-8")
@@ -204,6 +250,9 @@ class Handler(BaseHTTPRequestHandler):
             target = (ASSETS / rel).resolve()
             if rel.split("/")[0] in ("vendor", "presenter") and ASSETS in target.parents:
                 return self.file(target, "max-age=3600" if rel.startswith("vendor/") else "no-store")
+            if served and rel in served["assets"]:
+                ctype = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+                return self.send(200, served["assets"][rel], ctype)
         self.send(404, "not found", "text/plain")
 
     def file(self, target, cache):
@@ -218,13 +267,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, json.dumps(MOCK.emit(query.get("kind", ["content"])[0], query)), "application/json")
             if path == "/__mock/slides":
                 return self.send(200, MOCK.slides, "text/html; charset=utf-8")
+            if path == "/__mock/frames":
+                return self.send(200, FRAMES, "text/html; charset=utf-8")
+            on = query.get("on", ["1"])[0] == "1"
             if path == "/__mock/title":
                 MOCK.title = query.get("t", [""])[0]
+            elif path == "/__mock/lang":
+                MOCK.lang = query.get("l", ["en"])[0]
+            elif path == "/__mock/failroot":
+                MOCK.fail_root = on
+            elif path == "/__mock/hello-error":
+                MOCK.hello_error = on
             elif path == "/__mock/down":
                 MOCK.down_until = time.monotonic() + int(query.get("ms", ["3000"])[0]) / 1000
                 MOCK.drop_clients()
-            elif path == "/__mock/restart":
+            elif path == "/__mock/restart":  # the first build of the new process succeeds
                 MOCK.build_id, MOCK.events = 1, []
+                MOCK.status, MOCK.error = "ok", None
+                MOCK.served = MOCK.snapshot()
                 MOCK.drop_clients()
             elif path == "/__mock/reset":
                 MOCK.drop_clients()
@@ -241,8 +301,8 @@ class Handler(BaseHTTPRequestHandler):
             if time.monotonic() < MOCK.down_until:
                 return self.send(503, "down", "text/plain")
             generation, seen = MOCK.generation, len(MOCK.events)
-            hello = {"build_id": MOCK.build_id, "status": MOCK.status}
-            if MOCK.error:
+            hello = {"build_id": MOCK.build_id, "status": MOCK.status}  # live-reload.md §2
+            if MOCK.hello_error and MOCK.error:
                 hello["error"] = MOCK.error
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -266,11 +326,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8765, help="0 picks a free port")
     args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
-    print(f"mock presenter serve on http://127.0.0.1:{args.port}/ (Ctrl-C to stop)", flush=True)
+    port = server.server_address[1]
+    print(f"mock presenter serve on http://127.0.0.1:{port}/ (Ctrl-C to stop)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

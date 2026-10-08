@@ -1,41 +1,47 @@
-// `presenter serve` live-reload client (docs/spec/live-reload.md §3). ES2020, no deps.
-// Debugging: window.__presenterLiveReload = { connect, disconnect, state }.
+// Live-reload client of `presenter serve`: docs/spec/live-reload.md §3, ES2020, no deps.
+// Notes: docs/dev/live-reload-qa.md. Debugging: window.__presenterLiveReload.
 (() => {
 'use strict';
-const KEY = 'presenter:build_id';
-const state = { buildId: null, connected: false, retryMs: 500, lastStatus: null, swaps: { css: 0, content: 0 } };
+// Per frame: the speaker view shows the deck in two frames (different queries).
+const KEY = 'presenter:build_id:' + location.pathname + location.search;
+const state = { buildId: null, connected: false, retryMs: 500, lastStatus: 'ok', errorId: null };
 let source = null;
 let timer = null;
 let queue = Promise.resolve();
 const log = (...a) => console.debug('[presenter]', ...a);
-// Stylesheets and scripts, ?v= ignored: a document with other ones needs a reload.
-const signature = (doc) => Array.from(doc.querySelectorAll('link[rel~=stylesheet],script'), (el) =>
-  (el.getAttribute('href') || el.getAttribute('src') || el.textContent).replace(/\?v=\d+$/, '')).join('\n');
+
+// What a slide swap cannot update, ?v= ignored (scripts add head elements after the theme).
+const signature = (doc) => Array.from(doc.querySelectorAll('head>*,body>*'))
+  .filter((el) => !el.matches('title,meta,#presenter-overlay,#presenter-theme~*,.reveal') &&
+    !el.querySelector('.reveal'))
+  .map((el) => el.outerHTML).join('\n').replace(/\?v=\d+/g, '') + doc.documentElement.lang;
 let assets = signature(document);
 
 function store(id) {
   state.buildId = id;
-  try { sessionStorage.setItem(KEY, String(id)); } catch { /* storage disabled */ }
+  try { sessionStorage.setItem(KEY, id); } catch { /* storage disabled */ }
 }
 
-// Stores `id` (the build causing it) so the next hello does not reload again.
+// Stores the causing build first: the reloaded page must not reload again.
 function fullReload(why, id) {
-  if (id !== undefined) store(id);
+  store(id);
+  disconnect();
   log('full reload:', why);
   location.reload(); // reveal `hash: true` restores the slide
   return false;
 }
 
-function showOverlay(err) {
-  let el = document.getElementById('presenter-overlay');
-  if (!el) (el = document.body.appendChild(document.createElement('div'))).id = 'presenter-overlay';
-  el.style.cssText = 'position:fixed;top:12px;right:12px;max-width:50%;max-height:80vh;overflow:auto;' +
-    'z-index:10000;background:#222;color:#eee;border-left:4px solid #e55;padding:12px;' +
+function showOverlay(err, id) {
+  const el = document.getElementById('presenter-overlay') ||
+    document.body.appendChild(document.createElement('div'));
+  el.id = 'presenter-overlay';
+  el.style.cssText = 'position:fixed;top:1em;right:1em;max-width:50%;max-height:80vh;overflow:auto;' +
+    'z-index:10000;background:#222;color:#eee;border-left:4px solid #e55;padding:1em;' +
     'font:13px monospace;white-space:pre-wrap;cursor:pointer';
   el.onclick = () => { el.style.display = 'none'; };
-  const where = err.file ? err.file + (err.line ? ':' + err.line : '') : '';
-  el.textContent = ['build error' + (err.kind ? ' (' + err.kind + ')' : ''), err.message || 'unknown error', where,
-    '(click to dismiss)'].filter(Boolean).join('\n');
+  el.textContent = ['build error' + (err.kind ? ' (' + err.kind + ')' : ''), err.message || 'unknown error',
+    err.file && err.file + (err.line ? ':' + err.line : ''), '(click to dismiss)'].filter(Boolean).join('\n');
+  state.errorId = id; // a reconnect leaves this one alone
 }
 function hideOverlay() {
   const el = document.getElementById('presenter-overlay');
@@ -45,57 +51,43 @@ function hideOverlay() {
 // Loads `href` in a new <link> after `old`, then drops `old` (no flash); false on failure.
 const swapLink = (old, href) => new Promise((resolve) => {
   const link = old.cloneNode();
-  link.removeAttribute('id');
-  link.setAttribute('href', href);
+  link.href = href;
   link.onload = link.onerror = (e) => {
     const ok = e.type === 'load';
     (ok ? old : link).remove();
-    if (ok && old.id) link.id = old.id;
     if (!ok) log('stylesheet failed:', href);
     resolve(ok);
   };
   old.after(link);
 });
 
-// `all`: also re-request /__presenter/asset/ theme stylesheets.
-async function swapCss(id, all) {
-  const theme = document.getElementById('presenter-theme');
-  if (!theme || theme.tagName !== 'LINK') return fullReload('no #presenter-theme link', id);
-  const sel = 'link[rel~=stylesheet][href^="/__presenter/asset/"][href*=theme]';
-  const extra = all ? document.querySelectorAll(sel) : [];
-  const ok = await Promise.all([swapLink(theme, '/__presenter/theme.css?v=' + id),
-    ...Array.from(extra, (l) => swapLink(l, l.getAttribute('href').replace(/\?.*/, '') + '?v=' + id))]);
-  if (window.Reveal && Reveal.isReady()) Reveal.layout();
-  state.swaps.css++;
+async function swapCss(id) {
+  const theme = document.querySelector('link#presenter-theme');
+  if (!theme) return fullReload('no #presenter-theme link', id);
+  const sel = 'link[rel~=stylesheet][href^="/__presenter/asset/"]:not([href^="/__presenter/asset/vendor"])';
+  const ok = await Promise.all([swapLink(theme, '/__presenter/theme.css?v=' + id), ...Array.from(
+    document.querySelectorAll(sel), (l) => swapLink(l, l.getAttribute('href').replace(/\?.*/, '') + '?v=' + id))]);
+  if (window.Reveal?.isReady()) Reveal.layout();
   log('styles reloaded, build', id);
   return ok.every(Boolean);
 }
 
-// Mirrors the highlight plugin's init: wrapper class, data-trim, highlightBlock.
-function rehighlight(R, root) {
-  const hl = R.getPlugin && R.getPlugin('highlight');
-  if (!hl || !hl.highlightBlock || (R.getConfig().highlight || {}).highlightOnLoad === false) return;
-  root.querySelectorAll('pre code').forEach((code) => {
-    code.parentNode.classList.add('code-wrapper');
-    if (code.hasAttribute('data-trim')) {
-      const lines = code.innerHTML.replace(/^\s*\n|\n\s*$/g, '').split('\n');
-      const pad = Math.min(...lines.filter((l) => l.trim()).map((l) => l.length - l.trimStart().length));
-      code.innerHTML = lines.map((l) => l.slice(pad)).join('\n');
-    }
-    hl.highlightBlock(code);
-  });
-}
-
-// Restores the state, indices clamped to the new slide counts.
-function restore(R, s) {
-  const hs = R.getHorizontalSlides();
-  const h = Math.max(0, Math.min(s.indexh || 0, hs.length - 1));
-  const v = Math.max(0, Math.min(s.indexv || 0, (hs[h] ? hs[h].querySelectorAll('section').length : 0) - 1));
-  const f = h === s.indexh && v === s.indexv ? s.indexf : undefined;
+// The old slide by id (as a reload would), else the old indices clamped to the new counts.
+function restore(R, s, id) {
+  const el = id && document.getElementById(id);
+  let h, v, f;
+  if (el && el.matches('.slides section')) {
+    ({ h, v = 0 } = R.getIndices(el));
+    f = s.indexf;
+  } else {
+    const hs = R.getHorizontalSlides();
+    h = Math.min(s.indexh, hs.length - 1);
+    v = Math.min(s.indexv || 0, Math.max(0, hs[h].querySelectorAll('section').length - 1));
+    f = h === s.indexh && v === s.indexv ? s.indexf : undefined;
+  }
   try {
     R.setState({ ...s, indexh: h, indexv: v, indexf: f });
-  } catch (e) {
-    log('setState failed', e);
+  } catch {
     R.slide(h, v, f);
   }
 }
@@ -103,30 +95,35 @@ function restore(R, s) {
 async function swapContent(id) {
   const html = await fetch('/', { cache: 'no-store' }).then((r) => (r.ok ? r.text() : null), () => null);
   if (html === null) {
-    log('GET / failed, update skipped');
+    state.lastStatus = 'stale';
+    log('GET / failed, update postponed');
     return false;
   }
   const next = new DOMParser().parseFromString(html, 'text/html');
   const fresh = next.querySelector('.reveal .slides');
   const slides = document.querySelector('.reveal .slides');
   const R = window.Reveal;
-  if (!fresh || !slides || !R || !R.isReady()) return fullReload('cannot update in place', id);
-  const sig = signature(next); // scripts swapped into slides would not run
-  if (sig !== assets || fresh.querySelector('script')) return fullReload('new stylesheets or scripts', id);
+  if (!fresh || !slides || !R?.isReady() || R.isScrollView() || R.isPrintView()) {
+    return fullReload('cannot update in place', id);
+  }
+  const sig = signature(next); // scripts in the slides would not run
+  if (sig !== assets || fresh.querySelector('script')) {
+    return fullReload('page changed outside the slides', id);
+  }
   const before = R.getState();
+  const current = R.getCurrentSlide()?.id;
   try {
-    slides.replaceChildren(...fresh.childNodes); // keep the element reveal holds on to
-    R.removeHiddenSlides(); // as reveal does on init
-    if (window.katex && window.__presenterRenderMath) window.__presenterRenderMath(slides);
-    rehighlight(R, slides);
+    slides.replaceChildren(...fresh.childNodes); // reveal holds on to .slides itself
+    R.removeHiddenSlides();
+    if (window.katex) window.__presenterRenderMath?.(slides);
+    R.getPlugin?.('highlight')?.init?.(R); // its on-load pass; every `pre code` is new
     R.sync();
-    restore(R, before);
+    restore(R, before, current);
   } catch (e) {
     return fullReload('in-place update failed: ' + e, id);
   }
-  if (next.title && next.title !== document.title) document.title = next.title;
+  if (next.title) document.title = next.title;
   assets = sig;
-  state.swaps.content++;
   log('slides updated, build', id);
   return true;
 }
@@ -134,14 +131,11 @@ async function swapContent(id) {
 async function apply(d) {
   if (d.status === 'error') {
     state.lastStatus = 'error';
-    showOverlay(d.error || {});
+    showOverlay(d.error || {}, d.build_id);
   } else {
-    // A good build after a failed one may hold any earlier change: apply both.
-    const css = d.kind === 'css';
-    const afterError = state.lastStatus === 'error';
-    if ((!css || afterError) && !(await swapContent(d.build_id))) return;
-    // Content builds can change the theme stylesheet too (theme.toml, presenter.toml).
-    if (!(await swapCss(d.build_id, css || afterError))) return;
+    // After an error or a postponed update, apply everything.
+    if ((d.kind !== 'css' || state.lastStatus !== 'ok') && !(await swapContent(d.build_id))) return;
+    if (!(await swapCss(d.build_id))) return; // content builds can change it too
     state.lastStatus = 'ok';
     hideOverlay();
   }
@@ -149,14 +143,25 @@ async function apply(d) {
 }
 
 function onHello(d) {
+  const again = state.buildId !== null; // a reconnect
+  let prev = state.buildId;
+  try { prev = prev ?? sessionStorage.getItem(KEY); } catch { /* storage disabled */ }
   state.retryMs = 500;
   state.connected = true;
-  let prev = null;
-  try { prev = sessionStorage.getItem(KEY); } catch { /* storage disabled */ }
+  if (prev !== null && +prev !== d.build_id) {
+    return fullReload('build ' + prev + ' -> ' + d.build_id, d.build_id);
+  }
   store(d.build_id);
-  if (prev !== null && +prev !== d.build_id) return fullReload('build ' + prev + ' -> ' + d.build_id);
   log('connected, build', d.build_id);
-  if (d.status === 'error') onBuild(d);
+  if (d.status === 'error' && state.errorId !== d.build_id) {
+    state.lastStatus = 'error';
+    state.errorId = d.build_id;
+    // §2's hello has no details: keep the overlay of the server's fallback page.
+    const shown = document.getElementById('presenter-overlay');
+    if (d.error || !shown) showOverlay(d.error || { message: 'details in the terminal' }, d.build_id);
+  } else if (again && d.status !== 'error') {
+    onBuild({ ...d, kind: 'content' }); // same id: the server may have restarted
+  }
 }
 
 function onBuild(d) {
@@ -164,14 +169,13 @@ function onBuild(d) {
   queue = queue.then(() => apply(d)).catch((e) => fullReload('update failed: ' + e, d.build_id));
 }
 
-// Parses event data; never throws out of an event handler.
+// Never throws out of an event handler.
 const handler = (fn) => (ev) => {
   try {
     const d = JSON.parse(ev.data);
-    if (d && typeof d.build_id === 'number') fn(d);
-    else log('ignoring event:', ev.data);
+    if (typeof d?.build_id === 'number') fn(d);
   } catch (e) {
-    log('event handler failed', e);
+    log('bad event', e);
   }
 };
 
