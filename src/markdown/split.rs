@@ -5,21 +5,48 @@
 //! `Document`'s direct children, so `---`/`--` inside code fences, lists, block quotes or
 //! directives are never separators. Nothing is rendered here (T12 renders each [`RawSlide`]).
 //!
-//! Rules implemented by [`split`]:
+//! Two entry points, which differ only in how a top-level `Paragraph` is read:
+//! - [`split_with_source`] (preferred) also gets the Markdown text and reads the paragraph's
+//!   **raw source lines** (its sourcepos line range, each line trimmed of spaces and tabs,
+//!   joined with `\n`). Exactly `--` is a vertical separator; `^(---|--)\s*\{(.*)\}$` is a
+//!   separator with attributes, and the brace contents go to [`parse_attr_block`] verbatim:
+//!   the same text comrak's heading-attribute parser reads, so backslash escapes, entities,
+//!   emphasis delimiters (`bg_draft_.png`) and smart punctuation (`parse.smart`) cannot
+//!   change or hide a separator. A `--` paragraph spelled any other way (`\--`) is the escape
+//!   for a literal `--`.
+//! - [`split`] (the task-file signature) has only the AST and reads the paragraph's inlines:
+//!   `Text`, line breaks and autolinks. Any other inline (emphasis, code, math, raw HTML, an
+//!   ordinary link) or a leading escape means "not a separator". A bare `--` must be one
+//!   `Text` covering exactly the two source columns where the paragraph starts (so `\--`,
+//!   `-\-` and `&#45;&#45;` stay content). comrak's smart punctuation is undone (a leading
+//!   `–`/`—` is `--`/`---`, then curly quotes are straight and `…` is `...`). Limitation:
+//!   escapes and entities inside the braces are already resolved (`title="a \"b\""` reads
+//!   as `title="a "b""`), so values that need them should use [`split_with_source`].
+//!
+//! Rules implemented by both:
 //! - `FrontMatter` is skipped (neither a slide nor a separator).
-//! - `ThematicBreak` (`---`, `***`, `___`) opens a horizontal slide; a `Paragraph` whose only
-//!   child is `Text("--")` opens a vertical slide under the current horizontal one; a
-//!   `Paragraph` whose text matches `^(---|--)\s*\{(.*)\}$` does the same with attributes
-//!   ([`parse_attr_block`]) for the slide it opens.
+//! - `ThematicBreak` (`---`, `***`, `___`) opens a horizontal slide; a `--` paragraph opens a
+//!   vertical slide under the current horizontal one; the `{…}` forms do the same and carry
+//!   attributes for the slide they open.
 //! - Content before the first separator is slide 1. When there is no such content the first
 //!   separator opens slide 1 itself (a leading `--` has no horizontal slide to attach to: it
 //!   is treated as horizontal and reported as `orphan-vertical`). A document without
 //!   separators or content yields one empty slide.
-//! - Two consecutive separators yield an empty slide (not collapsed; `empty-slide` warning).
+//! - Every slide without nodes is reported as `empty-slide` (two consecutive separators, a
+//!   `--` right after `---`, a trailing separator), also when it carries attributes.
 //! - A horizontal separator closes an open vertical stack.
 //! - Attributes on a slide's first node, when it is a heading, are lifted onto the slide
 //!   ([`lift_heading_attrs`]); they win over the separator's attributes.
+//! - A line of an ordinary top-level paragraph that looks like an attribute separator
+//!   (`^---?\s*\{`) but is not one (no blank line around it, trailing text, or for [`split`]
+//!   inline syntax) is reported as `separator-not-recognized`, so a slide boundary is never
+//!   lost silently. (T34 reports raw `---`/`--` lines; this covers the `{…}` forms.)
+//! - Footnote definitions, which comrak moves to the end of the document, belong to the slide
+//!   whose source range they are written in (they count for its span, and footnotes before
+//!   the first separator make slide 1). They stay last among its nodes, in comrak's order, as
+//!   comrak's HTML formatter expects.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use comrak::nodes::{AstNode, NodeValue};
@@ -46,13 +73,15 @@ pub enum SplitMode {
 pub struct RawSlide<'a> {
     /// Separator attributes merged with the lifted first-heading attributes (heading wins).
     pub attrs: SlideAttrs,
-    /// The slide's top-level AST nodes in document order, separators excluded.
+    /// The slide's top-level AST nodes in document order, separators excluded; footnote
+    /// definitions come last (in comrak's order).
     pub nodes: Vec<&'a AstNode<'a>>,
     /// 1-based first line: the line of the separator that opened the slide; for a slide not
-    /// opened by a separator (content before the first separator), its first node's line.
+    /// opened by a separator (content before the first separator), its earliest node's first
+    /// line (the front matter's last line, or 1, when it has no nodes).
     pub start_line: usize,
-    /// 1-based last line: the last node's last line, or the opening separator's last line
-    /// when the slide has no nodes.
+    /// 1-based last line: the last line of its latest node, or the opening separator's last
+    /// line when the slide has no nodes.
     pub end_line: usize,
 }
 
@@ -81,11 +110,15 @@ impl RawSlide<'_> {
 pub struct RawDeck<'a> {
     /// `(horizontal slide, its vertical children)` in document order.
     pub slides: Vec<(RawSlide<'a>, Vec<RawSlide<'a>>)>,
-    /// `empty-slide`, `orphan-vertical` and `unknown-slide-attr` warnings (span set, no path).
+    /// `empty-slide`, `orphan-vertical`, `separator-not-recognized`, `unknown-slide-attr` and
+    /// `invalid-slide-attr` warnings, ordered by line (span set, `cell: None`, no path).
     pub diagnostics: Diagnostics,
 }
 
-/// Splits a parsed document (`root` is comrak's `Document` node) into slides.
+/// Splits a parsed document (`root` is comrak's `Document` node) into slides, reading
+/// separator paragraphs from their inlines. Prefer [`split_with_source`], which reads them
+/// from the source text and is exact for escapes, entities and inline syntax inside `{…}`
+/// (the module docs list the differences).
 ///
 /// Heading attributes that are lifted onto a slide are removed from the heading node
 /// (`attrs = None`), so the rendered `<h1>` is clean.
@@ -95,10 +128,33 @@ pub struct RawDeck<'a> {
 /// attribute block has an unbalanced quote. `split` does not know the file, so the caller
 /// fills in `path`.
 pub fn split<'a>(root: &'a AstNode<'a>, mode: SplitMode) -> Result<RawDeck<'a>> {
+    split_impl(root, None, mode)
+}
+
+/// Like [`split`], but classifies separator paragraphs by their raw source lines in `source`,
+/// the exact text `root` was parsed from (dialect §2.2 "text matches", §3.1 "the two must
+/// agree"). Additive to the T11 task-file API; T12 should call this one.
+///
+/// If a node's sourcepos lies outside `source` (wrong text passed), that node is read from
+/// its inlines as [`split`] does. Errors as [`split`].
+pub fn split_with_source<'a>(
+    root: &'a AstNode<'a>,
+    source: &str,
+    mode: SplitMode,
+) -> Result<RawDeck<'a>> {
+    let lines = source_lines(source);
+    split_impl(root, Some(&lines), mode)
+}
+
+fn split_impl<'a>(
+    root: &'a AstNode<'a>,
+    lines: Option<&[&str]>,
+    mode: SplitMode,
+) -> Result<RawDeck<'a>> {
     if let SplitMode::Headings { .. } = mode {
         return Err(Error::Other("headings mode: T43".into()));
     }
-    let mut builder = Builder::new();
+    let mut builder = Builder::new(root, lines);
     for node in root.children() {
         builder.visit(node)?;
     }
@@ -117,26 +173,51 @@ pub fn lift_heading_attrs<'a>(nodes: &[&'a AstNode<'a>]) -> Option<ParsedAttrs> 
 
 /// Plain text of the first heading among `nodes` (concatenate Text/Code descendants).
 ///
-/// Only the given (top-level) nodes are searched, not their descendants. Emphasis, links and
-/// other inline containers contribute their text; code spans their literal; soft and hard
-/// line breaks (multi-line setext headings) become a space; everything else (math, raw HTML,
-/// images) is skipped. The result is trimmed; `None` when there is no heading or the first
-/// heading has no text.
+/// The headings searched are the `nodes` themselves and, depth first, those inside a
+/// directive (`:::center`, `::::columns`, …; not `:::notes`), so a title wrapped in a layout
+/// directive still names the slide. Headings in block quotes, lists, alerts or footnotes do
+/// not count. The text is every `Text` (also inside emphasis, links, …) plus code spans'
+/// literals; soft and hard line breaks (multi-line setext headings) become spaces; images
+/// (including their alt text), math, raw HTML and footnote references are skipped. Runs of
+/// whitespace collapse to one space and the result is trimmed; `None` when there is no
+/// heading or the first heading has no text.
 pub fn first_heading_text<'a>(nodes: &[&'a AstNode<'a>]) -> Option<String> {
-    let heading = nodes
-        .iter()
-        .find(|node| matches!(node.data().value, NodeValue::Heading(_)))?;
+    let heading = nodes.iter().find_map(|node| find_heading(node))?;
     let mut text = String::new();
-    for node in heading.descendants() {
-        match &node.data().value {
-            NodeValue::Text(t) => text.push_str(t),
-            NodeValue::Code(code) => text.push_str(&code.literal),
-            NodeValue::SoftBreak | NodeValue::LineBreak => text.push(' '),
-            _ => {}
+    push_plain_text(heading, &mut text);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+/// `node` when it is a heading, else the first heading inside it if it is a directive other
+/// than `notes`.
+fn find_heading<'a>(node: &'a AstNode<'a>) -> Option<&'a AstNode<'a>> {
+    let descend = match &node.data().value {
+        NodeValue::Heading(_) => return Some(node),
+        NodeValue::BlockDirective(directive) => {
+            directive.info.split_whitespace().next() != Some("notes")
+        }
+        _ => false,
+    };
+    if descend {
+        node.children().find_map(find_heading)
+    } else {
+        None
+    }
+}
+
+/// Appends the plain text of `node`'s inline descendants (see [`first_heading_text`]).
+fn push_plain_text<'a>(node: &'a AstNode<'a>, out: &mut String) {
+    for child in node.children() {
+        match &child.data().value {
+            NodeValue::Text(text) => out.push_str(text),
+            NodeValue::Code(code) => out.push_str(&code.literal),
+            NodeValue::SoftBreak | NodeValue::LineBreak => out.push(' '),
+            NodeValue::Image(_) => {}
+            // math, raw HTML and footnote references have no children: nothing is added
+            _ => push_plain_text(child, out),
         }
     }
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,45 +226,177 @@ enum Direction {
     Vertical,
 }
 
-/// Classifies a top-level node as a separator (dialect §2.2): its direction and, for the
-/// `--- {…}` form, the text between the braces.
-fn separator<'a>(node: &'a AstNode<'a>) -> Option<(Direction, Option<String>)> {
+/// A recognized separator: its direction and, for the `{…}` forms, the brace contents.
+#[derive(Debug, PartialEq, Eq)]
+struct Separator {
+    direction: Direction,
+    attrs: Option<String>,
+}
+
+/// Classifies a top-level node (dialect §2.2). With `lines` (the source, see
+/// [`source_lines`]) a paragraph is read from its raw source, otherwise from its inlines.
+fn separator<'a>(node: &'a AstNode<'a>, lines: Option<&[&str]>) -> Option<Separator> {
     match node.data().value {
-        NodeValue::ThematicBreak => return Some((Direction::Horizontal, None)),
+        NodeValue::ThematicBreak => {
+            return Some(Separator {
+                direction: Direction::Horizontal,
+                attrs: None,
+            });
+        }
         NodeValue::Paragraph => {}
         _ => return None,
     }
-    if is_bare_vertical(node) {
-        return Some((Direction::Vertical, None));
+    match lines.and_then(|lines| raw_lines(lines, node)) {
+        Some(raw) => separator_in_text(&join_lines(&raw)),
+        None => separator_in_inlines(node),
     }
-    let text = separator_text(node)?;
-    let (direction, inner) = match_attr_separator(&text)?;
-    Some((direction, Some(inner.to_string())))
 }
 
-/// A `Paragraph` whose sole child is `Text` equal to `--`.
+/// A separator paragraph's text: exactly `--`, or `^(---|--)\s*\{(.*)\}$`.
+fn separator_in_text(text: &str) -> Option<Separator> {
+    if text == "--" {
+        return Some(Separator {
+            direction: Direction::Vertical,
+            attrs: None,
+        });
+    }
+    let (direction, inner) = match_attr_separator(text)?;
+    Some(Separator {
+        direction,
+        attrs: Some(inner.to_string()),
+    })
+}
+
+/// A separator read from a paragraph's inlines (no source text; see the module docs).
+fn separator_in_inlines<'a>(paragraph: &'a AstNode<'a>) -> Option<Separator> {
+    if is_bare_vertical(paragraph) {
+        return Some(Separator {
+            direction: Direction::Vertical,
+            attrs: None,
+        });
+    }
+    let text = inline_separator_text(paragraph)?;
+    let text = unsmart(&text);
+    let (direction, inner) = match_attr_separator(&text)?;
+    Some(Separator {
+        direction,
+        attrs: Some(inner.to_string()),
+    })
+}
+
+/// The 1-based numbers and trimmed text of a top-level block's source lines; `None` when
+/// its sourcepos lies outside `lines`.
+fn raw_lines<'s>(lines: &[&'s str], node: &AstNode<'_>) -> Option<Vec<(usize, &'s str)>> {
+    let pos = node.data().sourcepos;
+    let first = pos.start.line;
+    let block = lines.get(first.checked_sub(1)?..pos.end.line)?;
+    let trimmed = block.iter().map(|line| line.trim_matches([' ', '\t']));
+    Some((first..).zip(trimmed).collect())
+}
+
+fn join_lines(raw: &[(usize, &str)]) -> String {
+    let lines: Vec<&str> = raw.iter().map(|(_, line)| *line).collect();
+    lines.join("\n")
+}
+
+/// Splits Markdown source into lines the way comrak numbers them: `\n`, `\r\n` and a lone
+/// `\r` end a line; a leading byte-order mark is dropped.
+fn source_lines(source: &str) -> Vec<&str> {
+    let mut rest = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let mut lines = Vec::new();
+    while let Some(end) = rest.find(['\n', '\r']) {
+        lines.push(&rest[..end]);
+        let ending = if rest[end..].starts_with("\r\n") {
+            2
+        } else {
+            1
+        };
+        rest = &rest[end + ending..];
+    }
+    lines.push(rest);
+    lines
+}
+
+/// A paragraph that is one `Text("--")` (or `–`, comrak's smart form of it) covering exactly
+/// the two source columns where the paragraph starts, i.e. its source is literally `--`.
 fn is_bare_vertical<'a>(paragraph: &'a AstNode<'a>) -> bool {
     let Some(child) = paragraph.first_child() else {
         return false;
     };
-    child.next_sibling().is_none() && matches!(&child.data().value, NodeValue::Text(t) if t == "--")
+    if child.next_sibling().is_some() {
+        return false;
+    }
+    let start = paragraph.data().sourcepos.start;
+    let data = child.data();
+    let pos = data.sourcepos;
+    matches!(&data.value, NodeValue::Text(t) if t == "--" || t == "–")
+        && pos.start == start
+        && pos.end.line == start.line
+        && pos.end.column == start.column + 1
 }
 
-/// The text of a paragraph that could be a `--- {…}` separator: its `Text` nodes, with line
-/// breaks as `\n` and autolinked URLs (`Link` nodes) contributing their text. Any other
-/// inline (code span, emphasis, raw HTML, math, …) means the paragraph is ordinary content,
-/// so e.g. a code span showing `` `-- {auto-animate}` `` is never a separator.
-fn separator_text<'a>(paragraph: &'a AstNode<'a>) -> Option<String> {
+/// The text of a paragraph that could be a `--- {…}` separator: its `Text` nodes, line
+/// breaks as `\n` and autolinks' text. `None` for any other inline (code span, emphasis, raw
+/// HTML, math, an ordinary link, …), so a code span showing `` `-- {auto-animate}` `` is never
+/// a separator, and when the first `Text` does not start where the paragraph does (a leading
+/// escape such as `\---`).
+fn inline_separator_text<'a>(paragraph: &'a AstNode<'a>) -> Option<String> {
+    let start = paragraph.data().sourcepos.start;
+    if paragraph.first_child()?.data().sourcepos.start != start {
+        return None;
+    }
     let mut text = String::new();
-    for node in paragraph.descendants().skip(1) {
+    for node in paragraph.children() {
         match &node.data().value {
             NodeValue::Text(t) => text.push_str(t),
             NodeValue::SoftBreak | NodeValue::LineBreak => text.push('\n'),
-            NodeValue::Link(_) => {}
+            NodeValue::Link(link) => text.push_str(&autolink_text(node, &link.url)?),
             _ => return None,
         }
     }
     Some(text)
+}
+
+/// The text of an autolink (`https://…`, `www.…`, an e-mail address, `<…>`): a `Link` whose
+/// only child is a `Text` equal to its URL (minus the `mailto:`/`http://` comrak adds).
+fn autolink_text<'a>(link: &'a AstNode<'a>, url: &str) -> Option<String> {
+    let child = link.first_child()?;
+    if child.next_sibling().is_some() {
+        return None;
+    }
+    let data = child.data();
+    let NodeValue::Text(text) = &data.value else {
+        return None;
+    };
+    let shown = Some(&**text);
+    let autolink = Some(url) == shown
+        || url.strip_prefix("mailto:") == shown
+        || url.strip_prefix("http://") == shown;
+    autolink.then(|| text.to_string())
+}
+
+/// Undoes comrak's smart punctuation (`parse.smart`) on a separator candidate read from the
+/// AST: a leading em dash is `---`, a leading en dash `--`, and after it curly quotes are
+/// straight and `…` is `...`. Text starting with ASCII dashes was parsed without smart
+/// punctuation and is returned unchanged.
+fn unsmart(text: &str) -> Cow<'_, str> {
+    let (dashes, rest) = if let Some(rest) = text.strip_prefix('—') {
+        ("---", rest)
+    } else if let Some(rest) = text.strip_prefix('–') {
+        ("--", rest)
+    } else {
+        return Cow::Borrowed(text);
+    };
+    let mut out = String::from(dashes);
+    for c in rest.chars() {
+        match c {
+            '“' | '”' => out.push('"'),
+            '‘' | '’' => out.push('\''),
+            '…' => out.push_str("..."),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// `^(---|--)\s*\{(.*)\}$` (`.` excludes `\n`, `\s` is Unicode whitespace as in the `regex`
@@ -198,26 +411,75 @@ fn match_attr_separator(text: &str) -> Option<(Direction, &str)> {
     (!inner.contains('\n')).then_some((direction, inner))
 }
 
+/// `^---?\s*\{`: a line its author probably meant as an attribute separator.
+fn looks_like_attr_separator(line: &str) -> bool {
+    line.strip_prefix("--")
+        .map(|rest| rest.strip_prefix('-').unwrap_or(rest))
+        .is_some_and(|rest| rest.trim_start().starts_with('{'))
+}
+
+/// The start of each source line of a paragraph, read from its inlines: the first `Text`
+/// (when it starts where the paragraph does) and every `Text` right after a line break, with
+/// their lines and smart punctuation undone.
+fn inline_line_starts<'a>(paragraph: &'a AstNode<'a>) -> Vec<(usize, String)> {
+    let start = paragraph.data().sourcepos.start;
+    let mut out = Vec::new();
+    let mut line_start = true;
+    for (i, node) in paragraph.children().enumerate() {
+        let data = node.data();
+        match &data.value {
+            NodeValue::SoftBreak | NodeValue::LineBreak => {
+                line_start = true;
+                continue;
+            }
+            NodeValue::Text(text) if line_start && (i > 0 || data.sourcepos.start == start) => {
+                out.push((data.sourcepos.start.line, unsmart(text).into_owned()));
+            }
+            _ => {}
+        }
+        line_start = false;
+    }
+    out
+}
+
 /// Accumulates slides while walking the document's top-level nodes.
-struct Builder<'a> {
+struct Builder<'a, 's> {
+    /// The source split into lines ([`split_with_source`]), or `None` ([`split`]).
+    lines: Option<&'s [&'s str]>,
     /// Finished horizontal slides with their children.
     done: Vec<(RawSlide<'a>, Vec<RawSlide<'a>>)>,
     /// The open horizontal slide and its children; nodes go to its last child, if any.
     current: (RawSlide<'a>, Vec<RawSlide<'a>>),
     /// `current.0` is slide 1 and no separator has been seen yet.
     implicit: bool,
-    /// Footnote definitions (comrak moves them to the end of the document), with their lines.
-    footnotes: Vec<(&'a AstNode<'a>, usize, usize)>,
+    /// Every footnote definition, in comrak's order (the order they keep on a slide).
+    footnotes: Vec<&'a AstNode<'a>>,
+    /// Footnote definitions not placed yet, with their lines, the latest first.
+    pending: Vec<(&'a AstNode<'a>, usize, usize)>,
     diagnostics: Diagnostics,
 }
 
-impl<'a> Builder<'a> {
-    fn new() -> Self {
+impl<'a, 's> Builder<'a, 's> {
+    fn new(root: &'a AstNode<'a>, lines: Option<&'s [&'s str]>) -> Self {
+        let footnotes: Vec<&'a AstNode<'a>> = root
+            .children()
+            .filter(|node| matches!(node.data().value, NodeValue::FootnoteDefinition(_)))
+            .collect();
+        let mut pending: Vec<_> = footnotes
+            .iter()
+            .map(|node| {
+                let pos = node.data().sourcepos;
+                (*node, pos.start.line, pos.end.line)
+            })
+            .collect();
+        pending.sort_by_key(|&(_, start, _)| std::cmp::Reverse(start));
         Builder {
+            lines,
             done: Vec::new(),
             current: (RawSlide::empty(1), Vec::new()),
             implicit: true,
-            footnotes: Vec::new(),
+            footnotes,
+            pending,
             diagnostics: Diagnostics::new(),
         }
     }
@@ -233,18 +495,18 @@ impl<'a> Builder<'a> {
                     self.current.0 = RawSlide::empty(lines.1.max(1));
                     return Ok(());
                 }
-                NodeValue::FootnoteDefinition(_) => {
-                    self.footnotes.push((node, lines.0, lines.1));
-                    return Ok(());
-                }
+                // placed by their source line, see `flush_footnotes`
+                NodeValue::FootnoteDefinition(_) => return Ok(()),
                 _ => lines,
             }
         };
-        let Some((direction, attr_text)) = separator(node) else {
+        self.flush_footnotes(start);
+        let Some(separator) = separator(node, self.lines) else {
+            self.report_lookalikes(node);
             self.push(node, start, end);
             return Ok(());
         };
-        let attrs = match attr_text {
+        let attrs = match separator.attrs {
             Some(text) => {
                 SlideAttrs::from_parsed(parse_attr_block(&text).map_err(|err| Error::Parse {
                     path: PathBuf::new(),
@@ -260,7 +522,7 @@ impl<'a> Builder<'a> {
             start_line: start,
             end_line: end,
         };
-        self.open(direction, slide);
+        self.open(separator.direction, slide);
         Ok(())
     }
 
@@ -302,7 +564,54 @@ impl<'a> Builder<'a> {
         slide.end_line = slide.end_line.max(end);
     }
 
-    fn finish(self) -> RawDeck<'a> {
+    /// Puts the footnote definitions written before `line` on the open slide, as content.
+    fn flush_footnotes(&mut self, line: usize) {
+        while let Some(&(node, start, end)) = self.pending.last() {
+            if start >= line {
+                break;
+            }
+            self.pending.pop();
+            self.push(node, start, end);
+        }
+    }
+
+    /// Reports the lines of an ordinary top-level paragraph that look like attribute
+    /// separators (`separator-not-recognized`).
+    fn report_lookalikes(&mut self, node: &'a AstNode<'a>) {
+        if !matches!(node.data().value, NodeValue::Paragraph) {
+            return;
+        }
+        let (starts, hint) = match self.lines.and_then(|lines| raw_lines(lines, node)) {
+            Some(raw) => {
+                let starts = raw.into_iter().map(|(n, line)| (n, line.to_string()));
+                (starts.collect(), "")
+            }
+            None => (
+                inline_line_starts(node),
+                " and contain no Markdown inline syntax",
+            ),
+        };
+        for (line, text) in starts {
+            if !looks_like_attr_separator(&text) {
+                continue;
+            }
+            let message = format!(
+                "`{text}` looks like a slide separator with attributes but is not one: it must \
+                 be a paragraph of its own (blank lines around it) matching `--- {{…}}` or \
+                 `-- {{…}}`{hint}"
+            );
+            self.diagnostics
+                .warn("separator-not-recognized", message)
+                .span = Some(SourceSpan {
+                start_line: line,
+                end_line: line,
+                cell: None,
+            });
+        }
+    }
+
+    fn finish(mut self) -> RawDeck<'a> {
+        self.flush_footnotes(usize::MAX);
         let Builder {
             mut done,
             current,
@@ -311,72 +620,60 @@ impl<'a> Builder<'a> {
             ..
         } = self;
         done.push(current);
-        for (node, start, end) in footnotes {
-            place_footnote(&mut done, node, start, end);
-        }
         for (i, (slide, children)) in done.iter_mut().enumerate() {
-            finish_slide(slide, &(i + 1).to_string(), &mut diagnostics);
+            finish_slide(slide, &(i + 1).to_string(), &footnotes, &mut diagnostics);
             for (j, child) in children.iter_mut().enumerate() {
-                finish_slide(child, &format!("{}.{}", i + 1, j + 1), &mut diagnostics);
+                let label = format!("{}.{}", i + 1, j + 1);
+                finish_slide(child, &label, &footnotes, &mut diagnostics);
             }
         }
+        let mut diagnostics = diagnostics.into_vec();
+        diagnostics.sort_by_key(|d| d.span.as_ref().map(|span| span.start_line));
         RawDeck {
             slides: done,
-            diagnostics,
+            diagnostics: diagnostics.into(),
         }
     }
 }
 
-/// Gives a footnote definition back to the slide it was written in (the last slide starting
-/// at or before its line; slide 1 if none). comrak moves every referenced definition to the
-/// end of the document, which would otherwise put all of them on the last slide.
-fn place_footnote<'a>(
-    slides: &mut [(RawSlide<'a>, Vec<RawSlide<'a>>)],
-    node: &'a AstNode<'a>,
-    start: usize,
-    end: usize,
+/// Moves footnote definitions to the end (in comrak's order), lifts the first heading's
+/// attributes and reports `empty-slide`, `unknown-slide-attr` and `invalid-slide-attr`.
+fn finish_slide<'a>(
+    slide: &mut RawSlide<'a>,
+    label: &str,
+    footnotes: &[&'a AstNode<'a>],
+    diagnostics: &mut Diagnostics,
 ) {
-    let mut target = (0, None);
-    for (i, (slide, children)) in slides.iter().enumerate() {
-        if slide.start_line <= start {
-            target = (i, None);
-        }
-        for (j, child) in children.iter().enumerate() {
-            if child.start_line <= start {
-                target = (i, Some(j));
-            }
-        }
-    }
-    let Some((slide, children)) = slides.get_mut(target.0) else {
-        return;
-    };
-    let slide = match target.1.and_then(|j| children.get_mut(j)) {
-        Some(child) => child,
-        None => slide,
-    };
-    slide.nodes.push(node);
-    slide.end_line = slide.end_line.max(end);
-}
-
-/// Lifts the first heading's attributes and reports `empty-slide` / `unknown-slide-attr`.
-fn finish_slide(slide: &mut RawSlide<'_>, label: &str, diagnostics: &mut Diagnostics) {
+    // stable: other nodes (`None`) keep their order, footnotes follow by comrak's order
+    slide
+        .nodes
+        .sort_by_key(|node| footnotes.iter().position(|f| std::ptr::eq(*f, *node)));
     if let Some(lifted) = lift_heading_attrs(&slide.nodes) {
         slide.attrs.merge(SlideAttrs::from_parsed(lifted));
     }
     let span = slide.span();
-    // A slide with attributes but no content (e.g. a full-bleed background) is intentional.
-    if slide.nodes.is_empty() && slide.attrs.is_empty() {
-        diagnostics
-            .warn("empty-slide", format!("slide {label} is empty"))
-            .span = Some(span.clone());
+    let mut warn = |code: &'static str, message: String| {
+        diagnostics.warn(code, message).span = Some(span.clone());
+    };
+    if slide.nodes.is_empty() {
+        let only = if slide.attrs.is_empty() {
+            ""
+        } else {
+            " (it only has attributes)"
+        };
+        warn("empty-slide", format!("slide {label} is empty{only}"));
     }
     for key in &slide.attrs.unknown_keys {
-        diagnostics
-            .warn(
-                "unknown-slide-attr",
-                format!("unknown slide attribute `{key}` on slide {label} (kept verbatim)"),
-            )
-            .span = Some(span.clone());
+        warn(
+            "unknown-slide-attr",
+            format!("unknown slide attribute `{key}` on slide {label} (kept verbatim)"),
+        );
+    }
+    for key in &slide.attrs.invalid_keys {
+        warn(
+            "invalid-slide-attr",
+            format!("`{key}` on slide {label} is not a valid attribute name (dropped)"),
+        );
     }
 }
 
@@ -385,6 +682,12 @@ fn finish_slide(slide: &mut RawSlide<'_>, label: &str, diagnostics: &mut Diagnos
 /// `markdown::comrak_options` (T12).
 #[cfg(test)]
 pub(crate) fn dialect_options() -> comrak::Options<'static> {
+    dialect_options_with(false)
+}
+
+/// [`dialect_options`] with `parse.smart = smart` (`markdown.smart_punctuation`).
+#[cfg(test)]
+pub(crate) fn dialect_options_with(smart: bool) -> comrak::Options<'static> {
     let mut o = comrak::Options::default();
     o.extension.front_matter_delimiter = Some("---".into());
     o.extension.table = true;
@@ -401,7 +704,7 @@ pub(crate) fn dialect_options() -> comrak::Options<'static> {
     o.extension.fenced_code_attributes = true;
     o.extension.link_attributes = true;
     o.extension.inline_code_attributes = true;
-    o.parse.smart = false;
+    o.parse.smart = smart;
     o.parse.relaxed_autolinks = false;
     o.render.r#unsafe = true;
     o.render.escape = false;
@@ -434,8 +737,28 @@ mod tests {
         parse_document(arena, text, &dialect_options())
     }
 
-    fn split_text<'a>(arena: &'a Arena<'a>, text: &str) -> RawDeck<'a> {
-        split(parse(arena, text), SplitMode::Rules).unwrap()
+    /// Which entry point a test runs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Via {
+        /// [`split`]: AST only.
+        Ast,
+        /// [`split_with_source`]: raw source lines.
+        Source,
+    }
+
+    const BOTH: [Via; 2] = [Via::Ast, Via::Source];
+
+    fn run_with<'a>(arena: &'a Arena<'a>, text: &str, via: Via, smart: bool) -> RawDeck<'a> {
+        let root = parse_document(arena, text, &dialect_options_with(smart));
+        let deck = match via {
+            Via::Ast => split(root, SplitMode::Rules),
+            Via::Source => split_with_source(root, text, SplitMode::Rules),
+        };
+        deck.unwrap_or_else(|e| panic!("{via:?} {text:?}: {e}"))
+    }
+
+    fn run<'a>(arena: &'a Arena<'a>, text: &str, via: Via) -> RawDeck<'a> {
+        run_with(arena, text, via, false)
     }
 
     /// `start-end` per horizontal slide, children in brackets, slides separated by ` | `.
@@ -520,44 +843,66 @@ mod tests {
     fn fixtures_split_into_the_expected_shapes() {
         for (name, expected_shape, expected_diags) in FIXTURE_SHAPES {
             let text = fixture(name);
-            let arena = Arena::new();
-            let deck = split_text(&arena, &text);
-            assert_eq!(shape(&deck), *expected_shape, "{name}");
-            assert_eq!(diags(&deck), *expected_diags, "{name}");
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run(&arena, &text, via);
+                assert_eq!(shape(&deck), *expected_shape, "{name} {via:?}");
+                assert_eq!(diags(&deck), *expected_diags, "{name} {via:?}");
+            }
+        }
+    }
+
+    /// Per slide: span, node count and attributes.
+    fn summary(deck: &RawDeck<'_>) -> Vec<(usize, usize, usize, SlideAttrs)> {
+        flatten(deck)
+            .iter()
+            .map(|s| (s.start_line, s.end_line, s.nodes.len(), s.attrs.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn both_entry_points_agree_on_the_fixtures() {
+        for (name, _, _) in FIXTURE_SHAPES {
+            let text = fixture(name);
+            let (a, b) = (Arena::new(), Arena::new());
+            let ast = run(&a, &text, Via::Ast);
+            let source = run(&b, &text, Via::Source);
+            assert_eq!(summary(&ast), summary(&source), "{name}");
         }
     }
 
     /// Spans are 1-based and come from comrak's sourcepos: every separator node's line
-    /// starts exactly one slide, a slide not opened by a separator starts at its first node,
-    /// and every slide ends at its last node (or at its separator when empty).
+    /// starts exactly one slide, a slide not opened by a separator starts at its earliest
+    /// node, and every slide ends at its latest node (or at its separator when empty).
     #[test]
     fn fixture_spans_match_sourcepos() {
         for (name, _, _) in FIXTURE_SHAPES {
             let text = fixture(name);
+            let lines = source_lines(&text);
             let arena = Arena::new();
             let root = parse(&arena, &text);
             let separator_lines: Vec<(usize, usize)> = root
                 .children()
-                .filter(|node| separator(node).is_some())
+                .filter(|node| separator(node, Some(&lines)).is_some())
                 .map(line_range)
                 .collect();
-            let deck = split(root, SplitMode::Rules).unwrap();
+            let deck = split_with_source(root, &text, SplitMode::Rules).unwrap();
             let slides = flatten(&deck);
-            let opened: Vec<&&RawSlide<'_>> = slides
+            let opened = slides
                 .iter()
                 .filter(|s| {
                     separator_lines
                         .iter()
                         .any(|(start, _)| *start == s.start_line)
                 })
-                .collect();
-            assert_eq!(opened.len(), separator_lines.len(), "{name}");
+                .count();
+            assert_eq!(opened, separator_lines.len(), "{name}");
             for slide in &slides {
                 assert!(
                     slide.start_line >= 1 && slide.end_line >= slide.start_line,
                     "{name}"
                 );
-                let Some(first) = slide.nodes.first() else {
+                let Some(first) = slide.nodes.iter().map(|n| line_range(n).0).min() else {
                     let sep = separator_lines.iter().find(|(s, _)| *s == slide.start_line);
                     assert_eq!(sep.map(|(_, end)| *end), Some(slide.end_line), "{name}");
                     continue;
@@ -567,7 +912,7 @@ mod tests {
                 let opened_by_separator =
                     separator_lines.iter().any(|(s, _)| *s == slide.start_line);
                 assert!(
-                    opened_by_separator || line_range(first).0 == slide.start_line,
+                    opened_by_separator || first == slide.start_line,
                     "{name}: slide at {} does not start at a separator or its first node",
                     slide.start_line
                 );
@@ -609,7 +954,7 @@ mod tests {
     fn attributes_fixture_normalizes_and_lifts() {
         let text = fixture("attributes.md");
         let arena = Arena::new();
-        let deck = split_text(&arena, &text);
+        let deck = run(&arena, &text, Via::Source);
         let s = flatten(&deck);
         assert_eq!(s.len(), 9);
         // 1: nothing to lift
@@ -677,6 +1022,7 @@ mod tests {
         // 8: layout lifted from the first heading
         assert_attrs(s[8], None, Some("section"), &["x"], &[]);
         for slide in &s {
+            assert!(slide.attrs.invalid_keys.is_empty(), "{}", slide.start_line);
             if slide.start_line != 49 {
                 assert!(slide.attrs.unknown_keys.is_empty(), "{}", slide.start_line);
             }
@@ -721,7 +1067,7 @@ mod tests {
     fn attributes_fixture_applies_to_valid_ir_slides() {
         let text = fixture("attributes.md");
         let arena = Arena::new();
-        let deck = split_text(&arena, &text);
+        let deck = run(&arena, &text, Via::Source);
         let to_slide = |raw: &RawSlide<'_>| {
             let mut slide = Slide::new();
             raw.attrs.clone().apply_to(&mut slide);
@@ -757,23 +1103,25 @@ mod tests {
         // CommonMark reads `Text` directly followed by a `--` line as a level-2 setext
         // heading, so the AST has no `--` paragraph and the splitter cannot see a separator
         // (dialect §2.2 "Setext pitfall"; `check` warns about the raw line, T34).
-        let arena = Arena::new();
-        let deck = split_text(&arena, "# A\n\nText\n--\n\nmore\n");
-        assert_eq!(shape(&deck), "1-6");
-        assert!(deck.diagnostics.is_empty());
-        let setext = deck.slides[0].0.nodes[1].data();
-        assert!(matches!(
-            setext.value,
-            NodeValue::Heading(NodeHeading {
-                level: 2,
-                setext: true,
-                ..
-            })
-        ));
-        drop(setext);
-        // With a blank line before it, the same `--` line is a vertical separator.
-        let deck = split_text(&arena, "# A\n\nText\n\n--\n\nmore\n");
-        assert_eq!(shape(&deck), "1-3 [5-7]");
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run(&arena, "# A\n\nText\n--\n\nmore\n", via);
+            assert_eq!(shape(&deck), "1-6");
+            assert!(deck.diagnostics.is_empty());
+            let setext = deck.slides[0].0.nodes[1].data();
+            assert!(matches!(
+                setext.value,
+                NodeValue::Heading(NodeHeading {
+                    level: 2,
+                    setext: true,
+                    ..
+                })
+            ));
+            drop(setext);
+            // With a blank line before it, the same `--` line is a vertical separator.
+            let deck = run(&arena, "# A\n\nText\n\n--\n\nmore\n", via);
+            assert_eq!(shape(&deck), "1-3 [5-7]");
+        }
     }
 
     #[test]
@@ -822,10 +1170,16 @@ mod tests {
                 &[("empty-slide", 3)],
             ),
             (
-                "an empty slide with attributes is intentional (no warning)",
+                "an empty slide with attributes is still reported (dialect §2.2)",
                 "# A\n\n--- {background=x.png}\n\n---\n\n# B\n",
                 "1-1 | 3-3 | 5-7",
-                &[],
+                &[("empty-slide", 3)],
+            ),
+            (
+                "`---` with attributes, then `--`: the empty first slide is reported",
+                "# A\n\n--- {background=x.png}\n\n--\n\n# B\n",
+                "1-1 | 3-3 [5-7]",
+                &[("empty-slide", 3)],
             ),
             (
                 "`---` closes the vertical stack",
@@ -834,16 +1188,16 @@ mod tests {
                 &[],
             ),
             (
-                "code spans and emphasis are not separators",
+                "code spans and emphasis that do not start the line are not separators",
                 "# A\n\n`-- {auto-animate}`\n\n*--- {.x}*\n\n_--_\n",
                 "1-7",
                 &[],
             ),
             (
-                "`--` must be the whole paragraph",
+                "`--` must be the whole paragraph; a `{…}` line inside one is reported",
                 "# A\n\n--\nmore\n\nText\n-- {x}\n",
                 "1-7",
-                &[],
+                &[("separator-not-recognized", 7)],
             ),
             (
                 "attribute separator directly before a heading",
@@ -856,7 +1210,13 @@ mod tests {
                 "`.` in the pattern does not match a line break",
                 "# A\n\n--- {a\nb}\n",
                 "1-4",
-                &[],
+                &[("separator-not-recognized", 3)],
+            ),
+            (
+                "trailing text after the braces",
+                "# A\n\n--- {.x} trailing\n",
+                "1-3",
+                &[("separator-not-recognized", 3)],
             ),
             (
                 "`\\s*` does match a line break",
@@ -865,76 +1225,326 @@ mod tests {
                 &[],
             ),
             (
-                "separators nested in containers are content",
-                "# A\n\n> ---\n\n- item\n\n  --\n\n:::note\n---\n:::\n",
-                "1-11",
+                "separators nested in containers are content (and not reported)",
+                "# A\n\n> ---\n\n- item\n\n  --\n\n  -- {.x}\n\n:::note\n---\n:::\n",
+                "1-13",
+                &[],
+            ),
+            (
+                "escaped or encoded `--` is a literal paragraph, not a separator",
+                "# A\n\n\\--\n\n-\\-\n\n&#45;&#45;\n\n\\--- {.x}\n",
+                "1-9",
+                &[],
+            ),
+            (
+                "indentation and trailing spaces around `--` are fine",
+                "# A\n\n   --  \n\n# B\n",
+                "1-1 [3-5]",
                 &[],
             ),
         ];
         for (what, text, expected_shape, expected_diags) in cases {
-            let arena = Arena::new();
-            let deck = split_text(&arena, text);
-            assert_eq!(shape(&deck), *expected_shape, "{what}");
-            assert_eq!(diags(&deck), *expected_diags, "{what}");
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run(&arena, text, via);
+                assert_eq!(shape(&deck), *expected_shape, "{what} ({via:?})");
+                assert_eq!(diags(&deck), *expected_diags, "{what} ({via:?})");
+            }
         }
     }
 
     #[test]
     fn separator_attributes_reach_the_slide_they_open() {
-        let arena = Arena::new();
         let text = "-- {.first}\n\n# A\n\n--- {background=https://example.org/bg.png}\n\n# B\n\n\
-                    --\n{.x}\n\n# B.1\n";
-        let deck = split_text(&arena, text);
-        assert_eq!(shape(&deck), "1-3 | 5-7 [9-12]");
-        // the orphan `-- {…}` keeps its attributes on slide 1
-        assert_eq!(deck.slides[0].0.attrs.classes, ["first"]);
-        // an autolinked URL is still part of the separator text
-        assert_eq!(
-            deck.slides[1].0.attrs.attrs["data-background-image"],
-            "https://example.org/bg.png"
-        );
-        assert_eq!(deck.slides[1].1[0].attrs.classes, ["x"]);
+                    --\n{.x}\n\n# B.1\n\n--- {data-m=me@example.org}\n";
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run(&arena, text, via);
+            assert_eq!(shape(&deck), "1-3 | 5-7 [9-12] | 14-14", "{via:?}");
+            // the orphan `-- {…}` keeps its attributes on slide 1
+            assert_eq!(deck.slides[0].0.attrs.classes, ["first"]);
+            // an autolinked URL or e-mail address is still part of the separator text
+            assert_eq!(
+                deck.slides[1].0.attrs.attrs["data-background-image"],
+                "https://example.org/bg.png"
+            );
+            assert_eq!(deck.slides[1].1[0].attrs.classes, ["x"]);
+            assert_eq!(deck.slides[2].0.attrs.attrs["data-m"], "me@example.org");
+        }
+    }
+
+    /// Values with Markdown inline syntax. Read from the source they are exact; read from the
+    /// AST the paragraph cannot be trusted, so it stays content and is reported.
+    #[test]
+    fn inline_syntax_in_separator_values() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "--- {background=img/_draft_.png}",
+                "data-background-image",
+                "img/_draft_.png",
+            ),
+            (
+                "--- {background=__init__.png}",
+                "data-background-image",
+                "__init__.png",
+            ),
+            ("--- {data-x=~a~}", "data-x", "~a~"),
+            ("--- {data-x=a*b*c}", "data-x", "a*b*c"),
+            ("--- {data-x=\"<b>\"}", "data-x", "<b>"),
+            ("--- {data-x=$a$}", "data-x", "$a$"),
+            ("--- {data-x=`a`}", "data-x", "`a`"),
+            ("--- {data-x=[a](b)}", "data-x", "[a](b)"),
+            ("-- {data-x=**b**}", "data-x", "**b**"),
+        ];
+        for (line, key, value) in cases {
+            let text = format!("# A\n\n{line}\n\n# B\n");
+            let arena = Arena::new();
+            let deck = run(&arena, &text, Via::Source);
+            let slides = flatten(&deck);
+            assert_eq!(slides.len(), 2, "{line}");
+            assert_eq!(slides[1].start_line, 3, "{line}");
+            assert_eq!(slides[1].attrs.attrs[*key], *value, "{line}");
+            assert!(
+                !diags(&deck).contains(&("separator-not-recognized", 3)),
+                "{line}"
+            );
+
+            let arena = Arena::new();
+            let deck = run(&arena, &text, Via::Ast);
+            assert_eq!(shape(&deck), "1-5", "{line}");
+            assert_eq!(diags(&deck)[0], ("separator-not-recognized", 3), "{line}");
+        }
+    }
+
+    /// Backslash escapes and entities: from the source the separator agrees with the heading
+    /// grammar (§3.1); from the AST they are already resolved (documented limitation).
+    #[test]
+    fn escapes_in_separator_values() {
+        let cases: &[(&str, &str, &str)] = &[
+            (r#"--- {title="a \"q\" b"}"#, "title", r#"a "q" b"#),
+            (r#"--- {title="a \"b"}"#, "title", r#"a "b"#),
+            (r#"--- {data-path="C:\\dir"}"#, "data-path", r"C:\dir"),
+            ("--- {data-x=\"&lt;b&gt;\"}", "data-x", "&lt;b&gt;"),
+        ];
+        for (line, key, value) in cases {
+            let text = format!("# A\n\n{line}\n\n# B\n");
+            let arena = Arena::new();
+            let deck = run(&arena, &text, Via::Source);
+            assert_eq!(deck.slides[1].0.attrs.attrs[*key], *value, "{line}");
+            // the heading form reads the same block identically
+            let heading = format!("# B {}\n", &line[4..]);
+            let arena = Arena::new();
+            let lifted = run(&arena, &heading, Via::Source);
+            assert_eq!(lifted.slides[0].0.attrs.attrs[*key], *value, "{heading}");
+        }
+        // pinned AST-only behaviour
+        let arena = Arena::new();
+        let deck = run(&arena, "# A\n\n--- {title=\"a \\\"q\\\" b\"}\n", Via::Ast);
+        assert_eq!(deck.slides[1].0.attrs.attrs["title"], "a q b");
+        let arena = Arena::new();
+        let deck = run(&arena, "# A\n\n--- {data-x=\"&lt;b&gt;\"}\n", Via::Ast);
+        assert_eq!(deck.slides[1].0.attrs.attrs["data-x"], "<b>");
+        let arena = Arena::new();
+        let root = parse(&arena, "# A\n\n--- {title=\"a \\\"b\"}\n");
+        assert!(matches!(
+            split(root, SplitMode::Rules),
+            Err(Error::Parse { line: Some(3), .. })
+        ));
+    }
+
+    /// `markdown.smart_punctuation = true` turns `--` into `–` and quotes into curly ones;
+    /// separators keep working through both entry points.
+    #[test]
+    fn smart_punctuation_keeps_separators() {
+        let text = "# A\n\n--\n\n# A.1\n\n-- {auto-animate}\n\n# A.2\n\n\
+                    --- {.dark data-x=\"q\" y='s' z=a...b}\n\n# B\n\n\\--\n\n---- {x}\n";
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run_with(&arena, text, via, true);
+            assert_eq!(shape(&deck), "1-1 [3-5, 7-9] | 11-17", "{via:?}");
+            let slides = flatten(&deck);
+            assert_eq!(
+                slides[2].attrs.attrs,
+                BTreeMap::from([("data-auto-animate".to_string(), String::new())])
+            );
+            assert_eq!(slides[3].attrs.classes, ["dark"], "{via:?}");
+            assert_eq!(
+                slides[3].attrs.attrs,
+                BTreeMap::from([
+                    ("data-x".to_string(), "q".to_string()),
+                    ("y".to_string(), "s".to_string()),
+                    ("z".to_string(), "a...b".to_string()),
+                ]),
+                "{via:?}"
+            );
+            // `\--` and `---- {x}` stay content
+            assert_eq!(slides[3].nodes.len(), 3, "{via:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_attribute_names_are_dropped_and_reported() {
+        for via in BOTH {
+            let arena = Arena::new();
+            let text = "# A\n\n--- {\"a b\"=c '>x'=y ok=1 data-z=2}\n\n# B\n\n--- {a} {b}\n\n# C\n";
+            let deck = run(&arena, text, via);
+            let slides = flatten(&deck);
+            assert_eq!(slides[1].attrs.invalid_keys, ["a b", ">x"], "{via:?}");
+            assert_eq!(
+                slides[1].attrs.attrs,
+                BTreeMap::from([
+                    ("data-z".to_string(), "2".to_string()),
+                    ("ok".to_string(), "1".to_string()),
+                ])
+            );
+            assert_eq!(slides[2].attrs.invalid_keys, ["a}", "{b"], "{via:?}");
+            assert!(slides[2].attrs.attrs.is_empty());
+            assert_eq!(
+                diags(&deck),
+                [
+                    ("unknown-slide-attr", 3),
+                    ("invalid-slide-attr", 3),
+                    ("invalid-slide-attr", 3),
+                    ("invalid-slide-attr", 7),
+                    ("invalid-slide-attr", 7),
+                ],
+                "{via:?}"
+            );
+            let messages: Vec<String> =
+                deck.diagnostics.iter().map(|d| d.message.clone()).collect();
+            assert_eq!(
+                messages[1],
+                "`a b` on slide 2 is not a valid attribute name (dropped)"
+            );
+        }
+    }
+
+    #[test]
+    fn background_shorthand_from_a_later_source_wins() {
+        for via in BOTH {
+            let arena = Arena::new();
+            let text = "# A\n\n--- {background=photo.jpg}\n\n# B {background=\"navy\"}\n\n\
+                        --- {background=#000}\n\n# C {background=\"bg.png\"}\n";
+            let deck = run(&arena, text, via);
+            let slides = flatten(&deck);
+            assert_eq!(
+                slides[1].attrs.attrs,
+                BTreeMap::from([("data-background-color".to_string(), "navy".to_string())]),
+                "{via:?}"
+            );
+            assert_eq!(
+                slides[2].attrs.attrs,
+                BTreeMap::from([("data-background-image".to_string(), "bg.png".to_string())]),
+                "{via:?}"
+            );
+        }
     }
 
     #[test]
     fn unbalanced_quote_in_separator_is_a_parse_error_with_line() {
-        let arena = Arena::new();
-        let root = parse(&arena, "# A\n\n--- {k=\"v}\n");
-        let err = split(root, SplitMode::Rules).unwrap_err();
-        let Error::Parse {
-            path,
-            line,
-            message,
-        } = &err
-        else {
-            panic!("expected Error::Parse, got {err:?}");
-        };
-        assert_eq!(path, &PathBuf::new());
-        assert_eq!(*line, Some(3));
-        assert!(message.contains("unbalanced"), "{message}");
+        for via in BOTH {
+            let text = "# A\n\n--- {k=\"v}\n";
+            let arena = Arena::new();
+            let root = parse(&arena, text);
+            let err = match via {
+                Via::Ast => split(root, SplitMode::Rules),
+                Via::Source => split_with_source(root, text, SplitMode::Rules),
+            }
+            .unwrap_err();
+            let Error::Parse {
+                path,
+                line,
+                message,
+            } = &err
+            else {
+                panic!("expected Error::Parse, got {err:?}");
+            };
+            assert_eq!(path, &PathBuf::new());
+            assert_eq!(*line, Some(3));
+            assert!(message.contains("unbalanced"), "{message}");
+        }
     }
 
     #[test]
     fn headings_mode_is_not_implemented_yet() {
         let arena = Arena::new();
         let root = parse(&arena, "# A\n");
-        let err = split(root, SplitMode::Headings { slide_level: 2 }).unwrap_err();
-        assert!(
-            matches!(&err, Error::Other(m) if m == "headings mode: T43"),
-            "{err:?}"
-        );
+        for result in [
+            split(root, SplitMode::Headings { slide_level: 2 }),
+            split_with_source(root, "# A\n", SplitMode::Headings { slide_level: 2 }),
+        ] {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(&err, Error::Other(m) if m == "headings mode: T43"),
+                "{err:?}"
+            );
+        }
+    }
+
+    fn footnote_names(slide: &RawSlide<'_>) -> Vec<String> {
+        slide
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.data().value {
+                NodeValue::FootnoteDefinition(def) => Some(def.name.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
     fn footnote_definitions_stay_on_their_slide() {
-        let arena = Arena::new();
-        let text =
-            "# A\n\nText[^1].\n\n[^1]: The note.\n\n---\n\n# B\n\nMore[^2].\n\n[^2]: Second.\n";
-        let deck = split_text(&arena, text);
-        assert_eq!(shape(&deck), "1-5 | 7-13");
-        for (slide, _) in &deck.slides {
-            let last = slide.nodes.last().unwrap().data();
-            assert!(matches!(last.value, NodeValue::FootnoteDefinition(_)));
+        let cases: &[(&str, &str, &str, &[&[&str]])] = &[
+            (
+                "definitions after their references",
+                "# A\n\nText[^1].\n\n[^1]: The note.\n\n---\n\n# B\n\nMore[^2].\n\n[^2]: Second.\n",
+                "1-5 | 7-13",
+                &[&["1"], &["2"]],
+            ),
+            (
+                "a definition before its reference widens the span back",
+                "[^1]: note\n\nText[^1]\n\n---\n\n# B\n",
+                "1-3 | 5-7",
+                &[&["1"], &[]],
+            ),
+            (
+                "a definition before the first separator makes slide 1",
+                "---\ntitle: x\n---\n\n[^1]: The note.\n\n---\n\n# A[^1]\n",
+                "5-5 | 7-9",
+                &[&["1"], &[]],
+            ),
+            (
+                "comrak's order (by first reference) is kept on a slide",
+                "# A\n\nX[^b] Y[^a]\n\n[^a]: written first\n\n[^b]: written second\n",
+                "1-7",
+                &[&["b", "a"]],
+            ),
+            (
+                "a definition in a vertical slide",
+                "# A\n\n--\n\nZ[^z]\n\n[^z]: zed\n\n---\n\n# B\n",
+                "1-1 [3-7] | 9-11",
+                &[&[], &["z"], &[]],
+            ),
+        ];
+        for (what, text, expected_shape, expected_notes) in cases {
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run(&arena, text, via);
+                assert_eq!(shape(&deck), *expected_shape, "{what}");
+                let slides = flatten(&deck);
+                let notes: Vec<Vec<String>> = slides.iter().map(|s| footnote_names(s)).collect();
+                assert_eq!(notes, *expected_notes, "{what}");
+                for slide in slides {
+                    // definitions come after every other node
+                    let first_note = slide
+                        .nodes
+                        .iter()
+                        .position(|n| matches!(n.data().value, NodeValue::FootnoteDefinition(_)));
+                    if let Some(at) = first_note {
+                        assert_eq!(footnote_names(slide).len(), slide.nodes.len() - at);
+                    }
+                }
+            }
         }
     }
 
@@ -980,6 +1590,19 @@ mod tests {
             ("para only\n", None),
             ("#\n\n# Later\n", None),
             ("> # Quoted\n", None),
+            // image alt text is skipped; whitespace runs collapse
+            ("# ![logo](x.png) Title\n", Some("Title")),
+            ("# ![logo](x.png)\n", None),
+            ("# Euler $e^{i\\pi}$ identity\n", Some("Euler identity")),
+            ("# A <b>bold</b>  move\n", Some("A bold move")),
+            // headings inside layout directives count, `:::notes` does not
+            (":::center\n# Title\n:::\n", Some("Title")),
+            (
+                "::::columns\n:::column\n## Left\n:::\n::::\n\n# Later\n",
+                Some("Left"),
+            ),
+            (":::notes\n# Not a title\n:::\n\n# Real\n", Some("Real")),
+            ("- # In a list\n", None),
         ];
         for (text, expected) in cases {
             let arena = Arena::new();
@@ -1008,5 +1631,56 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(match_attr_separator(text), *expected, "{text:?}");
         }
+        for (line, looks) in [
+            ("--- {x}", true),
+            ("-- {x", true),
+            ("---{", true),
+            ("--\t{", true),
+            ("---- {x}", false),
+            ("- {x}", false),
+            ("--", false),
+            ("`-- {x}`", false),
+        ] {
+            assert_eq!(looks_like_attr_separator(line), looks, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn unsmart_undoes_smart_punctuation_only_after_a_smart_dash() {
+        for (text, expected) in [
+            ("— {.x k=“v” j=‘w’ z=a…}", "--- {.x k=\"v\" j='w' z=a...}"),
+            ("– {auto-animate}", "-- {auto-animate}"),
+            ("--- {k=“v”}", "--- {k=“v”}"),
+            ("plain", "plain"),
+        ] {
+            assert_eq!(unsmart(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn source_lines_match_comrak_line_numbers() {
+        assert_eq!(source_lines(""), [""]);
+        assert_eq!(source_lines("a\nb\n"), ["a", "b", ""]);
+        assert_eq!(source_lines("a\r\nb\rc\n"), ["a", "b", "c", ""]);
+        assert_eq!(source_lines("\u{feff}a\n"), ["a", ""]);
+        // end to end: CRLF, lone CR and a byte-order mark
+        let text = "\u{feff}# A\r\n\r\n--- {.x}\r\n\r\nb\rc\r\r-- {.y}\r\rz\r";
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run(&arena, text, via);
+            assert_eq!(shape(&deck), "1-1 | 3-6 [8-10]", "{via:?}");
+            assert_eq!(deck.slides[1].0.attrs.classes, ["x"]);
+            assert_eq!(deck.slides[1].1[0].attrs.classes, ["y"]);
+        }
+    }
+
+    #[test]
+    fn wrong_source_text_falls_back_to_the_ast() {
+        let text = "# A\n\n--- {.x}\n\n# B\n";
+        let arena = Arena::new();
+        let root = parse(&arena, text);
+        let deck = split_with_source(root, "", SplitMode::Rules).unwrap();
+        assert_eq!(shape(&deck), "1-1 | 3-5");
+        assert_eq!(deck.slides[1].0.attrs.classes, ["x"]);
     }
 }

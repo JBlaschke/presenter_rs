@@ -8,7 +8,8 @@
 //!   conveniences comrak lacks: single-quoted values and bare keys (`{auto-animate}`).
 //! - [`SlideAttrs`] is the slide-level normalization (§3.2): `#id` → id, `.class` → classes,
 //!   `layout=` consumed, shorthand keys expanded to reveal's `data-*` attributes by
-//!   [`normalize_key`], unknown keys kept verbatim and recorded for `check`.
+//!   [`normalize_key`], unknown keys kept verbatim and recorded for `check`, keys that are not
+//!   valid attribute names ([`is_valid_attr_name`]) dropped and recorded.
 
 use std::collections::BTreeMap;
 
@@ -52,9 +53,11 @@ impl From<&comrak::nodes::Attributes> for ParsedAttrs {
 /// `=` outside quotes) or a bare `key` (→ `(key, "")`). Double or single quotes group
 /// whitespace anywhere in an item and are removed; inside quotes a backslash escapes the next
 /// character. Unquoted values run to the next whitespace, so `background=#111` works here
-/// although comrak's heading grammar rejects it. Items with an empty id, class or key (`#`,
-/// `.`, `=v`) are ignored. Every block comrak accepts on a heading parses to the same
-/// [`ParsedAttrs`] here (shared unit tests).
+/// although comrak's heading grammar rejects it. Items with an empty key (`=v`) and a bare `#`
+/// or `.` are ignored; a quoted empty id or class (`#""`, `.""`) is kept as `""`, as comrak
+/// does. Keys are not validated here (see [`is_valid_attr_name`]). Every block comrak accepts
+/// on a heading parses to the same [`ParsedAttrs`] here (shared unit tests, including a
+/// differential run over random blocks).
 pub fn parse_attr_block(s: &str) -> Result<ParsedAttrs> {
     let trimmed = s.trim();
     let inner = trimmed.strip_prefix('{').unwrap_or(trimmed);
@@ -81,6 +84,8 @@ struct Token {
     lead: Option<char>,
     /// Whether any character (quoted or not) has been read.
     started: bool,
+    /// Whether the item contained a quoted run (so `#""` is an empty id, not a bare `#`).
+    quoted: bool,
 }
 
 impl Token {
@@ -88,13 +93,13 @@ impl Token {
         match self.lead {
             Some('#') => {
                 let id = &self.text['#'.len_utf8()..];
-                if !id.is_empty() {
+                if !id.is_empty() || self.quoted {
                     out.id = Some(id.to_string());
                 }
             }
             Some('.') => {
                 let class = &self.text['.'.len_utf8()..];
-                if !class.is_empty() {
+                if !class.is_empty() || self.quoted {
                     out.classes.push(class.to_string());
                 }
             }
@@ -124,7 +129,10 @@ fn tokenize(s: &str) -> std::result::Result<Vec<Token>, char> {
         }
         let token = current.get_or_insert_with(Token::default);
         match c {
-            '"' | '\'' => read_quoted(&mut chars, c, &mut token.text)?,
+            '"' | '\'' => {
+                read_quoted(&mut chars, c, &mut token.text)?;
+                token.quoted = true;
+            }
             '=' if token.eq.is_none() => {
                 token.eq = Some(token.text.len());
                 token.text.push(c);
@@ -174,16 +182,32 @@ pub struct SlideAttrs {
     /// Lowercased keys [`normalize_key`] did not recognize (still present in `attrs`
     /// verbatim); the splitter reports each as an `unknown-slide-attr` warning.
     pub unknown_keys: Vec<String>,
+    /// Keys (as written) dropped because they are not valid attribute names
+    /// ([`is_valid_attr_name`]); the splitter reports each as an `invalid-slide-attr` warning.
+    /// Not part of the IR. (Additive to the T11 task-file struct.)
+    pub invalid_keys: Vec<String>,
+    /// Whether the `background` shorthand was used. Like the CSS shorthand it replaces any
+    /// background colour and image set before it, so when these attributes are merged as the
+    /// later source ([`SlideAttrs::merge`], [`SlideAttrs::apply_to`]) the earlier
+    /// `data-background-color` and `data-background-image` are removed first. Not part of the
+    /// IR. (Additive to the T11 task-file struct.)
+    pub background_shorthand: bool,
 }
+
+/// The two attributes the `background` shorthand can write (dialect §3.2).
+const BACKGROUND_KEYS: [&str; 2] = ["data-background-color", "data-background-image"];
 
 impl SlideAttrs {
     /// Normalizes a raw attribute block for a slide.
     ///
-    /// Keys are lowercased. `id=` and `class=` pairs behave like `#id` and `.class` (a
-    /// `class=` value may hold several space-separated classes); `layout=` sets
-    /// [`SlideAttrs::layout`]; every other pair goes through [`normalize_key`]. Empty ids and
-    /// layouts are ignored (a slide's layout must be non-empty). Within one block a later
-    /// duplicate key wins.
+    /// Keys are lowercased. Keys that are not valid attribute names are dropped and recorded
+    /// in [`SlideAttrs::invalid_keys`]. `id=` and `class=` pairs behave like `#id` and `.class`
+    /// (a `class=` value may hold several space-separated classes); `layout=` sets
+    /// [`SlideAttrs::layout`]; every other pair goes through [`normalize_key`]. Empty ids,
+    /// classes and layouts are ignored (a slide's layout must be non-empty). Within one block
+    /// a later duplicate key wins, and a `background` shorthand also replaces any background
+    /// colour or image written before it (`{background-color=navy background=bg.png}` keeps
+    /// only the image; `{background=bg.png background-color=navy}` keeps both).
     pub fn from_parsed(p: ParsedAttrs) -> SlideAttrs {
         let mut out = SlideAttrs {
             id: p.id.filter(|id| !id.is_empty()),
@@ -192,8 +216,12 @@ impl SlideAttrs {
         for class in p.classes {
             out.add_classes(&class);
         }
-        for (key, value) in p.pairs {
-            let key = key.to_lowercase();
+        for (written, value) in p.pairs {
+            if !is_valid_attr_name(&written) {
+                push_unique(&mut out.invalid_keys, written);
+                continue;
+            }
+            let key = written.to_lowercase();
             match key.as_str() {
                 "id" => {
                     if !value.is_empty() {
@@ -211,6 +239,10 @@ impl SlideAttrs {
                     if !known {
                         push_unique(&mut out.unknown_keys, emitted.clone());
                     }
+                    if key == "background" {
+                        remove_background(&mut out.attrs);
+                        out.background_shorthand = true;
+                    }
                     out.attrs.insert(emitted, value);
                 }
             }
@@ -218,8 +250,10 @@ impl SlideAttrs {
         out
     }
 
-    /// Merges `later` into `self`; `later` wins for `id`, `layout` and equal `attrs` keys;
-    /// classes and unknown keys accumulate (deduplicated, order kept).
+    /// Merges `later` into `self`; `later` wins for `id`, `layout` and equal `attrs` keys, and
+    /// a `background` shorthand in `later` first removes `self`'s background colour and image
+    /// (dialect §3.2 "later wins"); classes, unknown and invalid keys accumulate
+    /// (deduplicated, order kept).
     pub fn merge(&mut self, later: SlideAttrs) {
         if later.id.is_some() {
             self.id = later.id;
@@ -230,16 +264,24 @@ impl SlideAttrs {
         for class in later.classes {
             push_unique(&mut self.classes, class);
         }
+        if later.background_shorthand {
+            remove_background(&mut self.attrs);
+            self.background_shorthand = true;
+        }
         self.attrs.extend(later.attrs);
         for key in later.unknown_keys {
             push_unique(&mut self.unknown_keys, key);
+        }
+        for key in later.invalid_keys {
+            push_unique(&mut self.invalid_keys, key);
         }
     }
 
     /// Writes the attributes into `slide` with the same precedence as [`SlideAttrs::merge`]:
     /// `id` and `layout` replace the slide's when set, classes are appended (deduplicated),
-    /// `attrs` entries are inserted (overwriting equal keys). `unknown_keys` is not part of
-    /// the IR and is dropped.
+    /// `attrs` entries are inserted (overwriting equal keys; a `background` shorthand first
+    /// removes the slide's background colour and image). `unknown_keys`, `invalid_keys` and
+    /// `background_shorthand` are not part of the IR and are dropped.
     pub fn apply_to(self, slide: &mut Slide) {
         if let Some(id) = self.id {
             slide.id = Some(id);
@@ -249,6 +291,9 @@ impl SlideAttrs {
         }
         for class in self.classes {
             push_unique(&mut slide.classes, class);
+        }
+        if self.background_shorthand {
+            remove_background(&mut slide.attrs);
         }
         slide.attrs.extend(self.attrs);
     }
@@ -266,6 +311,22 @@ impl SlideAttrs {
             push_unique(&mut self.classes, class.to_string());
         }
     }
+}
+
+fn remove_background(attrs: &mut BTreeMap<String, String>) {
+    for key in BACKGROUND_KEYS {
+        attrs.remove(key);
+    }
+}
+
+/// Whether `key` may become a `<section>` attribute name: comrak's attribute-key grammar
+/// (dialect §3.1), an ASCII letter followed by ASCII letters, digits, `-`, `_`, `:` or `.`.
+/// The separator parser ([`parse_attr_block`]) accepts any key (quoted keys, `{a} {b}`), so
+/// [`SlideAttrs::from_parsed`] uses this to keep malformed names out of the HTML.
+pub fn is_valid_attr_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
 }
 
 fn push_unique(list: &mut Vec<String>, item: String) {
@@ -414,6 +475,14 @@ mod tests {
         "{ #a   .b\tc=d }",
         "{data-background-image=\"img/a b.png\" target=_blank width=50% x:y=1}",
         "{background=\"#111\" class=\"one two\"}",
+        // empty quoted id / class are kept as `""`, like comrak
+        "{#\"\"}",
+        "{.\"\" .a}",
+        // escapes and characters that are Markdown syntax outside the block
+        "{title=\"a \\\"q\\\" b\"}",
+        "{data-path=\"C:\\\\dir\"}",
+        "{data-x=\"&lt;b&gt;\" data-y=\"<b>\"}",
+        "{background=\"img/_draft_.png\" data-z=\"a*b*c $x$ `c`\"}",
     ];
 
     fn comrak_heading_attrs(block: &str) -> Option<ParsedAttrs> {
@@ -433,6 +502,69 @@ mod tests {
                 .unwrap_or_else(|| panic!("comrak did not parse {block} as heading attributes"));
             let ours = parse_attr_block(block).unwrap();
             assert_eq!(ours, from_comrak, "{block}");
+        }
+    }
+
+    /// A small deterministic generator (64-bit LCG), so the differential test needs no
+    /// dependency and always checks the same blocks.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) % n as u64) as usize
+        }
+    }
+
+    /// Differential check: random blocks over the grammar's alphabet; whenever comrak accepts
+    /// one as heading attributes, `parse_attr_block` must return the same `ParsedAttrs`.
+    #[test]
+    fn parse_attr_block_agrees_with_comrak_on_random_blocks() {
+        let alphabet: Vec<char> = "ab#.=\" \\'-_:%1\tZé".chars().collect();
+        let mut rng = Lcg(0x5eed);
+        let mut accepted = 0;
+        for _ in 0..20_000 {
+            let len = rng.below(12);
+            let body: String = (0..len)
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect();
+            let block = format!("{{{body}}}");
+            let Some(from_comrak) = comrak_heading_attrs(&block) else {
+                continue;
+            };
+            accepted += 1;
+            assert_eq!(
+                parse_attr_block(&block).ok(),
+                Some(from_comrak),
+                "{block:?}"
+            );
+        }
+        assert!(
+            accepted > 1_000,
+            "only {accepted} blocks accepted by comrak"
+        );
+    }
+
+    /// End to end: the separator form `--- {…}` (read from the source) and the heading form
+    /// `# H {…}` give the same slide attributes (dialect §3.1 "the two must agree").
+    #[test]
+    fn separator_and_heading_forms_agree() {
+        use crate::markdown::split::{SplitMode, split_with_source};
+        for block in SHARED_CASES {
+            let separator = format!("# A\n\n--- {block}\n\nbody\n");
+            let heading = format!("# H {block}\n");
+            let [from_separator, from_heading] = [separator, heading].map(|text| {
+                let arena = comrak::Arena::new();
+                let root = comrak::parse_document(&arena, &text, &dialect_options());
+                let deck = split_with_source(root, &text, SplitMode::Rules).unwrap();
+                let (slide, _) = deck.slides.into_iter().last().unwrap();
+                slide.attrs
+            });
+            assert_eq!(from_separator, from_heading, "{block}");
+            assert_eq!(from_separator, slide_attrs(block), "{block}");
         }
     }
 
@@ -497,8 +629,9 @@ mod tests {
                 r#"k="a\"b\\c" w=C:\x"#,
                 attrs(None, &[], &[("k", r#"a"b\c"#), ("w", r"C:\x")]),
             ),
-            // empty id / class / key items are ignored
+            // bare `#` / `.` and empty keys are ignored; quoted empty id / class are kept
             ("{# . =v \"\" .ok}", attrs(None, &["ok"], &[])),
+            ("{#\"\" .\"\" .''}", attrs(Some(""), &["", ""], &[])),
             // the last id wins, keys keep their case (SlideAttrs lowercases them)
             ("#a #b Data-X=1", attrs(Some("b"), &[], &[("Data-X", "1")])),
             ("k= x", attrs(None, &[], &[("k", ""), ("x", "")])),
@@ -705,6 +838,115 @@ mod tests {
         assert_eq!(slide.layout, "default");
         assert_eq!(slide.classes, ["pre", "x"]);
         assert_eq!(slide.id, None);
+    }
+
+    /// The `{key: value}` map of a slide's attrs, for short assertions.
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn background_shorthand_behaves_like_the_css_shorthand() {
+        let image = ("data-background-image", "bg.png");
+        let navy = ("data-background-color", "navy");
+        // within one block: a later `background` replaces colour and image written before it
+        for (block, expected) in [
+            ("{background=bg.png background=navy}", vec![navy]),
+            ("{background=navy background=bg.png}", vec![image]),
+            ("{background-color=navy background=bg.png}", vec![image]),
+            ("{data-background-image=x.png background=navy}", vec![navy]),
+            // a longhand after the shorthand only sets its own attribute
+            (
+                "{background=bg.png background-color=navy}",
+                vec![navy, image],
+            ),
+            (
+                "{background-image=bg.png background-color=navy}",
+                vec![navy, image],
+            ),
+        ] {
+            let s = slide_attrs(block);
+            assert_eq!(s.attrs, map(&expected), "{block}");
+            assert_eq!(
+                s.background_shorthand,
+                block.contains("background="),
+                "{block}"
+            );
+        }
+
+        // across sources: the later source's shorthand wins, a later longhand adds to it
+        let merged = |earlier: &str, later: &str| {
+            let mut s = slide_attrs(earlier);
+            s.merge(slide_attrs(later));
+            s.attrs
+        };
+        assert_eq!(
+            merged("{background=photo.jpg}", "{background=navy}"),
+            map(&[navy])
+        );
+        assert_eq!(
+            merged("{background=#000}", "{background=bg.png}"),
+            map(&[image])
+        );
+        assert_eq!(
+            merged("{background-image=bg.png .x}", "{background=navy}"),
+            map(&[navy])
+        );
+        assert_eq!(
+            merged("{background=bg.png}", "{background-color=navy}"),
+            map(&[navy, image])
+        );
+        assert_eq!(
+            merged("{background=bg.png data-x=1}", "{transition=fade}"),
+            map(&[image, ("data-transition", "fade"), ("data-x", "1")])
+        );
+
+        // apply_to: the shorthand also replaces what the slide already has
+        let mut slide = Slide::new();
+        slide.attrs = map(&[image, ("data-x", "1")]);
+        slide_attrs("{background=navy}").apply_to(&mut slide);
+        assert_eq!(slide.attrs, map(&[navy, ("data-x", "1")]));
+        let mut slide = Slide::new();
+        slide.attrs = map(&[image]);
+        slide_attrs("{background-color=navy}").apply_to(&mut slide);
+        assert_eq!(slide.attrs, map(&[navy, image]));
+    }
+
+    #[test]
+    fn invalid_attribute_names_are_dropped() {
+        for (key, valid) in [
+            ("k", true),
+            ("data-x", true),
+            ("aria-label", true),
+            ("x:y.z_w-1", true),
+            ("Data-X", true),
+            ("", false),
+            ("1x", false),
+            ("-x", false),
+            ("_x", false),
+            ("a b", false),
+            (">x", false),
+            ("a}", false),
+            ("{b", false),
+            ("a\"b", false),
+            ("é", false),
+            ("a=b", false),
+        ] {
+            assert_eq!(is_valid_attr_name(key), valid, "{key:?}");
+        }
+        let s = slide_attrs("{\"a b\"=c '>x'=y ok=1 \"a b\"=d Data-Z=2}");
+        assert_eq!(s.invalid_keys, ["a b", ">x"]);
+        assert_eq!(s.attrs, map(&[("data-z", "2"), ("ok", "1")]));
+        assert_eq!(s.unknown_keys, ["ok"]);
+        // invalid keys alone change nothing on the slide, and they accumulate on merge
+        let mut s = slide_attrs("{a} {b}");
+        assert!(s.is_empty());
+        assert_eq!(s.invalid_keys, ["a}", "{b"]);
+        s.merge(slide_attrs("{'1'=x '{b'=y}"));
+        assert_eq!(s.invalid_keys, ["a}", "{b", "1"]);
     }
 
     #[test]
