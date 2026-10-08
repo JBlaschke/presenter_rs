@@ -9,10 +9,13 @@
 //! - theme `[styles] entries` (compiled into the theme stylesheet): next to the
 //!   stylesheet, then (§5) `assets/<rel>` in the chain's themes, child first (the lookup of
 //!   [`Theme::read_asset`], for any `rel`: `url(vendor/x.png)` finds `assets/vendor/x.png`
-//!   too); every reference must resolve. A fallback hit is named by its theme-root helper
-//!   path `@<theme>/assets/<rel>`, which names that one file whatever `rel` starts with (as
-//!   a helper path, `vendor/x.png` alone would name the embedded tree). The theme stylesheet
-//!   is processed by the renderer in every mode, so the fallback works in serve mode too;
+//!   too), and last, for a `vendor/…` or `presenter/…` `rel`, the embedded file of that
+//!   builtin helper path (§3: "`vendor/...` names come from the embedded vendor tree"; a
+//!   theme's own `assets/vendor/…` file wins); every reference must resolve. A chain hit is
+//!   named by its theme-root helper path `@<theme>/assets/<rel>`, which names that one file
+//!   whatever `rel` starts with (as a helper path, `vendor/x.png` alone names the embedded
+//!   tree). The theme stylesheet is processed by the renderer in every mode, so the fallback
+//!   works in serve mode too;
 //! - `style(path)` of a theme file (`@<theme>/…` or the `assets/` form): next to the
 //!   stylesheet only, as a browser resolves it; every reference must resolve (checked in
 //!   serve mode too, although the browser loads the files there);
@@ -223,7 +226,9 @@ struct Lookup<'l> {
 impl Lookup<'_> {
     /// The helper paths the reference `rel` may name, in lookup order: `rel` joined to the
     /// stylesheet's directory, then (with the `assets/` fallback) `@<theme>/assets/<rel>`
-    /// for each theme of the chain, child first.
+    /// for each theme of the chain, child first, and last, for a `vendor/…` or
+    /// `presenter/…` `rel`, that builtin helper path (theme-format.md §3: such names come
+    /// from the embedded tree; a theme's own `assets/vendor/…` file comes first).
     fn candidates(self, rel: &str) -> Vec<String> {
         let mut paths: Vec<String> = join_relative(self.key, rel).into_iter().collect();
         let fallback = self
@@ -232,14 +237,29 @@ impl Lookup<'_> {
             .then(|| normalize_helper_path(rel))
             .flatten();
         if let Some(rel) = fallback {
-            for name in self.chain {
-                let path = format!("@{name}/assets/{rel}");
+            let builtin = is_builtin(&rel).then(|| rel.clone());
+            let chain = self
+                .chain
+                .iter()
+                .map(|name| format!("@{name}/assets/{rel}"));
+            for path in chain.chain(builtin) {
                 if !paths.contains(&path) {
                     paths.push(path);
                 }
             }
         }
         paths
+    }
+
+    /// Where a reference `rel` that resolved to nothing was looked for, for the error.
+    fn looked_in(self, rel: &str) -> &'static str {
+        if !self.rules.assets_fallback {
+            ""
+        } else if normalize_helper_path(rel).is_some_and(|rel| is_builtin(&rel)) {
+            ", in the theme chain's assets/ directories or among the built-in files"
+        } else {
+            " or in the theme chain's assets/ directories"
+        }
     }
 }
 
@@ -277,11 +297,7 @@ fn register_urls(
             message: format!(
                 "url({}) not found next to the stylesheet{}",
                 path.display(),
-                if lookup.rules.assets_fallback {
-                    " or in the theme chain's assets/ directories"
-                } else {
-                    ""
-                }
+                lookup.looked_in(&path.to_string_lossy())
             ),
         },
         other => other,
@@ -352,14 +368,33 @@ a { background: url(https://x.example/not-an-import.png) }"#;
                 "@default/assets/logo.png"
             ]
         );
-        // Every `rel` falls back, named in the theme-root form whatever its first segment.
+        // Every `rel` falls back, named in the theme-root form whatever its first segment;
+        // a builtin-form `rel` then names the embedded file (§3).
         assert_eq!(
             entry.candidates("vendor/x.png"),
             [
                 "@t/styles/vendor/x.png",
                 "@t/assets/vendor/x.png",
-                "@default/assets/vendor/x.png"
+                "@default/assets/vendor/x.png",
+                "vendor/x.png"
             ]
+        );
+        assert_eq!(
+            entry.candidates("./presenter/../presenter/y.js"),
+            [
+                "@t/styles/presenter/y.js",
+                "@t/assets/presenter/y.js",
+                "@default/assets/presenter/y.js",
+                "presenter/y.js"
+            ]
+        );
+        assert_eq!(
+            entry.looked_in("logo.png"),
+            " or in the theme chain's assets/ directories"
+        );
+        assert_eq!(
+            entry.looked_in("./vendor/x.png"),
+            ", in the theme chain's assets/ directories or among the built-in files"
         );
         assert_eq!(
             entry.candidates("./presenter/../@u\\x.png"),
@@ -380,6 +415,14 @@ a { background: url(https://x.example/not-an-import.png) }"#;
         assert_eq!(
             lookup("@t/styles/a.css", style).candidates("logo.png"),
             ["@t/styles/logo.png"]
+        );
+        assert_eq!(
+            lookup("@t/styles/a.css", style).candidates("vendor/x.png"),
+            ["@t/styles/vendor/x.png"]
+        );
+        assert_eq!(
+            lookup("@t/styles/a.css", style).looked_in("vendor/x.png"),
+            ""
         );
         assert!(UrlRules::for_style("vendor/katex/katex.min.css").is_lenient());
     }

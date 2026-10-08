@@ -33,6 +33,8 @@ survives only if no full reload happens. Trigger builds with:
 | edit the head (stylesheets, inline `<style>`) | `curl --data-binary '<style>.reveal h2 { letter-spacing: 7px }</style>' $S/__mock/head` and then a content build |
 | edit `body_start` markup | `curl --data-binary '<div class="footer">footer v2</div>' $S/__mock/body` and then a content build |
 | edit `body_end` markup (after the client's `<script>`) | `curl --data-binary '<div class="end">footer</div>' $S/__mock/bodyend` and then a content build |
+| edit markup inside `.reveal` next to `.slides` (a theme footer) | the mock has no slot there: append `</div><div class="deck-footer">footer v2</div>` to the slides HTML in "edit slides" (the `</div>` closes `.slides`, and the parser drops the template's extra `</div>`), then a content build |
+| edit a `<body>` attribute | `curl --data-binary '<body data-deck="v2">' $S/__mock/body` and then a content build (the parser adds a stray `<body>` tag's attributes to `<body>`) |
 | emit the client's `<script>` before reveal's (a child theme's `scripts` block) | `curl "$S/__mock/early?on=1"` and then a content build |
 | a theme script that adds a `<body>` child at load (item 28) | `curl --data-binary '<script>document.addEventListener("ready", () => document.body.append(document.createElement("aside")))</script>' $S/__mock/head` and then a content build (the open page reloads once, item 19); reveal's `ready` event bubbles to `document`, so this listener runs when a `Reveal.on('ready', …)` registered before `Reveal.initialize` (a `theme.toml [scripts]` entry) does; use `"DOMContentLoaded"` for the other case |
 | parse error | `curl "$S/__mock/emit?kind=error"` (by default `slides.md:41: unknown directive 'include'`; override with `&message=…&file=…&line=…`) |
@@ -56,20 +58,18 @@ whose error the overlay shows or the user dismissed),
 
 ### Scripted run
 
-`tests/fixtures/live-reload/qa.mjs` runs items 1–27 of the checklist against the mock in
+`tests/fixtures/live-reload/qa.mjs` runs items 1–28 of the checklist against the mock in
 headless Chrome (over the DevTools protocol) and prints one PASS/FAIL line per scenario; the
 item numbers are in brackets. It needs Node ≥ 22, `python3` and Chrome or Chromium, and
-takes about two and a half minutes:
+takes about three minutes:
 
 ```sh
-node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHJRSF] [--chrome PATH] [--out DIR]
+node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHJKLMNPRSF] [--chrome PATH] [--out DIR]
 ```
 
-Item 28 is not scripted yet: check it by hand, with the item-28 row of the table above
-(run it once with `"ready"` and once with `"DOMContentLoaded"`, with a slide edit, a
-reconnect and a `body_start` edit each), or with `presenter serve` as described in B. The
-fourth run below scripted it in sessions K, L, M and N of a copy of `qa.mjs` that is not in
-the repository; porting those sessions into `qa.mjs` is a follow-up for T24.
+Sessions K, L, M and N cover item 28 (theme scripts that add a `<body>` child at load, and a
+build that lands before the client's baseline request); session P covers the parts of
+item 19 inside `.reveal` and on `<body>`.
 
 ### B. `presenter serve` (T23)
 
@@ -105,7 +105,7 @@ Item 24 needs the mock, which can fail `GET /` on purpose.
 | 16 | Burst of builds (content/css alternating) | applied in order; the final state matches the last build |
 | 17 | Builds that happen while disconnected | one full reload on reconnect |
 | 18 | A build whose document has other stylesheets or scripts (e.g. `reveal_theme` changed) | one full reload |
-| 19 | A template edit outside the slides: an inline `<style>` in the head, `body_start`/`body_end` markup, `<html lang>` | one full reload, and the change is shown; a later slide edit on such a page is still swapped in place |
+| 19 | A template edit outside the slides: an inline `<style>` in the head, `body_start`/`body_end` markup, markup inside `.reveal` next to `.slides`, `<html lang>` or another attribute of `<html>`, `<body>` or `.reveal` | one full reload, and the change is shown; a later slide edit on such a page is still swapped in place |
 | 20 | Speaker view open (`S`) while the server restarts or builds are missed | both previews (current and upcoming slide) reload, not only one |
 | 21 | Slides that contain a `<script>` (notebook HTML outputs) | every content build reloads in full, so the scripts run |
 | 22 | Open the page while the latest build failed, or before any build succeeded | on the deck, an overlay is shown right away (`details in the terminal`, since §2's `hello` has no error details; with the proposed `hello.error`, the details); on the fallback page, the server's pre-rendered overlay is kept unchanged, also across reconnects; the first good build reloads into the deck |
@@ -117,6 +117,45 @@ Item 24 needs the mock, which can fail `GET /` on purpose.
 | 28 | A theme script adds a `<body>` child at load: in a reveal `ready` handler (which runs before `DOMContentLoaded`), or in a `DOMContentLoaded` handler registered before the client's | a slide edit and a reconnect are still swapped in place, with no reload, and the added element stays; a template edit outside the slides (head, `body_start`, `body_end`) still reloads once (item 19) |
 
 ## Results
+
+### 2026-10-08: mock server, fifth run (W3FIX: whole served page compared)
+
+Environment as in the third run (macOS, Google Chrome 154.0.8037.98 headless over the
+DevTools protocol, Node 26.10.0, Python 3.14.8). `live-reload.js` was 7959 bytes, sha256
+`3bdbe117eaf46889…`. Since both sides of the comparison are documents as served, the client
+now compares the whole document outside `.reveal .slides` (see the design notes) instead of
+the elements of `<head>` and the children of `<body>` other than `.reveal`. Defect fixed:
+with the 7938-byte client of the fourth run, a template edit of markup inside `.reveal`
+next to `.slides` (e.g. a theme footer), or of an attribute of `<body>` (or of `.reveal`,
+which the mock cannot vary), was swapped in place and never shown until a manual reload. The fourth run's item-28 sessions
+K, L, M and N are now part of `qa.mjs`, and session P was added for these cases.
+
+Method:
+- `node tests/fixtures/live-reload/qa.mjs` (all sessions, 3 min 5 s): 60 of 60 passed, so
+  every row of the third run's table below and item 28 hold for this client too. The new
+  scenarios:
+  - P1, a page with a `deck-footer` inside `.reveal` next to `.slides` and
+    `<body data-deck="v1">`: a slide edit was swapped in place (marker kept, `{h:1,v:1}`,
+    requests `GET /` and `theme.css?v=3` only).
+  - P2, the footer text changed (`v1` → `v2`): one full reload, `deck footer v2` shown, hash
+    `#/stack-bottom` kept. P3, `data-deck` changed to `v2`: one full reload, new attribute.
+    P4, a slide edit after that: in place.
+- Check of the checks, with the same `qa.mjs` against the older clients (`--only KLMNP`):
+  the 7938-byte client of the fourth run failed P2 and P3 (both swapped in place, the edit
+  not shown) and passed the rest; the 7907-byte client of the third run failed K1, K2, L1,
+  L2, L3, P2 and P3.
+- The coordinator's CDP helper (`cdp.mjs`) loaded the mock with a reveal `ready` script that
+  appends an `<aside>` to `<body>`, a `deck-footer` inside `.reveal` and
+  `<body data-deck="v1">`: a slide edit was swapped in place (marker kept, `{h:1,v:1}`, log
+  `slides updated, build 3`), and so was a reconnect after `/__mock/down?ms=300` (same build
+  id). The screenshot showed the edited slide, the script-added element and the footer. No
+  console message other than `[presenter] …` appeared.
+
+| # | result | evidence |
+|---|---|---|
+| 1–27 | pass | `qa.mjs` sessions A–J, R, S, F (45 scenarios, as in the third run) |
+| 19 | pass | also P1–P4 above |
+| 28 | pass | `qa.mjs` sessions K, L, M and N (11 scenarios, described in the fourth run); the CDP helper check |
 
 ### 2026-10-08: mock server, fourth run (W3FIX: baseline as served)
 
@@ -133,8 +172,8 @@ document does.
 Method:
 - `node tests/fixtures/live-reload/qa.mjs` (all sessions, 2 min 21 s): 45 of 45 passed, so
   every row of the third run's table below holds for this client too.
-- Item 28 and the new baseline rule, with a scratch copy of `qa.mjs` (not in the
-  repository, see "Scripted run") that added four sessions to the same mock (set up through
+- Item 28 and the new baseline rule, with a scratch copy of `qa.mjs` that added four
+  sessions to the same mock (in `qa.mjs` itself since the fifth run; set up through
   the existing `/__mock/head`, `/__mock/body` and `/__mock/bodyend` routes, with scripts
   like the one in the setup table above):
   - K, a head `<script>` whose `DOMContentLoaded` listener appends a `<div>` to `<body>`
@@ -245,9 +284,10 @@ Still to do: repeat this checklist against `presenter serve` once T23 has landed
   Content builds re-request them too, because `theme.toml` and `presenter.toml` edits, and
   batches that mix CSS and other files, are content builds.
 - **When the client reloads instead of swapping.** It compares the new document with the one
-  shown, outside the slides: the elements of `<head>` (except `<title>`, which is updated in
-  place, and `<meta>`) and the children of `<body>` other than `.reveal`, as HTML with
-  `?v=<id>` removed, plus `<html lang>`. Both sides are documents as the server sent them,
+  shown, outside the slides: the whole document as HTML, with the children of
+  `.reveal .slides`, `<title>` (updated in place) and every `<meta>` removed and `?v=<id>`
+  dropped. So `<head>`, `<body>` and `.reveal` (markup next to `.slides`, attributes), and
+  the attributes of `<html>`, all count. Both sides are documents as the server sent them,
   never the live DOM: scripts change the live page at load (the highlight plugin appends a
   `<style>` to `<head>`, a theme script may append to `<body>` in a reveal `ready` handler,
   which runs before `DOMContentLoaded`, or in any `DOMContentLoaded` handler), and markup can
@@ -283,11 +323,10 @@ Still to do: repeat this checklist against `presenter serve` once T23 has landed
 - Editing a theme script file (`theme.toml [scripts]`) does not run the new code: its URL is
   unchanged, so the client swaps the slides only. Reload by hand. A serve-mode `script()`
   URL that carried a content hash would make this a full reload automatically.
-- Attributes of `<body>` and `.reveal`, and markup inside `.reveal` but outside `.slides`,
-  are not compared (reveal changes them at runtime), so template edits there need a manual
-  reload.
 - Elements that scripts add to the page are never compared, so they never cause a reload;
   they stay as they are across swaps (only the children of `.slides` are replaced).
+- `<meta>` elements are not compared, so a changed `<meta name="description">` (front
+  matter) is in the page only after a reload.
 - The client fetches `GET /` once per page load (per frame in the speaker view) for its
   baseline. If a build finishes between the page load and that request, the next content
   build reloads in full even when only the slides changed.

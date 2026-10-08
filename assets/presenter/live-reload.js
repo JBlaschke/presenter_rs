@@ -12,10 +12,13 @@ const log = (...a) => console.debug('[presenter]', ...a);
 // GET / parsed; null if it fails.
 const getDoc = () => fetch('/', { cache: 'no-store' }).then((r) => (r.ok ? r.text() : null))
   .then((t) => t && new DOMParser().parseFromString(t, 'text/html'), () => null);
-// What a swap cannot update, sans ?v=.
-const signature = (doc) => Array.from(doc.querySelectorAll('head>*,body>*'))
-  .filter((el) => !el.matches('title,meta,#presenter-overlay,.reveal') && !el.querySelector('.reveal'))
-  .map((el) => el.outerHTML).join('\n').replace(/\?v=\d+/g, '') + doc.documentElement.lang;
+// What a swap cannot update: a served page but the slides, <title>, <meta> and ?v=.
+const signature = (doc) => {
+  const d = doc.documentElement.cloneNode(true);
+  d.querySelectorAll('title,meta').forEach((el) => el.remove());
+  d.querySelector('.reveal .slides')?.replaceChildren();
+  return d.outerHTML.replace(/\?v=\d+/g, '');
+};
 // Baseline: this page as served, not as scripts changed it (e.g. on 'ready'), if GET / is
 // still its build. '' reloads.
 let assets = '';
