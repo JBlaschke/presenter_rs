@@ -127,6 +127,12 @@ Precedence is implemented by calling: defaults → `load/discover` → `merge_th
 project/front-matter reveal map **over** the theme map) → `merge_front_matter` → `apply_cli`.
 Write a unit test for every precedence pair.
 
+> **Additions (T01, 2026-10-08):** `Config::from_toml_str(&str)`; `Config::apply_cli_reveal(&Map)`
+> (reveal overrides from the CLI layer; no flag uses it yet); `Config::validate_plugins() -> Result<()>`
+> (strict check of the effective `plugins` list; `load`/`merge_front_matter` already reject bad
+> names, so `enabled_plugins()` stays infallible and skips unknown names with a warning);
+> `unknown_key_hint`/`with_unknown_key_hint` helpers for "did you mean" messages.
+
 ## 5. Determinism
 `reveal_options_json` must serialize keys in sorted order and numbers without trailing
 `.0`. Snapshot tests depend on it.

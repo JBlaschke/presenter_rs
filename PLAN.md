@@ -113,14 +113,14 @@ Mention compile times.
 
 ## Two columns
 
-:::columns
+::::columns
 :::column
 Left: $E = mc^2$
 :::
 :::column
 ![](figures/plot.png)
 :::
-:::
+::::
 ```
 
 ---
@@ -357,7 +357,9 @@ then T12 and T15, then T16 integrates. After T16, M2/M3/M4 tasks are almost all 
 | Serve | integration test with `ureq` | start server on port 0, GET `/`, edit file, read one SSE event |
 | Browser (opt-in) | `headless_chrome` | open built HTML, assert `Reveal.isReady()`, slide count, no console errors |
 
-Fixture corpus (created in T01, extended by later tasks):
+Fixture corpus (created in T01, extended by later tasks). No `presenter.toml` may live in an
+ancestor directory of `tests/fixtures/{md,ipynb}` (config discovery would pick it up); the
+config test fixture is `tests/fixtures/config/presenter.toml`.
 `tests/fixtures/md/{minimal,separators,attributes,directives,code,math,images,notes,headings-mode,reveal-compat}.md`,
 `tests/fixtures/ipynb/{minimal,slideshow,outputs,tags,frontmatter}.ipynb`,
 `tests/fixtures/ir/sample-deck.json`, `tests/fixtures/themes/child-theme/`.

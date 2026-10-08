@@ -6,7 +6,7 @@
 | Size | M |
 | Depends on | T00 |
 | Parallel-safe with | nothing (wave 2 starts after this merges) |
-| Files you own | `src/ir.rs`, `src/config.rs`, `src/error.rs`, `tests/ir_roundtrip.rs`, `tests/config.rs`, `tests/fixtures/ir/sample-deck.json`, `tests/fixtures/md/*.md` (inputs only), `tests/fixtures/presenter.toml` |
+| Files you own | `src/ir.rs`, `src/config.rs`, `src/error.rs`, `tests/ir_roundtrip.rs`, `tests/config.rs`, `tests/fixtures/ir/sample-deck.json`, `tests/fixtures/md/*.md` (inputs only), `tests/fixtures/config/presenter.toml` |
 
 ## Goal
 Make the contracts compile: the IR exactly as in `docs/spec/ir.md`, the config structs
@@ -87,3 +87,4 @@ Parsing Markdown or YAML (T10/T11/T12), theme files (T02/T13).
 - `Diagnostic` also derives `Deserialize` is **not** required (`code: &'static str`); add
   `Diagnostics::into_vec`, `Diagnostics::len/is_empty`, and `impl IntoIterator`.
 - Do not edit `docs/tasks/README.md`; the coordinator maintains the status table.
+- The config fixture lives at `tests/fixtures/config/presenter.toml` (not `tests/fixtures/`), so that config discovery from the md/ipynb fixtures never finds it.

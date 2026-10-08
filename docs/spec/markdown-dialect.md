@@ -28,7 +28,7 @@ o.extension.header_attributes = true;      // ## Title {#id .cls k=v}
 o.extension.fenced_code_attributes = true; // ```python {lines="1-3"}
 o.extension.link_attributes = true;        // ![](x.png){width=50%}
 o.extension.inline_code_attributes = true;
-o.extension.shortcodes = false;            // keep Cargo feature set small
+// (no `shortcodes` line: the field only exists with comrak's `shortcodes` feature, which we do not enable)
 // parse
 o.parse.smart = config.markdown.smart_punctuation;   // default false (keeps `--` literal)
 o.parse.relaxed_autolinks = false;
@@ -142,9 +142,11 @@ the node to `HtmlInline`/`HtmlBlock` before formatting. The reveal-compat
 
 ## 4. Directives
 
-`:::name arg arg` … `:::` is a comrak block directive. Fences may nest when the inner
-fence is indented or uses a longer fence (`::::`); comrak follows the fence-length rule like
-code fences. Default rendering by comrak is `<div class="name arg arg">…</div>`, which is
+`:::name arg arg` … `:::` is a comrak block directive. To nest directives the **outer**
+fence must be longer than the inner ones (`::::columns` … `::::` around `:::column` … `:::`):
+comrak 0.56 closes the first open directive whose fence is not longer than the closing fence,
+so same-length or indented inner fences close the outer directive early (verified by T01,
+contract change 2026-10-08). Default rendering by comrak is `<div class="name arg arg">…</div>`, which is
 already right for reveal (`fragment`, `r-stack`, `r-fit-text`, …). We special-case:
 
 | directive | rendered as | notes |
@@ -167,7 +169,7 @@ not consumed by the table above are emitted as `data-<key>="<value>"`.
 Emitted (via `SyntaxHighlighterAdapter` or an AST pass; T12 decides, see the task file):
 
 ```html
-<pre id="snippet" class="big"><code class="language-python" data-trim data-line-numbers="1-2|4" data-ln-start-from="10">…escaped source…</code></pre>
+<pre id="snippet" class="big"><code class="language-python" data-line-numbers="1-2|4" data-ln-start-from="10" data-noescape>…unescaped source…</code></pre>
 ```
 
 | info / attribute | effect |
@@ -186,6 +188,9 @@ Source is HTML-escaped (`html_escape::encode_text`) unless `escape=false`. Trail
 newline of the fence content is removed. `Features.code` becomes true.
 
 ```` ```math ```` fences (comrak `math_code`) render as `<div data-math-style="display">…</div>`
+(comrak itself emits `<pre><code class="language-math" data-math-style="display">`, so T12
+rewrites the node; comrak's `format_html` also does not emit node attrs for headings, links,
+images or inline code, so the §3.3 AST pass is required)
 and set `Features.math`.
 
 ## 6. Images and local assets
