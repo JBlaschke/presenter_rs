@@ -56,14 +56,20 @@ whose error the overlay shows or the user dismissed),
 
 ### Scripted run
 
-`tests/fixtures/live-reload/qa.mjs` runs the whole checklist against the mock in headless
-Chrome (over the DevTools protocol) and prints one PASS/FAIL line per scenario; the item
-numbers are in brackets. It needs Node ≥ 22, `python3` and Chrome or Chromium, and takes
-about two and a half minutes:
+`tests/fixtures/live-reload/qa.mjs` runs items 1–27 of the checklist against the mock in
+headless Chrome (over the DevTools protocol) and prints one PASS/FAIL line per scenario; the
+item numbers are in brackets. It needs Node ≥ 22, `python3` and Chrome or Chromium, and
+takes about two and a half minutes:
 
 ```sh
 node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHJRSF] [--chrome PATH] [--out DIR]
 ```
+
+Item 28 is not scripted yet: check it by hand, with the item-28 row of the table above
+(run it once with `"ready"` and once with `"DOMContentLoaded"`, with a slide edit, a
+reconnect and a `body_start` edit each), or with `presenter serve` as described in B. The
+fourth run below scripted it in sessions K, L, M and N of a copy of `qa.mjs` that is not in
+the repository; porting those sessions into `qa.mjs` is a follow-up for T24.
 
 ### B. `presenter serve` (T23)
 
@@ -116,20 +122,21 @@ Item 24 needs the mock, which can fail `GET /` on purpose.
 
 Environment as in the third run (macOS, Google Chrome 154.0.8037.98 headless over the
 DevTools protocol, Node 26.10.0, Python 3.14.8). `live-reload.js` was 7938 bytes, sha256
-`1cebf58521d507d7…`. The client
-now takes its baseline from the document as served (a `GET /` when it starts) instead of the
-page as parsed at `DOMContentLoaded`; see the design notes. Defect fixed: with the 7907-byte
-client of the third run, a theme script that added a `<body>` child in a reveal `ready`
-handler or in an earlier `DOMContentLoaded` handler made every content build and every
-reconnect reload in full (`full reload: page changed outside the slides`), because the
-baseline contained the added element and no served document does.
+`1cebf58521d507d7…`. The client now takes its baseline from the document as served (a
+`GET /` when it starts) instead of the page as parsed at `DOMContentLoaded`; see the design
+notes. Defect fixed: with the 7907-byte client of the third run, a theme script that added
+a `<body>` child in a reveal `ready` handler or in an earlier `DOMContentLoaded` handler
+made every content build and every reconnect reload in full (`full reload: page changed
+outside the slides`), because the baseline contained the added element and no served
+document does.
 
 Method:
 - `node tests/fixtures/live-reload/qa.mjs` (all sessions, 2 min 21 s): 45 of 45 passed, so
   every row of the third run's table below holds for this client too.
-- Item 28 and the new baseline rule, with a scratch copy of `qa.mjs` that added four
-  sessions to the same mock (set up through the existing `/__mock/head`, `/__mock/body` and
-  `/__mock/bodyend` routes, with scripts like the one in the setup table above):
+- Item 28 and the new baseline rule, with a scratch copy of `qa.mjs` (not in the
+  repository, see "Scripted run") that added four sessions to the same mock (set up through
+  the existing `/__mock/head`, `/__mock/body` and `/__mock/bodyend` routes, with scripts
+  like the one in the setup table above):
   - K, a head `<script>` whose `DOMContentLoaded` listener appends a `<div>` to `<body>`
     (registered before the client's): a slide edit (K1) and a reconnect with the same build
     id (K2) were swapped in place; the marker survived, the indices stayed `{h:1,v:1}`, the

@@ -1198,7 +1198,7 @@ struct Scan {
 
 /// The macros a template defines (`{% macro NAME(`).
 fn macro_names(source: &str) -> BTreeSet<String> {
-    let macro_def = Regex::new(r"^\{%-?\s*macro\s+([A-Za-z_]\w*)\s*\(").expect("regex");
+    let macro_def = Regex::new(r"^\{%[-+]?\s*macro\s+([A-Za-z_]\w*)\s*\(").expect("regex");
     tag_regions(source)
         .iter()
         .filter_map(|region| Some(macro_def.captures(region.trim())?[1].to_string()))
@@ -1215,10 +1215,11 @@ fn macro_names(source: &str) -> BTreeSet<String> {
 /// helper) or from a computed template name.
 fn callable_names(source: &str, templates: &[(String, String)]) -> BTreeSet<String> {
     let from_target =
-        Regex::new(r#"^\{%-?\s*from\s+(?:"([^"]*)"|'([^']*)')\s+import\b"#).expect("regex");
+        Regex::new(r#"^\{%[-+]?\s*from\s+(?:"([^"]*)"|'([^']*)')\s+import\b"#).expect("regex");
     let from_import =
-        Regex::new(r"(?s)^\{%-?\s*from\s.*?\bimport\s+(.*?)\s*-?%\}$").expect("regex");
-    let import_as = Regex::new(r"(?s)^\{%-?\s*import\s.*?\bas\s+([A-Za-z_]\w*)\b").expect("regex");
+        Regex::new(r"(?s)^\{%[-+]?\s*from\s.*?\bimport\s+(.*?)\s*[-+]?%\}$").expect("regex");
+    let import_as =
+        Regex::new(r"(?s)^\{%[-+]?\s*import\s.*?\bas\s+([A-Za-z_]\w*)\b").expect("regex");
     let context_marker = Regex::new(r"\s*\b(?:with|without)\s+context$").expect("regex");
     let mut names = macro_names(source);
     for region in tag_regions(source) {
@@ -1258,13 +1259,14 @@ fn callable_names(source: &str, templates: &[(String, String)]) -> BTreeSet<Stri
 /// call either a §4 helper or one of `allowed_calls` (minijinja's callables and the
 /// template's own macros and imports).
 fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, name: &str) {
-    let delimiters = Regex::new(r"\{\{-?|-?\}\}|\{%-?|-?%\}").expect("regex");
+    let delimiters = Regex::new(r"\{\{[-+]?|[-+]?\}\}|\{%[-+]?|[-+]?%\}").expect("regex");
     let safe = Regex::new(r"(\S+)\s*\|\s*safe\b").expect("regex");
     let filter = Regex::new(r"\|\s*([A-Za-z_]\w*)(?:\s*\([^()]*\))?").expect("regex");
     let test = Regex::new(r"\bis\s+(?:not\s+)?[A-Za-z_]\w*(?:\s*\([^()]*\))?").expect("regex");
     // Every name directly followed by `(` (also nested: `f(g(1))`); `.name(` is a method.
     let call = Regex::new(r"\b([A-Za-z_]\w*)\s*\(").expect("regex");
-    let escaping_off = Regex::new(r"^\{%-?\s*(?:autoescape\b|filter\b.*\bsafe\b)").expect("regex");
+    let escaping_off =
+        Regex::new(r"^\{%[-+]?\s*(?:autoescape\b|filter\b.*\bsafe\b)").expect("regex");
     let allowed_filters: BTreeSet<&str> = ALLOWED_FILTERS.split_whitespace().collect();
 
     let statement = region.trim_start().starts_with("{%");
@@ -1298,41 +1300,109 @@ fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, 
             scan.problems.push(format!("{name}: helper `{ident}`"));
         }
     }
+    for callee in computed_callees(&region, statement) {
+        scan.problems
+            .push(format!("{name}: call of the computed callee `{callee}`"));
+    }
+}
+
+/// Whether `word` is one of the space-separated words of `list`.
+fn listed(list: &str, word: &str) -> bool {
+    list.split_whitespace().any(|k| k == word)
+}
+
+/// The trailing name or number of `text` (empty when `text` ends in another character).
+fn last_word(text: &str) -> &str {
+    text.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or_default()
 }
 
 /// True when `word`, directly followed by `(` in a tag region whose text up to `word` is
 /// `before` (delimiters and string literals blanked), is minijinja syntax rather than a call:
 /// a [`STATEMENT_KEYWORDS`] word opening a `{% … %}` tag (`statement`), `not`, or an
-/// [`OPERATOR_KEYWORDS`] word after an operand (a name, number, string literal or closing
-/// bracket; `in` also after `not`).
+/// [`OPERATOR_KEYWORDS`] word after an operand ([`after_operand`]). `in` is also an operator
+/// after a binary `not` (`x not in (…)`), but not after a unary one: `{{ not in(1) }}` calls
+/// a global named `in`.
 fn is_keyword_use(word: &str, before: &str, statement: bool) -> bool {
-    let is_in = |list: &str, word: &str| list.split_whitespace().any(|k| k == word);
     let before = before.trim_end();
     if before.is_empty() {
-        return (statement && is_in(STATEMENT_KEYWORDS, word)) || word == "not";
+        return (statement && listed(STATEMENT_KEYWORDS, word)) || word == "not";
     }
     if word == "not" {
         return true;
     }
-    if !is_in(OPERATOR_KEYWORDS, word) {
+    if !listed(OPERATOR_KEYWORDS, word) {
         return false;
     }
-    let previous = before
-        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .next()
-        .unwrap_or_default();
+    let binary_not = word == "in"
+        && last_word(before) == "not"
+        && after_operand(&before[..before.len() - "not".len()], statement);
+    binary_not || after_operand(before, statement)
+}
+
+/// True when the tag-region text `before` ends with an operand: a closing bracket, a string
+/// literal, or a name or number that is not a keyword (an [`OPERATOR_KEYWORDS`] word, `not`,
+/// `is`, or the first word of a `{% … %}` tag, which is its keyword).
+fn after_operand(before: &str, statement: bool) -> bool {
+    let before = before.trim_end();
+    let word = last_word(before);
     match before.chars().last() {
         Some(')' | ']' | '}' | '"' | '\'') => true,
-        // A keyword before `word` leaves an operand to come, except `not in`. A statement's
-        // first word is its keyword.
-        Some(_) if !previous.is_empty() => {
-            let keyword = is_in(OPERATOR_KEYWORDS, previous)
-                || matches!(previous, "not" | "is")
-                || (statement && before.trim_start() == previous);
-            !keyword || (previous == "not" && word == "in")
+        Some(_) if !word.is_empty() => {
+            let keyword = listed(OPERATOR_KEYWORDS, word)
+                || matches!(word, "not" | "is")
+                || (statement && before.trim_start() == word);
+            !keyword
         }
         _ => false,
     }
+}
+
+/// The callees of calls on a computed value (`(…)(…)`, `[…](…)`, `f(…)(…)`) in a tag region
+/// with delimiters and string literals blanked. The scan cannot tell what such a call
+/// reaches (`(helper)(1)` and `[helper][0](1)` call the global `helper`), so each one is a
+/// problem, except a parenthesized attribute path such as `{% do (ns.a.append)(1) %}`, a
+/// method call like `ns.a.append(1)`.
+fn computed_callees(region: &str, statement: bool) -> Vec<String> {
+    let computed = Regex::new(r"[)\]]\s*\(").expect("regex");
+    let path = Regex::new(r"^\(\s*[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)+\s*\)$").expect("regex");
+    let mut callees = Vec::new();
+    for m in computed.find_iter(region) {
+        let close = m.start();
+        let open = matching_open(region, close).unwrap_or(close);
+        let callee = &region[open..=close];
+        // A `(` after an operand opens a call's arguments (`f(ns.a)(1)`), not a group.
+        let before = region[..open].trim_end();
+        let word = last_word(before);
+        let group = if word.is_empty() {
+            !matches!(before.chars().last(), Some(')' | ']' | '}' | '"' | '\''))
+        } else {
+            is_keyword_use(word, &before[..before.len() - word.len()], statement)
+        };
+        if !(group && path.is_match(callee)) {
+            callees.push(callee.to_string());
+        }
+    }
+    callees
+}
+
+/// The index of the opening bracket matched by the closing one at byte index `close`.
+fn matching_open(text: &str, close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in text[..=close].char_indices().rev() {
+        match c {
+            ')' | ']' | '}' => depth += 1,
+            '(' | '[' | '{' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The static scan behind "no helper other than those of §4 is used": every tag of every
@@ -1404,6 +1474,13 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
         "{% macro row(x) %}{{ caller(x) }}{% endmacro %}{% call(v) row(1) %}{{ v }}{% endcall %}",
         r#"{% import ("m" ~ ".html") as m %}{{ m.fmt(1) }}{{ loop . cycle(1) }}"#,
         r#"{% include ("m" ~ ".html") %}{% set ns = namespace(a=[]) %}{% do (ns.a.append)(1) %}"#,
+        "{{ (x.y)(1) }}{{ not ( ns . a )(2) }}{% if x and (ns.a.f)(3) %}{% endif %}",
+        "{{ x not in(1) }}{{ (a) not in(b) }}{% for x in(y) %}{% endfor %}",
+        // minijinja's `+` whitespace marker, like `-`.
+        "{%+ with (a, b) = (1, 2) %}{{+ a +}}{%- endwith +%}",
+        "{%+ if (a) %}x{% endif %}{%+ for (a, b) in x +%}{% endfor %}{%+ set (c, d) = (1, 2) %}",
+        r#"{%+ include ("m.html") %}{%+ macro g(x) %}{% endmacro %}{{ g(1) }}"#,
+        r#"{%+ from "m.html" import fmt +%}{{ fmt(1) }}{%+ import "m.html" as m %}{{ m(1) }}"#,
     ] {
         let result = scan(ok);
         assert!(result.problems.is_empty(), "{ok}: {:?}", result.problems);
@@ -1447,8 +1524,23 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
         "{% if and(1) %}{% endif %}",
         "{% include in(1) %}",
         "{{ x if y else (or(1)) }}",
+        // `in` after a unary `not` is an operand.
+        "{{ not in(1) }}",
+        "{% if x and not in(1) %}{% endif %}",
+        "{% if not in(1) %}{% endif %}",
         // Nested calls are found too.
         r#"{{ style(helper("x")) }}"#,
+        // A computed callee may be anything.
+        "{{ (helper)(1) }}",
+        "{% do (helper)(1) %}",
+        "{{ [helper][0](1) }}",
+        "{% set x = [helper] %}{{ x[0](1) }}",
+        "{{ (style)(1) }}",
+        r#"{% from "m.html" import fmt %}{{ fmt(1)(2) }}{{ fmt (ns.a)(3) }}"#,
+        "{{ (ns.a if x else helper)(1) }}",
+        // A `+` whitespace marker hides nothing.
+        "{%+ autoescape false %}{{ cell.source }}{% endautoescape %}",
+        "{{+ helper(1) +}}",
         // An import binds its alias, not the imported name.
         r#"{% from "m.html" import fmt as f %}{{ fmt(1) }}"#,
         r#"{% import "m.html" as m %}{{ fmt(1) }}"#,
@@ -1467,6 +1559,25 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
     ] {
         assert!(!scan(bad).problems.is_empty(), "{bad} passed the scan");
         assert_parses(bad);
+    }
+    // The intended check catches each kind.
+    for (bad, problem) in [
+        ("{{ not in(1) }}", "t.html: helper `in`"),
+        ("{%+ if in(1) %}{% endif %}", "t.html: helper `in`"),
+        (
+            "{% do (helper)(1) %}",
+            "t.html: call of the computed callee `(helper)`",
+        ),
+        (
+            "{{ [helper][0](1) }}",
+            "t.html: call of the computed callee `[0]`",
+        ),
+        (
+            "{%+ autoescape false %}{% endautoescape %}",
+            "t.html: `{%+ autoescape false %}` turns escaping off",
+        ),
+    ] {
+        assert_eq!(scan(bad).problems, [problem], "{bad}");
     }
     // Callables are scoped to the template that defines or imports them.
     let two = |caller: &str| {

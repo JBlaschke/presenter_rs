@@ -49,9 +49,13 @@ impl Deck {
     /// `data-math-style` attribute (6); spans are 1-based and ordered (8).
     ///
     /// Math is detected exactly as the Markdown frontend derives `features.math`
-    /// ([`has_math_markup`]: a start tag with that attribute, outside comments and raw-text
-    /// elements such as `<script>`/`<style>`), so the literal text `data-math-style`, e.g.
-    /// in inline code, is not math.
+    /// ([`has_math_markup`]: a start tag with that attribute, its name matched
+    /// case-insensitively as browsers do, outside comments and raw-text elements such as
+    /// `<script>`/`<style>`), so the literal text `data-math-style`, e.g. in inline code, is
+    /// not math. Every frontend must therefore set `features.math` at least for the HTML
+    /// for which [`has_math_markup`] is true: a broader test only loads KaTeX needlessly,
+    /// a narrower one (a case-sensitive substring test misses `<span DATA-MATH-STYLE=…>`)
+    /// is a violation here.
     pub fn invariant_violations(&self) -> Vec<String> {
         let mut problems = Vec::new();
         for (i, slide) in self.slides.iter().enumerate() {
