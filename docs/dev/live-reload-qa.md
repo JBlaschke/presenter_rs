@@ -118,6 +118,57 @@ Item 24 needs the mock, which can fail `GET /` on purpose.
 
 ## Results
 
+### 2026-10-09: `presenter serve` (T23), real server
+
+First run against the real dev server instead of the mock. Environment: macOS 26.7, Google
+Chrome 154.0.8037.98 headless over the DevTools protocol, Node 26.10.0, a debug build of
+`presenter` from the T23 branch. `live-reload.js` was the 7959-byte client of the fifth
+mock run (sha256 `3bdbe117eaf46889…`).
+
+Method: a copy of `examples/basic` in a scratch directory, with the default theme ejected
+into it (`presenter theme eject default theme`, `[deck] theme = "theme"` in the copy's
+`presenter.toml`), served with `presenter serve slides.md --port 0`; the URL was read from
+the first stdout line. A Node driver, built on the coordinator's CDP helper (`cdp.mjs`)
+connection code, opened `<url>#/1` and set `window.__qaMarker = 1`. For each step it edited
+the copy, polled `/__presenter/state` until the build was there, then waited until the
+client's `__presenterLiveReload.state.buildId` matched. Rebuilds took 42–77 ms (stderr
+`rebuilt in <n> ms (<kind>)`).
+
+| # | step | result | evidence |
+|---|---|---|---|
+| — | first stdout line | pass | `Serving http://127.0.0.1:<port>/`; nothing else on stdout |
+| 1 | `.reveal h2 { color: rgb(200, 0, 0) }` appended to `theme/styles/theme.css` | pass | stderr `(css)`; marker kept; still `{h:1,v:0}`; one `#presenter-theme`, href `?v=1` → `?v=2`; the slide's `h2` turned red (screenshot) |
+| 3 | current slide's heading edited | pass | in place (marker kept), same slide, new text, still red |
+| 4 | slide inserted after the current one | pass | in place, same slide, 17 → 18 slides, the next slide is the new one |
+| 7 | separator `--- {title="oops}` appended | pass | `/state` error; overlay `build error (parse)` / `slides.md:196: unbalanced " quote …` / `slides.md:196` / `(click to dismiss)` over the unchanged deck (screenshot); no reload; a click hides it |
+| 22 | page reloaded while that build fails | pass | the last good deck, with the overlay and its details right away (`hello.error`) |
+| 8 | error fixed | pass | overlay hidden, in place, same slide |
+| 19 | `body_end` markup added to `theme/templates/deck.html` | pass | stderr `(content)`; one full reload (`page changed outside the slides`), the new footer shown, same slide (screenshot) |
+| — | `figures/plot.png` (640×400) replaced by a 1280×720 PNG, on the figure slide | pass after a fix (see below) | stderr `(content)`; in place, same slide; the `<img>` src `…/deck-asset/58443e8b3a14?v=2253…` → `?v=8715…`, `naturalWidth` 640 → 1280 (screenshot) |
+| 9 | Ctrl-C to the server | pass | exit 0; the deck stays usable; client retries after 500, 1000, 2000 ms |
+| 10 | server restarted on the same port | pass | `hello` build 1 ≠ 8: one full reload (`build 8 -> 1`), same slide |
+| 26 | console during the run | pass | no uncaught exceptions; besides `[presenter]` debug lines only the browser's own `net::ERR_CONNECTION_REFUSED` for `/__presenter/events` while the server was down |
+
+Defect found and fixed: in the first run the image edit failed. A file asset's id names its
+path, so the document kept the same `/__presenter/deck-asset/<id>` URL and Chrome showed the
+image it already had for it after the in-place swap (`naturalWidth` stayed 640). The server
+did serve the new bytes, and a reload showed them. Fix in `src/cli/serve.rs`: before a
+build is stored, each file asset's URL gets `?v=<hash of mtime and size>`, so an edited
+image gets a new URL and is fetched again, and an unchanged one keeps its URL. The asset
+route ignores the query, and the client strips `?v=<digits>` when it compares pages. The
+second run passed every step above.
+
+Also checked: `presenter serve slides.md --site-preview` opened at `#/9` with the CDP
+helper. The page links `assets/theme-<hash>.css`, has no live-reload script, renders 4
+KaTeX elements, loads both `assets/plot-<hash>.png` images, logs nothing to the console
+(screenshot).
+
+Not repeated against the real server: items 2, 5, 6, 11–18, 20, 21, 23–25, 27 and 28. They
+test client behaviour that the mock runs above cover with the same events. Untested: an
+edited image referenced from a theme stylesheet (`url()` of a theme asset). Its URL does
+not change either, so after a `css` build it may also show stale (compare the theme-script
+limitation below).
+
 ### 2026-10-08: mock server, fifth run (W3FIX: whole served page compared)
 
 Environment as in the third run (macOS, Google Chrome 154.0.8037.98 headless over the
