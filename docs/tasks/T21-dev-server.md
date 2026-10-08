@@ -68,3 +68,4 @@ Watching files (T20), the client script (T22), CLI (T23).
 
 ## Amendments (coordinator, 2026-10-08)
 - Use `crate::serve::watch::ChangeKind` (defined by T00; T20 owns the rest of `watch.rs`).
+- Resolve `/__presenter/asset/{*path}` with T15's `render::resolve_helper_path` (all four path forms of theme-format.md §4, including `@<theme>/…`).

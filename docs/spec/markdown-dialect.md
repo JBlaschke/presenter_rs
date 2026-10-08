@@ -63,6 +63,10 @@ slide 4
   `subtitle`, `author`, `date`, `description`, `lang`, `theme`); `reveal:` must be a map
   and goes to `DeckMeta.reveal`; everything else goes to `DeckMeta.vars` verbatim.
 - Non-map YAML is an error `FrontMatter("expected a mapping")`.
+- An empty value for `reveal:`, `slides:`, `markdown:`, `math:` or `notebook:` (all options
+  commented out) counts as an empty mapping; any other non-mapping value for these keys is a
+  `FrontMatter` error. YAML is parsed as YAML 1.2 core schema (`serde_norway`): `yes/no/on/off`
+  are strings, not booleans. Duplicate keys are errors. (T10, 2026-10-08)
 - Values that are not strings for string fields (e.g. `date: 2026-10-08` parses as a
   date/plain scalar) are converted with their YAML scalar text; `title: 42` → `"42"`.
 

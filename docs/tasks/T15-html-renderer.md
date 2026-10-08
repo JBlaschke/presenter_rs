@@ -94,3 +94,20 @@ Writing files to disk (T16), SCSS (T42), live-reload client (T22).
   ← `config.reveal` ← `meta.reveal` (right wins), `plugins` stripped, keys sorted, no trailing `.0`
   on integers (config.md contract change).
 - `plugins()` uses `config.enabled_plugins()` (effective reveal map).
+- `RenderedDocument` also carries `pub diagnostics: Diagnostics` (e.g. `unknown-layout`, and
+  `standalone-background-video`: in standalone mode a `data-background-video` that points at a
+  deck asset becomes a `data:` URI, which reveal.js splits on `,` and cannot play — warn and
+  suggest `--site`).
+- Helper path resolution has a fourth form `@<theme>/<path>` (theme-format.md §4 contract
+  change). Implement it, plus `vendor/…`, `presenter/…` and chain `assets/`, in one public
+  function `render::resolve_helper_path(theme: &Theme, path: &str) -> Result<Option<(Vec<u8>, String /* mime */)>>`
+  (or a close variant) that T21's asset route will reuse. Fill the context's `theme.scripts`
+  and a path-valued `theme.highlight_style` in `@<theme>/…` form.
+- Helpers must be `Send + Sync + 'static` (minijinja 2.24), so they cannot hold an
+  `Emitter<'a>` that borrows `RenderInput.assets`; see the patterns in `src/assets/emit.rs`'s
+  module docs (helpers registering into an owned registry and one final emitter pass, or
+  `Emitter::with_files` per call). Site mode stylesheets use `Emitter::resolve_css_in_assets_dir`.
+- T02's templates already gate KaTeX/highlight on `features` and `config.math.enabled`; keep the
+  templates and the helpers consistent (T02's tests in `tests/theme_skeleton.rs` must keep passing).
+- Decorate children with `layout_template` too (T02's `slide.html` falls back by name when absent).
+- Map minijinja errors with `crate::error::template_error(e, env.debug())` (T13).

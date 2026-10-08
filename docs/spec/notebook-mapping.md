@@ -45,6 +45,13 @@ pub type MimeBundle = BTreeMap<String, serde_json::Value>;
   `Continue`; unknown string → `Continue` plus a warning.
 - Language: `metadata.language_info.name`, else `metadata.kernelspec.language`, else `"text"`.
 
+> **Clarifications (T30, 2026-10-08):** `""` and `null` slide types are treated like `"-"`
+> (JupyterLab 4 writes `""`). `CellType` has a fourth variant `Unknown` for cell types from newer
+> nbformat minors (kept so indices align with `SourceSpan.cell`; converters skip it with a warning).
+> The lenient entry point is `notebook::nbformat::parse_notebook(path, json) -> Result<(Notebook, Diagnostics-or-warnings)>`
+> (see its doc comment); deserializing `Notebook` directly is strict. `frontmatter.ipynb` puts the
+> front matter in the first **markdown** cell, which is not cell 0.
+
 ## 2. Cells → slides (`src/notebook/convert.rs`, T31)
 
 ```

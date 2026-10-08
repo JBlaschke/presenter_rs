@@ -21,12 +21,12 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 |---|---|---|---|---|---|
 | T00 | Repository scaffold, CI, vendoring, embedded assets | M0 | M | — | done |
 | T01 | Core IR, config, error types, fixture corpus | M0 | M | T00 | done |
-| T02 | Default theme skeleton against the IR fixture | M0 | M | T01 | todo |
-| T10 | Front matter → DeckMeta and config overrides | M1 | S | T01 | todo |
-| T11 | Slide splitter and attribute parsing | M1 | M | T01 | todo |
+| T02 | Default theme skeleton against the IR fixture | M0 | M | T01 | done |
+| T10 | Front matter → DeckMeta and config overrides | M1 | S | T01 | done |
+| T11 | Slide splitter and attribute parsing | M1 | M | T01 | done |
 | T12 | Markdown block renderer | M1 | L | T01, T10, T11 | todo |
-| T13 | Theme discovery, manifest, chain, template environment | M1 | M | T01 | todo |
-| T14 | Asset registry and emitter | M1 | M | T01 | todo |
+| T13 | Theme discovery, manifest, chain, template environment | M1 | M | T01 | done |
+| T14 | Asset registry and emitter | M1 | M | T01 | done |
 | T15 | HTML renderer, context, helpers, reveal config | M1 | M | T13, T14 | todo |
 | T16 | Pipeline, `build` and `dump` CLI, example deck, e2e snapshots | M1 | M | T10–T15 | todo |
 | T17 | Default theme v1 | M1 | L | T02, T16 | todo |
@@ -35,7 +35,7 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T22 | Live-reload client script | M2 | M | — (protocol only) | todo |
 | T23 | `serve` CLI and integration tests | M2 | S | T20, T21, T22 | todo |
 | T24 | Headless-browser smoke tests (opt-in) | M2 | S | T16 | todo |
-| T30 | nbformat model and notebook fixtures | M3 | M | T01 | todo |
+| T30 | nbformat model and notebook fixtures | M3 | M | T01 | done |
 | T31 | Cells → slides | M3 | M | T30, T12 | todo |
 | T32 | Output rendering | M3 | M | T30, T14 | todo |
 | T33 | Notebook theming and executed example notebook | M3 | M | T32, T17 | todo |

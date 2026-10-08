@@ -123,6 +123,16 @@ Helper functions (registered on the environment by T15; all return HTML marked s
 (`docs/spec/vendored-assets.md`); `presenter/…` → `assets/presenter/` (our JS);
 anything else → theme chain `assets/` directories (child first). Unknown path → `Error::Template`.
 
+> **Contract change (coordinator, 2026-10-08, from T02/T13):** §2 lets themes name files
+> relative to the theme directory (`scripts.entries = ["scripts/extra.js"]`, a path-valued
+> `highlight_style`), which the three rules above cannot reach. A fourth form is added:
+> `@<theme-name>/<path>` resolves `<path>` relative to that theme's **root directory** (not
+> `assets/`), inside that theme only (no `..` escapes). The context builder (T15) emits
+> `theme.scripts` entries and a path-valued `theme.highlight_style` in this form (chain order,
+> parent first for scripts), so templates pass them to `script()`/`style()` unchanged. One
+> resolver implements all four forms (`render::resolve_helper_path`, T15) and the dev server's
+> `/__presenter/asset/{*path}` route (T21) uses the same function.
+
 Filters: minijinja built-ins plus `markdown` (render a string as inline Markdown, notebook
 mode), `json` (built-in), `attrs` (render a `{k: v}` map as ` k="v"` pairs, escaped).
 Globals: `now` is deliberately **not** provided (determinism).

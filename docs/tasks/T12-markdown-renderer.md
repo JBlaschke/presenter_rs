@@ -101,3 +101,9 @@ Heading-split mode, `Note:` compat, `<!-- .slide: -->`, incremental lists (T43).
   honours `ctx.missing_asset_is_error = true` by returning `Error::MissingAsset` (test both).
 - `parse` applies `merge_front_matter` to a clone of `config` before splitting/rendering.
 - Diagnostics from T11's `RawDeck` are forwarded into `Parsed.diagnostics`.
+- Call `split::split_with_source(root, text, mode)` (T11's exact, source-based separator
+  detection) rather than the AST-only `split`. `split` returns `Error::Parse` with an empty path
+  for unbalanced quotes in a separator; fill in `source.path` before returning it.
+- comrak does not emit node attrs for headings/links/images/inline code, and renders ```` ```math ````
+  as `<pre><code class="language-math" …>`; both need the AST rewrites (dialect §3.3, §5 notes).
+- Standalone background videos: see T15's amendment (warning only; nothing to do here).
