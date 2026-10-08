@@ -1,0 +1,56 @@
+# Config fixture for tests/config.rs: every key of docs/spec/config.md §2 is set to a
+# value that differs from its built-in default.
+#
+# It lives in its own directory on purpose: `Config::discover` walks up from a source
+# file's directory, so a presenter.toml directly in tests/fixtures/ would be picked up by
+# every pipeline/CLI test that builds tests/fixtures/{md,ipynb}/* (non-existent theme,
+# headings mode, …).
+
+[deck]
+theme = "./my-theme"
+lang = "de"
+title = "Fallback title"
+author = "Fallback author"
+date = "2026-01-01"
+
+[build]
+out_dir = "public"
+standalone = false
+minify = true
+
+[slides]
+split = "headings"
+slide_level = 3
+incremental_lists = true
+
+[markdown]
+smart_punctuation = true
+sourcepos = true
+
+[reveal]
+hash = false
+slideNumber = "c/t"
+transition = "fade"
+controls = false
+progress = false
+center = false
+width = 1920
+height = 1080
+plugins = ["notes", "zoom"]
+
+[math]
+enabled = "always"
+katex_options = { macros = { "\\R" = "\\mathbb{R}" } }
+
+[notebook]
+mime_priority = ["image/png", "text/plain"]
+hide_input_tags = ["no-input"]
+hide_output_tags = ["no-output"]
+remove_cell_tags = ["drop"]
+split_markdown_cells = true
+show_prompts = false
+
+[serve]
+host = "0.0.0.0"
+port = 8080
+open = true
