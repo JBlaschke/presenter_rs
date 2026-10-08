@@ -4,12 +4,26 @@
 //! - Markdown files: comrak extracts the block as `NodeValue::FrontMatter(literal)`;
 //!   [`strip_delimiters`] turns that literal into the YAML between the `---` lines.
 //! - Sources comrak does not see (the first markdown cell of a notebook):
-//!   [`split_front_matter`] finds the block in plain text.
-//! - [`parse_front_matter`] turns the YAML into a [`DeckMeta`]. The per-deck config overrides
-//!   (`slides:`, `markdown:`, `math:`, `notebook:` maps) are ordinary entries of
-//!   [`DeckMeta::vars`] and are applied with
-//!   [`Config::merge_front_matter`](crate::config::Config::merge_front_matter), which also
-//!   merges [`DeckMeta::reveal`] over the configured reveal options.
+//!   [`split_front_matter`] finds the block in plain text, by the same rules as comrak.
+//! - [`parse_front_matter`] turns the YAML into a [`DeckMeta`]; [`meta_from_json`] applies
+//!   the same key rules to a JSON object (a notebook's `metadata.presenter`,
+//!   notebook-mapping.md §5).
+//!
+//! The per-deck config overrides (`slides:`, `markdown:`, `math:`, `notebook:` maps) are
+//! ordinary entries of [`DeckMeta::vars`]. They are applied, together with
+//! [`DeckMeta::reveal`], by
+//! [`Config::merge_front_matter`](crate::config::Config::merge_front_matter), which takes
+//! `&mut self`, so merge into a copy that you keep:
+//!
+//! ```
+//! # use presenter::{config::Config, markdown::frontmatter::parse_front_matter};
+//! # let config = Config::default();
+//! let meta = parse_front_matter("slides: {split: headings}")?;
+//! let mut deck_config = config.clone();
+//! deck_config.merge_front_matter(&meta)?;
+//! assert_eq!(deck_config.slides.split, presenter::config::SlideSplit::Headings);
+//! # Ok::<(), presenter::error::Error>(())
+//! ```
 //!
 //! # YAML flavour (`serde_norway` 0.9)
 //! `serde_norway` resolves plain scalars with the **YAML 1.2 core schema**, not YAML 1.1:
@@ -18,13 +32,26 @@
 //!   `incremental_lists: yes` under `slides:` is rejected as "expected a boolean";
 //! - null is `null`, `Null`, `NULL`, `~` or an empty value;
 //! - integers are decimal, `0x…`, `0o…` or `0b…`; a leading zero (`010`) makes a string;
+//!   an integer outside the 64-bit range has no JSON number form and becomes the string of
+//!   its decimal digits in `vars` and `reveal` (`n: 99999999999999999999` →
+//!   `"99999999999999999999"`), up to 128 bits; serde_norway reads even longer digit
+//!   strings as floats (`1e42`);
 //! - floats include `.inf`/`.nan`, which have no JSON form and become `null` in `vars`;
 //! - there is no timestamp type: `date: 2026-10-08` is the string `"2026-10-08"`.
 //!
 //! The string fields of [`DeckMeta`] take any scalar as its text exactly as written
 //! (`title: 42` → `"42"`, `subtitle: 1.50` → `"1.50"`, `author: yes` → `"yes"`).
+//! Keys must be unique in every mapping (a repeated key is an error, as YAML requires).
+//! Custom tags (`!expr x`) are rejected, except on the string fields, where the scalar's
+//! text is used and the tag ignored.
+
+use std::collections::BTreeSet;
+use std::fmt;
 
 use serde::Deserialize;
+use serde::de::{
+    self, DeserializeSeed, Deserializer, EnumAccess, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
@@ -36,16 +63,45 @@ const DELIMITER: &str = "---";
 /// Byte-order mark that may precede the opening delimiter (comrak skips it too).
 const BOM: char = '\u{feff}';
 
+/// The front matter error for a root that is not a mapping (dialect §2.1).
+const NOT_A_MAPPING: &str = "expected a mapping";
+
+/// The keys that map to the [`DeckMeta`] string fields.
+const STRING_FIELDS: [&str; 7] = [
+    "title",
+    "subtitle",
+    "author",
+    "date",
+    "description",
+    "lang",
+    "theme",
+];
+
+/// Keys whose value must be a mapping (or empty), each with an example for error messages:
+/// `reveal` (→ [`DeckMeta::reveal`]) and the config tables of config.md §3 (→ `vars`).
+const TABLES: [(&str, &str); 5] = [
+    ("reveal", "reveal: {transition: fade}"),
+    ("slides", "slides: {split: headings}"),
+    ("markdown", "markdown: {smart_punctuation: true}"),
+    ("math", "math: {enabled: never}"),
+    ("notebook", "notebook: {show_prompts: false}"),
+];
+
+/// `std`'s two-parameter `Result`, for serde trait methods (the crate's `Result` has one).
+type DeResult<T, E> = std::result::Result<T, E>;
+
 /// Text-based extraction for sources comrak does not see (notebook cells).
 /// Returns (yaml_without_delimiters, rest_of_text, number_of_lines_consumed) when `text`
 /// starts with a line `---` and a closing `---` line exists.
 ///
 /// Both delimiter lines must be exactly `---` (no trailing spaces), terminated by `\n` or
-/// `\r\n`; the closing one may also end the text. The YAML excludes the line break before
-/// the closing delimiter, and `rest_of_text` starts right after the closing line's break
-/// (a following blank line stays in it). `number_of_lines_consumed` counts the opening line,
+/// `\r\n`; the closing one may also end the text. As in comrak, the line right after the
+/// opening delimiter never closes the block, so `---\n---\n` is not front matter (an empty
+/// block needs a blank line: `---\n\n---\n`). The YAML excludes the line break before the
+/// closing delimiter, and `rest_of_text` starts right after the closing line's break (a
+/// following blank line stays in it). `number_of_lines_consumed` counts the opening line,
 /// the YAML lines and the closing line, so `rest_of_text` begins on line `consumed + 1`. A
-/// leading byte-order mark is skipped. An empty block (`---\n---\n`) yields empty YAML.
+/// leading byte-order mark is skipped.
 ///
 /// ```
 /// use presenter::markdown::frontmatter::split_front_matter;
@@ -62,7 +118,9 @@ pub fn split_front_matter(text: &str) -> Option<(&str, &str, usize)> {
     }
     let mut line_start = yaml_start;
     for (consumed, (line, end)) in (2..).zip(lines) {
-        if line == DELIMITER {
+        // comrak searches for `\n---` only after the opening line's break, so the closing
+        // delimiter is line 3 at the earliest.
+        if consumed > 2 && line == DELIMITER {
             let yaml = without_line_break(&text[yaml_start..line_start]);
             return Some((yaml, &text[end..], consumed));
         }
@@ -104,42 +162,26 @@ pub fn strip_delimiters(literal: &str) -> &str {
 /// - `title subtitle author date description lang theme` → the [`DeckMeta`] fields; any
 ///   scalar is taken as its YAML text (`date: 2026-10-08` → `"2026-10-08"`, `title: 42` →
 ///   `"42"`), `null` leaves the field `None`, a sequence or mapping is an error.
-/// - `reveal` → [`DeckMeta::reveal`]; it must be a mapping (`null` counts as empty).
+/// - `reveal` → [`DeckMeta::reveal`]. It must be a mapping; an empty value (`reveal:`, e.g.
+///   with all its options commented out) counts as an empty mapping.
 /// - Every other key → [`DeckMeta::vars`] in the order written, values as typed by YAML
 ///   (see the module docs). This includes the `slides`/`markdown`/`math`/`notebook` config
-///   overrides, which stay in `vars` (config.md §3). Non-string scalar keys become their
-///   text; when a key is repeated the last value wins (repeating a known key is an error).
+///   overrides, which stay in `vars` (config.md §3); like `reveal` they must be mappings
+///   or empty (`slides: headings` is an error). Non-string scalar keys become their text.
+/// - A key repeated in any mapping is an error (``duplicate key `title` ``), reported at
+///   the repeated key.
 ///
-/// Every failure, including YAML syntax errors, is an [`Error::FrontMatter`]; line numbers
-/// in messages count from the first YAML line (the line after the opening `---`).
+/// Every failure, including YAML syntax errors, is an [`Error::FrontMatter`]. Line numbers
+/// in messages are those of the source the block came from: the YAML is taken to start on
+/// line 2, right after the opening `---` on line 1 (always the case for a Markdown file
+/// and for a notebook cell), so `title: a: b` as the first YAML line is reported on line 2.
 pub fn parse_front_matter(yaml: &str) -> Result<DeckMeta> {
-    let entries = match serde_norway::from_str::<Value>(yaml).map_err(yaml_error)? {
-        Value::Null => return Ok(DeckMeta::default()),
-        Value::Object(entries) => entries,
-        _ => return Err(Error::FrontMatter("expected a mapping".to_string())),
-    };
-    // Second pass for the string fields: deserializing a scalar as a string yields its
-    // text exactly as written, which the generic `Value` above has already lost (`1.50`).
-    let text: StringFields = serde_norway::from_str(yaml).map_err(yaml_error)?;
-    let mut meta = DeckMeta {
-        title: text.title,
-        subtitle: text.subtitle,
-        author: text.author,
-        date: text.date,
-        description: text.description,
-        lang: text.lang,
-        theme: text.theme,
-        ..DeckMeta::default()
-    };
-    for (key, value) in entries {
-        match key.as_str() {
-            "title" | "subtitle" | "author" | "date" | "description" | "lang" | "theme" => {}
-            "reveal" => meta.reveal = reveal_map(value)?,
-            _ => {
-                meta.vars.insert(key, value);
-            }
-        }
-    }
+    // One leading line break shifts serde_norway's line numbers to source lines.
+    let source = format!("\n{yaml}");
+    let root = serde_norway::Deserializer::from_str(&source)
+        .deserialize_any(RootVisitor)
+        .map_err(|err| Error::FrontMatter(err.to_string()))?;
+    let meta = root.ok_or_else(|| Error::FrontMatter(NOT_A_MAPPING.to_string()))?;
     tracing::debug!(
         vars = meta.vars.len(),
         reveal = meta.reveal.len(),
@@ -148,38 +190,310 @@ pub fn parse_front_matter(yaml: &str) -> Result<DeckMeta> {
     Ok(meta)
 }
 
-/// The [`DeckMeta`] string fields. Unknown keys are ignored here (they are read from the
-/// generic value); `Option<String>` turns `null` into `None` and any other scalar into its
-/// text.
-#[derive(Deserialize)]
-struct StringFields {
-    title: Option<String>,
-    subtitle: Option<String>,
-    author: Option<String>,
-    date: Option<String>,
-    description: Option<String>,
-    lang: Option<String>,
-    theme: Option<String>,
-}
-
-/// The `reveal:` value as a map: a mapping as is, `null` as empty, anything else an error.
-fn reveal_map(value: Value) -> Result<Map<String, Value>> {
-    let kind = match value {
-        Value::Object(map) => return Ok(map),
-        Value::Null => return Ok(Map::new()),
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "a sequence",
+/// Deck metadata from a JSON value, with the key rules of [`parse_front_matter`]: for a
+/// notebook's `metadata.presenter` object ("same keys as Markdown front matter",
+/// notebook-mapping.md §5).
+///
+/// `null` → [`DeckMeta::default()`]; any other non-object → `"expected a mapping"`. A
+/// number or boolean for a string field becomes its JSON text (`42` → `"42"`, `1.50` →
+/// `"1.5"`). Messages start with the offending key and carry no line numbers.
+pub fn meta_from_json(value: &Value) -> Result<DeckMeta> {
+    let object = match value {
+        Value::Null => return Ok(DeckMeta::default()),
+        Value::Object(object) => object,
+        _ => return Err(Error::FrontMatter(NOT_A_MAPPING.to_string())),
     };
-    Err(Error::FrontMatter(format!(
-        "reveal must be a mapping of reveal.js options, got {kind}"
-    )))
+    let mut meta = DeckMeta::default();
+    for (key, value) in object {
+        let value = match value {
+            Value::Bool(_) | Value::Number(_) if STRING_FIELDS.contains(&key.as_str()) => {
+                Value::String(value.to_string())
+            }
+            _ => value.clone(),
+        };
+        let entry = EntrySeed {
+            meta: &mut meta,
+            key: key.clone(),
+        };
+        entry
+            .deserialize(value)
+            .map_err(|err| Error::FrontMatter(format!("{key}: {err}")))?;
+    }
+    Ok(meta)
 }
 
-/// Wraps a YAML parse/shape error.
-fn yaml_error(err: serde_norway::Error) -> Error {
-    Error::FrontMatter(err.to_string())
+/// The front matter root: `Some(meta)` for a mapping or an empty document, `None` for any
+/// other value (reported as [`NOT_A_MAPPING`]).
+struct RootVisitor;
+
+impl<'de> Visitor<'de> for RootVisitor {
+    type Value = Option<DeckMeta>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a mapping")
+    }
+
+    fn visit_unit<E: de::Error>(self) -> DeResult<Self::Value, E> {
+        Ok(Some(DeckMeta::default()))
+    }
+
+    fn visit_none<E: de::Error>(self) -> DeResult<Self::Value, E> {
+        Ok(Some(DeckMeta::default()))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> DeResult<Self::Value, A::Error> {
+        let mut meta = DeckMeta::default();
+        let mut seen = BTreeSet::new();
+        while let Some(key) = map.next_key_seed(KeySeed(&mut seen))? {
+            map.next_value_seed(EntrySeed {
+                meta: &mut meta,
+                key,
+            })?;
+        }
+        Ok(Some(meta))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i128<E: de::Error>(self, _: i128) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u128<E: de::Error>(self, _: u128) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> DeResult<Self::Value, A::Error> {
+        // serde_norway checks that the whole sequence was consumed.
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> DeResult<Self::Value, A::Error> {
+        unsupported_tag(data)
+    }
+}
+
+/// One top-level entry: routes the value for `key` into `meta` (see [`parse_front_matter`]).
+struct EntrySeed<'m> {
+    meta: &'m mut DeckMeta,
+    key: String,
+}
+
+impl<'de> DeserializeSeed<'de> for EntrySeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, value: D) -> DeResult<(), D::Error> {
+        let EntrySeed { meta, key } = self;
+        if let Some(field) = string_field(meta, &key) {
+            // `Option<String>` asks for a string, and serde_norway then hands over a
+            // scalar's text exactly as written (`1.50`, `2026-10-08`); `null` gives `None`.
+            *field = Option::<String>::deserialize(value)?;
+        } else if let Some((_, example)) = TABLES.iter().find(|(name, _)| *name == key) {
+            let table = value.deserialize_any(TableVisitor { example })?;
+            if key == "reveal" {
+                meta.reveal = table.unwrap_or_default();
+            } else {
+                meta.vars
+                    .insert(key, table.map_or(Value::Null, Value::Object));
+            }
+        } else {
+            let value = JsonVisitor.deserialize(value)?;
+            meta.vars.insert(key, value);
+        }
+        Ok(())
+    }
+}
+
+/// The [`DeckMeta`] string field for `key`, if it is one of [`STRING_FIELDS`].
+fn string_field<'m>(meta: &'m mut DeckMeta, key: &str) -> Option<&'m mut Option<String>> {
+    Some(match key {
+        "title" => &mut meta.title,
+        "subtitle" => &mut meta.subtitle,
+        "author" => &mut meta.author,
+        "date" => &mut meta.date,
+        "description" => &mut meta.description,
+        "lang" => &mut meta.lang,
+        "theme" => &mut meta.theme,
+        _ => return None,
+    })
+}
+
+/// A mapping key as text (a non-string scalar key becomes its YAML text). A key already in
+/// the set is an error; raising it while the key is read lets serde_norway report the
+/// key's own line and column.
+struct KeySeed<'s>(&'s mut BTreeSet<String>);
+
+impl<'de> DeserializeSeed<'de> for KeySeed<'_> {
+    type Value = String;
+
+    fn deserialize<D: Deserializer<'de>>(self, key: D) -> DeResult<String, D::Error> {
+        key.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for KeySeed<'_> {
+    type Value = String;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a scalar key")
+    }
+
+    fn visit_str<E: de::Error>(self, key: &str) -> DeResult<String, E> {
+        if self.0.insert(key.to_owned()) {
+            Ok(key.to_owned())
+        } else {
+            Err(E::custom(format_args!("duplicate key `{key}`")))
+        }
+    }
+}
+
+/// A value that must be a mapping: `Some(map)`, or `None` when empty (`null`). Anything
+/// else is an "invalid type … expected a mapping, e.g. `example`" error.
+struct TableVisitor {
+    example: &'static str,
+}
+
+impl<'de> Visitor<'de> for TableVisitor {
+    type Value = Option<Map<String, Value>>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a mapping, e.g. `{}`", self.example)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E: de::Error>(self) -> DeResult<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> DeResult<Self::Value, A::Error> {
+        json_map(map).map(Some)
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> DeResult<Self::Value, A::Error> {
+        unsupported_tag(data)
+    }
+}
+
+/// Any YAML value as JSON, for `vars` and `reveal`: integers outside the 64-bit range
+/// become their decimal text, `.inf`/`.nan` become `null`, keys must be unique and custom
+/// tags are errors.
+#[derive(Clone, Copy)]
+struct JsonVisitor;
+
+impl<'de> DeserializeSeed<'de> for JsonVisitor {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, value: D) -> DeResult<Value, D::Error> {
+        value.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for JsonVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any YAML value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> DeResult<Value, E> {
+        Ok(Value::Bool(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> DeResult<Value, E> {
+        Ok(Value::from(v))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> DeResult<Value, E> {
+        Ok(Value::from(v))
+    }
+
+    fn visit_i128<E: de::Error>(self, v: i128) -> DeResult<Value, E> {
+        // serde_norway only calls this for integers that do not fit an i64.
+        Ok(Value::String(v.to_string()))
+    }
+
+    fn visit_u128<E: de::Error>(self, v: u128) -> DeResult<Value, E> {
+        // serde_norway only calls this for integers that do not fit a u64.
+        Ok(Value::String(v.to_string()))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> DeResult<Value, E> {
+        // `null` for infinities and NaN, which JSON cannot represent.
+        Ok(Value::from(v))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> DeResult<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> DeResult<Value, E> {
+        Ok(Value::String(v))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> DeResult<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> DeResult<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> DeResult<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(self)? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> DeResult<Value, A::Error> {
+        json_map(map).map(Value::Object)
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> DeResult<Value, A::Error> {
+        unsupported_tag(data)
+    }
+}
+
+/// A mapping's entries as JSON, in the order written; a repeated key is an error.
+fn json_map<'de, A: MapAccess<'de>>(mut map: A) -> DeResult<Map<String, Value>, A::Error> {
+    let mut seen = BTreeSet::new();
+    let mut entries = Map::new();
+    while let Some(key) = map.next_key_seed(KeySeed(&mut seen))? {
+        let value = map.next_value_seed(JsonVisitor)?;
+        entries.insert(key, value);
+    }
+    Ok(entries)
+}
+
+/// The error for a value with a custom YAML tag (serde_norway presents those as enums).
+fn unsupported_tag<'de, A: EnumAccess<'de>, T>(data: A) -> DeResult<T, A::Error> {
+    let (tag, _value) = data.variant::<String>()?;
+    Err(de::Error::custom(format_args!(
+        "YAML tags such as `!{tag}` are not supported"
+    )))
 }
 
 /// Lines of `text` as `(content, end)`: `content` without its `\n` / `\r\n`, `end` the byte
@@ -317,14 +631,63 @@ alpha: [1, 2]
 
     #[test]
     fn reveal_must_be_a_mapping() {
-        let message = front_matter_error("reveal: fade\n");
-        assert!(message.contains("reveal"), "{message}");
-        assert!(message.contains("mapping"), "{message}");
-        assert!(front_matter_error("reveal: [fade]\n").contains("reveal"));
-        assert!(front_matter_error("reveal: 3\n").contains("reveal"));
-        // An empty `reveal:` (null) is treated like an absent one.
-        assert!(meta("reveal:\n").reveal.is_empty());
+        assert_eq!(
+            front_matter_error("reveal: fade\n"),
+            "reveal: invalid type: string \"fade\", expected a mapping, \
+             e.g. `reveal: {transition: fade}` at line 2 column 9"
+        );
+        for yaml in ["reveal: [fade]\n", "reveal: 3\n", "reveal: true\n"] {
+            let message = front_matter_error(yaml);
+            assert!(message.starts_with("reveal: invalid type"), "{message}");
+            assert!(message.contains("expected a mapping"), "{message}");
+        }
+        // An empty `reveal:` (null, e.g. all options commented out) counts as empty.
+        for yaml in [
+            "reveal:\n",
+            "reveal: ~\n",
+            "reveal: null\n",
+            "reveal:\n  # x: 1\n",
+        ] {
+            let meta = meta(yaml);
+            assert!(meta.reveal.is_empty(), "{yaml:?}");
+            assert!(meta.vars.is_empty(), "{yaml:?}");
+        }
         assert!(meta("reveal: {}\n").vars.is_empty());
+    }
+
+    #[test]
+    fn config_tables_must_be_mappings() {
+        assert_eq!(
+            front_matter_error("slides: headings\n"),
+            "slides: invalid type: string \"headings\", expected a mapping, \
+             e.g. `slides: {split: headings}` at line 2 column 9"
+        );
+        assert_eq!(
+            front_matter_error("title: T\nmath: never\n"),
+            "math: invalid type: string \"never\", expected a mapping, \
+             e.g. `math: {enabled: never}` at line 3 column 7"
+        );
+        for yaml in [
+            "slides: [split]\n",
+            "markdown: 3\n",
+            "notebook: true\n",
+            "math: [never]\n",
+        ] {
+            let message = front_matter_error(yaml);
+            let key = yaml.split(':').next().unwrap();
+            assert!(
+                message.starts_with(&format!("{key}: invalid type")),
+                "{message}"
+            );
+            assert!(message.contains("expected a mapping, e.g. `"), "{message}");
+        }
+        // Empty tables stay in vars as null, and merging them changes nothing.
+        let meta = meta("slides:\nmath: ~\n");
+        assert_eq!(var_keys(&meta), ["slides", "math"]);
+        assert_eq!(meta.vars["slides"], Value::Null);
+        let mut config = Config::default();
+        config.merge_front_matter(&meta).unwrap();
+        assert_eq!(config, Config::default());
     }
 
     #[test]
@@ -346,10 +709,56 @@ alpha: [1, 2]
 
     #[test]
     fn yaml_syntax_errors_are_front_matter_errors() {
-        let message = front_matter_error("title: [unclosed\n");
-        assert!(message.contains("line"), "{message}");
-        front_matter_error("a: 1\n  b: 2\n");
-        front_matter_error("key: *undefined_alias\n");
+        // Line numbers are source lines: the YAML starts on line 2, after the opening `---`.
+        assert_eq!(
+            front_matter_error("title: Rust: the good parts\nauthor: Me\n"),
+            "mapping values are not allowed in this context at line 2 column 12"
+        );
+        assert_eq!(
+            front_matter_error("a: 1\n  b: 2\n"),
+            "mapping values are not allowed in this context at line 3 column 4"
+        );
+        assert_eq!(
+            front_matter_error("key: *undefined_alias\n"),
+            "unknown anchor at line 2 column 6"
+        );
+        let message = front_matter_error("title: T\nauthor: Me\nlist:\n\t- a\n");
+        assert!(message.contains("at line 5 column 1"), "{message}");
+        let message = front_matter_error("title: T\nlist: [unclosed\n");
+        assert!(message.contains("line 3"), "{message}");
+        // CRLF line breaks count once.
+        assert_eq!(
+            front_matter_error("title: T\r\nkey: a: b\r\n"),
+            "mapping values are not allowed in this context at line 3 column 7"
+        );
+        // A type error is reported at the value's own line too.
+        assert_eq!(
+            front_matter_error("lang: de\ntitle: [a, b]\n"),
+            "title: invalid type: sequence, expected a string at line 3 column 8"
+        );
+    }
+
+    #[test]
+    fn error_lines_match_the_markdown_file() {
+        let document = "---\ntitle: Rust: the good parts\nauthor: Me\n---\n\n# Slide\n";
+        let literal = comrak_literal(document).unwrap();
+        let message = match parse_front_matter(strip_delimiters(&literal)) {
+            Err(Error::FrontMatter(message)) => message,
+            other => panic!("expected a front matter error, got {other:?}"),
+        };
+        let line = document
+            .lines()
+            .position(|line| line.starts_with("title:"))
+            .unwrap()
+            + 1;
+        assert_eq!(line, 2);
+        assert!(
+            message.contains(&format!("at line {line} column 12")),
+            "{message}"
+        );
+        // The same through the text-based split (notebook cells).
+        let (yaml, _, _) = split_front_matter(document).unwrap();
+        assert_eq!(front_matter_error(yaml), message);
     }
 
     #[test]
@@ -387,13 +796,77 @@ alpha: [1, 2]
     }
 
     #[test]
-    fn duplicate_keys() {
-        // Repeating a var: the last value wins, at the first position.
-        let meta = meta("a: 1\nb: 2\na: 3\n");
-        assert_eq!(var_keys(&meta), ["a", "b"]);
-        assert_eq!(meta.vars["a"], 3);
-        // Repeating a known field is rejected.
-        assert!(front_matter_error("title: A\ntitle: B\n").contains("title"));
+    fn duplicate_keys_are_errors_at_the_repeated_key() {
+        assert_eq!(
+            front_matter_error("title: A\ntitle: B\n"),
+            "duplicate key `title` at line 3 column 1"
+        );
+        assert_eq!(
+            front_matter_error("a: 1\nb: 2\na: 3\n"),
+            "duplicate key `a` at line 4 column 1"
+        );
+        // A second `reveal:` block would otherwise silently drop the first one.
+        assert_eq!(
+            front_matter_error("reveal: {transition: fade}\nreveal: {width: 10}\n"),
+            "duplicate key `reveal` at line 3 column 1"
+        );
+        assert_eq!(
+            front_matter_error("slides:\n  split: rules\nslides:\n  split: headings\n"),
+            "duplicate key `slides` at line 4 column 1"
+        );
+        // Nested mappings, inside reveal and inside vars.
+        assert_eq!(
+            front_matter_error("reveal:\n  transition: fade\n  transition: zoom\n"),
+            "reveal: duplicate key `transition` at line 4 column 3"
+        );
+        assert_eq!(
+            front_matter_error("list: [{a: 1, a: 2}]\n"),
+            "list[0]: duplicate key `a` at line 2 column 15"
+        );
+        // A non-string key is compared by its text.
+        assert!(front_matter_error("1: a\n1: b\n").starts_with("duplicate key `1`"));
+        // The same key in different mappings is fine.
+        let meta = meta("a: {x: 1}\nb: {x: 2}\n");
+        assert_eq!(meta.vars["b"]["x"], 2);
+    }
+
+    #[test]
+    fn integers_outside_64_bits_keep_their_digits() {
+        let parsed = meta(
+            "title: 99999999999999999999\nlonger: 18446744073709551616\n\
+             neg: -99999999999999999999\nmax: 18446744073709551615\nmin: -9223372036854775808\n\
+             reveal: {big: 340282366920938463463374607431768211455}\n",
+        );
+        assert_eq!(parsed.title.as_deref(), Some("99999999999999999999"));
+        assert_eq!(parsed.vars["longer"], "18446744073709551616");
+        assert_eq!(parsed.vars["neg"], "-99999999999999999999");
+        // In range: still numbers.
+        assert_eq!(parsed.vars["max"], u64::MAX);
+        assert_eq!(parsed.vars["min"], i64::MIN);
+        assert_eq!(parsed.reveal["big"], u128::MAX.to_string());
+        // Beyond 128 bits serde_norway itself reads the scalar as a float.
+        let huge = meta("huge: 999999999999999999999999999999999999999999\n");
+        assert_eq!(huge.vars["huge"], Value::from(1e42));
+    }
+
+    #[test]
+    fn custom_tags_are_rejected_with_a_clear_message() {
+        assert_eq!(
+            front_matter_error("x: !expr foo\n"),
+            "x: YAML tags such as `!expr` are not supported at line 2 column 4"
+        );
+        assert_eq!(
+            front_matter_error("reveal: {width: !px 10}\n"),
+            "reveal.width: YAML tags such as `!px` are not supported at line 2 column 17"
+        );
+        assert!(front_matter_error("slides: !t {split: headings}\n").contains("`!t`"));
+        assert!(front_matter_error("!root\na: 1\n").contains("`!root`"));
+        // Core-schema tags are plain YAML and work.
+        let core = meta("title: !!str 42\nn: !!int 7\n");
+        assert_eq!(core.title.as_deref(), Some("42"));
+        assert_eq!(core.vars["n"], 7);
+        // On a string field the scalar text is used and the tag ignored (documented).
+        assert_eq!(meta("title: !t x\n").title.as_deref(), Some("x"));
     }
 
     #[test]
@@ -458,8 +931,15 @@ alpha: [1, 2]
             split_front_matter("---\na: 1\n---\n"),
             Some(("a: 1", "", 3))
         );
-        // Empty block.
-        assert_eq!(split_front_matter("---\n---\nbody"), Some(("", "body", 2)));
+        // As in comrak, the line after the opening delimiter never closes the block: an
+        // empty block needs a blank line.
+        assert_eq!(split_front_matter("---\n---\nbody"), None);
+        assert_eq!(split_front_matter("---\n---"), None);
+        assert_eq!(split_front_matter("---\r\n---\r\nbody"), None);
+        assert_eq!(
+            split_front_matter("---\n---\n---\nbody"),
+            Some(("---", "body", 3))
+        );
         assert_eq!(
             split_front_matter("---\n\n---\nbody"),
             Some(("", "body", 3))
@@ -581,6 +1061,63 @@ alpha: [1, 2]
         assert_eq!(strip_delimiters("---\na: ---\n"), "a: ---");
     }
 
+    /// Every document of up to five lines built from `---`, `a: 1`, an empty line and `x`
+    /// (LF or CRLF, with or without a final line break): comrak and [`split_front_matter`]
+    /// agree on whether there is front matter, on its YAML, and on where the block ends
+    /// (comrak's literal also takes one following empty line). Lines like `----` or `--- `
+    /// and mixed line breaks are left out: there comrak's substring search has quirks that
+    /// the line-based split deliberately does not copy.
+    #[test]
+    fn split_agrees_with_comrak_on_generated_documents() {
+        const ATOMS: [&str; 4] = ["---", "a: 1", "", "x"];
+        let mut documents = Vec::new();
+        let mut sequences: Vec<Vec<&str>> = vec![Vec::new()];
+        for _ in 0..5 {
+            sequences = sequences
+                .iter()
+                .flat_map(|seq| {
+                    ATOMS.iter().map(move |atom| {
+                        let mut longer = seq.clone();
+                        longer.push(atom);
+                        longer
+                    })
+                })
+                .collect();
+            for seq in &sequences {
+                for eol in ["\n", "\r\n"] {
+                    documents.push(seq.join(eol));
+                    documents.push(seq.join(eol) + eol);
+                }
+            }
+        }
+        assert_eq!(documents.len(), 4 * (4 + 16 + 64 + 256 + 1024));
+        let mut with_front_matter = 0;
+        for document in &documents {
+            let literal = comrak_literal(document);
+            let split = split_front_matter(document);
+            let (Some(literal), Some((yaml, rest, consumed))) = (&literal, split) else {
+                assert_eq!(
+                    literal.is_some(),
+                    split.is_some(),
+                    "{document:?}: comrak {literal:?}, split {split:?}"
+                );
+                continue;
+            };
+            with_front_matter += 1;
+            assert_eq!(strip_delimiters(literal), yaml, "{document:?}");
+            let block = &document[..document.len() - rest.len()];
+            assert_eq!(block.lines().count(), consumed, "{document:?}");
+            let extra = literal
+                .strip_prefix(block)
+                .unwrap_or_else(|| panic!("{document:?}: literal {literal:?}, block {block:?}"));
+            assert!(
+                ["", "\n", "\r\n"].contains(&extra) && rest.starts_with(extra),
+                "{document:?}: literal {literal:?}, block {block:?}"
+            );
+        }
+        assert!(with_front_matter > 100, "{with_front_matter}");
+    }
+
     #[test]
     fn fixture_front_matter_agrees_between_comrak_and_text_split() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/md");
@@ -605,6 +1142,75 @@ alpha: [1, 2]
             "no fixture with front matter found in {}",
             dir.display()
         );
+    }
+
+    // ---- meta_from_json -------------------------------------------------------------------
+
+    #[test]
+    fn json_object_follows_the_front_matter_key_rules() {
+        let value = serde_json::json!({
+            "zeta": 1,
+            "title": 42,
+            "subtitle": 1.50,
+            "author": true,
+            "date": "2026-10-08",
+            "lang": null,
+            "reveal": { "width": 1.50, "transition": "fade" },
+            "slides": { "split": "headings" },
+            "alpha": [1, { "k": "v" }],
+        });
+        let meta = meta_from_json(&value).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("42"));
+        assert_eq!(meta.subtitle.as_deref(), Some("1.5"));
+        assert_eq!(meta.author.as_deref(), Some("true"));
+        assert_eq!(meta.date.as_deref(), Some("2026-10-08"));
+        assert_eq!(meta.lang, None);
+        assert_eq!(
+            Value::Object(meta.reveal.clone()),
+            serde_json::json!({ "width": 1.5, "transition": "fade" })
+        );
+        assert_eq!(var_keys(&meta), ["zeta", "slides", "alpha"]);
+        assert_eq!(meta.vars["alpha"], serde_json::json!([1, { "k": "v" }]));
+        // Same result as the equivalent YAML.
+        let yaml = meta_from_json(&serde_json::json!({ "title": "T", "venue": "PyData" }));
+        assert_eq!(yaml.unwrap(), self::meta("title: T\nvenue: PyData\n"));
+    }
+
+    #[test]
+    fn json_errors_match_the_yaml_rules() {
+        assert_eq!(meta_from_json(&Value::Null).unwrap(), DeckMeta::default());
+        for value in [
+            serde_json::json!([1]),
+            serde_json::json!("x"),
+            serde_json::json!(3),
+        ] {
+            assert_eq!(
+                meta_from_json(&value).unwrap_err().to_string(),
+                "front matter: expected a mapping"
+            );
+        }
+        let message = |value: Value| match meta_from_json(&value) {
+            Err(Error::FrontMatter(message)) => message,
+            other => panic!("expected Error::FrontMatter for {value}, got {other:?}"),
+        };
+        assert_eq!(
+            message(serde_json::json!({ "reveal": "fade" })),
+            "reveal: invalid type: string \"fade\", expected a mapping, \
+             e.g. `reveal: {transition: fade}`"
+        );
+        assert_eq!(
+            message(serde_json::json!({ "slides": "headings" })),
+            "slides: invalid type: string \"headings\", expected a mapping, \
+             e.g. `slides: {split: headings}`"
+        );
+        assert_eq!(
+            message(serde_json::json!({ "title": ["a"] })),
+            "title: invalid type: sequence, expected a string"
+        );
+        // Empty tables, as in YAML.
+        let meta = meta_from_json(&serde_json::json!({ "reveal": null, "math": null })).unwrap();
+        assert!(meta.reveal.is_empty());
+        assert_eq!(meta.vars["math"], Value::Null);
     }
 
     // ---- Config::merge_front_matter through parsed front matter -------------------------
