@@ -1,0 +1,167 @@
+---
+source: tests/cli_build.rs
+expression: region
+---
+<div class="slides">
+<section class="layout-title">
+<h1>Presenter basics</h1>
+
+<p class="subtitle">Every Markdown feature of presenter in one deck</p>
+<p class="author">Johannes Blaschke</p>
+<p class="date">2026-10-08</p>
+<aside class="notes"><p>The title slide uses <code>layout=title</code>: the theme adds the subtitle, author and date from the
+front matter under the heading.</p>
+</aside>
+</section>
+<section class="layout-default">
+<h2>What this deck shows</h2>
+<ul>
+<li>A <strong>title slide</strong> with the subtitle, author and date from the front matter</li>
+<li>A <strong>vertical stack</strong>, <strong>fragments</strong> and <strong>two columns</strong></li>
+<li><strong>Code</strong> with line stepping, <strong>math</strong>, a <strong>figure</strong> and a <strong>table</strong></li>
+<li><strong>Backgrounds</strong>, an <strong>embedded page</strong>, a <strong>footnote</strong> and <strong>speaker notes</strong></li>
+</ul>
+<p>Press <kbd>S</kbd> for the speaker view and <kbd>Esc</kbd> for the overview.</p>
+
+<aside class="notes"><p>Speaker notes go in a <code>:::notes</code> block anywhere on the slide. They show up in the speaker
+view (press S), never on the slide itself.</p>
+</aside>
+</section>
+<section>
+<section class="layout-default">
+<h2>A vertical stack</h2>
+<p>A line with just <code>--</code> starts a slide <em>below</em> the current one.</p>
+<p>Press <kbd>↓</kbd> to go down the stack.</p>
+
+</section>
+<section id="stack-child" class="layout-default">
+<h2>One level down</h2>
+<p>This slide has the id <code>stack-child</code> (written <code>{#stack-child}</code> after the heading), so
+<a href="#/stack-child">a link to <code>#/stack-child</code></a> jumps straight here.</p>
+
+</section>
+<section class="layout-default">
+<h2>The bottom of the stack</h2>
+<p>Press <kbd>→</kbd> to leave the stack, or <kbd>↑</kbd> to go back up.</p>
+
+</section>
+</section>
+<section class="layout-default">
+<h2>Fragments</h2>
+<div class="fragment" data-fragment-index="1">
+<p><strong>First click:</strong> a plain fragment fades in.</p>
+</div>
+<div class="fragment fade-up" data-fragment-index="3">
+<p><strong>Third click:</strong> written second, but <code>index=3</code> shows it last.</p>
+</div>
+<div class="fragment highlight-blue" data-fragment-index="2">
+<p><strong>Second click:</strong> <code>highlight-blue</code> turns this paragraph blue.</p>
+</div>
+<p>Fragments can also be raw HTML, inline:
+<span class="fragment highlight-red" data-fragment-index="4">the fourth click</span>.</p>
+
+</section>
+<section class="layout-default">
+<h2>Two columns</h2>
+<div class="columns" style="grid-template-columns: 2fr 3fr">
+<div class="column">
+<p>The figure is a local file, <code>figures/plot.png</code>.</p>
+<p>A standalone build inlines it; a site build copies it to <code>assets/</code>.</p>
+</div>
+<div class="column">
+<p><img src="[data-uri]" alt="A damped oscillation" /></p>
+</div>
+</div>
+
+</section>
+<section class="layout-default">
+<h2>Code with line stepping</h2>
+<pre><code class="language-python" data-trim data-line-numbers="1|3-4|6-7">import math
+
+def area(radius):
+    return math.pi * radius ** 2
+
+for r in (1, 2, 3):
+    print(f"r = {r}: area = {area(r):.2f}")</code></pre>
+<p>Each click highlights the next group of lines.</p>
+
+<aside class="notes"><p>The fence is written as <code>python {lines=&quot;1|3-4|6-7&quot;}</code>.</p>
+</aside>
+</section>
+<section class="layout-default">
+<h2>Math</h2>
+<p>Inline math sits in the text: a circle of radius <span data-math-style="inline">r</span> has the area <span data-math-style="inline">A = \pi r^2</span>, and
+Euler's identity reads <span data-math-style="inline">e^{i\pi} + 1 = 0</span>.</p>
+<p>Display math gets a line of its own:</p>
+<p><span data-math-style="display">\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}</span></p>
+
+</section>
+<section class="layout-default">
+<h2>A table</h2>
+<table>
+<thead>
+<tr>
+<th align="left">Line</th>
+<th align="left">Starts</th>
+<th align="left">Use it for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td align="left"><code>---</code></td>
+<td align="left">a horizontal slide</td>
+<td align="left">the next topic</td>
+</tr>
+<tr>
+<td align="left"><code>--</code></td>
+<td align="left">a vertical slide</td>
+<td align="left">details of the current topic</td>
+</tr>
+<tr>
+<td align="left"><code>--- {…}</code></td>
+<td align="left">a slide with attributes</td>
+<td align="left">backgrounds, transitions, layouts</td>
+</tr>
+</tbody>
+</table>
+
+</section>
+<section class="layout-default">
+<h2>A footnote</h2>
+<p>presenter renders slides with reveal.js<sup class="footnote-ref"><a href="#fn-reveal" id="fnref-reveal" data-footnote-ref>1</a></sup> and math with KaTeX<sup class="footnote-ref"><a href="#fn-katex" id="fnref-katex" data-footnote-ref>2</a></sup>.
+Both are bundled, so this deck works offline.</p>
+<div class="footnotes" data-footnotes>
+<ol>
+<li id="fn-reveal">
+<p>reveal.js 6.0.2, <a href="https://revealjs.com">https://revealjs.com</a> <a href="#fnref-reveal" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="1" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="fn-katex">
+<p>KaTeX 0.19.0, <a href="https://katex.org">https://katex.org</a> <a href="#fnref-katex" class="footnote-backref" data-footnote-backref data-footnote-backref-idx="2" aria-label="Back to reference 2">↩</a></p>
+</li>
+</ol>
+</div>
+
+</section>
+<section class="layout-default" data-background-color="#0f172a" data-transition="zoom">
+<h2>Backgrounds</h2>
+<p>This slide starts with <code>--- {background=&quot;#0f172a&quot; transition=zoom}</code>.</p>
+<p>A colour sets the slide's background colour, a file name its background image.</p>
+
+</section>
+<section class="layout-default" data-background-image="[data-uri]" data-background-opacity="0.2" data-background-size="contain">
+<h2>Background images</h2>
+<p>The figure behind this text is <code>figures/plot.png</code>, drawn at 20% opacity.</p>
+
+</section>
+<section class="layout-default">
+<h2>Raw HTML: an embedded page</h2>
+<iframe src="[data-uri]" width="900" height="360" title="An embedded local page"></iframe>
+<p>Raw HTML passes through unchanged, except that local <code>src</code> files are bundled like images.</p>
+
+</section>
+<section class="layout-section">
+<h1>Thank you</h1>
+<p>Build this deck with <code>presenter build examples/basic/slides.md</code>.</p>
+
+</section>
+</div>

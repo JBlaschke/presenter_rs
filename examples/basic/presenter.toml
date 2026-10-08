@@ -1,0 +1,31 @@
+# Project configuration for examples/basic (docs/spec/config.md). `presenter` finds this file
+# by walking up from the deck's directory. Every key is optional; a value equal to the
+# built-in default is marked "(default)". Front matter in slides.md overrides these values,
+# and command-line flags override both.
+
+[deck]
+theme = "default"          # (default) built-in theme name, or a theme directory relative to this file
+lang = "en"                # (default) <html lang> when the front matter sets none
+
+[build]
+out_dir = "dist"           # (default) `presenter build slides.md` writes dist/slides.html
+standalone = true          # (default) one self-contained file; false (or --site) writes dist/slides/index.html + assets/
+
+[slides]
+split = "rules"            # (default) slides are separated by `---` (horizontal) and `--` (vertical) lines
+
+[markdown]
+smart_punctuation = false  # (default) true turns "quotes" and -- into typographic quotes and dashes
+
+[reveal]
+hash = true                # (default) keep the slide in the URL (#/3/1), so a reload stays on it
+slideNumber = "c/t"        # show "current/total" in the corner (default: false)
+transition = "slide"       # (default) transition between slides; a slide can set its own
+width = 1280               # (default) slide size; reveal scales it to fit the window
+height = 720               # (default)
+
+[math]
+enabled = "auto"           # (default) include KaTeX only when the deck contains math
+
+[serve]
+port = 3000                # (default) `presenter serve slides.md` listens on http://127.0.0.1:3000

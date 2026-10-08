@@ -132,8 +132,9 @@ pub struct RenderedDocument {
     pub slide_count: usize,
     /// Warnings found while rendering: `unknown-layout` (a slide's layout is not a template
     /// of the chain; the default layout is used), `standalone-background-video` (a local
-    /// background video cannot play from a `data:` URI) and `remote-import` (standalone: an
+    /// background video cannot play from a `data:` URI), `remote-import` (standalone: an
     /// inlined stylesheet `@import`s an absolute URL, e.g. a stock reveal theme's Google
-    /// Fonts).
+    /// Fonts) and the `markdown` filter's Markdown warnings (e.g. `missing-asset`; message
+    /// prefixed `markdown filter: `, no span).
     pub diagnostics: Diagnostics,
 }

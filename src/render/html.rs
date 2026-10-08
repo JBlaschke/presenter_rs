@@ -47,17 +47,23 @@
 //! such imports too, without a warning.
 //!
 //! **Filters.** `attrs` renders a map as ` k="v"` pairs (escaped; `none` values skipped);
-//! `markdown` renders a string with comrak and the markdown-dialect §1 options (raw HTML
-//! allowed, no front matter, `parse.smart` = `config.markdown.smart_punctuation`;
+//! `markdown` renders a string with the Markdown frontend's
+//! [`render_fragment`] in notebook mode (§4: the
+//! markdown-dialect §1 options without front matter, raw HTML allowed, directives, math and
+//! code fences as in a deck, `parse.smart` = `config.markdown.smart_punctuation`;
 //! `render.sourcepos` stays off because the positions would be relative to the template
 //! value, not to the deck's source file); a result that is one paragraph is unwrapped, so
-//! the filter works inline (`<p class="subtitle">{{ meta.subtitle|markdown }}</p>`). Images
-//! in template-rendered Markdown are not registered as assets (not supported). T16 switches
-//! the filter to the Markdown frontend's `render_fragment`. `json` is minijinja's `tojson`
-//! under the name §4 lists (its output is safe in HTML and inside `<script>`).
+//! the filter works inline (`<p class="subtitle">{{ meta.subtitle|markdown }}</p>`).
+//! Relative image paths resolve against the deck's directory and are registered with the
+//! helpers' files, so they are inlined (standalone), emitted (site) or, in serve mode, also
+//! inlined as `data:` URIs (the dev server only serves the deck's own assets). Its warnings
+//! (e.g. `missing-asset`) join the render diagnostics without a span (the lines would be
+//! those of the template value). `json` is minijinja's `tojson` under the name §4 lists
+//! (its output is safe in HTML and inside `<script>`).
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use minijinja::value::ValueKind;
@@ -71,8 +77,11 @@ use super::styles::{self, Targets, UrlRules};
 use super::{BuildMode, RenderInput, RenderedDocument, context};
 use crate::assets::emit::{EmittedFile, Emitter, OutputMode, data_uri};
 use crate::assets::registry::AssetRegistry;
+use crate::config::MarkdownConfig;
 use crate::error::{Diagnostic, Diagnostics, Error, Result, template_error};
 use crate::ir::{Deck, Slide};
+use crate::markdown::comrak_options;
+use crate::markdown::render::{RenderCtx, RenderMode, render_fragment};
 use crate::theme::Theme;
 
 /// URL prefix of the dev server route that serves helper paths (live-reload.md §1).
@@ -111,6 +120,7 @@ pub fn render(input: RenderInput<'_>) -> Result<RenderedDocument> {
         live_reload: input.build.live_reload,
         build_id: input.build.id,
         smart_punctuation: input.config.markdown.smart_punctuation,
+        base_dir: Arc::from(input.deck.source.base_dir.as_path()),
     };
     let state = Arc::new(Mutex::new(state));
     let html = render_deck(&input, &state, extras, &ctx)?;
@@ -226,6 +236,8 @@ struct Extras {
     live_reload: bool,
     build_id: u64,
     smart_punctuation: bool,
+    /// The deck's directory: relative image paths in `markdown` filter input resolve here.
+    base_dir: Arc<Path>,
 }
 
 impl HelperState {
@@ -397,6 +409,7 @@ fn register_helpers(
         live_reload,
         build_id,
         smart_punctuation,
+        base_dir,
     } = extras;
     let st = Arc::clone(state);
     env.add_function("style", move |path: String| call(&st, |s| s.style(&path)));
@@ -420,8 +433,9 @@ fn register_helpers(
         Value::from_safe_string(tag)
     });
     env.add_filter("attrs", attrs_filter);
+    let st = Arc::clone(state);
     env.add_filter("markdown", move |text: Value| {
-        markdown_filter(text, smart_punctuation)
+        markdown_filter(&st, text, smart_punctuation, &base_dir)
     });
     // §4 lists `json` among the built-in filters; minijinja names its JSON filter `tojson`.
     env.add_filter("json", minijinja::filters::tojson);
@@ -572,42 +586,48 @@ fn text_of(value: &Value) -> String {
     }
 }
 
-/// `markdown`: renders a string with comrak (see the module docs); none/undefined → empty.
-fn markdown_filter(text: Value, smart_punctuation: bool) -> Value {
+/// `markdown`: renders a string with the Markdown frontend (see the module docs);
+/// none/undefined → empty. Local images are registered with the helpers' files and their
+/// placeholders resolved at once; warnings go to the helpers' diagnostics without a span.
+fn markdown_filter(
+    state: &Mutex<HelperState>,
+    text: Value,
+    smart_punctuation: bool,
+    base_dir: &Path,
+) -> std::result::Result<Value, minijinja::Error> {
     if text.is_undefined() || text.is_none() {
-        return Value::from_safe_string(String::new());
+        return Ok(Value::from_safe_string(String::new()));
     }
-    let html = comrak::markdown_to_html(&text_of(&text), &markdown_options(smart_punctuation));
-    Value::from_safe_string(unwrap_paragraph(&html).to_string())
-}
-
-/// The markdown-dialect §1 comrak options, without front matter (the filter renders
-/// fragments) and without source positions (see the module docs).
-fn markdown_options(smart_punctuation: bool) -> comrak::Options<'static> {
-    let mut o = comrak::Options::default();
-    o.extension.table = true;
-    o.extension.strikethrough = true;
-    o.extension.tasklist = true;
-    o.extension.autolink = true;
-    o.extension.footnotes = true;
-    o.extension.description_lists = true;
-    o.extension.alerts = true;
-    o.extension.math_dollars = true;
-    o.extension.math_code = true;
-    o.extension.block_directive = true;
-    o.extension.header_attributes = true;
-    o.extension.fenced_code_attributes = true;
-    o.extension.link_attributes = true;
-    o.extension.inline_code_attributes = true;
-    o.parse.smart = smart_punctuation;
-    o.parse.relaxed_autolinks = false;
-    o.render.r#unsafe = true;
-    o.render.escape = false;
-    o.render.hardbreaks = false;
-    o.render.github_pre_lang = false;
-    o.render.full_info_string = false;
-    o.render.sourcepos = false;
-    o
+    let opts = comrak_options(&MarkdownConfig {
+        smart_punctuation,
+        sourcepos: false,
+    });
+    let mut guard = state
+        .lock()
+        .map_err(|_| helper_error(poisoned().to_string()))?;
+    let mut diagnostics = Diagnostics::new();
+    let mut ctx = RenderCtx {
+        assets: &mut guard.registry,
+        base_dir,
+        mode: RenderMode::Notebook,
+        diagnostics: &mut diagnostics,
+        missing_asset_is_error: false,
+    };
+    let rendered = render_fragment(&text_of(&text), &opts, &mut ctx)
+        .map_err(|err| helper_error(format!("markdown filter: {err}")))?;
+    let html = if guard.mode == OutputMode::Serve {
+        // The dev server serves only the deck's own assets by id.
+        Emitter::new(&guard.registry, &OutputMode::Standalone).resolve_html(&rendered.html)
+    } else {
+        guard.with_emitter(|emitter| emitter.resolve_html(&rendered.html))
+    }
+    .map_err(|err| helper_error(format!("markdown filter: {err}")))?;
+    for mut diagnostic in diagnostics {
+        diagnostic.span = None;
+        diagnostic.message = format!("markdown filter: {}", diagnostic.message);
+        guard.diagnostics.push(diagnostic);
+    }
+    Ok(Value::from_safe_string(unwrap_paragraph(&html).to_string()))
 }
 
 /// The content of `html` when it is exactly one `<p>…</p>` paragraph, else `html`.
@@ -698,17 +718,86 @@ mod tests {
         }
     }
 
+    fn helper_state(mode: OutputMode) -> Mutex<HelperState> {
+        Mutex::new(HelperState {
+            theme: crate::theme::resolve("default", &[]).expect("built-in default theme"),
+            mode,
+            registry: AssetRegistry::new(),
+            files: Vec::new(),
+            diagnostics: Diagnostics::new(),
+        })
+    }
+
+    fn fixtures_md() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/md")
+    }
+
     #[test]
     fn markdown_filter_unwraps_single_paragraphs() {
-        let render = |s: &str| markdown_filter(Value::from(s), false).to_string();
+        let state = helper_state(OutputMode::Standalone);
+        let base_dir = fixtures_md();
+        let filter = |text: Value, smart: bool| {
+            let out = markdown_filter(&state, text, smart, &base_dir).unwrap();
+            assert!(out.is_safe());
+            out.to_string()
+        };
+        let render = |s: &str| filter(Value::from(s), false);
         assert_eq!(render("*Fast* tools"), "<em>Fast</em> tools");
         assert_eq!(render("a\n\nb"), "<p>a</p>\n<p>b</p>\n");
         assert_eq!(render("$x$"), "<span data-math-style=\"inline\">x</span>");
         assert_eq!(render("<b>raw</b>"), "<b>raw</b>");
         assert_eq!(render("\"a\" -- b"), "&quot;a&quot; -- b");
-        assert_eq!(markdown_filter(Value::UNDEFINED, false).to_string(), "");
-        let smart = markdown_filter(Value::from("\"a\" -- b"), true).to_string();
-        assert_eq!(smart, "“a” – b");
+        assert_eq!(
+            render("---\ntitle: x\n---\n"),
+            "<hr />\n<h2>title: x</h2>\n"
+        );
+        assert_eq!(filter(Value::UNDEFINED, false), "");
+        assert_eq!(filter(Value::from("\"a\" -- b"), true), "“a” – b");
+        assert!(state.lock().unwrap().diagnostics.is_empty());
+    }
+
+    #[test]
+    fn markdown_filter_resolves_images_for_the_output_mode() {
+        let base_dir = fixtures_md();
+        let render = |mode: OutputMode, text: &str| {
+            let state = helper_state(mode);
+            let html = markdown_filter(&state, Value::from(text), false, &base_dir)
+                .unwrap()
+                .to_string();
+            let state = state.into_inner().unwrap();
+            (html, state.files, state.diagnostics)
+        };
+        let image = "![logo](images/ok.png)";
+        let (html, files, _) = render(OutputMode::Standalone, image);
+        assert!(
+            html.starts_with(r#"<img src="data:image/png;base64,"#),
+            "{html}"
+        );
+        assert!(files.is_empty());
+        let (html, _, _) = render(OutputMode::Serve, image);
+        assert!(
+            html.starts_with(r#"<img src="data:image/png;base64,"#),
+            "{html}"
+        );
+        let site = OutputMode::Site {
+            assets_dir: "out/assets".into(),
+            url_prefix: "assets/".into(),
+        };
+        let (html, files, _) = render(site, image);
+        assert!(html.starts_with(r#"<img src="assets/ok-"#), "{html}");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.starts_with("out/assets"));
+
+        let (html, _, diagnostics) = render(OutputMode::Standalone, "![x](images/missing.png)");
+        assert_eq!(html, r#"<img src="images/missing.png" alt="x" />"#);
+        let diagnostic = diagnostics.iter().next().expect("a missing-asset warning");
+        assert_eq!(diagnostic.code, "missing-asset");
+        assert!(diagnostic.span.is_none());
+        assert!(
+            diagnostic.message.starts_with("markdown filter: "),
+            "{}",
+            diagnostic.message
+        );
     }
 
     #[test]
