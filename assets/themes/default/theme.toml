@@ -5,7 +5,7 @@ name = "default"
 description = "Built-in presenter theme: reveal's white colours, system fonts, top-aligned slides, styled code, tables, alerts and columns, print rules"
 
 [styles]
-entries = ["styles/theme.css"]
+entries = ["styles/theme.css", "styles/notebook.css"]
 reveal_theme = "white"
 highlight_style = "monokai"
 

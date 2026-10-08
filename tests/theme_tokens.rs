@@ -9,7 +9,10 @@
 //! - no `@import`, `@font-face` or remote URL in the theme CSS (offline output);
 //! - rules that keep reveal's layout helpers, highlight styles, inline images, tables and
 //!   the overview working (the browser checks themselves are manual, see the T17 PR);
-//! - the title layout's logo: front matter `logo:`, theme `[vars] logo`, `logo: false`.
+//! - the title layout's logo: front matter `logo:`, theme `[vars] logo`, `logo: false`;
+//! - (T33) `styles/notebook.css`: its tokens are in the README's "Notebook cells" section,
+//!   and the rules behind the notebook browser checks (scrolling outputs, hidden parts,
+//!   sticky DataFrame headers, tinted stderr and errors).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -494,6 +497,137 @@ fn overview_thumbnails_are_one_slide_high() {
         .collect();
     assert!(auto.len() >= 3, "{auto:?}");
     assert!(auto.iter().all(|&i| i < overview), "{auto:?} vs {overview}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Notebook cells (T33): styles/notebook.css and the README's "Notebook cells" section
+// ---------------------------------------------------------------------------------------
+
+/// styles/notebook.css without comments.
+fn notebook_css() -> String {
+    let comments = Regex::new(r"(?s)/\*.*?\*/").unwrap();
+    comments
+        .replace_all(&read("styles/notebook.css"), "")
+        .into_owned()
+}
+
+/// The README from `## Notebook cells` up to the next `## ` heading.
+fn notebook_section() -> String {
+    let readme = readme();
+    let start = readme
+        .find("\n## Notebook cells\n")
+        .expect("README section Notebook cells");
+    let rest = &readme[start + 1..];
+    let end = rest[3..].find("\n## ").map_or(rest.len(), |i| i + 3);
+    rest[..end].to_string()
+}
+
+/// notebook.css comes after theme.css, so its rules win over theme.css's structural cell
+/// rules, and the README's notebook section documents every token it declares (the rows of
+/// the other tables are checked by `every_declared_token_is_documented_with_its_default`).
+#[test]
+fn notebook_tokens_are_documented_in_the_notebook_section() {
+    let entries = stylesheets();
+    let position = |entry: &str| {
+        entries
+            .iter()
+            .position(|e| e == entry)
+            .unwrap_or_else(|| panic!("{entry} not in theme.toml [styles] entries"))
+    };
+    assert!(
+        position("styles/theme.css") < position("styles/notebook.css"),
+        "{entries:?}"
+    );
+    let css = notebook_css();
+    let declared = declared(&css, "--p-");
+    let section = documented_tokens(&notebook_section());
+    for token in ["--p-prompt-color", "--p-cell-font-size"] {
+        assert!(declared.contains_key(token), "{token} not declared");
+    }
+    for (name, value) in &declared {
+        assert_eq!(section.get(name), Some(value), "{name} in Notebook cells");
+    }
+    // The cell tokens theme.css declares are read here and documented in the token table.
+    let used = used(&css);
+    let documented = documented_tokens(&readme());
+    for token in ["--p-cell-gap", "--p-cell-border", "--p-output-max-height"] {
+        assert!(used.contains(token), "notebook.css does not read {token}");
+        assert!(documented.contains_key(token), "{token}");
+    }
+}
+
+/// The rules behind the browser checks of T33: outputs scroll past --p-output-max-height,
+/// hidden parts are `display: none`, DataFrame headers stick, images fit, stderr and errors
+/// are tinted with their tokens, prompts use theirs.
+#[test]
+fn notebook_outputs_scroll_and_hidden_parts_stay_hidden() {
+    let rules = rules(&notebook_css());
+    let outputs = rule(&rules, ".reveal .cell-outputs");
+    assert_eq!(
+        outputs.get("max-height"),
+        Some("var(--p-output-max-height)")
+    );
+    assert_eq!(outputs.get("overflow"), Some("auto"));
+    assert_eq!(outputs.get("border"), Some("var(--p-cell-border)"));
+    assert_eq!(
+        rule(&rules, ".reveal .cell").get("margin"),
+        Some("var(--p-cell-gap) 0")
+    );
+    assert_eq!(
+        rule(&rules, ".reveal .cell-prompt").get("color"),
+        Some("var(--p-prompt-color)")
+    );
+    let hidden = rule(
+        &rules,
+        ".reveal .cell.hide-input .cell-input, .reveal .cell.hide-output .cell-outputs, .reveal .cell.hide-input .cell-prompt",
+    );
+    assert_eq!(hidden.get("display"), Some("none"));
+    let header = rule(&rules, ".reveal .output-display table thead th");
+    assert_eq!(header.get("position"), Some("sticky"));
+    assert_eq!(header.get("top"), Some("0"));
+    let images = rule(
+        &rules,
+        ".reveal .output-display img.output-image, .reveal .output-display figure.output-image > svg",
+    );
+    assert_eq!(images.get("max-width"), Some("100%"));
+    assert!(
+        images.get("width").is_none() && images.get("height").is_none(),
+        "keeps width/height attributes"
+    );
+    let stderr = rule(&rules, ".reveal .cell-outputs .output-stream.stderr");
+    assert!(
+        stderr
+            .get("background")
+            .unwrap()
+            .contains("var(--p-stderr-color)")
+    );
+    let error = rule(&rules, ".reveal .cell-outputs .output-error");
+    assert!(
+        error
+            .get("border-left")
+            .unwrap()
+            .contains("var(--p-error-color)")
+    );
+    assert!(
+        error
+            .get("background")
+            .unwrap()
+            .contains("var(--p-error-color)")
+    );
+}
+
+/// The theme stylesheet is inlined into every document, and tests elsewhere scan whole
+/// documents: no prompt text (tests/theme_skeleton.rs asserts its absence when prompts are
+/// off), no lowercase `katex` (tests/render.rs, math off) and no `<section`, comments
+/// included.
+#[test]
+fn theme_css_contains_no_text_that_document_tests_look_for() {
+    for entry in stylesheets() {
+        let source = read(&entry);
+        for needle in ["In [", "Out [", "katex", "<section"] {
+            assert!(!source.contains(needle), "{entry} contains {needle:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------

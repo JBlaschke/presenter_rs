@@ -90,7 +90,13 @@ fn builtin_default_resolves_without_search_roots() {
     assert_eq!(theme.reveal_theme(), "white");
     assert_eq!(theme.highlight_style(), "monokai");
     let styles = theme.style_entries().unwrap();
-    assert_eq!(origins(&styles), [("default", "styles/theme.css")]);
+    assert_eq!(
+        origins(&styles),
+        [
+            ("default", "styles/theme.css"),
+            ("default", "styles/notebook.css")
+        ]
+    );
     for layout in ["blank", "default", "section", "title"] {
         assert!(theme.layouts().contains(&layout.to_string()), "{layout}");
     }
@@ -286,11 +292,12 @@ fn child_theme_styles_are_concatenated_parent_first() {
         origins(&styles),
         [
             ("default", "styles/theme.css"),
+            ("default", "styles/notebook.css"),
             ("child-theme", "styles/child.css")
         ]
     );
     assert_eq!(
-        styles[1].bytes,
+        styles[2].bytes,
         fs::read(fixtures().join("child-theme/styles/child.css")).unwrap()
     );
 }
