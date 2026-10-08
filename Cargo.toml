@@ -32,7 +32,6 @@ comrak = { version = "0.56", default-features = false, features = ["attributes"]
 minijinja = { version = "2.24", features = ["loader", "json", "loop_controls"] }
 rust-embed = { version = "8.13", features = ["include-exclude"] }
 notify = "8.2"
-notify-debouncer-full = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "fs"] }
 axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }

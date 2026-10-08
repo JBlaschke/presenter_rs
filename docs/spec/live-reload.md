@@ -95,6 +95,6 @@ Computed from each successful build (and from the failed attempt's inputs when p
 the source file; `presenter.toml` if found; every theme directory in the chain
 (recursive); the parent directories of all file assets (non-recursive, per directory);
 `assets/themes/default/` when running a debug build (so working on the built-in theme
-live-reloads too). Debounce 150 ms (`notify-debouncer-full`). Editors that write via rename
+live-reloads too). Debounce 150 ms (implemented by T20 directly on `notify` with its own coalescing thread: a batch goes out after 150 ms without a relevant event, capped at 2 s; `notify-debouncer-full` dropped events for rename-replace editors). Editors that write via rename
 (vim, VS Code "safe write") produce `Remove`+`Create`; treat any event kind as a change and
 re-add watches for paths that were recreated.
