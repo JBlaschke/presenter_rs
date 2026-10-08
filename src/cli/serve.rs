@@ -3,8 +3,9 @@
 //!
 //! # Lifecycle
 //!
-//! 1. The file watcher ([`crate::serve::watch::Watcher`]) starts on
-//!    [`watch_set_before_build`], so that a change saved during the first build is not lost.
+//! 1. The Ctrl-C handler is installed first (step 5), then the file watcher
+//!    ([`crate::serve::watch::Watcher`]) starts on [`watch_set_before_build`], so that a
+//!    change saved during the first build is not lost.
 //! 2. The first build (id 1, serve mode, missing assets are warnings) runs **before** the
 //!    port is bound, so `GET /` is never empty. A failed first build does not stop the
 //!    command: its error is printed and stored ([`server::apply_error`]; `GET /` then shows
@@ -12,10 +13,15 @@
 //! 3. The server binds `host:port` (`--host`/`--port`, else `[serve]` of `presenter.toml`,
 //!    else `127.0.0.1:3000`; port 0 picks a free one) and prints
 //!    `Serving http://<address>:<port>/` as the **first line on stdout** (always, also with
-//!    `-q`: with port 0 it is the only place the port is shown). A bind failure ends the
-//!    command with exit 1 and the hint to use `--port 0`. `--open` (or `[serve] open`) then
-//!    opens that URL with the `open` crate (`localhost` for an unspecified address such as
-//!    `0.0.0.0`); a failure to open is a warning. `--open` is not covered by tests.
+//!    `-q`: with port 0 it is the only place the port is shown). A port in use ends the
+//!    command with exit 1 and the hint to use `--port 0`, also when the other server
+//!    listens on the wildcard address (`0.0.0.0` or a dual-stack `[::]`), which macOS would
+//!    let the bind shadow: unless the port is 0, the address is first probed with a
+//!    connection. Other bind failures exit 1 too, with a hint at `--host` when the address
+//!    cannot be used or resolved. `--open` (or `[serve] open`)
+//!    then opens that URL with the `open` crate (at the loopback address, `127.0.0.1` or
+//!    `[::1]`, when the server listens on an unspecified one such as `0.0.0.0`); a failure
+//!    to open is a warning. `--open` is not covered by tests.
 //! 4. Every change batch of the watcher is rebuilt on the blocking pool (batches that queue
 //!    up meanwhile are merged into one rebuild, classified `css` or `content` by
 //!    [`classify`]); the result is stored ([`server::apply_build`] or
@@ -26,11 +32,16 @@
 //!    build's error; diagnostics are printed as `presenter build` prints them. Rebuild
 //!    errors never stop the server.
 //! 5. Ctrl-C (SIGINT) shuts the server down gracefully ([`server::serve_until`]) and the
-//!    command exits 0. The handler is installed before the URL is printed, so a Ctrl-C
-//!    after that line always takes this path.
+//!    command exits 0. The handler is installed before anything else happens (only the
+//!    arguments are checked and the async runtime is started before it), so a Ctrl-C
+//!    during the first build exits 0 too: the build is abandoned and nothing is bound.
 //!
 //! The address and the theme flags are read once: a changed `[serve]` section needs a
-//! restart; every other input (deck, `presenter.toml`, theme, images) is rebuilt live.
+//! restart, and a build whose `[serve]` address differs from the one the server was
+//! started with prints a warning saying so (once per change); every other input (deck,
+//! `presenter.toml`, theme, images) is rebuilt live. When `presenter.toml` cannot be
+//! loaded at start, the server uses the default `[serve]` settings (with the command
+//! line applied) and prints a warning saying so; the first build reports the error.
 //!
 //! # Versioned deck-asset URLs
 //!
@@ -40,7 +51,11 @@
 //! asset therefore gets `?v=<version>`, a number that changes whenever the file's
 //! modification time or size does: the swapped slides then load an edited image, and only
 //! that one. The route ignores the query, and the client disregards `?v=<digits>` when it
-//! compares pages (live-reload.md §3), so neither the protocol nor the client changes.
+//! compares pages (live-reload.md §3), so neither the protocol nor the client changes; the
+//! URL shape differs from live-reload.md §1 by the query only (a contract note for the
+//! coordinator). Images that theme templates reference with `asset()` (e.g. the title
+//! slide's logo) are served from `/__presenter/asset/…` and are not versioned: editing one
+//! is a `css` build, after which an open page keeps showing the old image until a reload.
 //!
 //! # `--site-preview`
 //!
@@ -50,20 +65,21 @@
 //! site build writes to `assets/` (whole files, no byte ranges). The page has **no**
 //! live-reload client, since a site build has none (and the client's stylesheet swap
 //! assumes serve-mode URLs): it is still rebuilt on every change, but the browser must be
-//! refreshed by hand, and build errors show on stderr only (and in `/__presenter/state`).
+//! refreshed by hand, and build errors show on stderr only (and in `/__presenter/state`),
+//! never in a browser overlay. A note on stderr after the URL line says so (not with `-q`).
 //! Before the first good build, `GET /` is the dev server's error page, which reloads into
 //! the deck once a build succeeds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, PoisonError, RwLock, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use axum::Router;
@@ -75,11 +91,14 @@ use axum::routing::get;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
-use super::{GlobalArgs, ServeArgs, input_kind, locate, print_stdout, report, report_diagnostics};
+use super::{
+    GlobalArgs, ServeArgs, display_path, input_kind, locate, print_stdout, report,
+    report_diagnostics,
+};
 use crate::assets::emit::{OutputMode, SERVE_ASSET_PREFIX};
-use crate::assets::registry::AssetData;
+use crate::assets::registry::{AssetData, ID_LEN};
 use crate::config::{CliOverrides, Config, ServeConfig};
-use crate::error::Error;
+use crate::error::{Diagnostic, Diagnostics, Error};
 use crate::pipeline::{self, Build, BuildFailure, BuildOptions, SITE_ASSETS_DIR};
 use crate::render::BuildInfo;
 use crate::serve::events::{BuildEvent, ErrorPayload};
@@ -92,26 +111,50 @@ use crate::serve::watch::{
 /// The files of the latest site-preview build by path below `assets/` (`--site-preview`).
 type SiteFiles = Arc<RwLock<BTreeMap<String, Bytes>>>;
 
-/// Runs `presenter serve` (module docs). Returns only on Ctrl-C (exit 0) or when the
-/// server cannot start: an input whose format cannot be told (exit 2), the port cannot be
-/// bound or the watcher cannot start (exit 1).
+/// Runs `presenter serve` (module docs). Returns only on Ctrl-C (exit 0, also during the
+/// first build) or when the server cannot start: an input whose format cannot be told
+/// (exit 2), the port cannot be bound or the watcher cannot start (exit 1).
 pub fn run(args: &ServeArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let opts = serve_options(args, global)?;
-    let config = serve_config(&opts);
-    let (tx, batches) = mpsc::channel();
-    let watcher = Watcher::start(&watch_set_before_build(&opts), tx)?;
-    let mut session = Session::new(opts, args.site_preview, global.clone(), watcher);
-    session.build(ChangeKind::Content);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("presenter-serve")
         .build()
         .context("cannot start the server runtime")?;
-    let served = runtime.block_on(serve(session, batches, &config));
-    // A rebuild still running is abandoned: serve mode writes nothing to disk.
+    let served = runtime.block_on(start(opts, args.site_preview, global));
+    // A build still running is abandoned: serve mode writes nothing to disk.
     runtime.shutdown_background();
     served?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Steps 1–5 of the module docs: installs the Ctrl-C handler, starts the watcher, runs the
+/// first build on the blocking pool, then serves. Returns `Ok` on Ctrl-C, also when it
+/// comes during the first build (the build is then abandoned and nothing is bound).
+async fn start(opts: BuildOptions, site_preview: bool, global: &GlobalArgs) -> anyhow::Result<()> {
+    // First of all, so that from here on Ctrl-C always ends the command with exit 0.
+    let mut shutdown = Box::pin(interrupt().context("cannot listen for Ctrl-C")?);
+    let config = serve_config(&opts, global);
+    let (tx, batches) = mpsc::channel();
+    let watcher = Watcher::start(&watch_set_before_build(&opts), tx)?;
+    let mut session = Session::new(opts, site_preview, global.clone(), watcher, &config);
+    tracing::info!(
+        "first build of {}",
+        display_path(&session.opts.input).display()
+    );
+    let first = tokio::task::spawn_blocking(move || {
+        session.build(ChangeKind::Content);
+        session
+    });
+    let session = tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            tracing::info!("interrupted during the first build");
+            return Ok(());
+        }
+        session = first => session.context("the first build stopped")?,
+    };
+    serve(session, batches, &config, shutdown).await
 }
 
 /// The pipeline options of `args` for serve mode: the input and its format (by extension;
@@ -142,32 +185,49 @@ fn serve_options(args: &ServeArgs, global: &GlobalArgs) -> anyhow::Result<BuildO
 }
 
 /// The `[serve]` settings with the command line applied. When `presenter.toml` cannot be
-/// loaded, the defaults with the command line applied (the first build reports the error).
-fn serve_config(opts: &BuildOptions) -> ServeConfig {
+/// loaded, the defaults with the command line applied, and a warning saying so (the first
+/// build reports the error itself).
+fn serve_config(opts: &BuildOptions, global: &GlobalArgs) -> ServeConfig {
     match pipeline::load_config(opts) {
         Ok((config, _)) => config.serve,
         Err(err) => {
-            tracing::debug!("serving with the default [serve] settings: {err}");
+            tracing::debug!("cannot load the configuration: {err}");
             let mut config = Config::default();
             config.apply_cli(&opts.cli);
+            let note = format!(
+                "the [serve] settings cannot be read (the build error below says why), so \
+                 the server listens on {} until it is restarted",
+                display_address(&config.serve.host, config.serve.port)
+            );
+            let mut diagnostics = Diagnostics::new();
+            diagnostics.push(Diagnostic::warning(SERVE_CONFIG_CODE, note));
+            report_diagnostics(&diagnostics, global);
             config.serve
         }
     }
 }
 
+/// The diagnostic code of the warnings about `[serve]` settings that are not in effect.
+const SERVE_CONFIG_CODE: &str = "serve-config";
+
 /// Binds the listener, prints the URL, opens the browser if asked, then serves until
-/// Ctrl-C while [`rebuild_loop`] handles the watcher's batches.
+/// `shutdown` (Ctrl-C) while [`rebuild_loop`] handles the watcher's batches.
 async fn serve(
     session: Session,
     batches: mpsc::Receiver<ChangeBatch>,
     config: &ServeConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = bind(&config.host, config.port).await?;
-    let shutdown = interrupt().context("cannot listen for Ctrl-C")?;
     let addr = listener
         .local_addr()
         .context("cannot read the server's address")?;
     print_stdout(&format!("Serving {}", url_for(addr)))?;
+    if session.site_preview && !session.global.quiet {
+        let note = "note: --site-preview pages do not live-reload and show no build errors: \
+                    refresh the browser after a rebuild";
+        let _ = writeln!(std::io::stderr().lock(), "{note}");
+    }
     if config.open {
         open_browser(url_for(browser_addr(addr)));
     }
@@ -192,20 +252,86 @@ async fn serve(
     Ok(served?)
 }
 
-/// Binds `host:port`. Errors name the address and suggest `--port 0` (live-reload.md §4).
+/// How long [`bind`] waits for a server that may already answer on the address.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Binds `host:port` (each address `host` resolves to, in order, until one binds).
+///
+/// A port that another server already answers on is in use (live-reload.md §4: an error
+/// with the hint to use `--port 0`), also when the bind itself succeeds: the listener
+/// sets `SO_REUSEADDR` (so that a restart is not refused while connections of the previous
+/// run linger in `TIME_WAIT`), and on macOS and the BSDs that lets it bind `127.0.0.1:P`
+/// although another server listens on `0.0.0.0:P` or a dual-stack `[::]:P`. So, unless the
+/// port is 0, each address is first probed with a connection (an unspecified address at
+/// its loopback address). Errors name the address and hint at the fix ([`bind_error`]).
 async fn bind(host: &str, port: u16) -> anyhow::Result<TcpListener> {
-    TcpListener::bind((host, port))
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|err| bind_error(host, port, &err))
+        .map_err(|err| {
+            let err = io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("cannot resolve {host}: {err}"),
+            );
+            bind_error(host, port, &err)
+        })?
+        .collect();
+    let taken = if port == 0 {
+        None
+    } else {
+        answering(&addrs).await
+    };
+    let listener = TcpListener::bind(addrs.as_slice())
+        .await
+        .map_err(|err| bind_error(host, port, &err))?;
+    match taken {
+        Some(addr) => {
+            let err = io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("another server already answers on {addr}"),
+            );
+            Err(bind_error(host, port, &err))
+        }
+        None => Ok(listener),
+    }
 }
 
-/// The error for a failed bind of `host:port`.
-fn bind_error(host: &str, port: u16, err: &std::io::Error) -> anyhow::Error {
-    let address = match host.parse::<IpAddr>() {
+/// The first of `addrs` (an unspecified address at its loopback address) where a server
+/// accepts a connection within [`PROBE_TIMEOUT`].
+async fn answering(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    for addr in addrs.iter().map(|addr| browser_addr(*addr)) {
+        let connect = tokio::net::TcpStream::connect(addr);
+        if let Ok(Ok(_)) = tokio::time::timeout(PROBE_TIMEOUT, connect).await {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+/// The error for a failed bind of `host:port`: names the address, then a hint by the
+/// kind of `err`: `--port 0` for a port in use (or one that needs privileges), the host
+/// settings for an address that cannot be used here (or resolved).
+fn bind_error(host: &str, port: u16, err: &io::Error) -> anyhow::Error {
+    let address = display_address(host, port);
+    let hint = match err.kind() {
+        io::ErrorKind::AddrInUse => Some("use --port 0 to pick a free port"),
+        io::ErrorKind::PermissionDenied if port != 0 => Some("use --port 0 to pick a free port"),
+        io::ErrorKind::AddrNotAvailable => {
+            Some("check --host, or host in [serve] of presenter.toml")
+        }
+        _ => None,
+    };
+    match hint {
+        Some(hint) => anyhow::anyhow!("cannot listen on {address}: {err} ({hint})"),
+        None => anyhow::anyhow!("cannot listen on {address}: {err}"),
+    }
+}
+
+/// `host:port` for messages (an IPv6 address in brackets).
+fn display_address(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
         Ok(ip) => SocketAddr::new(ip, port).to_string(),
         Err(_) => format!("{host}:{port}"),
-    };
-    anyhow::anyhow!("cannot listen on {address}: {err} (use --port 0 to pick a free port)")
+    }
 }
 
 /// A future that completes on Ctrl-C (SIGINT). The handler is installed by this call, not
@@ -258,8 +384,9 @@ fn open_browser(url: String) {
 }
 
 /// Receives change batches and rebuilds on the blocking pool, one rebuild at a time; the
-/// batches that arrive meanwhile are merged into the next rebuild. Ends when the watcher
-/// stops (or the task is aborted on shutdown).
+/// batches that arrive meanwhile are merged into the next rebuild. Runs until the task is
+/// aborted at shutdown (the session's watcher keeps the channel open), or until a rebuild
+/// panics outside the build itself (which [`try_build`] turns into a build error).
 async fn rebuild_loop(
     mut session: Session,
     mut batches: tokio_mpsc::UnboundedReceiver<ChangeBatch>,
@@ -281,7 +408,6 @@ async fn rebuild_loop(
             }
         };
     }
-    tracing::warn!("the file watcher stopped; live reload is off");
 }
 
 /// The batches of `queued` as one: their paths (sorted, without duplicates), classified
@@ -322,11 +448,21 @@ struct Session {
     set: WatchSet,
     /// The inputs of the latest successful build.
     last_good: Option<WatchSet>,
+    /// The `[serve]` settings the server was started with (read once).
+    listening: ServeConfig,
+    /// The last [`restart_note`] printed, so that it is printed once per change.
+    restart_note: Option<String>,
 }
 
 impl Session {
-    /// A session with nothing built yet.
-    fn new(opts: BuildOptions, site_preview: bool, global: GlobalArgs, watcher: Watcher) -> Self {
+    /// A session with nothing built yet, for a server started with `listening`.
+    fn new(
+        opts: BuildOptions,
+        site_preview: bool,
+        global: GlobalArgs,
+        watcher: Watcher,
+        listening: &ServeConfig,
+    ) -> Self {
         Session {
             opts,
             site_preview,
@@ -337,6 +473,8 @@ impl Session {
             watcher,
             set: WatchSet::default(),
             last_good: None,
+            listening: listening.clone(),
+            restart_note: None,
         }
     }
 
@@ -439,7 +577,27 @@ impl Session {
         self.last_good = Some(set.clone());
         self.watch(set);
         report_diagnostics(&build.diagnostics, &self.global);
+        self.note_restart(&build);
         build_id
+    }
+
+    /// Warns (once per change) when the `[serve]` address of `build`'s configuration is not
+    /// the one the server listens on: it is read only at start.
+    fn note_restart(&mut self, build: &Build) {
+        let note = restart_note(&self.listening, &build.config.serve);
+        if let Some(text) = note
+            .as_ref()
+            .filter(|text| self.restart_note.as_ref() != Some(*text))
+        {
+            let mut diagnostic = Diagnostic::warning(SERVE_CONFIG_CODE, text.clone());
+            if let Some(path) = &build.config_path {
+                diagnostic = diagnostic.with_path(path);
+            }
+            let mut diagnostics = Diagnostics::new();
+            diagnostics.push(diagnostic);
+            report_diagnostics(&diagnostics, &self.global);
+        }
+        self.restart_note = note;
     }
 
     /// Has the watcher watch `set`; a directory that cannot be watched is a warning.
@@ -468,26 +626,55 @@ fn try_build(opts: &BuildOptions) -> Result<Build, BuildFailure> {
     )
 }
 
+/// The warning for a configuration whose `[serve]` address (`configured`) is not the one
+/// the server listens on (`listening`), else `None`.
+fn restart_note(listening: &ServeConfig, configured: &ServeConfig) -> Option<String> {
+    let now = display_address(&listening.host, listening.port);
+    let wanted = display_address(&configured.host, configured.port);
+    (now != wanted).then(|| {
+        format!(
+            "[serve] now asks for {wanted}, but the server was started with {now}: restart \
+             presenter serve to apply it"
+        )
+    })
+}
+
 /// Appends `?v=<version>` ([`file_version`]) to every `/__presenter/deck-asset/<id>` URL
-/// of a file asset in the serve-mode document of `build` (module docs). Ids have a fixed
-/// length, so one id's URL is never the start of another's. A file that cannot be read is
-/// left alone (the asset route answers 404 for it).
+/// of a file asset in the serve-mode document of `build` (module docs), in one pass over
+/// the document. A file that cannot be read is left alone (the asset route answers 404
+/// for it).
 fn version_file_assets(build: &mut Build) {
-    for asset in build.assets.iter() {
-        let AssetData::File(path) = &asset.data else {
-            continue;
-        };
-        let Some(version) = file_version(path) else {
-            continue;
-        };
-        let url = format!("{SERVE_ASSET_PREFIX}{}", asset.id);
-        if build.document.html.contains(&url) {
-            build.document.html = build
-                .document
-                .html
-                .replace(&url, &format!("{url}?v={version}"));
-        }
+    let versions: BTreeMap<&str, u64> = build
+        .assets
+        .iter()
+        .filter_map(|asset| match &asset.data {
+            AssetData::File(path) => Some((asset.id.as_str(), file_version(path)?)),
+            _ => None,
+        })
+        .collect();
+    if !versions.is_empty() {
+        build.document.html = versioned_urls(&build.document.html, &versions);
     }
+}
+
+/// `html` with `?v=<version>` after each `/__presenter/deck-asset/<id>` whose id (always
+/// [`ID_LEN`] characters) has a version in `versions`.
+fn versioned_urls(html: &str, versions: &BTreeMap<&str, u64>) -> String {
+    let mut out = String::with_capacity(html.len() + 24 * versions.len());
+    let mut rest = html;
+    while let Some(at) = rest.find(SERVE_ASSET_PREFIX) {
+        let id_start = at + SERVE_ASSET_PREFIX.len();
+        let id = rest.get(id_start..id_start + ID_LEN);
+        let end = id.map_or(id_start, |id| id_start + id.len());
+        out.push_str(&rest[..end]);
+        if let Some(version) = id.and_then(|id| versions.get(id)) {
+            out.push_str("?v=");
+            out.push_str(&version.to_string());
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A number that changes when the file at `path` is rewritten: a hash of its modification
@@ -540,9 +727,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bind_errors_name_the_address_and_suggest_port_0() {
-        let err = std::io::Error::from(std::io::ErrorKind::AddrInUse);
-        let message = bind_error("127.0.0.1", 3000, &err).to_string();
+    fn bind_errors_name_the_address_and_hint_by_kind() {
+        let in_use = io::Error::from(io::ErrorKind::AddrInUse);
+        let message = bind_error("127.0.0.1", 3000, &in_use).to_string();
         assert!(
             message.starts_with("cannot listen on 127.0.0.1:3000: "),
             "{message}"
@@ -551,11 +738,40 @@ mod tests {
             message.ends_with("(use --port 0 to pick a free port)"),
             "{message}"
         );
-        assert!(bind_error("::1", 80, &err).to_string().contains("[::1]:80"));
         assert!(
-            bind_error("localhost", 80, &err)
+            bind_error("::1", 80, &in_use)
+                .to_string()
+                .contains("[::1]:80")
+        );
+        assert!(
+            bind_error("localhost", 80, &in_use)
                 .to_string()
                 .contains("localhost:80")
+        );
+        // A privileged port: --port 0 helps; with port 0 already, it does not.
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(
+            bind_error("127.0.0.1", 80, &denied)
+                .to_string()
+                .contains("--port 0")
+        );
+        assert!(
+            !bind_error("127.0.0.1", 0, &denied)
+                .to_string()
+                .contains("--port 0")
+        );
+        // The host is the problem: point at the host settings, not at the port.
+        let elsewhere = io::Error::from(io::ErrorKind::AddrNotAvailable);
+        let message = bind_error("192.0.2.1", 0, &elsewhere).to_string();
+        assert!(
+            message.ends_with("(check --host, or host in [serve] of presenter.toml)"),
+            "{message}"
+        );
+        assert!(!message.contains("--port 0"), "{message}");
+        let other = io::Error::other("boom");
+        assert_eq!(
+            bind_error("127.0.0.1", 3000, &other).to_string(),
+            "cannot listen on 127.0.0.1:3000: boom"
         );
     }
 
@@ -567,6 +783,106 @@ mod tests {
         assert!(err.to_string().contains("--port 0"), "{err}");
         let free = bind("127.0.0.1", 0).await.unwrap();
         assert_ne!(free.local_addr().unwrap().port(), 0);
+    }
+
+    /// With `SO_REUSEADDR` (which the listener sets), macOS lets `127.0.0.1:P` be bound
+    /// while another server listens on `0.0.0.0:P` or a dual-stack `[::]:P`; the probe in
+    /// `bind` reports the port as in use anyway (on Linux the bind itself fails).
+    #[tokio::test]
+    async fn a_port_held_on_a_wildcard_address_is_in_use() {
+        let v4 = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let err = bind("127.0.0.1", port).await.unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("cannot listen on 127.0.0.1:{port}: ")),
+            "{err}"
+        );
+        assert!(err.ends_with("(use --port 0 to pick a free port)"), "{err}");
+        drop(v4);
+        // A dual-stack [::] listener, where the system has IPv6 and makes it dual-stack.
+        let Ok(v6) = std::net::TcpListener::bind("[::]:0") else {
+            return;
+        };
+        let port = v6.local_addr().unwrap().port();
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let err = bind("127.0.0.1", port).await.unwrap_err().to_string();
+            assert!(err.contains("--port 0"), "{err}");
+        }
+    }
+
+    /// The probe does not mistake a port whose previous server is gone, with connections
+    /// left in `TIME_WAIT` on the server side, for one in use (a restart on the same port).
+    #[tokio::test]
+    async fn a_port_left_in_time_wait_can_be_bound_again() {
+        let first = bind("127.0.0.1", 0).await.unwrap();
+        let addr = first.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (accepted, _) = first.accept().await.unwrap();
+        // The server side closes first, so its end of the connection enters TIME_WAIT.
+        drop(accepted);
+        drop(first);
+        drop(client);
+        let again = bind("127.0.0.1", addr.port()).await.unwrap();
+        assert_eq!(again.local_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn an_address_of_another_machine_is_a_host_error() {
+        // TEST-NET-1 (RFC 5737) is no address of this machine; port 0 skips the probe.
+        let err = bind("192.0.2.1", 0).await.unwrap_err().to_string();
+        assert!(err.starts_with("cannot listen on 192.0.2.1:0: "), "{err}");
+        assert!(!err.contains("--port 0"), "{err}");
+    }
+
+    #[test]
+    fn a_changed_serve_address_needs_a_restart() {
+        let started = ServeConfig::default();
+        assert_eq!(restart_note(&started, &ServeConfig::default()), None);
+        let open = ServeConfig {
+            open: true,
+            ..ServeConfig::default()
+        };
+        assert_eq!(
+            restart_note(&started, &open),
+            None,
+            "only the address counts"
+        );
+        let moved = ServeConfig {
+            port: 4000,
+            ..ServeConfig::default()
+        };
+        assert_eq!(
+            restart_note(&started, &moved).as_deref(),
+            Some(
+                "[serve] now asks for 127.0.0.1:4000, but the server was started with \
+                 127.0.0.1:3000: restart presenter serve to apply it"
+            )
+        );
+    }
+
+    #[test]
+    fn versioned_urls_take_one_pass() {
+        let a = "0123456789ab";
+        let b = "ba9876543210";
+        let versions = BTreeMap::from([(a, 7_u64), (b, 42)]);
+        let html = format!(
+            "<img src=\"/__presenter/deck-asset/{a}\"><img src=\"/__presenter/deck-asset/{b}\">\
+             <a href=\"/__presenter/deck-asset/{a}\">ä</a>\
+             <img src=\"/__presenter/deck-asset/ffffffffffff\">/__presenter/deck-asset/ä"
+        );
+        assert_eq!(
+            versioned_urls(&html, &versions),
+            format!(
+                "<img src=\"/__presenter/deck-asset/{a}?v=7\"><img src=\"/__presenter/deck-asset/{b}?v=42\">\
+                 <a href=\"/__presenter/deck-asset/{a}?v=7\">ä</a>\
+                 <img src=\"/__presenter/deck-asset/ffffffffffff\">/__presenter/deck-asset/ä"
+            )
+        );
+        assert_eq!(versioned_urls("no assets", &versions), "no assets");
+        assert_eq!(
+            versioned_urls("/__presenter/deck-asset/0123", &versions),
+            "/__presenter/deck-asset/0123"
+        );
     }
 
     #[test]
@@ -716,7 +1032,7 @@ mod tests {
         assert_eq!(opts.cli.theme.as_deref(), Some("./t"));
         assert_eq!(opts.cli.port, Some(0));
         assert_eq!(opts.cli.open, None);
-        let config = serve_config(&opts);
+        let config = serve_config(&opts, &GlobalArgs::default());
         assert_eq!((config.host.as_str(), config.port), ("127.0.0.1", 0));
 
         let site = ServeArgs {

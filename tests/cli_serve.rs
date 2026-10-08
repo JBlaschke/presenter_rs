@@ -117,6 +117,31 @@ impl Server {
         self.stderr.lock().unwrap().clone()
     }
 
+    /// Waits until `pattern` matches stderr at least `count` times; returns stderr. The
+    /// server writes a rebuild's line after it stores the build, so a test that saw the
+    /// build in `/__presenter/state` must wait for the line. Fails after [`REBUILD_TIMEOUT`].
+    fn wait_for_stderr(&self, pattern: &str, count: usize) -> String {
+        let pattern = Regex::new(pattern).unwrap();
+        let start = Instant::now();
+        loop {
+            let stderr = self.stderr();
+            if pattern.find_iter(&stderr).count() >= count {
+                return stderr;
+            }
+            assert!(
+                start.elapsed() < REBUILD_TIMEOUT,
+                "{count} × {pattern} not on stderr within {REBUILD_TIMEOUT:?}:\n{stderr}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Sends SIGINT and waits (at most 10 s) for the child to exit; returns its exit code.
+    #[cfg(unix)]
+    fn interrupt(&mut self) -> Option<i32> {
+        interrupt(&mut self.child, &self.stderr)
+    }
+
     /// `GET path`: status, `Content-Type` and body (as text, lossily).
     fn get(&self, path: &str) -> (u16, String, String) {
         let url = format!("{}{}", self.url, path.trim_start_matches('/'));
@@ -235,9 +260,7 @@ fn serve_rebuilds_on_change_and_survives_errors() {
     assert_eq!(sections(&server.text("/")), before + 2);
 
     // One line per rebuild on stderr: the timing, or the error.
-    let stderr = server.stderr();
-    let rebuilt = Regex::new(r"(?m)^rebuilt in \d+ ms \(content\)$").unwrap();
-    assert!(rebuilt.find_iter(&stderr).count() >= 2, "{stderr}");
+    let stderr = server.wait_for_stderr(r"(?m)^rebuilt in \d+ ms \(content\)$", 2);
     assert!(
         stderr
             .lines()
@@ -342,11 +365,7 @@ fn builds_are_broadcast_as_css_or_content() {
     let build = next_build(&events);
     assert_eq!(build["kind"], "content", "{build}");
     assert_eq!(build["status"], "ok", "{build}");
-    assert!(
-        server.stderr().contains(" ms (css)\n"),
-        "{}",
-        server.stderr()
-    );
+    server.wait_for_stderr(r"(?m)^rebuilt in \d+ ms \(css\)$", 1);
 }
 
 /// An edited image is a content build, and its URL in the document changes (a browser that
@@ -384,11 +403,7 @@ fn an_edited_image_gets_a_new_url() {
         .read_to_vec()
         .unwrap();
     assert_eq!(response, b"\x89PNG second, longer");
-    assert!(
-        server.stderr().contains(" ms (content)\n"),
-        "{}",
-        server.stderr()
-    );
+    server.wait_for_stderr(r"(?m)^rebuilt in \d+ ms \(content\)$", 1);
 }
 
 /// A first build that fails still starts the server (with the error page), and its inputs
@@ -450,24 +465,27 @@ fn site_preview_serves_the_site_layout() {
 }
 
 /// live-reload.md §4: a port that cannot be bound ends the command with exit 1 and the
-/// hint to use `--port 0`; nothing is printed on stdout.
+/// hint to use `--port 0`; nothing is printed on stdout. Also when the other server listens
+/// on the wildcard address, which macOS would otherwise let presenter shadow.
 #[test]
 fn a_port_in_use_exits_1_with_a_hint() {
     let dir = project(&[("a.md", &minimal())]);
-    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = taken.local_addr().unwrap().port().to_string();
-    let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_presenter"))
-        .args(["serve", "a.md", "--port", &port])
-        .current_dir(dir.path())
-        .env_remove("RUST_LOG")
-        .timeout(Duration::from_secs(60))
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
-    assert!(stderr.contains(&format!("127.0.0.1:{port}")), "{stderr}");
-    assert!(stderr.contains("--port 0"), "{stderr}");
+    for holder in ["127.0.0.1:0", "0.0.0.0:0"] {
+        let taken = std::net::TcpListener::bind(holder).unwrap();
+        let port = taken.local_addr().unwrap().port().to_string();
+        let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_presenter"))
+            .args(["serve", "a.md", "--port", &port])
+            .current_dir(dir.path())
+            .env_remove("RUST_LOG")
+            .timeout(Duration::from_secs(60))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{holder}: {stderr}");
+        assert!(output.stdout.is_empty(), "{holder}: {:?}", output.stdout);
+        assert!(stderr.contains(&format!("127.0.0.1:{port}")), "{stderr}");
+        assert!(stderr.contains("--port 0"), "{stderr}");
+    }
 }
 
 /// An input whose format cannot be told is a usage error (exit 2) before anything starts.
@@ -484,6 +502,27 @@ fn an_unknown_input_format_exits_2() {
     assert!(output.stdout.is_empty());
 }
 
+/// Sends SIGINT to `child` and waits (at most 10 s) for it to exit; returns its exit code
+/// (`None`: ended by a signal).
+#[cfg(unix)]
+fn interrupt(child: &mut Child, stderr: &Mutex<String>) -> Option<i32> {
+    let pid = child.id().to_string();
+    let kill = Command::new("kill").args(["-INT", &pid]).status().unwrap();
+    assert!(kill.success());
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.code();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "still running after SIGINT; stderr:\n{}",
+            stderr.lock().unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// cli.md: Ctrl-C (SIGINT) exits 0, also with a browser connected to the event stream.
 #[cfg(unix)]
 #[test]
@@ -492,24 +531,88 @@ fn ctrl_c_exits_0() {
     let mut server = Server::start(dir.path(), &["a.md", "--port", "0"]);
     let events = events(&server);
     assert_eq!(events.recv_timeout(REBUILD_TIMEOUT).unwrap().0, "hello");
-    let pid = server.child.id().to_string();
-    let kill = Command::new("kill").args(["-INT", &pid]).status().unwrap();
-    assert!(kill.success());
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = server.child.try_wait().unwrap() {
-            break status;
+    assert_eq!(server.interrupt(), Some(0), "{}", server.stderr());
+    // The child has exited: its stdout ends, and nothing followed the URL.
+    let rest: Vec<String> = server.stdout_rest.iter().collect();
+    assert!(rest.is_empty(), "only the URL on stdout: {rest:?}");
+}
+
+/// cli.md: Ctrl-C exits 0 also during the first build (before the URL is printed): the
+/// handler is installed before it starts. The deck is large enough that a debug build of it
+/// takes a while; the signal is sent once the log says the first build has started.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_during_the_first_build_exits_0() {
+    let slides: String = (0..3000)
+        .map(|i| format!("## Slide {i}\n\nText with *emphasis* and `code`.\n\n---\n\n"))
+        .collect();
+    let dir = project(&[("big.md", &slides)]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_presenter"))
+        .args(["-v", "serve", "big.md", "--port", "0"])
+        .current_dir(dir.path())
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&stderr);
+    let mut err = child.stderr.take().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = err.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
         }
+    });
+    let start = Instant::now();
+    while !stderr.lock().unwrap().contains("first build of big.md") {
         assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "still running after SIGINT; stderr:\n{}",
-            server.stderr()
+            start.elapsed() < Duration::from_secs(60),
+            "the first build never started:\n{}",
+            stderr.lock().unwrap()
         );
-        thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(status.code(), Some(0), "{}", server.stderr());
+        thread::sleep(Duration::from_millis(5));
+    }
+    let code = interrupt(&mut child, &stderr);
+    assert_eq!(code, Some(0), "{}", stderr.lock().unwrap());
+}
+
+/// A `presenter.toml` that cannot be loaded at start: the server still starts, on the
+/// default `[serve]` settings with the command line applied, and says so on stderr. Once
+/// fixed, a `[serve]` address other than the one in use gets a note that a restart is
+/// needed.
+#[test]
+fn an_unreadable_config_is_reported_and_serve_changes_need_a_restart() {
+    let dir = project(&[
+        ("presenter.toml", "[deck]\nlang = 5\n"),
+        ("a.md", &minimal()),
+    ]);
+    let server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    assert_eq!(server.state()["status"], "error");
+    let stderr = server.wait_for_stderr(r"(?m)^warning: the \[serve\] settings cannot be read", 1);
     assert!(
-        server.stdout_rest.try_recv().is_err(),
-        "only the URL on stdout"
+        stderr.contains("listens on 127.0.0.1:0 until it is restarted"),
+        "{stderr}"
+    );
+
+    write(
+        &dir.path().join("presenter.toml"),
+        "[serve]\nhost = \"localhost\"\n",
+    );
+    server.wait_for(1, "ok");
+    let stderr = server.wait_for_stderr(r"presenter\.toml: warning: \[serve\] now asks for", 1);
+    assert!(
+        stderr.contains(
+            "[serve] now asks for localhost:0, but the server was started with 127.0.0.1:0: \
+             restart presenter serve to apply it"
+        ),
+        "{stderr}"
     );
 }
