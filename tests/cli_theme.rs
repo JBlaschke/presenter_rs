@@ -519,6 +519,14 @@ fn check_fails_on_manifest_and_chain_errors() {
         assert_eq!(code, 1, "{dir}: {stdout}{stderr}");
         assert!(stderr.starts_with("error: "), "{dir}: {stderr}");
         assert!(stderr.contains(message), "{dir}: {message:?} in {stderr}");
+        // Resolution errors of the checked theme name the directory as typed, not its
+        // absolute path.
+        if matches!(*dir, "unknown-key" | "typo" | "incomplete-root") {
+            assert!(
+                stderr.starts_with(&format!("error: theme '{dir}': ")),
+                "{dir}: {stderr}"
+            );
+        }
     }
     presenter(tmp.path())
         .args(["theme", "check", "typo"])

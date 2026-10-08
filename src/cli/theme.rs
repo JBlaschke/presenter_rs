@@ -690,7 +690,17 @@ fn check(args: &ThemeCheckArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode>
     let spec = absolute
         .to_str()
         .ok_or_else(|| anyhow!("theme check: {} is not a valid UTF-8 path", dir.display()))?;
-    let theme = theme::resolve(spec, &[])?;
+    // Errors name the theme by its spec; report the directory as the user wrote it rather
+    // than the absolute path used for resolution.
+    let theme = theme::resolve(spec, &[]).map_err(|err| match err {
+        crate::error::Error::Theme { name, message } if name == spec => {
+            crate::error::Error::Theme {
+                name: dir.display().to_string(),
+                message,
+            }
+        }
+        other => other,
+    })?;
     if !matches!(theme.chain[0].source, ThemeSource::Disk { .. }) {
         // Cannot happen: an absolute spec is never a built-in theme name.
         return Err(anyhow!(

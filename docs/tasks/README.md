@@ -41,7 +41,7 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T33 | Notebook theming and executed example notebook | M3 | M | T32, T17 | todo |
 | T34 | `check` command and lints | M3 | M | T16, T31 | todo |
 | T40 | `init` scaffold | M4 | S | T16 | todo |
-| T41 | `theme list/eject/new/check` | M4 | S | T13 | todo |
+| T41 | `theme list/eject/new/check` | M4 | S | T13 | done |
 | T42 | SCSS themes via grass, reveal template imports, CSS asset inlining | M4 | M | T14, T17 | todo |
 | T43 | Heading-split mode, incremental lists, reveal compat comments | M4 | M | T11, T12 | done |
 | T44 | Diagnostics quality | M4 | S | T16, T22 | todo |
