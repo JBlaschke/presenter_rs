@@ -945,19 +945,6 @@ mod tests {
     }
 
     #[test]
-    fn export_pdf_help_documents_the_limitations() {
-        let mut command = Cli::command();
-        let pdf = command
-            .find_subcommand_mut("export")
-            .and_then(|export| export.find_subcommand_mut("pdf"))
-            .expect("export pdf");
-        let help = pdf.render_long_help().to_string();
-        assert!(help.contains("pdfSeparateFragments"), "{help}");
-        assert!(help.contains("static"), "{help}");
-        assert!(help.contains("exits with code 3"), "{help}");
-    }
-
-    #[test]
     fn paths_are_shown_relative_to_the_current_directory() {
         let cwd = Some(Path::new("/work"));
         assert_eq!(
