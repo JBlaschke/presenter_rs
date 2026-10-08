@@ -608,3 +608,34 @@ fn rust_log_adds_to_the_verbosity_flags() {
         .stdout("")
         .stderr("");
 }
+
+/// T47: `presenter --version` names the exact build, `presenter <version> (<build id>)`,
+/// where the build id is what `build.rs` embeds: `git describe --always --dirty` output
+/// (`33a4607`, `v0.1.0`, `v0.1.0-3-g33a4607`, each optionally `-dirty`), `unknown` without
+/// git, or the `PRESENTER_GIT_SHA` override.
+#[test]
+fn version_names_the_build() {
+    let line =
+        Regex::new(r"^presenter (\d+\.\d+\.\d+\S*) \(([0-9A-Za-z][0-9A-Za-z._+/-]*)\)\n$").unwrap();
+    let build_id = env!("PRESENTER_GIT_SHA");
+    for flag in ["--version", "-V"] {
+        let stdout = stdout_of(presenter().arg(flag));
+        let caps = line
+            .captures(&stdout)
+            .unwrap_or_else(|| panic!("{flag}: {stdout:?}"));
+        assert_eq!(&caps[1], env!("CARGO_PKG_VERSION"));
+        assert_eq!(&caps[2], build_id);
+    }
+    // Built from a git checkout without the override: described, not the fallback
+    // (tests/build_script.rs covers the forms of the description).
+    let git_installed = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok();
+    if root().join(".git").exists()
+        && git_installed
+        && std::env::var_os("PRESENTER_GIT_SHA").is_none()
+    {
+        assert_ne!(build_id, "unknown");
+    }
+}
