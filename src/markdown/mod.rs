@@ -9,9 +9,14 @@
 //!    front matter can switch `slides.split` or `markdown.*`; when it changes
 //!    `markdown.smart_punctuation` the text is parsed again with the new options;
 //! 3. [`split::split_with_source`] splits the document into slides;
-//! 4. each slide is rendered by [`render::render_nodes`]; its attributes (separator plus
-//!    lifted heading attributes) are applied with `SlideAttrs::apply_to`, and relative
-//!    background images/videos/iframes are registered ([`render::rewrite_slide_assets`]);
+//! 4. each slide is rendered by [`render::render_nodes`] (through [`compat::render_slide`],
+//!    which splits off a `Note:` paragraph and what follows as notes); its attributes
+//!    (separator, `<!-- .slide: -->` comments and lifted heading attributes) are applied with
+//!    `SlideAttrs::apply_to`, an image-like `data-background` becomes
+//!    `data-background-image` ([`compat::image_background`]), and relative background
+//!    images/videos/iframes are registered ([`render::rewrite_slide_assets`]); the body and notes HTML then go through
+//!    [`postprocess`] (`<!-- .element: -->` comments; incremental lists in the body when
+//!    [`postprocess::incremental_enabled`] says so for the slide);
 //! 5. `Deck.features` is the union of the slides' features and `Deck.assets` summarizes the
 //!    registry. The splitter's and the renderer's diagnostics get the source path and are
 //!    ordered by line.
@@ -38,14 +43,14 @@ use crate::assets::registry::AssetRegistry;
 use crate::config::{Config, MarkdownConfig, SlideSplit, SlidesConfig};
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{Block, Deck, DeckMeta, Features, Parsed, Slide, SourceInfo};
-use crate::markdown::render::{RenderCtx, RenderMode, render_nodes, rewrite_slide_assets};
+use crate::markdown::render::{RenderCtx, RenderMode, rewrite_slide_assets};
 use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
 
 /// Parses a Markdown deck into the IR (see the module docs for the steps).
 ///
 /// Errors: `Error::FrontMatter` for invalid front matter (or front matter the config
 /// rejects), `Error::Parse { path: source.path, line, .. }` for a separator attribute block
-/// with an unbalanced quote, and `Error::Other` for `slides.split = "headings"` until T43.
+/// or `<!-- .slide: -->` comment with an unbalanced quote.
 pub fn parse(source: &SourceInfo, text: &str, config: &Config) -> Result<Parsed> {
     let arena = Arena::new();
     let first_opts = comrak_options(&config.markdown);
@@ -71,10 +76,14 @@ pub fn parse(source: &SourceInfo, text: &str, config: &Config) -> Result<Parsed>
         diagnostics: &mut diagnostics,
         missing_asset_is_error: false,
     };
+    let incremental = deck_config.slides.incremental_lists;
+    let lines = split::source_lines(text);
     for (raw_slide, raw_children) in raw.slides {
-        let mut slide = build_slide(&arena, raw_slide, &opts, &mut ctx, &mut features)?;
+        let mut slide = build_slide(&arena, raw_slide, &lines, &opts, &mut ctx, &mut features)?;
+        postprocess_slide(&mut slide, incremental, ctx.diagnostics)?;
         for raw_child in raw_children {
-            let child = build_slide(&arena, raw_child, &opts, &mut ctx, &mut features)?;
+            let mut child = build_slide(&arena, raw_child, &lines, &opts, &mut ctx, &mut features)?;
+            postprocess_slide(&mut child, incremental, ctx.diagnostics)?;
             slide.children.push(child);
         }
         slides.push(slide);
@@ -150,18 +159,21 @@ fn split_mode(slides: &SlidesConfig) -> SplitMode {
     }
 }
 
-/// Renders one raw slide into an IR [`Slide`] (without children).
+/// Renders one raw slide into an IR [`Slide`] (without children); `lines` is the source
+/// split by [`split::source_lines`] (for `Note:` paragraphs, T43).
 fn build_slide<'a>(
     arena: &'a Arena<'a>,
     raw: RawSlide<'a>,
+    lines: &[&str],
     opts: &Options,
     ctx: &mut RenderCtx,
     features: &mut Features,
 ) -> Result<Slide> {
     let span = raw.span();
-    let rendered = render_nodes(arena, &raw.nodes, opts, ctx)?;
+    let rendered = compat::render_slide(arena, &raw.nodes, Some(lines), opts, ctx)?;
     let mut slide = Slide::new();
     raw.attrs.apply_to(&mut slide);
+    compat::image_background(&mut slide.attrs);
     rewrite_slide_assets(&mut slide.attrs, Some(&span), ctx)?;
     slide.title = rendered.title;
     slide.notes = rendered.notes;
@@ -171,6 +183,23 @@ fn build_slide<'a>(
     }
     features.merge(rendered.features);
     Ok(slide)
+}
+
+/// [`postprocess`] for a built slide (T43): `.element:` comments in its body and notes, and
+/// incremental lists in its body when [`postprocess::incremental_enabled`] (`config` is
+/// `slides.incremental_lists`).
+fn postprocess_slide(slide: &mut Slide, config: bool, diagnostics: &mut Diagnostics) -> Result<()> {
+    let incremental = postprocess::incremental_enabled(config, &slide.classes);
+    let span = slide.span.clone();
+    for block in &mut slide.blocks {
+        if let Block::Html { html } = block {
+            *html = postprocess::slide_html(html, incremental, span.as_ref(), diagnostics)?;
+        }
+    }
+    if let Some(notes) = &mut slide.notes {
+        *notes = postprocess::element_attributes(notes, span.as_ref(), diagnostics)?;
+    }
+    Ok(())
 }
 
 /// `split` reports separator errors without a path; fill in the source file.

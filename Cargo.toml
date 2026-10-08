@@ -43,6 +43,7 @@ ansi-to-html = "0.2"
 regex = "1"
 walkdir = "2"
 open = "5"
+lol_html = "3"
 
 [dev-dependencies]
 insta = { version = "1.49", features = ["json", "filters", "redactions"] }

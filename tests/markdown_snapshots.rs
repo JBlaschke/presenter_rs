@@ -554,10 +554,9 @@ fn front_matter_errors_and_bad_separators() {
         }
         other => panic!("expected Error::Parse, got {other:?}"),
     }
-    assert!(matches!(
-        parse_text("---\nslides:\n  split: headings\n---\n\n# x\n"),
-        Err(Error::Other(_))
-    ));
+    // headings mode (T43) is implemented: front matter switches it on
+    let headings = parse_text("---\nslides:\n  split: headings\n---\n\n# x\n\n## y\n").unwrap();
+    assert_eq!(shape(&headings.deck), [1]);
 }
 
 #[test]
