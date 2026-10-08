@@ -306,10 +306,12 @@ pub fn parse_only(opts: &BuildOptions) -> Result<(Parsed, Config, Option<PathBuf
 
 /// [`parse_only`], keeping the frontend's diagnostics when the config rejects the deck's
 /// front matter ([`Config::merge_front_matter`] fails): the failure's diagnostics are the
-/// parsed deck's, so the deck's warnings are reported with the error. The Markdown frontend
-/// leaves a `reveal.plugins` list to this merge (`reveal` does not change how a deck is
-/// parsed); a rejected config table (`slides:`, `markdown:`, …), and anything the notebook
-/// frontend rejects, fails the frontend itself, before it has diagnostics. Every other
+/// parsed deck's, so the deck's warnings are reported with the error. The frontends merge
+/// only the front matter tables that change how they parse (Markdown: `slides`,
+/// `markdown`; notebooks: `markdown`, `notebook`) before they parse, and leave the rest
+/// (`reveal`, `math`, …) to this merge, so only a rejected table that changes the parse
+/// fails the frontend itself, before it has diagnostics. A notebook's error still names
+/// the metadata layer it came from (`metadata.presenter: …`, `cell N: …`). Every other
 /// error (reading the input, `presenter.toml`, the frontend's errors) comes without
 /// diagnostics.
 pub fn try_parse_only(
@@ -322,16 +324,23 @@ pub fn try_parse_only(
     let text = read_source(&opts.input)?;
     let source = source_info(&opts.input, kind)?;
     let (mut config, config_path) = load_config(opts)?;
-    let parsed = match kind {
-        SourceKind::Markdown => crate::markdown::parse(&source, &text, &config)?,
-        SourceKind::Notebook => crate::notebook::parse(&source, &text, &config)?,
+    let (parsed, deferred) = match kind {
+        SourceKind::Markdown => (
+            crate::markdown::parse_deferring_config(&source, &text, &config)?,
+            None,
+        ),
+        SourceKind::Notebook => crate::notebook::parse_deferring_config(&source, &text, &config)?,
     };
     tracing::debug!(
         diagnostics = parsed.diagnostics.len(),
         "parsed {} ({kind:?})",
         source.path.display()
     );
-    if let Err(error) = config.merge_front_matter(&parsed.deck.meta) {
+    let merged = match deferred {
+        Some(error) => Err(error),
+        None => config.merge_front_matter(&parsed.deck.meta),
+    };
+    if let Err(error) = merged {
         return Err(BuildFailure {
             error,
             diagnostics: parsed.diagnostics,
@@ -946,6 +955,16 @@ mod tests {
         assert!(matches!(prepare(&opts), Err(Error::Theme { .. })));
     }
 
+    /// `(code, level, start line)` of a failure's diagnostics.
+    fn found(failure: &BuildFailure) -> Vec<(&'static str, Level, usize)> {
+        let line = |d: &Diagnostic| d.span.as_ref().map_or(0, |s| s.start_line);
+        failure
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.level, line(d)))
+            .collect()
+    }
+
     #[test]
     fn rejected_front_matter_keeps_the_diagnostics_found_before_the_error() {
         let dir = project(&[
@@ -959,14 +978,6 @@ mod tests {
             ),
         ]);
         let opts = BuildOptions::new(dir.path().join("fp.md"));
-        let found = |failure: &BuildFailure| -> Vec<(&str, Level, usize)> {
-            let line = |d: &Diagnostic| d.span.as_ref().map_or(0, |s| s.start_line);
-            failure
-                .diagnostics
-                .iter()
-                .map(|d| (d.code, d.level, line(d)))
-                .collect()
-        };
         let rejected = |failure: &BuildFailure| {
             matches!(&failure.error, Error::FrontMatter(message)
                 if message.contains("unknown reveal plugin 'bogus'"))
@@ -1016,6 +1027,102 @@ mod tests {
             "{failure:?}"
         );
         assert!(failure.diagnostics.is_empty(), "{failure:?}");
+    }
+
+    #[test]
+    fn rejected_tables_the_frontend_does_not_read_keep_the_diagnostics() {
+        // A notebook whose first markdown cell is `first` and whose raw LaTeX cell warns.
+        let notebook = |metadata: serde_json::Value, first: &str| {
+            serde_json::json!({
+                "nbformat": 4, "nbformat_minor": 5, "metadata": metadata,
+                "cells": [
+                    {"cell_type": "markdown", "metadata": {}, "source": first},
+                    {"cell_type": "raw", "metadata": {"raw_mimetype": "text/latex"}, "source": "x"},
+                ],
+            })
+            .to_string()
+        };
+        let presenter_plugins = notebook(
+            serde_json::json!({"presenter": {"reveal": {"plugins": ["bogus"]}}}),
+            "# A",
+        );
+        let front_tables = notebook(
+            serde_json::json!({}),
+            "---\nslides:\n  splt: rules\nmath:\n  enable: never\n---\n# A",
+        );
+        let presenter_table = notebook(
+            serde_json::json!({"presenter": {"notebook": {"hide_inputs": []}}}),
+            "# A",
+        );
+        let dir = project(&[
+            (
+                "math.md",
+                "---\nmath:\n  enable: never\n---\n# A\n\n---\n\n---\n",
+            ),
+            (
+                "nb.md",
+                "---\nnotebook: {hide_inputs: []}\n---\n# A\n\n---\n\n---\n",
+            ),
+            ("plugins.ipynb", &presenter_plugins),
+            ("tables.ipynb", &front_tables),
+            ("table.ipynb", &presenter_table),
+        ]);
+        let raw_skipped = ("raw-cell-skipped", Level::Warning, 1);
+        let empty = |line| ("empty-slide", Level::Warning, line);
+        let cases = [
+            // Markdown reads only the `slides` and `markdown` tables.
+            (
+                "math.md",
+                "math: unknown field `enable`",
+                vec![empty(7), empty(9)],
+            ),
+            (
+                "nb.md",
+                "notebook: unknown field `hide_inputs`",
+                vec![empty(6), empty(8)],
+            ),
+            // Notebooks read only `markdown` and `notebook`; the error still names the layer.
+            (
+                "plugins.ipynb",
+                "metadata.presenter: unknown reveal plugin 'bogus'",
+                vec![raw_skipped],
+            ),
+            (
+                "tables.ipynb",
+                "cell 0: slides: unknown field `splt`",
+                vec![raw_skipped],
+            ),
+            // A table the conversion reads fails it, before there are diagnostics.
+            (
+                "table.ipynb",
+                "metadata.presenter: notebook: unknown field `hide_inputs`",
+                vec![],
+            ),
+        ];
+        for (name, error, diagnostics) in cases {
+            let path = dir.path().join(name);
+            let failure = try_build_deck(&BuildOptions::new(path.clone())).unwrap_err();
+            assert!(
+                matches!(&failure.error, Error::FrontMatter(message) if message.starts_with(error)),
+                "{name}: {failure:?}"
+            );
+            assert_eq!(found(&failure), diagnostics, "{name}");
+            // The public frontends still reject the front matter themselves (ir.md §4).
+            let kind = detect_kind(&path).unwrap();
+            let (source, text) = (
+                source_info(&path, kind).unwrap(),
+                read_source(&path).unwrap(),
+            );
+            let config = Config::default();
+            let strict = match kind {
+                SourceKind::Markdown => crate::markdown::parse(&source, &text, &config).err(),
+                SourceKind::Notebook => crate::notebook::parse(&source, &text, &config).err(),
+            };
+            assert!(
+                matches!(&strict, Some(Error::FrontMatter(message)) if message.starts_with(error)),
+                "{name}: {strict:?}"
+            );
+        }
     }
 
     /// A project whose child theme `t` (next to the deck, so `theme: t` finds it without a

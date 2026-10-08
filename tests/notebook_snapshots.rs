@@ -1308,9 +1308,9 @@ fn attachment_diagnostics_name_the_attachment_as_written() {
         .iter()
         .map(|d| d.message.as_str())
         .collect();
-    // Attachments are tried in name order: "empty.png" before "my plot.png".
-    assert_eq!(messages[0], "attachment 'empty.png' skipped: no data");
-    assert!(messages[1].starts_with("attachment 'my plot.png' skipped: invalid base64"));
+    // Attachments are registered in document order: "my plot.png" before "empty.png".
+    assert!(messages[0].starts_with("attachment 'my plot.png' skipped: invalid base64"));
+    assert_eq!(messages[1], "attachment 'empty.png' skipped: no data");
     assert_eq!(
         messages[2..],
         [
@@ -1394,6 +1394,188 @@ fn attachment_urls_spelled_differently_from_the_name_resolve() {
         );
     }
     assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
+}
+
+/// One markdown cell (`source`, with the attachment `a+b.png`) parsed with `config`.
+fn attachment_cell(source: &str, config: &Config) -> Parsed {
+    let cell = json!({
+        "cell_type": "markdown", "metadata": {}, "source": source,
+        "attachments": {"a+b.png": {"image/png": PIXEL_PNG}},
+    });
+    parse_inline(&notebook(json!([cell]), python()), config).unwrap()
+}
+
+#[test]
+fn attachment_urls_shown_in_code_stay_as_written() {
+    // comrak escapes `<` in code but not quotes: these are text, not tags, whatever the
+    // spelling (the exact name included) and whether the attachment exists.
+    let source = "Write `<img src='attachment:a%2Bb.png'>` or `<img src=\"attachment:a+b.png\">` \
+                  or `<img src=attachment:none.png>`:\n\n\
+                  ```html\n<img src=\"attachment:a%2Bb.png\"> <img src='attachment:none.png'>\n```\n\n\
+                  \x20   <img src=\"attachment:a+b.png\">\n\n\
+                  and the attachment:a+b.png text.\n";
+    let parsed = attachment_cell(source, &Config::default());
+    let body = html(&parsed.deck.slides[0].blocks[0]);
+    for shown in [
+        "<code>&lt;img src='attachment:a%2Bb.png'&gt;</code>",
+        "<code>&lt;img src=&quot;attachment:a+b.png&quot;&gt;</code>",
+        "<code>&lt;img src=attachment:none.png&gt;</code>",
+        "&lt;img src=\"attachment:a%2Bb.png\"&gt; &lt;img src='attachment:none.png'&gt;",
+        "<pre><code data-trim>&lt;img src=\"attachment:a+b.png\"&gt;</code></pre>",
+        "the attachment:a+b.png text",
+    ] {
+        assert!(body.contains(shown), "{shown} in {body}");
+    }
+    assert!(!body.contains("asset:"), "{body}");
+    assert!(
+        parsed.deck.assets.is_empty(),
+        "nothing loads the attachment"
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
+}
+
+#[test]
+fn attachment_urls_resolve_in_every_url_attribute_of_a_tag() {
+    let source = "<img src=attachment:a%2Bb.png> <IMG SRC=attachment:a+b.png alt=x>\n\
+                  <img srcset=\"attachment:a%2Bb.png 2x, attachment:none.png 1x,attachment:a+b.png\">\n\
+                  <video poster='attachment:a%2bb.png' data-src=\"attachment:a+b.png\"></video>\n\n\
+                  ![q](attachment:a%2Bb.png?v=1) ![f](attachment:a+b.png#x) \
+                  [link](attachment:a%2Bb.png#frag) ![m](attachment:none.png#x)\n";
+    let parsed = attachment_cell(source, &Config::default());
+    let body = html(&parsed.deck.slides[0].blocks[0]);
+    let id = &parsed.deck.assets[0].id;
+    let asset = format!("asset:{id}");
+    for resolved in [
+        format!("<img src={asset}>"),
+        format!("<IMG SRC={asset} alt=x>"),
+        format!("srcset=\"{asset} 2x, attachment:none.png 1x,{asset}\""),
+        format!("poster='{asset}' data-src=\"{asset}\""),
+        format!("src=\"{asset}?v=1\""),
+        format!("src=\"{asset}#x\""),
+        format!("href=\"{asset}#frag\""),
+        "src=\"attachment:none.png#x\"".to_owned(),
+    ] {
+        assert!(body.contains(&resolved), "{resolved} in {body}");
+    }
+    assert_eq!(parsed.deck.assets.len(), 1);
+    let messages: Vec<(&str, &str)> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.as_str()))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            (
+                "missing-attachment",
+                "`attachment:none.png`: the cell has no attachment `none.png`"
+            ),
+            (
+                "missing-attachment",
+                "`attachment:none.png#x`: the cell has no attachment `none.png`"
+            ),
+        ]
+    );
+
+    // Raw HTML cells too, unquoted values included.
+    let raw_cell = json!({
+        "cell_type": "raw",
+        "metadata": {"raw_mimetype": "text/html"},
+        "source": "<img src=attachment:a%2Bb.png> <img srcset='attachment:a+b.png 2x'> \
+                   <img src=attachment:nope.png>",
+        "attachments": {"a+b.png": {"image/png": PIXEL_PNG}},
+    });
+    let parsed = inline(json!([raw_cell]));
+    let raw_html = html(&parsed.deck.slides[0].blocks[0]);
+    assert_eq!(raw_html.matches("asset:").count(), 2, "{raw_html}");
+    assert!(raw_html.contains("src=attachment:nope.png"), "{raw_html}");
+    assert_eq!(codes(&parsed), [("missing-attachment", Some(0), 1)]);
+}
+
+#[test]
+fn attachment_urls_resolve_in_slide_attributes() {
+    let asset = |slide: &Slide, key: &str| {
+        let value = &slide.attrs[key];
+        assert!(value.starts_with("asset:"), "{key}={value}");
+        value.clone()
+    };
+    // A lifted heading's attributes, with the `background` shorthand and a video list.
+    let source = "# One {data-background-image=\"attachment:a%2Bb.png\"}\n";
+    let parsed = attachment_cell(source, &Config::default());
+    let one = &parsed.deck.slides[0];
+    let id = asset(one, "data-background-image");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
+    let source = "# One {background=\"attachment:a+b.png\" \
+                  data-background-video=\"attachment:a%2Bb.png, attachment:none.mp4\"}\n";
+    let parsed = attachment_cell(source, &Config::default());
+    let one = &parsed.deck.slides[0];
+    assert_eq!(asset(one, "data-background-image"), id);
+    assert_eq!(
+        one.attrs["data-background-video"],
+        format!("{id}, attachment:none.mp4")
+    );
+    assert_eq!(codes(&parsed), [("missing-attachment", Some(0), 1)]);
+
+    // Separators and `.slide` comments of a split cell; an unknown name warns.
+    let config = Config::from_toml_str("[notebook]\nsplit_markdown_cells = true\n").unwrap();
+    let source = "# One\n\n\
+                  --- {data-background-image=\"attachment:a%2Bb.png\"}\n\n# Two\n\n\
+                  ---\n\n<!-- .slide: data-background-image=\"attachment:a%2bb.png\" -->\n# Three\n\n\
+                  ---\n\n<!-- .slide: data-background-iframe=\"attachment:none.html\" -->\n# Four\n";
+    let parsed = attachment_cell(source, &config);
+    let slides = &parsed.deck.slides;
+    assert_eq!(slides.len(), 4);
+    assert_eq!(asset(&slides[1], "data-background-image"), id);
+    assert_eq!(asset(&slides[2], "data-background-image"), id);
+    assert_eq!(
+        slides[3].attrs["data-background-iframe"],
+        "attachment:none.html"
+    );
+    assert_eq!(codes(&parsed), [("missing-attachment", Some(0), 12)]);
+    assert_eq!(
+        parsed.diagnostics.iter().next().map(|d| d.message.as_str()),
+        Some("`attachment:none.html`: the cell has no attachment `none.html`")
+    );
+
+    // `metadata.presenter` attributes resolve against the cell that carries them.
+    let cell = json!({
+        "cell_type": "markdown", "source": "# Hi",
+        "metadata": {"slideshow": {"slide_type": "slide"},
+                     "presenter": {"attrs": {"background": "attachment:a%2Bb.png"}}},
+        "attachments": {"a+b.png": {"image/png": PIXEL_PNG}},
+    });
+    let parsed = inline(json!([cell]));
+    assert_eq!(asset(&parsed.deck.slides[0], "data-background-image"), id);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
+}
+
+#[test]
+fn attachment_urls_resolve_in_css_urls() {
+    // Inline styles and `<style>` elements, any spelling (the exact name worked before the
+    // URLs were resolved in the rendered HTML; it must keep working).
+    let source = "<div style=\"background: url(attachment:a+b.png)\">x</div>\n\
+                  <div style='background-image: URL(\"attachment:a%2Bb.png\"), url(none.png)'>y</div>\n\
+                  <style>.z { background: url('attachment:a%2bb.png') }\n\
+                  .w { background: url(attachment:gone.png) }</style>\n\n\
+                  Shown: `<div style=\"background: url(attachment:a+b.png)\">`\n";
+    let parsed = attachment_cell(source, &Config::default());
+    let body = html(&parsed.deck.slides[0].blocks[0]);
+    let asset = format!("asset:{}", parsed.deck.assets[0].id);
+    for resolved in [
+        format!("style=\"background: url({asset})\""),
+        format!("URL(\"{asset}\"), url(none.png)"),
+        format!(".z {{ background: url('{asset}') }}"),
+        ".w { background: url(attachment:gone.png) }".to_owned(),
+        "<code>&lt;div style=&quot;background: url(attachment:a+b.png)&quot;&gt;</code>".to_owned(),
+    ] {
+        assert!(body.contains(&resolved), "{resolved} in {body}");
+    }
+    assert_eq!(parsed.deck.assets.len(), 1);
+    assert_eq!(codes(&parsed), [("missing-attachment", Some(0), 1)]);
+    assert_eq!(
+        parsed.diagnostics.iter().next().map(|d| d.message.as_str()),
+        Some("`attachment:gone.png`: the cell has no attachment `gone.png`")
+    );
 }
 
 #[test]

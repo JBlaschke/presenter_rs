@@ -5,8 +5,7 @@
 //!
 //! 1. comrak parses the text with [`comrak_options`] (dialect §1);
 //! 2. the `FrontMatter` node goes through [`frontmatter::parse_front_matter`] into
-//!    `Deck.meta`, and is merged into a clone of the config (`Config::merge_front_matter`,
-//!    without the `reveal:` table, which the parse does not use and the pipeline checks), so
+//!    `Deck.meta`, and is merged into a clone of the config (`Config::merge_front_matter`), so
 //!    front matter can switch `slides.split` or `markdown.*`; when it changes
 //!    `markdown.smart_punctuation` the text is parsed again with the new options;
 //! 3. [`split::split_with_source`] splits the document into slides;
@@ -49,24 +48,43 @@ use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
 
 /// Parses a Markdown deck into the IR (see the module docs for the steps).
 ///
-/// Errors: `Error::FrontMatter` for invalid front matter (or a config table in it that the
-/// config rejects), `Error::Parse { path: source.path, line, .. }` for a separator attribute
-/// block or `<!-- .slide: -->` comment with an unbalanced quote. The front matter's `reveal:`
-/// table is not checked here: it does not change the parse, and the caller merges the front
-/// matter into its own config again (ir.md §4), so the pipeline reports a rejected
-/// `reveal.plugins` list together with this deck's diagnostics.
+/// Errors: `Error::FrontMatter` for invalid front matter (or front matter the config
+/// rejects), `Error::Parse { path: source.path, line, .. }` for a separator attribute block
+/// or `<!-- .slide: -->` comment with an unbalanced quote.
 pub fn parse(source: &SourceInfo, text: &str, config: &Config) -> Result<Parsed> {
+    parse_with(source, text, config, false)
+}
+
+/// [`parse`] for a caller that merges the front matter into its own config afterwards (the
+/// pipeline, ir.md §4): only the front matter's `slides` and `markdown` tables, the ones
+/// that change how the deck is split and rendered, are merged into the config clone, so a
+/// `reveal`, `math` or `notebook` value the config rejects does not fail the parse. The
+/// caller's merge reports it, together with the deck's diagnostics. Otherwise as [`parse`].
+pub(crate) fn parse_deferring_config(
+    source: &SourceInfo,
+    text: &str,
+    config: &Config,
+) -> Result<Parsed> {
+    parse_with(source, text, config, true)
+}
+
+/// [`parse`]; with `defer`, [`parse_deferring_config`].
+fn parse_with(source: &SourceInfo, text: &str, config: &Config, defer: bool) -> Result<Parsed> {
     let arena = Arena::new();
     let first_opts = comrak_options(&config.markdown);
     let mut root = parse_document(&arena, text, &first_opts);
     let meta = deck_meta(root)?;
     let mut deck_config = config.clone();
-    // `reveal` is left to the caller's merge (see the docs above).
-    let parse_meta = DeckMeta {
-        reveal: Default::default(),
-        ..meta.clone()
-    };
-    deck_config.merge_front_matter(&parse_meta)?;
+    if defer {
+        let mut parse_meta = meta.clone();
+        parse_meta.reveal.clear();
+        parse_meta
+            .vars
+            .retain(|key, _| !matches!(key.as_str(), "math" | "notebook"));
+        deck_config.merge_front_matter(&parse_meta)?;
+    } else {
+        deck_config.merge_front_matter(&meta)?;
+    }
     let opts = comrak_options(&deck_config.markdown);
     if opts.parse.smart != first_opts.parse.smart {
         root = parse_document(&arena, text, &opts);

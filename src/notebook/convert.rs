@@ -41,15 +41,22 @@
 //! - **Markdown cells**: T12's renderer in notebook mode
 //!   ([`render_fragment_with_lift`]); the attributes of a leading `# Heading {…}` are lifted
 //!   onto `cur` only while `cur` has no blocks yet. One cell is one [`Block::Html`], wrapped
-//!   in `<div class="fragment">` for fragments. `:::notes` go to `cur.notes`. Attachments
-//!   (`attachment:NAME` in the source) are registered as inline assets and the URL becomes
-//!   `asset:<id>`: the name as written and its `encodeURI` spelling in the source, any
-//!   other spelling that names the attachment once HTML entities and percent escapes are
-//!   decoded in the rendered HTML (body and notes). An `attachment:` URL left after that is
-//!   a skipped attachment (`notebook-attachment-skipped`, reported once) or warns
-//!   [`codes::MISSING_ATTACHMENT`]. With `[notebook] split_markdown_cells = true`, `---` /
-//!   `--` separators inside a cell open new slides exactly as in a Markdown deck
-//!   ([`split_with_source`]); the part before the first separator continues `cur`.
+//!   in `<div class="fragment">` for fragments. `:::notes` go to `cur.notes`.
+//!   With `[notebook] split_markdown_cells = true`, `---` / `--` separators inside a cell
+//!   open new slides exactly as in a Markdown deck ([`split_with_source`]); the part before
+//!   the first separator continues `cur`.
+//! - **Attachments** of markdown and raw cells are resolved after rendering, in the cell's
+//!   HTML (body and notes) and in the slide attributes the cell sets: an `attachment:NAME`
+//!   URL in a start tag's `src`, `href`, `poster`, `data-src`, `data` or `xlink:href`
+//!   attribute (quoted or not), a `srcset` candidate, a CSS `url(…)` in a `style` attribute
+//!   or `<style>` element, or a `data-background`/`-image`/`-video`/`-iframe` slide
+//!   attribute is registered as an inline asset and becomes `asset:<id>`. HTML shown in code
+//!   is text, not a tag, and stays as written (so do scripts). The name is matched as
+//!   written, then with HTML entities and percent escapes decoded (`attachment:a%2Bb.png`
+//!   names `a+b.png`), then without a `?query` or `#fragment`, which is kept after the
+//!   placeholder. A URL whose attachment was skipped stays as written
+//!   (`notebook-attachment-skipped`, reported once per name); any other unresolved one warns
+//!   [`codes::MISSING_ATTACHMENT`].
 //! - **Code cells**: [`Block::Cell`] with the outputs of [`render_outputs`] (T32); relative
 //!   `src`/`poster` URLs in `text/html` outputs go through T12's raw-HTML asset rewriting.
 //!   `hide_input` / `hide_output` come from the configured tag lists and
@@ -78,9 +85,8 @@
 //! Every diagnostic carries the notebook path and a span with `cell: Some(index)`; lines are
 //! lines of the cell source (front matter included).
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -101,8 +107,8 @@ use crate::markdown::attrs::{ParsedAttrs, SlideAttrs};
 use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::{meta_from_json, parse_front_matter, split_front_matter};
 use crate::markdown::render::{
-    RenderCtx, RenderMode, Rendered, has_math_markup, html_start_tags, percent_decode,
-    render_fragment, render_fragment_with_lift, render_nodes, rewrite_html_assets,
+    RenderCtx, RenderMode, Rendered, has_math_markup, html_attr_values, html_start_tags,
+    percent_decode, render_fragment, render_fragment_with_lift, render_nodes, rewrite_html_assets,
     rewrite_slide_assets,
 };
 use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
@@ -144,6 +150,9 @@ const FRAGMENT_TAG: &str = "fragment";
 const NOTES_TAG: &str = "notes";
 /// The config tables front matter may override (config.md §3); merged key by key.
 const CONFIG_TABLES: [&str; 4] = ["slides", "markdown", "math", "notebook"];
+/// The config tables the conversion reads (`markdown.*` options, `notebook.*` tag lists, …);
+/// `slides` and `math` only matter to the Markdown frontend and the renderer.
+const CONVERSION_TABLES: [&str; 2] = ["markdown", "notebook"];
 /// Splitter diagnostics kept for split markdown cells (the others are recomputed per deck).
 const SEPARATOR_NOT_RECOGNIZED: &str = "separator-not-recognized";
 /// The splitter's report of a leading `--`, which in a cell opens a vertical slide.
@@ -152,15 +161,18 @@ const ORPHAN_VERTICAL: &str = "orphan-vertical";
 /// The scheme of a notebook attachment URL (`attachment:NAME`).
 const ATTACHMENT_SCHEME: &str = "attachment:";
 
-/// `src`, `href` or `poster` values (double- or single-quoted) that still point at an
-/// attachment after the source rewrite; the name is group 1 or 2, as written in the HTML,
-/// and [`ATTACHMENT_SCHEME`] directly precedes it. Unquoted values are not matched: in
-/// rendered Markdown they would also match HTML shown in code (`&lt;img src=attachment:…`).
-static ATTACHMENT_URL: LazyLock<Regex> = LazyLock::new(|| {
-    // A constant pattern covered by the unit tests: compiling it cannot fail.
-    Regex::new(r#"(?i:src|href|poster)\s*=\s*(?:"attachment:([^"]*)"|'attachment:([^']*)')"#)
-        .expect("attachment URL regex")
-});
+/// The HTML attributes whose value is one URL, resolved when it is an `attachment:` URL
+/// (`srcset` and `style` hold several and are parsed: [`srcset_urls`], [`css_urls`]).
+const ATTACHMENT_ATTRS: [&str; 6] = ["src", "href", "poster", "data-src", "data", "xlink:href"];
+
+/// The slide attributes whose `attachment:` URLs are resolved (`data-background-video` is a
+/// comma-separated list), as [`rewrite_slide_assets`] resolves files.
+const SLIDE_URL_ATTRS: [&str; 4] = [
+    "data-background",
+    "data-background-image",
+    "data-background-video",
+    "data-background-iframe",
+];
 
 /// An HTML comment, possibly unclosed (for the plain text of a heading).
 static HTML_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
@@ -193,9 +205,48 @@ pub fn convert(
     assets: &mut AssetRegistry,
     diags: &mut Diagnostics,
 ) -> Result<Deck> {
+    convert_with(nb, source, config, assets, diags, false).map(|(deck, _)| deck)
+}
+
+/// [`convert`] for a caller that merges the deck metadata into its own config afterwards
+/// (the pipeline, ir.md §4): deck metadata the conversion does not read (`reveal` options,
+/// the `slides` and `math` tables) that the config rejects does not stop it. The error
+/// [`convert`] would return for it, naming its layer, comes back with the deck, so that the
+/// caller can report it with the diagnostics; `config` then receives the deck metadata
+/// without those values. A rejected `markdown` or `notebook` table still fails.
+pub(crate) fn convert_deferring_config(
+    nb: &Notebook,
+    source: &SourceInfo,
+    config: &mut Config,
+    assets: &mut AssetRegistry,
+    diags: &mut Diagnostics,
+) -> Result<(Deck, Option<Error>)> {
+    convert_with(nb, source, config, assets, diags, true)
+}
+
+/// [`convert`]; with `defer`, [`convert_deferring_config`].
+fn convert_with(
+    nb: &Notebook,
+    source: &SourceInfo,
+    config: &mut Config,
+    assets: &mut AssetRegistry,
+    diags: &mut Diagnostics,
+    defer: bool,
+) -> Result<(Deck, Option<Error>)> {
     let front = find_front_matter(nb);
     let (meta, layers) = deck_meta(nb, front.as_ref())?;
-    merge_config(config, &meta, &layers)?;
+    let deferred = match merge_config(config, &meta, &layers) {
+        Ok(()) => None,
+        Err(error) if defer => {
+            let layers: Vec<Layer> = layers
+                .iter()
+                .map(|(context, layer)| (context.clone(), conversion_meta(layer)))
+                .collect();
+            merge_config(config, &conversion_meta(&meta), &layers)?;
+            Some(error)
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(warning) = front.as_ref().and_then(empty_front_matter) {
         diags.push(warning.with_path(&source.path));
     }
@@ -204,13 +255,14 @@ pub fn convert(
         converter.cell(index, cell)?;
     }
     let (slides, features) = converter.finish()?;
-    Ok(Deck {
+    let deck = Deck {
         meta,
         slides,
         features,
         source: source.clone(),
         assets: assets.infos(&source.base_dir),
-    })
+    };
+    Ok((deck, deferred))
 }
 
 /// The front matter block of the first markdown cell.
@@ -287,6 +339,17 @@ fn merge_config(config: &mut Config, meta: &DeckMeta, layers: &[Layer]) -> Resul
             .map_err(|err| in_context(err, context))?;
     }
     config.merge_front_matter(meta)
+}
+
+/// `meta` with only what the conversion reads: no `reveal` options and, of the config
+/// tables, only [`CONVERSION_TABLES`] (other vars stay; the config ignores them).
+fn conversion_meta(meta: &DeckMeta) -> DeckMeta {
+    let mut meta = meta.clone();
+    meta.reveal.clear();
+    meta.vars.retain(|key, _| {
+        !CONFIG_TABLES.contains(&key.as_str()) || CONVERSION_TABLES.contains(&key.as_str())
+    });
+    meta
 }
 
 /// Prefixes a front matter error message with where the metadata came from.
@@ -581,8 +644,10 @@ impl<'a> Converter<'a> {
         );
     }
 
-    /// Applies slide attributes to the current slide, reporting unknown and invalid keys.
-    fn apply_attrs(&mut self, attrs: SlideAttrs, span: &SourceSpan) {
+    /// Applies slide attributes to the current slide, reporting unknown and invalid keys and
+    /// resolving attachment URLs against the attachments of the cell that set them
+    /// (`span.cell`).
+    fn apply_attrs(&mut self, mut attrs: SlideAttrs, span: &SourceSpan) {
         let label = self.label();
         for key in &attrs.unknown_keys {
             let message =
@@ -594,6 +659,7 @@ impl<'a> Converter<'a> {
                 format!("`{key}` on slide {label} is not a valid attribute name (dropped)");
             self.warn(codes::INVALID_SLIDE_ATTR, message, span);
         }
+        self.resolve_slide_attachments(&mut attrs.attrs, span);
         attrs.apply_to(self.cur());
     }
 
@@ -694,15 +760,14 @@ impl<'a> Converter<'a> {
         cur.blocks.push(Block::html(wrap_fragment(html, fragment)));
     }
 
-    /// The Markdown source of a cell (front matter removed) with attachments rewritten, and
-    /// the number of lines removed before it.
-    fn markdown_text(&mut self, index: usize, cell: &'a Cell) -> (Cow<'a, str>, usize) {
+    /// The Markdown source of a cell (front matter removed) and the number of lines removed
+    /// before it.
+    fn markdown_text(&mut self, index: usize, cell: &'a Cell) -> (&'a str, usize) {
         let front = self.front.filter(|front| front.cell == index);
-        let (text, offset) = match front {
+        match front {
             Some(front) => (front.rest, front.consumed),
             None => self.without_ignored_front_matter(index, cell),
-        };
-        (self.with_attachments(index, cell, text), offset)
+        }
     }
 
     /// The source of a markdown cell other than the first one, without a leading `---` block
@@ -730,7 +795,7 @@ impl<'a> Converter<'a> {
     fn markdown_cell(&mut self, index: usize, cell: &'a Cell, fragment: bool) -> Result<()> {
         let (text, offset) = self.markdown_text(index, cell);
         if self.config.notebook.split_markdown_cells {
-            self.split_cell(index, cell, &text, offset, fragment)?;
+            self.split_cell(index, cell, text, offset, fragment)?;
             if let Some((span, _)) = self.deferred.take() {
                 self.override_ignored(&span, true);
             }
@@ -739,7 +804,7 @@ impl<'a> Converter<'a> {
         let lift = self.cur_is_empty();
         let span = cell.span(index);
         let (mut rendered, lifted) = self.render(Some(&span), offset, |ctx, opts| {
-            render_fragment_with_lift(&text, opts, ctx, lift)
+            render_fragment_with_lift(text, opts, ctx, lift)
         })?;
         if let Some(attrs) = lifted {
             self.apply_attrs(SlideAttrs::from_parsed(attrs), &span);
@@ -960,8 +1025,8 @@ impl<'a> Converter<'a> {
         Ok(())
     }
 
-    /// The HTML of a raw cell with `raw_mimetype` `text/html` (attachments and relative
-    /// URLs rewritten); `None` (with a warning unless the cell is blank) otherwise.
+    /// The HTML of a raw cell with `raw_mimetype` `text/html` (relative URLs and attachments
+    /// resolved); `None` (with a warning unless the cell is blank) otherwise.
     fn raw_html(&mut self, index: usize, cell: &'a Cell) -> Result<Option<String>> {
         let source = cell.source.as_str();
         if source.trim().is_empty() {
@@ -978,7 +1043,7 @@ impl<'a> Converter<'a> {
             self.warn(codes::RAW_CELL_SKIPPED, message, &span);
             return Ok(None);
         }
-        let mut html = self.with_attachments(index, cell, source).into_owned();
+        let mut html = source.to_owned();
         self.render(Some(&span), 0, |ctx, _| {
             rewrite_html_assets(&mut html, Some(&span), ctx)
         })?;
@@ -994,7 +1059,7 @@ impl<'a> Converter<'a> {
                 let (text, offset) = self.markdown_text(index, cell);
                 let span = cell.span(index);
                 let mut rendered = self.render(Some(&span), offset, |ctx, opts| {
-                    render_fragment(&text, opts, ctx)
+                    render_fragment(text, opts, ctx)
                 })?;
                 self.resolve_rendered(index, cell, &mut rendered, &span);
                 self.features.merge(rendered.features);
@@ -1008,33 +1073,6 @@ impl<'a> Converter<'a> {
             append_notes(self.cur(), &html);
         }
         Ok(())
-    }
-
-    /// `text` with every `attachment:NAME` URL of an attachment of `cell` replaced by the
-    /// `asset:<id>` of the registered attachment. Only the name as written and its `encodeURI`
-    /// spelling are known here; [`Self::resolve_attachments`] handles other spellings in the
-    /// rendered HTML.
-    fn with_attachments(&mut self, index: usize, cell: &Cell, text: &'a str) -> Cow<'a, str> {
-        let mut text = Cow::Borrowed(text);
-        for name in cell.attachments.keys() {
-            let needles = attachment_needles(name);
-            if !needles
-                .iter()
-                .any(|needle| url_starts(&text, needle).next().is_some())
-            {
-                continue;
-            }
-            let Some(id) = self.attachment_id(index, cell, name) else {
-                continue;
-            };
-            let url = AssetRegistry::placeholder(&id);
-            for needle in &needles {
-                if let Some(replaced) = replace_url(&text, needle, &url) {
-                    text = Cow::Owned(replaced);
-                }
-            }
-        }
-        text
     }
 
     /// Registers one attachment (the first MIME type in `mime_priority`, else the first
@@ -1100,14 +1138,9 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Resolves the `attachment:` URLs left in `html` ([`ATTACHMENT_URL`]) after
-    /// [`Self::with_attachments`], which knows only two spellings of each name. A URL that
-    /// names an attachment of `cell` as written, or once HTML entities and percent escapes
-    /// are decoded (`attachment:a%2Bb.png` for `a+b.png`, lower-case hex, `a&amp;b.png` in raw
-    /// HTML), becomes that attachment's `asset:<id>`. One whose attachment was skipped stays
-    /// as written (already reported). Any other gets a [`codes::MISSING_ATTACHMENT`] warning
-    /// naming it decoded, as written in the source; so no `attachment:` URL is left
-    /// unreported.
+    /// Resolves the `attachment:` URLs of `html` (a markdown cell's rendered body or notes,
+    /// or a raw HTML cell) found by [`attachment_url_candidates`], in document order, with
+    /// [`Self::attachment_url`].
     fn resolve_attachments(
         &mut self,
         index: usize,
@@ -1115,39 +1148,83 @@ impl<'a> Converter<'a> {
         html: &mut String,
         span: &SourceSpan,
     ) {
-        let mut resolved = String::new();
-        let mut copied = None;
-        let mut missing = Vec::new();
-        for caps in ATTACHMENT_URL.captures_iter(html) {
-            let Some(value) = caps.get(1).or_else(|| caps.get(2)) else {
-                continue;
-            };
-            let written = value.as_str().trim_end();
-            let unescaped = html_escape::decode_html_entities(written);
-            let decoded = percent_decode(&unescaped);
-            let found = [written, &unescaped, &decoded]
-                .into_iter()
-                .find(|name| cell.attachments.contains_key(*name))
-                .map(str::to_owned);
-            let Some(name) = found else {
-                missing.push(decoded);
-                continue;
-            };
-            if let Some(id) = self.attachment_id(index, cell, &name) {
-                let start = value.start() - ATTACHMENT_SCHEME.len();
-                resolved.push_str(&html[copied.unwrap_or(0)..start]);
-                resolved.push_str(&AssetRegistry::placeholder(&id));
-                copied = Some(value.start() + written.len());
+        let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+        for url in attachment_url_candidates(html) {
+            if let Some(resolved) = self.attachment_url(index, cell, &html[url.clone()], span) {
+                edits.push((url, resolved));
             }
         }
-        if let Some(copied) = copied {
-            resolved.push_str(&html[copied..]);
-            *html = resolved;
+        for (range, text) in edits.into_iter().rev() {
+            html.replace_range(range, &text);
         }
-        for name in missing {
-            let message = format!("`attachment:{name}`: the cell has no attachment `{name}`");
+    }
+
+    /// Resolves the `attachment:` URLs of the slide attributes a cell sets
+    /// ([`SLIDE_URL_ATTRS`]; `span.cell` is the cell) like [`Self::resolve_attachments`].
+    fn resolve_slide_attachments(
+        &mut self,
+        attrs: &mut BTreeMap<String, String>,
+        span: &SourceSpan,
+    ) {
+        let nb = self.nb;
+        let Some((index, cell)) = span.cell.and_then(|i| Some((i, nb.cells.get(i)?))) else {
+            return;
+        };
+        for key in SLIDE_URL_ATTRS {
+            let Some(value) = attrs.get(key).cloned() else {
+                continue;
+            };
+            let parts: Vec<&str> = if key == "data-background-video" {
+                value.split(',').collect()
+            } else {
+                vec![value.as_str()]
+            };
+            let mut changed = false;
+            let mut resolved = Vec::with_capacity(parts.len());
+            for part in parts {
+                let url = self.attachment_url(index, cell, part.trim(), span);
+                changed |= url.is_some();
+                resolved.push(url.unwrap_or_else(|| part.to_owned()));
+            }
+            if changed {
+                attrs.insert(key.to_owned(), resolved.join(","));
+            }
+        }
+    }
+
+    /// The `asset:<id>` replacing one URL (as written in HTML) when it names an attachment
+    /// of `cell`: as written, once HTML entities and percent escapes are decoded
+    /// (`attachment:a%2Bb.png` for `a+b.png`, any hex case, `a&amp;b.png`), or without the
+    /// `?query` / `#fragment` it ends with, which is kept after the placeholder. `None`
+    /// for a URL that is not an `attachment:` URL, one whose attachment was skipped (already
+    /// reported) and one that names no attachment of `cell`, which warns
+    /// [`codes::MISSING_ATTACHMENT`] (naming it decoded, as written in the source).
+    fn attachment_url(
+        &mut self,
+        index: usize,
+        cell: &Cell,
+        url: &str,
+        span: &SourceSpan,
+    ) -> Option<String> {
+        let scheme = url.get(..ATTACHMENT_SCHEME.len())?;
+        if !scheme.eq_ignore_ascii_case(ATTACHMENT_SCHEME) {
+            return None;
+        }
+        let written = &url[ATTACHMENT_SCHEME.len()..];
+        let cut = written.find(['?', '#']).unwrap_or(written.len());
+        let (path, suffix) = written.split_at(cut);
+        let found = attachment_name(cell, written)
+            .map(|name| (name, ""))
+            .or_else(|| Some((attachment_name(cell, path)?, suffix)));
+        let Some((name, suffix)) = found else {
+            let decoded = |text: &str| percent_decode(&html_escape::decode_html_entities(text));
+            let (url, name) = (decoded(written), decoded(path));
+            let message = format!("`attachment:{url}`: the cell has no attachment `{name}`");
             self.warn(codes::MISSING_ATTACHMENT, message, span);
-        }
+            return None;
+        };
+        let id = self.attachment_id(index, cell, &name)?;
+        Some(format!("{}{suffix}", AssetRegistry::placeholder(&id)))
     }
 
     /// Closes the walk: one empty slide for a notebook without content (it receives the
@@ -1420,60 +1497,145 @@ fn decode_attachment(payload: &str) -> std::result::Result<Vec<u8>, String> {
         .map_err(|err| format!("invalid base64: {err}"))
 }
 
-/// The spellings of an attachment URL: as named, and percent-encoded like JavaScript's
-/// `encodeURI` (JupyterLab writes names with spaces as `attachment:my%20plot.png`).
-fn attachment_needles(name: &str) -> Vec<String> {
-    let mut needles = vec![format!("attachment:{name}")];
-    let encoded = encode_uri(name);
-    if encoded != name {
-        needles.push(format!("attachment:{encoded}"));
+/// The name of `cell`'s attachment that `written` (an `attachment:` URL without its scheme,
+/// as written in HTML) names: as written, with HTML entities decoded, or with percent
+/// escapes decoded too.
+fn attachment_name(cell: &Cell, written: &str) -> Option<String> {
+    if cell.attachments.contains_key(written) {
+        return Some(written.to_owned());
     }
-    needles
+    let unescaped = html_escape::decode_html_entities(written);
+    if cell.attachments.contains_key(unescaped.as_ref()) {
+        return Some(unescaped.into_owned());
+    }
+    let decoded = percent_decode(&unescaped);
+    cell.attachments.contains_key(&decoded).then_some(decoded)
 }
 
-/// `encodeURI`: percent-encodes every byte except ASCII alphanumerics and `-_.!~*'();/?:@&=+$,#`.
-fn encode_uri(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for byte in name.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.!~*'();/?:@&=+$,#".contains(&byte) {
-            out.push(char::from(byte));
-        } else {
-            // Writing to a String cannot fail.
-            let _ = write!(out, "%{byte:02X}");
+/// The byte ranges of the URLs in `html` that may be `attachment:` URLs, in document order:
+/// the value of an [`ATTACHMENT_ATTRS`] attribute, each `srcset` candidate
+/// ([`srcset_urls`]) and each CSS `url(…)` ([`css_urls`]) of a `style` attribute or a
+/// `<style>` element ([`style_elements`]). Attributes and elements are those of the start
+/// tags T12's HTML tokenizer finds ([`html_attr_values`]): text, comments, scripts and HTML
+/// shown in code (`&lt;img src=…`, quotes included) are not tags, so their URLs are not
+/// candidates.
+fn attachment_url_candidates(html: &str) -> Vec<Range<usize>> {
+    let shift = |base: usize| move |url: Range<usize>| base + url.start..base + url.end;
+    let mut urls = Vec::new();
+    for (name, value) in html_attr_values(html) {
+        let text = &html[value.clone()];
+        let found = match name.as_str() {
+            "srcset" => srcset_urls(text),
+            "style" => css_urls(text),
+            name if ATTACHMENT_ATTRS.contains(&name) => vec![trimmed(text)],
+            _ => continue,
+        };
+        urls.extend(found.into_iter().map(shift(value.start)));
+    }
+    for content in style_elements(html) {
+        let found = css_urls(&html[content.clone()]);
+        urls.extend(found.into_iter().map(shift(content.start)));
+    }
+    urls.sort_by_key(|url| url.start);
+    urls
+}
+
+/// The byte ranges of the contents of the `<style>` elements of `html` (from the end of
+/// the start tag to the `</style` that closes it, or the end of `html`).
+fn style_elements(html: &str) -> Vec<Range<usize>> {
+    // ASCII lowercasing keeps every byte offset.
+    let lower = html.to_ascii_lowercase();
+    html_start_tags(html)
+        .into_iter()
+        .filter(|(name, _)| name == "style")
+        .map(|(_, end)| {
+            end..lower[end..]
+                .find("</style")
+                .map_or(html.len(), |at| end + at)
+        })
+        .collect()
+}
+
+/// The byte ranges of the URLs of the CSS `url(…)` functions in `css` (a `style` attribute
+/// value as written in HTML, or a `<style>` element): white space and one pair of quotes
+/// (`"`, `'`, or `&quot;` / `&#39;` in an attribute) removed. A `)` ends the function,
+/// also inside quotes.
+fn css_urls(css: &str) -> Vec<Range<usize>> {
+    const FUNCTION: &str = "url(";
+    const QUOTES: [&str; 5] = ["\"", "'", "&quot;", "&#39;", "&#x27;"];
+    // ASCII lowercasing keeps every byte offset; CSS function names ignore ASCII case.
+    let lower = css.to_ascii_lowercase();
+    let mut urls = Vec::new();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(FUNCTION) {
+        let start = from + at + FUNCTION.len();
+        let Some(len) = css[start..].find(')') else {
+            break;
+        };
+        let inner = trimmed(&css[start..start + len]);
+        let mut url = start + inner.start..start + inner.end;
+        let text = &css[url.clone()];
+        if let Some(quote) = QUOTES.iter().find(|quote| {
+            text.len() >= 2 * quote.len() && text.starts_with(**quote) && text.ends_with(**quote)
+        }) {
+            url = url.start + quote.len()..url.end - quote.len();
+        }
+        urls.push(url);
+        from = start + len + 1;
+    }
+    urls
+}
+
+/// The byte range of `value` without leading and trailing ASCII white space (which URL
+/// parsing ignores).
+fn trimmed(value: &str) -> Range<usize> {
+    let start = value.len()
+        - value
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .len();
+    let end = value
+        .trim_end_matches(|c: char| c.is_ascii_whitespace())
+        .len();
+    start..end.max(start)
+}
+
+/// The byte ranges of the URLs in a `srcset` value, by HTML's parsing rules: candidates
+/// are separated by commas; a candidate's URL is its first run of non-white-space
+/// characters without trailing commas, the descriptors after it (`2x`, `100w`) run to the
+/// next comma outside parentheses.
+fn srcset_urls(value: &str) -> Vec<Range<usize>> {
+    let bytes = value.as_bytes();
+    let mut urls = Vec::new();
+    let mut at = 0;
+    loop {
+        while at < bytes.len() && (bytes[at].is_ascii_whitespace() || bytes[at] == b',') {
+            at += 1;
+        }
+        if at == bytes.len() {
+            return urls;
+        }
+        let start = at;
+        while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let mut end = at;
+        while end > start && bytes[end - 1] == b',' {
+            end -= 1;
+        }
+        urls.push(start..end);
+        if end < at {
+            continue; // `url,` ends the candidate
+        }
+        let mut depth = 0usize;
+        while at < bytes.len() && !(bytes[at] == b',' && depth == 0) {
+            match bytes[at] {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            at += 1;
         }
     }
-    out
-}
-
-/// Byte offsets of `needle` in `text` where it is a whole URL (followed by the end, white
-/// space, a quote, `)`, `>`, `]`, `?` or `#`), so `attachment:a.png` never matches inside
-/// `attachment:a.png.bak`.
-fn url_starts<'t>(text: &'t str, needle: &'t str) -> impl Iterator<Item = usize> + 't {
-    text.match_indices(needle).filter_map(move |(at, _)| {
-        let next = text[at + needle.len()..].chars().next();
-        next.is_none_or(|c| {
-            c.is_whitespace() || matches!(c, ')' | '>' | ']' | '"' | '\'' | '?' | '#')
-        })
-        .then_some(at)
-    })
-}
-
-/// `text` with every whole-URL occurrence of `needle` replaced by `url`; `None` when there
-/// is none.
-fn replace_url(text: &str, needle: &str, url: &str) -> Option<String> {
-    let starts: Vec<usize> = url_starts(text, needle).collect();
-    if starts.is_empty() {
-        return None;
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for at in starts {
-        out.push_str(&text[last..at]);
-        out.push_str(url);
-        last = at + needle.len();
-    }
-    out.push_str(&text[last..]);
-    Some(out)
 }
 
 #[cfg(test)]
@@ -1551,28 +1713,62 @@ mod tests {
     }
 
     #[test]
-    fn attachment_urls_are_replaced_as_whole_urls() {
-        let text =
-            "![a](attachment:a.png) ![b](attachment:a.png.bak) <img src=\"attachment:a.png\">";
+    fn srcset_urls_follow_the_html_rules() {
+        let urls = |value: &str| -> Vec<String> {
+            srcset_urls(value)
+                .into_iter()
+                .map(|range| value[range].to_owned())
+                .collect()
+        };
+        assert_eq!(urls("a.png"), ["a.png"]);
         assert_eq!(
-            replace_url(text, "attachment:a.png", "asset:x").as_deref(),
-            Some("![a](asset:x) ![b](attachment:a.png.bak) <img src=\"asset:x\">")
+            urls(" attachment:a%2Bb.png 2x,\n  b.png 100w , c.png"),
+            ["attachment:a%2Bb.png", "b.png", "c.png"]
         );
+        // A URL may end with commas (no descriptors); a comma inside it is part of it.
+        assert_eq!(urls("a.png,b.png 2x"), ["a.png,b.png"]);
+        assert_eq!(urls("a.png, b.png,, c.png"), ["a.png", "b.png", "c.png"]);
+        // Descriptors run to the next comma outside parentheses.
+        assert_eq!(urls("a.png f(1,2), b.png"), ["a.png", "b.png"]);
+        assert!(urls(" , ").is_empty());
+        assert!(urls("").is_empty());
+        let trim = |value: &str| value[trimmed(value)].to_owned();
+        assert_eq!(trim(" \tattachment:a.png \n"), "attachment:a.png");
+        assert_eq!(trim("   "), "");
+        assert_eq!(trim("ü"), "ü");
+    }
+
+    #[test]
+    fn css_and_attribute_url_candidates() {
+        let texts = |html: &str, ranges: Vec<Range<usize>>| -> Vec<String> {
+            ranges.into_iter().map(|r| html[r].to_owned()).collect()
+        };
+        let css = "background: URL( a.png ) , url(\"b c.png\") url('d.png'), \
+                   url(&quot;e.png&quot;) url(&#39;f.png&#39;) url(\"\") url(g.png";
         assert_eq!(
-            replace_url("attachment:a.pngx", "attachment:a.png", "u"),
-            None
+            texts(css, css_urls(css)),
+            ["a.png", "b c.png", "d.png", "e.png", "f.png", ""]
         );
+        assert!(css_urls("color: red").is_empty());
+
+        let html = "<p style=\"background:url(attachment:a.png)\" title=\"attachment:t\">\
+                    <img alt=attachment:x SRC = attachment:b.png srcset='c.png 2x, d.png'>\
+                    <svg><image xlink:href=\"e.png\"/></svg>\
+                    <STYLE>.x { background: url(f.png) } <img src=no.png></style>\
+                    <!-- <img src=no.png> --><script>'<img src=no.png>'</script>\
+                    <code>&lt;img src=\"no.png\"&gt;</code><style>url(g.png)";
         assert_eq!(
-            replace_url("attachment:a.png", "attachment:a.png", "u").as_deref(),
-            Some("u")
+            texts(html, attachment_url_candidates(html)),
+            [
+                "attachment:a.png",
+                "attachment:b.png",
+                "c.png",
+                "d.png",
+                "e.png",
+                "f.png",
+                "g.png"
+            ]
         );
-        assert_eq!(encode_uri("my plot (1).png"), "my%20plot%20(1).png");
-        assert_eq!(encode_uri("ü.png"), "%C3%BC.png");
-        assert_eq!(
-            attachment_needles("a b.png"),
-            ["attachment:a b.png", "attachment:a%20b.png"]
-        );
-        assert_eq!(attachment_needles("a.png"), ["attachment:a.png"]);
     }
 
     #[test]
@@ -1582,20 +1778,6 @@ mod tests {
         assert_eq!(decode_attachment("<svg/>").unwrap(), b"<svg/>");
         assert!(decode_attachment("  ").is_err());
         assert!(decode_attachment("!!!").is_err());
-        let html = "<img src=\"attachment:x.png\" /> <img src='attachment:y z.png'> \
-                    <a HREF = \"attachment:w.svg\"> src=\"other:attachment:no\" \
-                    <img src=\"attachment:s.png \"> <img src=attachment:u.png> \
-                    <code>&lt;img src=attachment:c.png&gt; src=&quot;attachment:q.png&quot;</code>";
-        let names: Vec<&str> = ATTACHMENT_URL
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)))
-            .map(|name| {
-                let at = name.start() - ATTACHMENT_SCHEME.len();
-                assert_eq!(&html[at..name.start()], ATTACHMENT_SCHEME);
-                name.as_str()
-            })
-            .collect();
-        assert_eq!(names, ["x.png", "y z.png", "w.svg", "s.png "]);
         assert_eq!(percent_decode("my%20plot.png"), "my plot.png");
         assert_eq!(percent_decode("%C3%BC.png"), "ü.png");
         // T12's decoder (shared with missing-asset resolution): exactly two hex digits.

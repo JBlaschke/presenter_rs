@@ -52,11 +52,11 @@
 //!
 //! Logging ([`log_directives`]): the base level is warn; `-v` raises presenter's own
 //! modules to info and `-vv` to debug; `RUST_LOG` (when set) is applied on top of that, so it
-//! can add targets or set any level, including presenter's (`presenter=error`). A bare
-//! `RUST_LOG` level never makes the flags less verbose: `RUST_LOG=debug` with `-v` logs
-//! presenter at debug. `-q` logs only errors and ignores `RUST_LOG`. Logs and diagnostics
-//! go to stderr, in color when stderr is a terminal and `NO_COLOR` is not set. Stdout
-//! carries only a command's result.
+//! can add targets or set any level, including presenter's (`presenter=error`). The flags
+//! never lower the level a bare `RUST_LOG` level (or a target prefix of `presenter`) gives
+//! presenter: `RUST_LOG=debug` with `-v` logs presenter at debug. `-q` logs only errors and
+//! ignores `RUST_LOG`. Logs and diagnostics go to stderr, in color when stderr is a terminal
+//! and `NO_COLOR` is not set. Stdout carries only a command's result.
 
 pub mod build;
 pub mod check;
@@ -516,11 +516,14 @@ const LOG_TARGET: &str = "presenter";
 /// The `EnvFilter` directives for `global` and the value of `RUST_LOG`: `warn`, the flags'
 /// `presenter=<level>`, then `RUST_LOG`. A later directive for the same target replaces an
 /// earlier one, so a `RUST_LOG` directive naming presenter wins (`RUST_LOG=presenter=debug`
-/// with `-v` logs presenter at debug). The flags never make presenter's own logs less
-/// verbose than `RUST_LOG` alone: when a directive that covers presenter without naming it
-/// (a bare level such as `debug`, which `presenter=info` would otherwise shadow for
-/// presenter's targets) is more verbose than the flags, the flags' directive takes its
-/// level. `-q` gives `error` and ignores `RUST_LOG`.
+/// with `-v` logs presenter at debug). When a `RUST_LOG` directive without span or field
+/// filters covers presenter without naming it (a bare level such as `debug`, which
+/// `presenter=info` would otherwise shadow for presenter's targets) and is more verbose
+/// than the flags, the flags' directive takes its level, so the flags never make
+/// presenter's own logs less verbose than such a directive. Directives with span or field
+/// filters are not taken into account: with a field directive such as
+/// `[{diagnostics}]=debug`, the flags' more specific `presenter=<level>` decides for
+/// presenter's events. `-q` gives `error` and ignores `RUST_LOG`.
 pub fn log_directives(global: &GlobalArgs, rust_log: Option<&str>) -> String {
     use tracing_subscriber::filter::LevelFilter;
 
@@ -853,6 +856,11 @@ mod tests {
         assert_eq!(
             log_directives(&flags(0, false), Some("debug")),
             "warn,debug"
+        );
+        // Span and field directives are not read (documented): the flags' level stays.
+        assert_eq!(
+            log_directives(&flags(1, false), Some("[{diagnostics}]=debug")),
+            "warn,presenter=info,[{diagnostics}]=debug"
         );
     }
 

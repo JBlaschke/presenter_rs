@@ -24,7 +24,7 @@ use std::path::Path;
 
 use crate::assets::registry::AssetRegistry;
 use crate::config::Config;
-use crate::error::{Diagnostics, Result};
+use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{Parsed, SourceInfo};
 
 /// Parses a Jupyter notebook (`json` is the `.ipynb` file's contents) into a [`Parsed`] deck.
@@ -38,27 +38,52 @@ use crate::ir::{Parsed, SourceInfo};
 /// separator with an unbalanced quote in a split markdown cell; `Error::FrontMatter` for
 /// invalid `metadata.presenter` or first-cell front matter.
 pub fn parse(source: &SourceInfo, json: &str, config: &Config) -> Result<Parsed> {
+    parse_with(source, json, config, false).map(|(parsed, _)| parsed)
+}
+
+/// [`parse`] for a caller that merges the deck metadata into its own config afterwards (the
+/// pipeline, ir.md §4): deck metadata the conversion does not read (`reveal` options, the
+/// `slides` and `math` tables) that the config rejects does not fail it. The
+/// `Error::FrontMatter` [`parse`] would return for it (naming the layer) comes back with the
+/// deck, for the caller to report together with the deck's diagnostics. Otherwise as
+/// [`parse`].
+pub(crate) fn parse_deferring_config(
+    source: &SourceInfo,
+    json: &str,
+    config: &Config,
+) -> Result<(Parsed, Option<Error>)> {
+    parse_with(source, json, config, true)
+}
+
+/// [`parse`]; with `defer`, [`parse_deferring_config`].
+fn parse_with(
+    source: &SourceInfo,
+    json: &str,
+    config: &Config,
+    defer: bool,
+) -> Result<(Parsed, Option<Error>)> {
     let (notebook, mut diagnostics) = nbformat::parse_notebook(&source.path, json)?;
     let mut deck_config = config.clone();
     let mut assets = AssetRegistry::new();
-    let deck = convert::convert(
-        &notebook,
-        source,
-        &mut deck_config,
-        &mut assets,
-        &mut diagnostics,
-    )?;
+    let (deck_config, diags) = (&mut deck_config, &mut diagnostics);
+    let (deck, deferred) = if defer {
+        convert::convert_deferring_config(&notebook, source, deck_config, &mut assets, diags)?
+    } else {
+        let deck = convert::convert(&notebook, source, deck_config, &mut assets, diags)?;
+        (deck, None)
+    };
     tracing::debug!(
         slides = deck.slides.len(),
         assets = assets.len(),
         warnings = diagnostics.len(),
         "parsed notebook"
     );
-    Ok(Parsed {
+    let parsed = Parsed {
         deck,
         assets,
         diagnostics: finish_diagnostics(diagnostics, &source.path),
-    })
+    };
+    Ok((parsed, deferred))
 }
 
 /// Sets `path` on every diagnostic that has none and orders them by cell, then line
