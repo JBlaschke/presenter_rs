@@ -173,7 +173,7 @@ fn is_image_background(value: &str) -> bool {
 
 /// The reveal.js form `data-background="images/bg.png"` (a `.slide:` comment's or a
 /// separator's verbatim key, dialect §3.2): when the value is an image to reveal
-/// ([`is_image_background`]), it moves to `data-background-image`, which reveal would set
+/// (`is_image_background`), it moves to `data-background-image`, which reveal would set
 /// from it at runtime (replacing an explicit one, so it does here too). Then the image is
 /// registered as a local asset or reported missing like any `data-background-image`
 /// (dialect §6), and still works once the URL is rewritten (a `data:` URI in standalone
@@ -218,7 +218,7 @@ fn strip_note_marker<'a>(paragraph: &'a AstNode<'a>, marker: &str) -> bool {
 
 /// Renders one deck slide ([`render_nodes`]) with the `Note:` convention (dialect §7): in
 /// [`RenderMode::Deck`], the first top-level paragraph starting with `Note:` or `Notes:`
-/// ([`note_marker`]; `lines` is the deck's source split by [`split::source_lines`], or `None`
+/// (`note_marker`; `lines` is the deck's source split by `split::source_lines`, or `None`
 /// to read the marker from the AST only) ends the body. That paragraph (without the marker;
 /// dropped when nothing else is in it) and every later node are rendered as a second document
 /// and become notes. Footnote definitions, which the splitter keeps last, go with the part

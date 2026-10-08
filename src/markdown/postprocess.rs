@@ -29,7 +29,7 @@
 //! builds it from the HTML (comrak's output is always balanced; raw HTML may not be): tag
 //! names are case-insensitive, a stray end tag closes nothing, and the end tags a browser
 //! implies are honored where it matters here (a `<ul>`, `<div>`, `<h2>`, … start tag closes
-//! an open `<p>`; `<li>` closes the previous `<li>`; see [`close_implied`]). Other implied
+//! an open `<p>`; `<li>` closes the previous `<li>`; see `close_implied`). Other implied
 //! end tags (such as `</td>`, `</option>` or `</dd>`) and the adoption agency's re-nesting of
 //! misnested inline tags are not modelled: in such raw HTML an `.element` comment may pick
 //! another element than reveal would, and a list may be taken as nested.
@@ -404,7 +404,7 @@ fn mentions_list(html: &str) -> bool {
 /// Adds the class `fragment` to the `<li>` children of the lists at the top level of `html`
 /// (a slide body), except lists with the class `no-incremental` (module docs). The top level
 /// is tracked like the browser builds it: elements are opened by start tags and closed by
-/// their end tags or implicitly ([`close_implied`]); a stray end tag closes nothing. Returns
+/// their end tags or implicitly (`close_implied`); a stray end tag closes nothing. Returns
 /// `html` unchanged when it has no list. Errors as [`element_attributes`].
 pub fn incremental_lists(html: &str) -> Result<String> {
     if !mentions_list(html) {
