@@ -703,7 +703,7 @@ fn theme_stylesheet_errors() {
     )
     .unwrap_err();
     assert!(
-        matches!(&err, Error::Style { file, message } if file == "styles/x.scss" && message.contains("SCSS support arrives in T42")),
+        matches!(&err, Error::Style { file, message } if file == "@scss/styles/x.scss" && message.contains("SCSS support arrives in T42")),
         "{err:?}"
     );
     let missing = disk_theme(

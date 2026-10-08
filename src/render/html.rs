@@ -280,16 +280,17 @@ fn looked_in(key: &str) -> String {
 /// `assets/` directories, registered in `registry` as bytes and rewritten to `asset:<id>`
 /// placeholders (the caller resolves them for its output mode).
 ///
-/// Errors: [`Error::Style`] for a `.scss`/`.sass` entry ("SCSS support arrives in T42"),
-/// another extension, a file that is not UTF-8 or a `url()` that resolves to nothing;
-/// [`Error::Theme`] for an entry that does not exist.
+/// Errors: [`Error::Style`] (`file` = the entry as a helper path, `@<theme>/<path>`) for a
+/// `.scss`/`.sass` entry ("SCSS support arrives in T42"), another extension, a file that is
+/// not UTF-8 or a `url()` that resolves to nothing; [`Error::Theme`] for an entry that does
+/// not exist.
 pub fn compile_theme_css(theme: &Theme, registry: &mut AssetRegistry) -> Result<String> {
     let mut css = String::new();
     for entry in theme.style_entries()? {
         let key = format!("@{}/{}", entry.theme, entry.rel_path);
         let style_error = |message: String| Error::Style {
-            file: entry.rel_path.clone(),
-            message: format!("{message} (theme '{}')", entry.theme),
+            file: key.clone(),
+            message,
         };
         let lower = entry.rel_path.to_ascii_lowercase();
         if lower.ends_with(".scss") || lower.ends_with(".sass") {
