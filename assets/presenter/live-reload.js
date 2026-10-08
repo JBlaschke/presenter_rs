@@ -1,8 +1,8 @@
-// Live-reload client of `presenter serve`: docs/spec/live-reload.md §3, ES2020, no deps.
-// Notes: docs/dev/live-reload-qa.md. Debugging: window.__presenterLiveReload.
+// Client of `presenter serve` (docs/spec/live-reload.md §3); ES2020, no deps.
+// Notes: docs/dev/live-reload-qa.md; debug: window.__presenterLiveReload.
 (() => {
 'use strict';
-// Per frame: the speaker view shows the deck in two frames (different queries).
+// Per frame: the speaker view has two deck frames.
 const KEY = 'presenter:build_id:' + location.pathname + location.search;
 const state = { buildId: null, connected: false, retryMs: 500, lastStatus: 'ok', errorId: null };
 let source = null;
@@ -10,19 +10,23 @@ let timer = null;
 let queue = Promise.resolve();
 const log = (...a) => console.debug('[presenter]', ...a);
 
-// What a slide swap cannot update, ?v= ignored (scripts add head elements after the theme).
+// What a swap cannot update, sans ?v= (scripts add head elements after the theme).
 const signature = (doc) => Array.from(doc.querySelectorAll('head>*,body>*'))
   .filter((el) => !el.matches('title,meta,#presenter-overlay,#presenter-theme~*,.reveal') &&
     !el.querySelector('.reveal'))
   .map((el) => el.outerHTML).join('\n').replace(/\?v=\d+/g, '') + doc.documentElement.lang;
-let assets = signature(document);
+// Once parsed: deck.html's body_end follows this script. '' reloads.
+let assets = '';
+const snap = () => { assets = signature(document); };
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', snap);
+else snap();
 
 function store(id) {
   state.buildId = id;
   try { sessionStorage.setItem(KEY, id); } catch { /* storage disabled */ }
 }
 
-// Stores the causing build first: the reloaded page must not reload again.
+// Stored first: the reloaded page must not reload.
 function fullReload(why, id) {
   store(id);
   disconnect();
@@ -31,9 +35,9 @@ function fullReload(why, id) {
   return false;
 }
 
+const overlay = () => document.getElementById('presenter-overlay');
 function showOverlay(err, id) {
-  const el = document.getElementById('presenter-overlay') ||
-    document.body.appendChild(document.createElement('div'));
+  const el = overlay() || document.body.appendChild(document.createElement('div'));
   el.id = 'presenter-overlay';
   el.style.cssText = 'position:fixed;top:1em;right:1em;max-width:50%;max-height:80vh;overflow:auto;' +
     'z-index:10000;background:#222;color:#eee;border-left:4px solid #e55;padding:1em;' +
@@ -44,11 +48,11 @@ function showOverlay(err, id) {
   state.errorId = id; // a reconnect leaves this one alone
 }
 function hideOverlay() {
-  const el = document.getElementById('presenter-overlay');
+  const el = overlay();
   if (el) el.style.display = 'none';
 }
 
-// Loads `href` in a new <link> after `old`, then drops `old` (no flash); false on failure.
+// Adds a <link> to `href`, drops `old` once it loads (no flash); false on failure.
 const swapLink = (old, href) => new Promise((resolve) => {
   const link = old.cloneNode();
   link.href = href;
@@ -157,8 +161,7 @@ function onHello(d) {
     state.lastStatus = 'error';
     state.errorId = d.build_id;
     // §2's hello has no details: keep the overlay of the server's fallback page.
-    const shown = document.getElementById('presenter-overlay');
-    if (d.error || !shown) showOverlay(d.error || { message: 'details in the terminal' }, d.build_id);
+    if (d.error || !overlay()) showOverlay(d.error || { message: 'details in the terminal' }, d.build_id);
   } else if (again && d.status !== 'error') {
     onBuild({ ...d, kind: 'content' }); // same id: the server may have restarted
   }

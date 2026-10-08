@@ -12,14 +12,19 @@ the routes of docs/spec/live-reload.md §1 (GET /, /__presenter/theme.css,
   POST /__mock/head             body = extra HTML appended to <head> (no event)
   POST /__mock/body             body = HTML put before <div class="reveal">, like deck.html's
                                 body_start block (no event)
+  POST /__mock/bodyend          body = HTML put after the client's <script>, like deck.html's
+                                body_end block (no event)
   POST /__mock/asset?path=P     body = a theme-chain file served at /__presenter/asset/P
                                 (e.g. P = extra.css or @corporate/styles/hl.css; no event)
   GET  /__mock/title?t=...      set the <title> (no event)
   GET  /__mock/lang?l=...       set <html lang> (no event)
+  GET  /__mock/early?on=1|0     emit the client's <script> before reveal.js instead of after
+                                Reveal.initialize, like a child theme whose `scripts` block
+                                calls live_reload() first (no event)
   GET  /__mock/emit?kind=css|content|error[&message=..&file=..&line=..][&nodoc=1]
                                 next build_id; broadcast a `build` event (an ok build makes
-                                the current slides/CSS/title/head/body/assets the served
-                                document; an error with nodoc=1 serves the "no successful
+                                the current slides/CSS/title/lang/head/body/bodyend/early/
+                                assets the served document; an error with nodoc=1 serves the "no successful
                                 build yet" page, whose overlay is pre-populated as in §1)
   GET  /__mock/down?ms=N        drop SSE clients and answer /__presenter/events with 503 for N ms
   GET  /__mock/restart          like a restarted server: SSE clients dropped, and a first good
@@ -110,17 +115,18 @@ PAGE = """<!DOCTYPE html>
 <div class="reveal">
 <div class="slides">{slides}</div>
 </div>
-<script src="/__presenter/asset/vendor/reveal/dist/reveal.js"></script>
+{lr_early}<script src="/__presenter/asset/vendor/reveal/dist/reveal.js"></script>
 <script src="/__presenter/asset/vendor/reveal/dist/plugin/highlight.js"></script>
 <script src="/__presenter/asset/vendor/reveal/dist/plugin/notes.js"></script>
 <script src="/__presenter/asset/vendor/katex/katex.min.js"></script>
 <script src="/__presenter/asset/presenter/math.js"></script>
 <script>{math}</script>
 <script>Reveal.initialize(Object.assign({{"hash":true,"transition":"none","width":1280,"height":720}}, {{ plugins: [RevealHighlight, RevealNotes] }}));</script>
-<script src="/__presenter/live-reload.js"></script>
+{lr_late}{body_end}
 </body>
 </html>
 """
+CLIENT = '<script src="/__presenter/live-reload.js"></script>\n'
 
 
 class Mock:
@@ -135,7 +141,7 @@ class Mock:
         self.build_id = 1
         self.status, self.error = "ok", None
         self.slides, self.css, self.title, self.lang = INITIAL_SLIDES, INITIAL_CSS, INITIAL_TITLE, "en"
-        self.head, self.body, self.assets = "", "", {}
+        self.head, self.body, self.body_end, self.early, self.assets = "", "", "", False, {}
         self.served = self.snapshot()
         self.events = []  # data of the `build` events, in order
         self.down_until = 0.0
@@ -145,7 +151,8 @@ class Mock:
     def snapshot(self):
         """The document of the current build (?v= in it is that build's id)."""
         return dict(slides=self.slides, css=self.css, title=self.title, lang=self.lang,
-                    head=self.head, body=self.body, assets=dict(self.assets), build_id=self.build_id)
+                    head=self.head, body=self.body, body_end=self.body_end, early=self.early,
+                    assets=dict(self.assets), build_id=self.build_id)
 
     def emit(self, kind, query):
         self.build_id += 1
@@ -204,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
         fields = {"/__mock/slides": "slides", "/__mock/css": "css", "/__mock/head": "head",
-                  "/__mock/body": "body", "/__mock/asset": "assets"}
+                  "/__mock/body": "body", "/__mock/bodyend": "body_end", "/__mock/asset": "assets"}
         field = fields.get(path)
         if field is None:
             return self.do_GET()
@@ -234,8 +241,10 @@ class Handler(BaseHTTPRequestHandler):
             if fail_root:
                 return self.send(503, "failroot", "text/plain")
             if served:
-                fields = {k: v for k, v in served.items() if k != "assets"}
-                page = PAGE.format(math=MATH_FALLBACK, **fields)
+                fields = {k: v for k, v in served.items() if k not in ("assets", "early")}
+                early = served["early"]
+                page = PAGE.format(math=MATH_FALLBACK, lr_early=CLIENT if early else "",
+                                   lr_late="" if early else CLIENT, **fields)
             else:
                 page = FALLBACK.format(text=html.escape(overlay_text(state["error"])))
             return self.send(200, page, "text/html; charset=utf-8")
@@ -274,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
                 MOCK.title = query.get("t", [""])[0]
             elif path == "/__mock/lang":
                 MOCK.lang = query.get("l", ["en"])[0]
+            elif path == "/__mock/early":
+                MOCK.early = on
             elif path == "/__mock/failroot":
                 MOCK.fail_root = on
             elif path == "/__mock/hello-error":

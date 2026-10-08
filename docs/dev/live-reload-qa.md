@@ -32,6 +32,8 @@ survives only if no full reload happens. Trigger builds with:
 | change the title or `<html lang>` | `curl "$S/__mock/title?t=New"` or `curl "$S/__mock/lang?l=de"`, and then a content build |
 | edit the head (stylesheets, inline `<style>`) | `curl --data-binary '<style>.reveal h2 { letter-spacing: 7px }</style>' $S/__mock/head` and then a content build |
 | edit `body_start` markup | `curl --data-binary '<div class="footer">footer v2</div>' $S/__mock/body` and then a content build |
+| edit `body_end` markup (after the client's `<script>`) | `curl --data-binary '<div class="end">footer</div>' $S/__mock/bodyend` and then a content build |
+| emit the client's `<script>` before reveal's (a child theme's `scripts` block) | `curl "$S/__mock/early?on=1"` and then a content build |
 | parse error | `curl "$S/__mock/emit?kind=error"` (by default `slides.md:41: unknown directive 'include'`; override with `&message=…&file=…&line=…`) |
 | "no good build yet" page | `curl "$S/__mock/emit?kind=error&nodoc=1"` and then reload the page |
 | `hello` with the error details (proposed §2 addition) | `curl "$S/__mock/hello-error?on=1"` |
@@ -56,20 +58,21 @@ whose error the overlay shows or the user dismissed),
 `tests/fixtures/live-reload/qa.mjs` runs the whole checklist against the mock in headless
 Chrome (over the DevTools protocol) and prints one PASS/FAIL line per scenario; the item
 numbers are in brackets. It needs Node ≥ 22, `python3` and Chrome or Chromium, and takes
-about two minutes:
+about two and a half minutes:
 
 ```sh
-node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHRSF] [--chrome PATH] [--out DIR]
+node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHJRSF] [--chrome PATH] [--out DIR]
 ```
 
 ### B. `presenter serve` (T23)
 
 Run `cargo run -- serve examples/basic/slides.md` and repeat the checklist by editing the
 real files: the theme's CSS for items 1 and 2; `slides.md` for items 3–8, 11–16 and 21–23;
-the theme's `deck.html` and `theme.toml` for items 18 and 19. For items 9, 10 and 17, stop
-the server process, edit a file and start it again. Open the speaker view with `S` for
-item 20, and the page with `?view=scroll` for item 25. Item 24 needs the mock, which can
-fail `GET /` on purpose.
+the theme's `deck.html` and `theme.toml` for items 18, 19 and 27 (for item 27, put markup
+in the `body_end` block, and override `scripts` in a child theme to call `live_reload()`
+first). For items 9, 10 and 17, stop the server process, edit a file and start it again.
+Open the speaker view with `S` for item 20, and the page with `?view=scroll` for item 25.
+Item 24 needs the mock, which can fail `GET /` on purpose.
 
 ## Checklist
 
@@ -101,25 +104,36 @@ fail `GET /` on purpose.
 | 24 | `GET /` fails during a content build, then a css build arrives | the content update is postponed (build id not stored), and the css build also applies the slides |
 | 25 | reveal's scroll view (`view: "scroll"`, or a viewport narrower than reveal's `scrollActivationWidth`) | a content build reloads in full |
 | 26 | Console during the whole run | no uncaught exceptions; every client message starts with `[presenter]` |
+| 27 | Markup in `body_end` (parsed after the client's `<script>`), or the client's `<script>` emitted before reveal's (a child theme overriding the `scripts` block) | a slide edit and a reconnect are still swapped in place, with no reload; editing the `body_end` markup or moving the script reloads once (item 19) |
 
 ## Results
 
-### 2026-10-08: mock server, second run (T22 review fixes)
+### 2026-10-08: mock server, third run (T22 review fixes, round 2)
 
 Environment: macOS, Google Chrome 154.0.8037.98 (headless, driven over the DevTools
-protocol), Node 26.10.0, Python 3.14.8. `live-reload.js` was 7846 bytes, sha256
-`1770c563cd8ceba3…`. This run replaces the first one (7988-byte client), which the review
-showed to be incomplete: its mock sent a non-spec `hello.error`, so item 22 was tested only
-with that, and its tests did not cover items 2, 5, 19, 20 and 23–25.
+protocol), Node 26.10.0, Python 3.14.8. `live-reload.js` was 7907 bytes, sha256
+`a349bc4b5d193dd8…`. This run replaces the earlier ones, which missed a defect:
+- The first run (7988-byte client) used a mock that sent a non-spec `hello.error`, so
+  item 22 was tested only with that. It also did not cover items 2, 5, 19, 20 and 23–25.
+- The second run (7846-byte client, 40 of 40 passed) tested item 19 only with
+  `body_start` markup, which the mock put before `.reveal`. That client took its baseline
+  of the page when its script ran. At that point, deck.html's `body_end` markup, which comes
+  after the script, was not parsed yet. So with any `body_end` markup, every slide edit and
+  every reconnect reloaded in full. The mock now has a `body_end` placeholder after the
+  client's `<script>`, and it can emit the script before reveal's. Item 27 covers both cases.
 
-Method: `node tests/fixtures/live-reload/qa.mjs` (40 scenarios in 10 browser sessions, 2 min).
-The page was opened at the slide given below, builds were triggered through the mock's
-control routes, and the assertions ran in the page. `window.__qaMarker` detected full
-reloads, `performance.getEntriesByType('navigation')` told reloads from first loads, and
-`/__mock/log` recorded the requests. Every item passed (40 of 40); the overlay states were
-also checked on screenshots. As a check of the checks, the same run against the previous
-client (7988 bytes) failed 19 of the 39 scenarios that existed then, among them every scenario added for a review
-finding (items 2, 5, 10 same-id restart, 19, 20, 22–24).
+Method: `node tests/fixtures/live-reload/qa.mjs` (45 scenarios in 11 browser sessions,
+2 min 21 s). The page was opened at the slide given below. Builds were triggered through the
+mock's control routes, and the assertions ran in the page. `window.__qaMarker` detected full
+reloads, and `performance.getEntriesByType('navigation')` told reloads from first loads.
+`/__mock/log` recorded the requests. Every item passed (45 of 45). Separately, the
+coordinator's CDP helper loaded the mock with a `body_end` footer: the error overlay looked
+right on a screenshot, and the good content build after it was swapped in place (the marker
+survived, the indices stayed `{h:1,v:1}`). As a check of the checks, session J (item 27) ran against the
+previous 7846-byte client. It failed J1, J2 and J5: each slide edit and reconnect logged
+`full reload: page changed outside the slides`. It passed J3 and J4, which expect a reload.
+In the second run, the same comparison against the 7988-byte client failed 19 of 39
+scenarios, among them every scenario added for a review finding.
 
 | # | result | evidence |
 |---|---|---|
@@ -141,7 +155,7 @@ finding (items 2, 5, 10 same-id restart, 19, 20, 22–24).
 | 16 | pass | After 5 builds, the last edit was shown, the stored build id was the last one, and the only `#presenter-theme` pointed at `?v=<last>`. |
 | 17 | pass | The page reloaded once (`build 1 -> 2`) and showed the edit made while it was disconnected, on `#/math`. |
 | 18 | pass | An extra reveal theme stylesheet in the new document caused one reload, and the new theme was applied. |
-| 19 | pass | Each of these caused exactly one reload and was then shown: an inline `<style>` added to the head (`letter-spacing: 7px` applied), a `body_start` footer added, its text changed (`footer v1` → `footer v2`), and `<html lang>` changed to `de`. A slide edit afterwards, on the page with the head `<style>`, the highlight plugin's own `<style>` and the footer, was still swapped in place. |
+| 19 | pass | Each of these caused exactly one reload and was then shown: an inline `<style>` added to the head (`letter-spacing: 7px` applied), a `body_start` footer added, its text changed (`footer v1` → `footer v2`), the `body_end` markup changed (`footer v2` shown, hash `#/stack-bottom` kept), the client's `<script>` moved before reveal's, and `<html lang>` changed to `de`. A slide edit afterwards, on the page with the head `<style>`, the highlight plugin's own `<style>` and the footer, was still swapped in place. |
 | 20 | pass | `/__mock/frames` (the speaker view's two iframes, whose URLs differ in their query) stored the build id under two keys. A build made while both were disconnected reloaded both frames, and both showed the new slide (7 slides, build 2). |
 | 21 | pass | Adding a slide script caused a reload, and the script ran. A later text edit, with the script unchanged, reloaded again. |
 | 22 | pass | Deck opened while build 2 had failed, with the §2 `hello`: the overlay read `build error` / `details in the terminal` / `(click to dismiss)` over a working deck. With `hello.error` turned on, a reload showed `build error (parse)` / `boom` / `slides.md:7`. On the fallback page, the pre-rendered `build error (parse)` / `first` / `slides.md:41` stayed unchanged, with no second overlay, also after a reconnect. The first good build reloaded into the deck (`cannot update in place`). |
@@ -149,6 +163,7 @@ finding (items 2, 5, 10 same-id restart, 19, 20, 22–24).
 | 24 | pass | With `GET /` answering 503, a content build logged `GET / failed, update postponed`; the build id stayed 1 and the state became `stale`. The next css build fetched `/` too and showed the edit, and stored its id; a later reconnect changed nothing. |
 | 25 | pass | Opened with `?view=scroll`: a content build reloaded once (`cannot update in place`), and the edit was shown. |
 | 26 | pass | No exceptions occurred in any session, and every client message was `[presenter] …`. The only other console lines were Chrome's own `Failed to load resource` errors for the deliberate failures: `/__presenter/events` during the outages (503 and `ERR_CONNECTION_REFUSED`) and `GET /` in item 24 (503). |
+| 27 | pass | Page opened at `#/1/1` with a `body_end` footer after the client's `<script>` (the last child of `<body>`). A slide edit was swapped in place: the marker survived, the edited slide was a new element, the indices stayed `{h:1,v:1}`, and the only requests were `GET /` and `theme.css?v=3`. A reconnect (`hello` with the same build id 3) refreshed in place too: the requests were the event stream, `GET /` and `theme.css?v=3`, and the log read `slides updated, build 3`. After the client's `<script>` was moved before `reveal.js` (one reload, item 19), a slide edit and a reconnect were again both in place (build 6). |
 
 Still to do: repeat this checklist against `presenter serve` once T23 has landed.
 
@@ -176,10 +191,13 @@ Still to do: repeat this checklist against `presenter serve` once T23 has landed
   place, and `<meta>`) and the children of `<body>` other than `.reveal`, as HTML with
   `?v=<id>` removed, plus `<html lang>`. Head elements after `#presenter-theme` are skipped:
   they are added by scripts (the highlight plugin appends a `<style>`), and §5 makes the
-  theme link the last stylesheet a template emits. Any difference, slides that contain a
-  `<script>`, a page without a reveal deck (T21's fallback page), and reveal's scroll and
-  print views all lead to a full reload. reveal's `hash: true` (the presenter default) then
-  restores the slide.
+  theme link the last stylesheet a template emits. The baseline of the page shown is taken
+  once the page has been parsed (`DOMContentLoaded`), not when the client's script runs:
+  markup can follow that script (deck.html's `body_end` block, or everything after it when
+  a child theme's `scripts` block calls `live_reload()` first). A build that arrives before
+  then reloads in full. Any difference, slides that contain a `<script>`, a page without a
+  reveal deck (T21's fallback page), and reveal's scroll and print views all lead to a full
+  reload. reveal's `hash: true` (the presenter default) then restores the slide.
 - **After an error or a postponed update.** A content update is postponed when `GET /`
   fails (`lastStatus` becomes `stale`, the build id is not stored). After an error build or
   a postponed update, the next good build of any kind is applied as content and css, since
@@ -207,8 +225,9 @@ Still to do: repeat this checklist against `presenter serve` once T23 has landed
 - Attributes of `<body>` and `.reveal`, and markup inside `.reveal` but outside `.slides`,
   are not compared (reveal changes them at runtime), so template edits there need a manual
   reload.
-- A theme script that adds elements to `<body>`, or to `<head>` before `#presenter-theme`,
-  before the client runs makes every content build reload in full.
+- A script that adds elements to `<body>`, or to `<head>` before `#presenter-theme`, while
+  the page is being parsed (inline, or a `DOMContentLoaded` handler registered before the
+  client's) makes every content build reload in full. Elements added later are ignored.
 - In reveal's scroll view (also active automatically below `scrollActivationWidth`, 435 px
   by default) and print view, every content build reloads in full.
 - After any lost connection, the client fetches `/` once and swaps the slides, even if

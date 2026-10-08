@@ -3,7 +3,7 @@
 // mock-server.py: drives headless Chrome over the DevTools protocol, runs each scenario in the
 // page and prints one PASS/FAIL line per scenario; exit code 1 if any fails.
 //
-// usage: node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHRSF] [--chrome PATH] [--out DIR]
+// usage: node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHJRSF] [--chrome PATH] [--out DIR]
 //   --only   sessions to run (default: all); F stops and restarts the mock process (~40 s)
 //   --chrome Chrome or Chromium binary (default: $CHROME_PATH, else the usual install path)
 //   --out    directory for a log and a final screenshot per session
@@ -22,7 +22,7 @@ const opt = (name, fallback) => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : fallback;
 };
-const ONLY = opt('--only', 'ABCDEGHRSF');
+const ONLY = opt('--only', 'ABCDEGHJRSF');
 const CHROME = opt('--chrome', process.env.CHROME_PATH ||
   (process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 'google-chrome'));
 const OUT = opt('--out', null);
@@ -84,6 +84,31 @@ function installHelpers() {
         total: window.Reveal ? Reveal.getTotalSlides() : null,
         present: window.Reveal ? (Reveal.getCurrentSlide() || {}).id : null,
       };
+    },
+    // A content edit of #stack-bottom (the current slide); in place iff the marker survives
+    // and the slide's element is a new one (tagged before the build).
+    async editInPlace(label) {
+      window.__qaMarker = label; await qa.mock();
+      document.getElementById('stack-bottom').__qaOld = true;
+      const text = 'bottom ' + label;
+      const r = await qa.edit((h) => h.replace(/<p>bottom[^<]*<\/p>/, '<p>' + text + '</p>'), 'content',
+        () => document.querySelector('#stack-bottom p').textContent === text);
+      const s = r.snap;
+      return { ok: r.ok && s.marker === label && !document.getElementById('stack-bottom').__qaOld
+        && s.idx.h === 1 && s.idx.v === 1 && r.requests.includes('GET / [empty]'), idx: s.idx, requests: r.requests };
+    },
+    // A reconnect (same build id): in place iff the marker survives and the slides were swapped.
+    async reconnectInPlace(label) {
+      window.__qaMarker = label;
+      document.getElementById('stack-bottom').__qaOld = true;
+      await qa.mock();
+      await qa.get('/__mock/down?ms=300');
+      const reconnected = await qa.until(() => !qa.lr().connected) && await qa.until(() => qa.lr().connected);
+      const swapped = await qa.until(() => !document.getElementById('stack-bottom').__qaOld);
+      await qa.wait(500);
+      const s = qa.snap(), req = await qa.mock();
+      return { ok: reconnected && swapped && s.marker === label && s.idx.h === 1 && s.idx.v === 1
+        && req.includes('GET / [empty]'), idx: s.idx, requests: req };
     },
   };
   return 'qa helpers installed';
@@ -416,6 +441,47 @@ function d5Check() {
   return { item: 'D5 [21] text edit, slides keep an unchanged <script>: still a full reload', pass: !window.__qaMarker && qa.nav() === 'reload' && document.getElementById('widget').textContent === 'widget ran' && h2 === 'Math 2', h2 };
 }
 
+// --- J: markup after the client's script, client script moved earlier (item 27) ----------
+
+async function j1Edit() {
+  const footer = (document.querySelector('.body-end-footer') || {}).textContent;
+  const last = document.body.lastElementChild.className;
+  const r = await qa.editInPlace('J1');
+  return { item: 'J1 [27] body_end markup after the client script: a slide edit is swapped in place', pass: r.ok
+    && footer === 'footer at body_end' && last === 'body-end-footer' && qa.nav() === 'navigate', footer, last, ...r };
+}
+async function j2Reconnect() {
+  const r = await qa.reconnectInPlace('J2');
+  return { item: 'J2 [27] body_end markup after the client script: a reconnect (same build id) refreshes in place', pass: r.ok && qa.nav() === 'navigate', ...r };
+}
+async function j3BodyEnd() {
+  window.__qaMarker = 'J3';
+  await qa.post('/__mock/bodyend', '\n<div class="body-end-footer">footer v2</div>');
+  return JSON.parse(await qa.get('/__mock/emit?kind=content'));
+}
+function j3Check() {
+  const footer = (document.querySelector('.body-end-footer') || {}).textContent;
+  const pass = !window.__qaMarker && qa.nav() === 'reload' && footer === 'footer v2' && qa.snap().stored === '4'
+    && location.hash === '#/stack-bottom';
+  return { item: 'J3 [19,27] template edit, body_end markup changed: one full reload, new markup shown', pass, footer, hash: location.hash };
+}
+async function j4Early() {
+  window.__qaMarker = 'J4';
+  await qa.get('/__mock/early?on=1');
+  return JSON.parse(await qa.get('/__mock/emit?kind=content'));
+}
+function j4Check() {
+  const client = document.querySelector('script[src="/__presenter/live-reload.js"]');
+  const next = client.nextElementSibling.getAttribute('src');
+  const pass = !window.__qaMarker && qa.nav() === 'reload' && next.endsWith('/reveal.js') && qa.snap().stored === '5';
+  return { item: 'J4 [19,27] template edit, client script moved before reveal.js: one full reload', pass, next };
+}
+async function j5Early() {
+  const a = await qa.editInPlace('J5');
+  const b = await qa.reconnectInPlace('J5');
+  return { item: 'J5 [27] client script before reveal.js (child theme `scripts` block): slide edit and reconnect in place', pass: a.ok && b.ok, a, b };
+}
+
 // --- E: page opened while the build fails (item 22) -------------------------------------
 
 function e1Check() {
@@ -576,6 +642,11 @@ const SESSIONS = [
     steps: [H, e1Check, { navigates: e1bOn }, 2500, H, e1bCheck, { navigates: e2NoDoc }, 2500, H, e2Check,
       e3Good, 3000, H, e3Check] },
   { id: 'G', path: '/#/3', steps: [H, g1Postponed] },
+  { id: 'J', path: '/#/1/1', async setup(m) {
+    await ctl(m, '/__mock/bodyend', '\n<div class="body-end-footer">footer at body_end</div>');
+    await ctl(m, '/__mock/emit?kind=content'); // build 2
+  }, // H again before each scenario, so that one that fails by reloading does not take the next ones with it
+  steps: [H, j1Edit, 1500, H, j2Reconnect, 1500, H, j3BodyEnd, 3000, H, j3Check, j4Early, 3000, H, j4Check, j5Early] },
   { id: 'H', path: '/__mock/frames', steps: [H, h1Frames, 5000, h1Check] },
   { id: 'R', path: '/#/3', steps: [H, r1RestartSame] },
   { id: 'S', path: '/?view=scroll#/3', steps: [H, s1Scroll, 3000, H, s1Check] },
@@ -699,7 +770,8 @@ async function runSession(s, shared, results) {
         results.push({ item: `${s.id} ${fn.name} threw: ${r.error}`, pass: false });
       }
     }
-    if (OUT) await page.screenshot(join(OUT, s.id + '.png'));
+    // e.g. while a reload the client should not have made is in progress
+    if (OUT) await page.screenshot(join(OUT, s.id + '.png')).catch((e) => out.push('screenshot failed: ' + e.message));
   } finally {
     await page.close();
     if (s.ownMock) await ctx.mock.stop();
