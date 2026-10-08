@@ -8,18 +8,26 @@
 //! `index.html` and `<size>` the total of all files written; `<path>` is relative to the
 //! current directory when below it); diagnostics go to stderr. A failed build prints the
 //! diagnostics found before the error (warnings, and every other missing asset as an
-//! error), then the error. `--watch` is [`watch`] (T20).
+//! error), then the error.
+//!
+//! `--watch` ([`watch`], T20) builds once, then rebuilds on every change of the deck's
+//! inputs ([`crate::serve::watch`]) until interrupted: each build prints exactly what a
+//! single build prints (a failed one prints its error and the loop goes on), and stderr gets
+//! `Watching for changes (Ctrl-C to stop)` after the first build and `Rebuilding (<kind>):
+//! <paths>` before every rebuild (neither with `-q`).
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::{
-    BuildArgs, GlobalArgs, UsageError, display_path, input_format, locate, print_stdout,
+    BuildArgs, GlobalArgs, display_path, input_format, locate, print_stdout, report,
     report_diagnostics,
 };
 use crate::config::CliOverrides;
-use crate::pipeline::{self, BuildFailure, BuildOptions};
+use crate::pipeline::{self, Build, BuildFailure, BuildOptions};
 use crate::render::BuildInfo;
+use crate::serve::watch::{self as watcher, ChangeBatch, ChangeKind, WatchStatus};
 
 /// Runs `presenter build`.
 pub fn run(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
@@ -31,16 +39,73 @@ pub fn run(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `presenter build --watch`: rebuild on every change without serving. T20 replaces this
-/// body (it can call [`build_options`] once and [`build_once`] per change).
+/// `presenter build --watch`: builds, then rebuilds on every change without serving
+/// ([`watcher::run_build_watch_with`]); runs until interrupted. Errors before the first
+/// build (input format, `presenter.toml`) end the command like a single build's; build
+/// errors are printed and watching goes on.
 pub fn watch(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
-    let _ = (args, global);
-    Err(UsageError("build --watch: watch arrives in T20".into()).into())
+    let (opts, out) = build_options(args, global)?;
+    watcher::run_build_watch_with(&opts, &out, |status| {
+        print_watch_status(status, &opts, &out, global);
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Prints one [`WatchStatus`] of `build --watch` (module docs).
+fn print_watch_status(
+    status: WatchStatus<'_>,
+    opts: &BuildOptions,
+    out: &Path,
+    global: &GlobalArgs,
+) {
+    match status {
+        WatchStatus::Built { build, written } => {
+            report_diagnostics(&build.diagnostics, global);
+            if !global.quiet {
+                let document = written.first().map_or(out, PathBuf::as_path);
+                // stdout is gone (closed pipe ignored); nothing sensible is left to do.
+                let _ = print_stdout(&wrote_line(build, document));
+            }
+        }
+        WatchStatus::Failed(BuildFailure { error, diagnostics }) => {
+            report_diagnostics(&diagnostics, global);
+            report::report_error(&locate(error, &opts.input));
+        }
+        WatchStatus::Watching(_) => status_line("Watching for changes (Ctrl-C to stop)", global),
+        WatchStatus::Changed(batch) => status_line(&rebuilding_line(batch), global),
+    }
+}
+
+/// `Rebuilding (<kind>): <paths>` for a change batch: at most three paths (relative to the
+/// current directory when below it), then `and N more`.
+fn rebuilding_line(batch: &ChangeBatch) -> String {
+    const SHOWN: usize = 3;
+    let kind = match batch.kind {
+        ChangeKind::Css => "css",
+        ChangeKind::Content => "content",
+    };
+    let mut paths: Vec<String> = batch
+        .paths
+        .iter()
+        .take(SHOWN)
+        .map(|path| display_path(path).display().to_string())
+        .collect();
+    if batch.paths.len() > SHOWN {
+        paths.push(format!("and {} more", batch.paths.len() - SHOWN));
+    }
+    format!("Rebuilding ({kind}): {}", paths.join(", "))
+}
+
+/// Writes `text` as a line on stderr, unless `-q`.
+fn status_line(text: &str, global: &GlobalArgs) {
+    if !global.quiet {
+        let _ = writeln!(std::io::stderr().lock(), "{text}");
+    }
 }
 
 /// The pipeline options for `args` and the output path (file or site directory).
 ///
-/// Errors: an input whose format cannot be told ([`UsageError`]) and `presenter.toml`
+/// Errors: an input whose format cannot be told ([`super::UsageError`]) and `presenter.toml`
 /// problems ([`crate::error::Error::Config`]).
 pub fn build_options(
     args: &BuildArgs,
@@ -83,6 +148,13 @@ pub fn build_once(opts: &BuildOptions, out: &Path, global: &GlobalArgs) -> anyho
     if global.quiet {
         return Ok(());
     }
+    let document = written.first().map_or(out, PathBuf::as_path);
+    print_stdout(&wrote_line(&build, document))
+}
+
+/// `Wrote <document> (<n> slides, <size>)`: `document` relative to the current directory
+/// when below it, `<size>` the document plus every file written next to it.
+fn wrote_line(build: &Build, document: &Path) -> String {
     let bytes = build.document.html.len()
         + build
             .document
@@ -91,13 +163,12 @@ pub fn build_once(opts: &BuildOptions, out: &Path, global: &GlobalArgs) -> anyho
             .map(|file| file.bytes.len())
             .sum::<usize>();
     let slides = build.document.slide_count;
-    let document = written.first().map_or(out, PathBuf::as_path);
-    print_stdout(&format!(
+    format!(
         "Wrote {} ({slides} {}, {})",
         display_path(document).display(),
         if slides == 1 { "slide" } else { "slides" },
         format_size(bytes)
-    ))
+    )
 }
 
 /// `bytes` in decimal units with one decimal place: `512 B`, `12.3 kB`, `1.8 MB`. The unit
@@ -135,20 +206,26 @@ mod tests {
         assert_eq!(format_size(1_250_000_000), "1250.0 MB");
     }
 
-    /// The T20 stub (T20 replaces `watch` and deletes this test).
     #[test]
-    fn watch_is_a_usage_error_until_t20() {
-        let args = BuildArgs {
-            input: PathBuf::from("slides.md"),
-            out: None,
-            theme: None,
-            standalone: false,
-            site: false,
-            watch: true,
-            format: None,
+    fn rebuilding_line_shows_three_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let batch = |names: &[&str], kind| ChangeBatch {
+            paths: names.iter().map(|name| cwd.join(name)).collect(),
+            kind,
         };
-        let err = run(&args, &GlobalArgs::default()).unwrap_err();
-        assert_eq!(err.to_string(), "build --watch: watch arrives in T20");
-        assert_eq!(super::super::exit_code_for(&err), super::super::EXIT_USAGE);
+        assert_eq!(
+            rebuilding_line(&batch(&["slides.md"], ChangeKind::Content)),
+            "Rebuilding (content): slides.md"
+        );
+        assert_eq!(
+            rebuilding_line(&batch(&["t/a.css", "t/b.css"], ChangeKind::Css)),
+            format!(
+                "Rebuilding (css): {}, {}",
+                Path::new("t/a.css").display(),
+                Path::new("t/b.css").display()
+            )
+        );
+        let many = rebuilding_line(&batch(&["a", "b", "c", "d", "e"], ChangeKind::Content));
+        assert_eq!(many, "Rebuilding (content): a, b, c, and 2 more");
     }
 }

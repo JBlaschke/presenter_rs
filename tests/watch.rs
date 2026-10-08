@@ -1,0 +1,464 @@
+//! T20: the file watcher (`presenter::serve::watch`) against the real OS backend (FSEvents
+//! on macOS, inotify on Linux), the watch sets of successful and failed builds, and
+//! `presenter build --watch` end to end.
+//!
+//! Every test works in its own temporary directory. Timeouts are generous: FSEvents can
+//! take about a second to deliver, and a batch is sent only after the debounce (150 ms)
+//! and the settle time (150 ms).
+
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use presenter::pipeline::{self, BuildOptions};
+use presenter::serve::watch::{
+    ChangeBatch, ChangeKind, WatchSet, Watcher, canonical, watch_set_for, watch_set_for_failed,
+};
+
+/// How long a batch may take to arrive.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait to be sure that no (further) batch comes.
+const QUIET: Duration = Duration::from_millis(1200);
+
+fn write(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+fn append(path: &Path, text: &str) {
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+/// A deck `a.md` and a theme `theme/` with `styles/x.css`, in a fresh temporary directory.
+fn deck_and_theme() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let deck = dir.path().join("a.md");
+    let theme = dir.path().join("theme");
+    let css = theme.join("styles/x.css");
+    write(&deck, "# A\n");
+    write(&theme.join("theme.toml"), "name = \"t\"\n");
+    write(&css, "body { color: red; }\n");
+    (dir, deck, theme, css)
+}
+
+/// Starts a watcher on `set` and waits until it is surely running, discarding anything
+/// it reports for the files just created.
+fn start(set: &WatchSet) -> (Watcher, Receiver<ChangeBatch>) {
+    let (tx, rx) = mpsc::channel();
+    let watcher = Watcher::start(set, tx).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    drain(&rx, Duration::from_millis(400));
+    (watcher, rx)
+}
+
+/// The next batch; fails the test after [`BATCH_TIMEOUT`].
+fn next(rx: &Receiver<ChangeBatch>, what: &str) -> ChangeBatch {
+    match rx.recv_timeout(BATCH_TIMEOUT) {
+        Ok(batch) => batch,
+        Err(err) => panic!("no batch after {what} within {BATCH_TIMEOUT:?}: {err}"),
+    }
+}
+
+/// Every batch that arrives until none has arrived for `quiet`.
+fn drain(rx: &Receiver<ChangeBatch>, quiet: Duration) -> Vec<ChangeBatch> {
+    let mut batches = Vec::new();
+    loop {
+        match rx.recv_timeout(quiet) {
+            Ok(batch) => batches.push(batch),
+            Err(RecvTimeoutError::Timeout) => return batches,
+            Err(RecvTimeoutError::Disconnected) => panic!("watcher stopped"),
+        }
+    }
+}
+
+#[test]
+fn edits_produce_classified_batches_and_bursts_coalesce() {
+    let (_dir, deck, theme, css) = deck_and_theme();
+    let set = WatchSet::new([deck.clone()], [theme]);
+    let (_watcher, rx) = start(&set);
+
+    append(&deck, "\nmore\n");
+    let batch = next(&rx, "appending to a.md");
+    assert_eq!(batch.kind, ChangeKind::Content);
+    assert_eq!(batch.paths, vec![canonical(&deck)]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    write(&css, "body { color: blue; }\n");
+    let batch = next(&rx, "touching x.css");
+    assert_eq!(batch.kind, ChangeKind::Css);
+    assert_eq!(batch.paths, vec![canonical(&css)]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    // Both within 50 ms: one batch, content (one path is not a stylesheet).
+    append(&deck, "\neven more\n");
+    std::thread::sleep(Duration::from_millis(30));
+    write(&css, "body { color: green; }\n");
+    let batch = next(&rx, "writing both files");
+    assert_eq!(batch.kind, ChangeKind::Content);
+    assert_eq!(batch.paths, vec![canonical(&deck), canonical(&css)]);
+    assert_eq!(drain(&rx, QUIET), vec![], "a second batch for the burst");
+}
+
+#[test]
+fn rename_replace_is_seen_and_later_edits_too() {
+    let (dir, deck, theme, _css) = deck_and_theme();
+    let set = WatchSet::new([deck.clone()], [theme]);
+    let (_watcher, rx) = start(&set);
+    let tmp = dir.path().join("a.md.tmp");
+
+    for round in 1..=2 {
+        // How vim and VS Code ("safe write") save: a new file renamed over the old one.
+        write(&tmp, &format!("# A\n\nround {round}\n"));
+        std::fs::rename(&tmp, &deck).unwrap();
+        let batches = drain_at_least_one(&rx, "rename-replacing a.md");
+        for batch in &batches {
+            assert_eq!(batch.paths, vec![canonical(&deck)], "round {round}");
+            assert_eq!(batch.kind, ChangeKind::Content);
+        }
+
+        append(&deck, "\nedited after the rename\n");
+        let batch = next(&rx, "editing a.md after the rename");
+        assert_eq!(batch.paths, vec![canonical(&deck)]);
+        assert_eq!(batch.kind, ChangeKind::Content);
+        assert_eq!(drain(&rx, QUIET), vec![]);
+    }
+}
+
+/// The next batch and any that follow it within [`QUIET`].
+fn drain_at_least_one(rx: &Receiver<ChangeBatch>, what: &str) -> Vec<ChangeBatch> {
+    let mut batches = vec![next(rx, what)];
+    batches.extend(drain(rx, QUIET));
+    batches
+}
+
+#[test]
+fn unrelated_and_ignored_paths_do_not_count() {
+    let (dir, deck, theme, _css) = deck_and_theme();
+    // Creating a directory inside a theme is a change; `templates/` exists beforehand.
+    std::fs::create_dir(theme.join("templates")).unwrap();
+    let set = WatchSet::new([deck.clone()], [theme.clone()]);
+    let (_watcher, rx) = start(&set);
+
+    // Next to the deck but not an input; inside the theme but on the ignore list.
+    write(&dir.path().join("notes.txt"), "x");
+    write(&dir.path().join("out.html"), "x");
+    write(&theme.join("styles/x.css~"), "x");
+    write(&theme.join("styles/.x.css.swp"), "x");
+    write(&theme.join("templates/4913"), "x");
+    write(&theme.join(".git/HEAD"), "x");
+    write(&theme.join("dist/x.html"), "x");
+    write(&theme.join("target/x.css"), "x");
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    write(&theme.join("templates/deck.html"), "{{ x }}");
+    write(&dir.path().join("notes.txt"), "y");
+    let batch = next(&rx, "writing a template");
+    assert_eq!(
+        batch.paths,
+        vec![canonical(&theme.join("templates/deck.html"))]
+    );
+    assert_eq!(batch.kind, ChangeKind::Content);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+}
+
+#[test]
+fn update_watches_the_new_set() {
+    let (dir, deck, theme, css) = deck_and_theme();
+    let other = dir.path().join("b.md");
+    write(&other, "# B\n");
+    let (mut watcher, rx) = start(&WatchSet::new([deck.clone()], []));
+    let root = canonical(dir.path());
+    assert_eq!(watcher.watched_dirs(), vec![(root.clone(), false)]);
+
+    write(&css, "body { color: blue; }\n");
+    assert_eq!(drain(&rx, QUIET), vec![], "the theme is not watched yet");
+
+    watcher
+        .update(&WatchSet::new([other.clone()], [theme.clone()]))
+        .unwrap();
+    assert_eq!(
+        watcher.watched_dirs(),
+        vec![(root.clone(), false), (root.join("theme"), true)]
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    append(&deck, "\nno longer an input\n");
+    write(&css, "body { color: green; }\n");
+    let batch = next(&rx, "touching x.css after the update");
+    assert_eq!(batch.paths, vec![canonical(&css)]);
+    assert_eq!(batch.kind, ChangeKind::Css);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    append(&other, "\nnow an input\n");
+    let batch = next(&rx, "appending to b.md");
+    assert_eq!(batch.paths, vec![canonical(&other)]);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    // Unwatching the theme again.
+    watcher.update(&WatchSet::new([other], [])).unwrap();
+    assert_eq!(watcher.watched_dirs(), vec![(root, false)]);
+}
+
+#[test]
+fn a_dropped_watcher_closes_the_channel() {
+    let (_dir, deck, _theme, _css) = deck_and_theme();
+    let (watcher, rx) = start(&WatchSet::new([deck], []));
+    drop(watcher);
+    match rx.recv_timeout(BATCH_TIMEOUT) {
+        Err(RecvTimeoutError::Disconnected) => {}
+        other => panic!("expected the channel to close, got {other:?}"),
+    }
+}
+
+/// The built-in theme directory a debug build also watches.
+fn builtin_theme_dirs() -> Vec<PathBuf> {
+    if cfg!(debug_assertions) {
+        vec![canonical(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/themes/default"),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// A project: `presenter.toml` choosing the disk theme `mytheme/` (a child of the
+/// built-in default), `figures/plot.png`, and `slides.md` with `deck` as its text.
+fn project(deck: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("presenter.toml"),
+        "[deck]\ntheme = \"mytheme\"\n",
+    );
+    write(
+        &dir.path().join("mytheme/theme.toml"),
+        "name = \"mytheme\"\nextends = \"default\"\n",
+    );
+    let png = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/basic/figures/plot.png"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("figures")).unwrap();
+    std::fs::write(dir.path().join("figures/plot.png"), png).unwrap();
+    let input = dir.path().join("slides.md");
+    write(&input, deck);
+    (dir, input)
+}
+
+fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths
+}
+
+#[test]
+fn watch_set_of_a_build_lists_every_input() {
+    let (dir, input) = project(
+        "# Hi\n\n![plot](figures/plot.png)\n\n---\n\n![gone](figures/missing.png)\n\n\
+         ![elsewhere](other/none.png)\n",
+    );
+    let opts = BuildOptions {
+        missing_asset_is_error: false,
+        ..BuildOptions::new(&input)
+    };
+    let build = pipeline::build_deck(&opts).unwrap();
+    let set = watch_set_for(&build);
+
+    let root = canonical(dir.path());
+    assert_eq!(
+        set.files,
+        sorted(vec![
+            root.join("slides.md"),
+            root.join("presenter.toml"),
+            root.join("figures/plot.png"),
+            root.join("figures/missing.png"),
+            root.join("other/none.png"),
+        ])
+    );
+    assert_eq!(
+        set.dirs_flat,
+        vec![root.clone(), root.join("figures"), root.join("other")]
+    );
+    let mut themes = builtin_theme_dirs();
+    themes.push(root.join("mytheme"));
+    assert_eq!(set.theme_dirs, sorted(themes));
+    assert_eq!(set.dirs_recursive, set.theme_dirs);
+}
+
+#[test]
+fn watch_set_of_a_failed_build_still_has_the_known_inputs() {
+    // A missing asset (an error in `build`): the deck parses, so its assets and theme are known.
+    let (dir, input) = project("# Hi\n\n![gone](figures/missing.png)\n");
+    let opts = BuildOptions::new(&input);
+    assert!(pipeline::build_deck(&opts).is_err());
+    let set = watch_set_for_failed(&opts);
+    let root = canonical(dir.path());
+    assert_eq!(
+        set.files,
+        sorted(vec![
+            root.join("slides.md"),
+            root.join("presenter.toml"),
+            root.join("figures/missing.png"),
+        ])
+    );
+    let mut themes = builtin_theme_dirs();
+    themes.push(root.join("mytheme"));
+    assert_eq!(set.theme_dirs, sorted(themes.clone()));
+
+    // Invalid front matter: the deck does not parse; presenter.toml still names the theme.
+    write(&input, "---\ntitle: [unclosed\n---\n\n# Hi\n");
+    assert!(pipeline::build_deck(&opts).is_err());
+    let set = watch_set_for_failed(&opts);
+    assert_eq!(
+        set.files,
+        sorted(vec![root.join("slides.md"), root.join("presenter.toml")])
+    );
+    assert_eq!(set.theme_dirs, sorted(themes));
+
+    // An invalid presenter.toml is still watched (fixing it must rebuild).
+    write(&dir.path().join("presenter.toml"), "[deck\n");
+    assert!(pipeline::build_deck(&opts).is_err());
+    let set = watch_set_for_failed(&opts);
+    assert_eq!(
+        set.files,
+        sorted(vec![root.join("slides.md"), root.join("presenter.toml")])
+    );
+    assert_eq!(set.theme_dirs, builtin_theme_dirs());
+    assert_eq!(set.dirs_flat, vec![root]);
+}
+
+/// A `presenter build --watch` child process, killed when dropped.
+struct WatchProcess {
+    child: Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl WatchProcess {
+    fn spawn(dir: &Path, args: &[&str]) -> WatchProcess {
+        let stdout = dir.join("stdout.txt");
+        let stderr = dir.join("stderr.txt");
+        let child = Command::new(env!("CARGO_BIN_EXE_presenter"))
+            .args(args)
+            .current_dir(dir)
+            .env_remove("RUST_LOG")
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        WatchProcess {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn stdout(&self) -> String {
+        std::fs::read_to_string(&self.stdout).unwrap()
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr).unwrap()
+    }
+
+    /// Waits up to `timeout` for `done` to hold, failing with the process output.
+    fn wait_for(&mut self, what: &str, timeout: Duration, done: impl Fn(&Self) -> bool) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if done(self) {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "presenter exited ({status}) while waiting for {what}\nstdout:\n{}\nstderr:\n{}",
+                    self.stdout(),
+                    self.stderr()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for {what}\nstdout:\n{}\nstderr:\n{}",
+            self.stdout(),
+            self.stderr()
+        );
+    }
+}
+
+impl Drop for WatchProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn contains(path: &Path, text: &str) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|html| html.contains(text))
+}
+
+#[test]
+fn build_watch_rebuilds_on_every_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let deck = dir.path().join("slides.md");
+    write(&deck, "# Watch test\n\nFirst slide.\n");
+    let out = dir.path().join("out/deck.html");
+    let mut process = WatchProcess::spawn(
+        dir.path(),
+        &["build", "slides.md", "--watch", "-o", "out/deck.html"],
+    );
+    process.wait_for("the first build", Duration::from_secs(30), |p| {
+        p.stderr().contains("Watching for changes (Ctrl-C to stop)")
+    });
+    assert!(contains(&out, "First slide."));
+    assert!(
+        process
+            .stdout()
+            .starts_with("Wrote out/deck.html (1 slide, "),
+        "{}",
+        process.stdout()
+    );
+
+    // An edit rebuilds.
+    append(&deck, "\n---\n\n## Marker one\n");
+    process.wait_for("the rebuild after an edit", Duration::from_secs(15), |_| {
+        contains(&out, "Marker one")
+    });
+
+    // A failed build is reported and watching goes on; the missing image is watched.
+    append(&deck, "\n---\n\n## Marker two\n\n![figure](fig.png)\n");
+    process.wait_for("the missing-asset error", Duration::from_secs(15), |p| {
+        p.stderr().contains("asset not found")
+    });
+    assert!(!contains(&out, "Marker two"));
+    let png = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/basic/figures/plot.png"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("fig.png"), png).unwrap();
+    process.wait_for(
+        "the rebuild after adding the image",
+        Duration::from_secs(15),
+        |_| contains(&out, "Marker two"),
+    );
+
+    let stdout = process.stdout();
+    let wrote: Vec<&str> = stdout.lines().collect();
+    assert_eq!(wrote.len(), 3, "{stdout}");
+    assert!(
+        wrote
+            .iter()
+            .all(|line| line.starts_with("Wrote out/deck.html ("))
+    );
+    assert!(wrote[2].contains("(3 slides, "), "{stdout}");
+    let stderr = process.stderr();
+    assert!(
+        stderr.contains("Rebuilding (content): slides.md"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Rebuilding (content): fig.png"), "{stderr}");
+    assert!(stderr.contains("error: slides.md:"), "{stderr}");
+}
