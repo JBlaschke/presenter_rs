@@ -12,21 +12,30 @@
 //! file descriptors 3 (commands) and 4 (replies and events), flat sessions. Chrome opens no
 //! network port, so no other local user or process can drive it.
 //!
-//! 1. A private temporary directory (mode 0700) holds Chrome's fresh profile: in the
-//!    system's temporary directory (`$TMPDIR`), or for a snap browser in its
-//!    `~/snap/<name>/common` when that exists (a snap has a private `/tmp`). Chrome starts
+//! 1. A private temporary directory (mode 0700) holds the deck, `deck.html`, and Chrome's
+//!    fresh profile: in the system's temporary directory (`$TMPDIR`), or for a snap browser
+//!    in its `~/snap/<name>/common` when that exists (a snap has a private `/tmp`, and
+//!    `~/snap/<name>/common` is its `$SNAP_USER_COMMON`, which it can read). Chrome starts
 //!    headless with a quiet throwaway configuration (no first-run UI, sync, extensions or
 //!    keychain access; plus `--no-sandbox` when running as root on Linux, which Chrome
 //!    requires); `/bin/sh` moves presenter's pipes to descriptors 3 and 4 and `exec`s it.
 //! 2. `Target.createTarget` (about:blank) and `Target.attachToTarget {flatten: true}` open a
-//!    page; `Fetch.enable` for `http://presenter.localhost/*`, `Page.enable`,
-//!    `Runtime.enable`, `Inspector.enable`; `Page.navigate` to [`DECK_URL`]. presenter answers
-//!    Chrome's request for it with the deck (`Fetch.fulfillRequest`; anything else there gets
-//!    a 404), so the deck is never written to disk and a confined browser (a snap, with its
-//!    private `/tmp`) needs no access to presenter's files. Like the `file://` page of
-//!    `presenter build`, a `.localhost` page is a secure context. Then the page's
+//!    page; `Page.enable`, `Runtime.enable`, `Inspector.enable`; `Page.navigate` to
+//!    `file://<dir>/deck.html?print-pdf`, the same kind of page as the output of
+//!    `presenter build` opened from disk (so images given by absolute path or `file://` URL
+//!    show, and the deck may be as large as Chrome can load). Then the page's
 //!    `Page.loadEventFired`. JavaScript dialogs (`alert`, `confirm`, …) are dismissed, with a
 //!    warning.
+//!
+//!    Fallback: a snap browser without `~/snap/<name>/common` (a snap that has never run)
+//!    cannot read the system's temporary directory. presenter then serves the deck itself
+//!    at [`SERVED_DECK_URL`] (`Fetch.enable` for `http://presenter.localhost/*`; Chrome's
+//!    request for the deck is answered with `Fetch.fulfillRequest`, anything else there
+//!    with a 404; a `.localhost` page is a secure context like a `file://` page). That has
+//!    two limits: images given by absolute path or `file://` URL do not show, and the deck
+//!    must fit into one DevTools message (Chrome takes at most 100 MiB, the deck travels
+//!    base64-encoded), so a larger deck is refused before Chrome starts. Running the snap
+//!    once creates the directory.
 //! 3. `Runtime.evaluate` of [`READY_SCRIPT`] (awaited): waits for `Reveal.isReady()`, the
 //!    end of reveal's print layout (`html.print-pdf` set, `loading-scroll-mode` gone from
 //!    the viewport, i.e. after its `pdf-ready` event), `document.fonts.ready` and two
@@ -37,10 +46,11 @@
 //!    then it is killed.
 //!
 //! Everything shares one deadline (`timeout`, [`DEFAULT_TIMEOUT`] for the CLI); an exited
-//! Chrome is noticed within 0.1 s. A failure is an [`Error::Other`] that names the browser,
-//! says what failed (`Chrome exited (…) while …`, `timed out after 120 s while …`), lists the
-//! page's uncaught errors and dismissed dialogs when there were any, and ends with the last
-//! lines Chrome wrote on stderr.
+//! Chrome is noticed within 0.1 s and a closed DevTools pipe (either direction) at once,
+//! and no message larger than Chrome accepts is sent. A failure is an [`Error::Other`]
+//! that names the browser, says what failed (`Chrome exited (…) while …`, `timed out after
+//! 120 s while …`), lists the page's uncaught errors and dismissed dialogs when there were
+//! any, and ends with the last lines Chrome wrote on stderr.
 //!
 //! # Cleanup
 //!
@@ -51,15 +61,16 @@
 //! process group and ignoring SIGINT, SIGTERM and SIGHUP, that reads presenter's messages on
 //! its stdin: Chrome's process id, then `done` once presenter has cleaned up. When its stdin
 //! closes without `done`, it waits for Chrome to exit (killing it after 3 s, while its
-//! command line still names the directory) and removes the directory. presenter's own signal handling is left alone, so an interrupted export ends
-//! the way an interrupted process does.
+//! command line still names the directory) and removes the directory. presenter's own
+//! signal handling is left alone, so an interrupted export ends the way an interrupted
+//! process does.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -76,13 +87,26 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long Chrome may take to exit after `Browser.close` before it is killed.
 pub const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
-/// Where Chrome loads the deck from (module docs, step 2). presenter answers every request
-/// for this origin itself, so the name is never resolved and nothing is fetched from the
-/// network or the loopback interface.
-pub const DECK_URL: &str = "http://presenter.localhost/deck.html?print-pdf";
+/// Where Chrome loads the deck from when it cannot read the temporary directory (module
+/// docs, step 2, fallback). presenter answers every request for this origin itself, so the
+/// name is never resolved and nothing is fetched from the network or the loopback
+/// interface.
+pub const SERVED_DECK_URL: &str = "http://presenter.localhost/deck.html?print-pdf";
 
 /// The requests presenter answers instead of the network (a `Fetch.enable` pattern).
-const DECK_ORIGIN_PATTERN: &str = "http://presenter.localhost/*";
+const SERVED_ORIGIN_PATTERN: &str = "http://presenter.localhost/*";
+
+/// The largest DevTools message presenter sends, NUL terminator included. Chrome's pipe
+/// handler drops the connection (and stops answering) when one message does not fit into
+/// its 100 MiB read buffer; this leaves room for the read chunk it adds.
+const MAX_MESSAGE: usize = 96 << 20;
+
+// Chrome's own limit, 100 MiB per message, must stay out of reach.
+const _: () = assert!(MAX_MESSAGE < 100 << 20);
+
+/// Bytes of a `Fetch.fulfillRequest` message besides its base64 body (ids and headers;
+/// generous).
+const FULFILL_OVERHEAD: usize = 4096;
 
 /// macOS app bundles searched by [`find_chrome`], in order: bundle and executable name.
 /// Each is looked for in `/Applications`, then `~/Applications`.
@@ -329,16 +353,36 @@ fn is_executable(path: &Path) -> bool {
 /// resolved like `--chrome` ([`find_chrome`] step 1).
 ///
 /// Errors (all [`Error::Other`]): `chrome` is not an executable; the temporary directory
-/// cannot be created; Chrome cannot be started; Chrome exits, times out or the page fails
-/// (with the browser's path, the page's errors and Chrome's stderr); not macOS or Linux.
+/// or the deck in it cannot be written; a deck to be served (module docs, step 2,
+/// fallback) is too large; Chrome cannot be started; Chrome exits, times out or the page
+/// fails (with the browser's path, the page's errors and Chrome's stderr); not macOS or
+/// Linux.
 pub fn html_to_pdf(chrome: &Path, html: &str, timeout: Duration) -> Result<Vec<u8>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let base = temp_base(chrome, home.as_deref()).unwrap_or_else(std::env::temp_dir);
-    print_in(chrome, html, timeout, &base)
+    let (base, source) = placement(chrome, home.as_deref());
+    let base = base.unwrap_or_else(std::env::temp_dir);
+    print_in(chrome, html, timeout, &base, source)
 }
 
-/// [`html_to_pdf`] with the temporary directory created in `base`.
-fn print_in(chrome: &Path, html: &str, timeout: Duration, base: &Path) -> Result<Vec<u8>> {
+/// How Chrome gets the deck (module docs, step 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeckSource {
+    /// `deck.html` in the export's temporary directory, opened as a `file://` page.
+    File,
+    /// Served from memory at [`SERVED_DECK_URL`], for a browser that cannot read the
+    /// temporary directory.
+    Served,
+}
+
+/// [`html_to_pdf`] with the temporary directory created in `base` and the deck handed over
+/// as `source` says.
+fn print_in(
+    chrome: &Path,
+    html: &str,
+    timeout: Duration,
+    base: &Path,
+    source: DeckSource,
+) -> Result<Vec<u8>> {
     if cfg!(not(unix)) {
         return Err(Error::Other(
             "PDF export needs macOS or Linux (Chrome is started through /bin/sh)".into(),
@@ -352,11 +396,15 @@ fn print_in(chrome: &Path, html: &str, timeout: Duration, base: &Path) -> Result
             chrome.display()
         ))
     })?;
+    if source == DeckSource::Served {
+        check_servable(html.len(), chrome, base)?;
+    }
     let mut dir = TempDir::new(base, "presenter-pdf")?;
-    tracing::info!("printing the deck with {}", executable.display());
+    let deck = Deck::new(&dir, html, source)?;
+    tracing::info!("printing {} with {}", deck.url, executable.display());
     let mut browser = Browser::launch(&executable, &dir.path().join("profile"))?;
     dir.watch(browser.pid());
-    let result = drive(&mut browser, html, deadline, timeout);
+    let result = drive(&mut browser, &deck, deadline, timeout);
     browser.stop(if result.is_ok() {
         CLOSE_GRACE
     } else {
@@ -369,13 +417,96 @@ fn print_in(chrome: &Path, html: &str, timeout: Duration, base: &Path) -> Result
     result
 }
 
-/// Where an export's temporary directory goes when `chrome` is a snap (module docs, step 2):
-/// the snap has a private `/tmp` that presenter can neither see nor clean, so the profile
-/// goes to the snap's `<home>/snap/<name>/common` instead, when that exists. `None` means
-/// the system's temporary directory.
-fn temp_base(chrome: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let dir = home?.join("snap").join(snap_name(chrome)?).join("common");
-    dir.is_dir().then_some(dir)
+/// The deck as Chrome gets it: the URL to open, and the HTML to answer for it when it is
+/// served (module docs, step 2).
+struct Deck<'a> {
+    /// `file://<dir>/deck.html?print-pdf` or [`SERVED_DECK_URL`].
+    url: String,
+    /// The HTML that presenter serves at [`SERVED_DECK_URL`]; `None` for a `file://` deck.
+    served: Option<&'a str>,
+}
+
+impl<'a> Deck<'a> {
+    /// Hands `html` over as `source` says: writes `deck.html` into `dir`, or keeps it to
+    /// be served.
+    fn new(dir: &TempDir, html: &'a str, source: DeckSource) -> Result<Deck<'a>> {
+        match source {
+            DeckSource::File => {
+                let page = dir.path().join("deck.html");
+                std::fs::write(&page, html)
+                    .map_err(|e| Error::Other(format!("cannot write {}: {e}", page.display())))?;
+                let url = format!("{}?print-pdf", file_url(&page));
+                Ok(Deck { url, served: None })
+            }
+            DeckSource::Served => Ok(Deck {
+                url: SERVED_DECK_URL.to_string(),
+                served: Some(html),
+            }),
+        }
+    }
+}
+
+/// The size of the `Fetch.fulfillRequest` message that serves a deck of `html_len` bytes
+/// (base64 body, NUL terminator included).
+fn served_message_len(html_len: usize) -> usize {
+    html_len.div_ceil(3) * 4 + FULFILL_OVERHEAD
+}
+
+/// Fails when a deck of `html_len` bytes is too large to be served to `chrome` in one
+/// DevTools message (module docs, step 2, fallback). `base` is the temporary directory the
+/// browser cannot read.
+fn check_servable(html_len: usize, chrome: &Path, base: &Path) -> Result<()> {
+    if served_message_len(html_len) <= MAX_MESSAGE {
+        return Ok(());
+    }
+    let limit = (MAX_MESSAGE - FULFILL_OVERHEAD) / 4 * 3;
+    let name = snap_name(chrome).unwrap_or_else(|| "<name>".into());
+    Err(Error::Other(format!(
+        "the deck is too large to print with {}: {html_len} bytes of HTML, but this \
+         browser cannot read {} (a snap that has never run), so it gets the deck in one \
+         DevTools message, which holds at most {limit} bytes\n  run the browser once \
+         (that creates ~/snap/{name}/common, which presenter then uses), or name a browser \
+         that is not a snap with --chrome PATH",
+        chrome.display(),
+        base.display()
+    )))
+}
+
+/// `file://` URL of an absolute path, percent-encoding everything but unreserved
+/// characters, `/` and `:`.
+fn file_url(path: &Path) -> String {
+    let mut url = String::from("file://");
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.first() != Some(&b'/') {
+        url.push('/');
+    }
+    for &byte in bytes {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                url.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(url, "%{byte:02X}");
+            }
+        }
+    }
+    url
+}
+
+/// Where an export's temporary directory goes (`None`: the system's temporary directory)
+/// and how Chrome gets the deck (module docs, steps 1 and 2). A snap has a private `/tmp`
+/// that presenter can neither see nor clean, so for a snap the directory goes to its
+/// `<home>/snap/<name>/common`, which it can read, when that exists; otherwise the deck is
+/// served.
+fn placement(chrome: &Path, home: Option<&Path>) -> (Option<PathBuf>, DeckSource) {
+    let Some(name) = snap_name(chrome) else {
+        return (None, DeckSource::File);
+    };
+    let common = home.map(|home| home.join("snap").join(name).join("common"));
+    match common.filter(|dir| dir.is_dir()) {
+        Some(dir) => (Some(dir), DeckSource::File),
+        None => (None, DeckSource::Served),
+    }
 }
 
 /// The snap a browser belongs to: `/snap/bin/<name>[.<app>]`, `/snap/<name>/…`, or a small
@@ -514,11 +645,11 @@ fn is_pdf_delimiter(byte: u8) -> bool {
 /// the browser's name and stderr ([`chrome_error`] adds those).
 fn drive(
     browser: &mut Browser,
-    html: &str,
+    deck: &Deck<'_>,
     deadline: Instant,
     timeout: Duration,
 ) -> std::result::Result<Vec<u8>, String> {
-    let mut cdp = Cdp::new(browser, html, deadline);
+    let mut cdp = Cdp::new(browser, deck, deadline);
     match print_page(&mut cdp) {
         Ok(pdf) => {
             cdp.close_browser();
@@ -571,17 +702,20 @@ fn print_page(cdp: &mut Cdp) -> std::result::Result<Vec<u8>, Failure> {
         "sessionId",
     )?;
     let page = Some(session.as_str());
-    let patterns = json!({ "patterns": [{ "urlPattern": DECK_ORIGIN_PATTERN }] });
-    cdp.call(page, "Fetch.enable", patterns)?;
+    if cdp.deck.served.is_some() {
+        let patterns = json!({ "patterns": [{ "urlPattern": SERVED_ORIGIN_PATTERN }] });
+        cdp.call(page, "Fetch.enable", patterns)?;
+    }
     for domain in ["Page.enable", "Runtime.enable", "Inspector.enable"] {
         cdp.call(page, domain, json!({}))?;
     }
 
     cdp.stage = "loading the deck";
     cdp.loaded = false;
-    let navigation = cdp.call(page, "Page.navigate", json!({ "url": DECK_URL }))?;
+    let url = cdp.deck.url.clone();
+    let navigation = cdp.call(page, "Page.navigate", json!({ "url": url }))?;
     if let Some(error) = navigation.get("errorText").and_then(Value::as_str) {
-        return Err(Failure::Other(format!("cannot load the deck: {error}")));
+        return Err(Failure::Other(load_error(cdp.deck, error)));
     }
     while !cdp.loaded {
         let message = cdp.next_message()?;
@@ -607,6 +741,20 @@ fn print_page(cdp: &mut Cdp) -> std::result::Result<Vec<u8>, Failure> {
         )));
     }
     Ok(pdf)
+}
+
+/// The reason when Chrome cannot open `deck` (`error`, e.g. `net::ERR_FILE_NOT_FOUND`).
+/// A `file://` deck that cannot be read means a confined browser that presenter did not
+/// recognize as one: the hint names the workaround.
+fn load_error(deck: &Deck<'_>, error: &str) -> String {
+    let mut reason = format!("cannot load {}: {error}", deck.url);
+    if deck.served.is_none() {
+        reason.push_str(
+            "\n  a sandboxed browser may be unable to read the temporary directory: set \
+             TMPDIR to a directory it can read",
+        );
+    }
+    reason
 }
 
 /// Evaluates [`READY_SCRIPT`] in the page and checks its result.
@@ -712,8 +860,8 @@ impl Failure {
 struct Cdp<'a> {
     /// The browser.
     browser: &'a mut Browser,
-    /// The deck, served for [`DECK_URL`].
-    html: &'a str,
+    /// The deck.
+    deck: &'a Deck<'a>,
     /// When everything must be done.
     deadline: Instant,
     /// The last request id used.
@@ -727,11 +875,11 @@ struct Cdp<'a> {
 }
 
 impl<'a> Cdp<'a> {
-    /// A connection to `browser` that serves `html` and must be done by `deadline`.
-    fn new(browser: &'a mut Browser, html: &'a str, deadline: Instant) -> Cdp<'a> {
+    /// A connection to `browser` that prints `deck` and must be done by `deadline`.
+    fn new(browser: &'a mut Browser, deck: &'a Deck<'a>, deadline: Instant) -> Cdp<'a> {
         Cdp {
             browser,
-            html,
+            deck,
             deadline,
             next_id: 0,
             stage: "starting Chrome",
@@ -777,6 +925,13 @@ impl<'a> Cdp<'a> {
         }
         tracing::trace!("CDP -> {method}");
         let bytes = request.to_string().into_bytes();
+        if bytes.len() >= MAX_MESSAGE {
+            return Err(Failure::Other(format!(
+                "{method}: the DevTools message is {} bytes, more than Chrome accepts \
+                 ({MAX_MESSAGE} bytes)",
+                bytes.len()
+            )));
+        }
         let commands = self.browser.commands.as_ref();
         if commands.is_some_and(|commands| commands.send(bytes).is_ok()) {
             Ok(self.next_id)
@@ -786,25 +941,40 @@ impl<'a> Cdp<'a> {
     }
 
     /// The next message from Chrome, waiting at most until the deadline and failing as soon
-    /// as Chrome has exited.
+    /// as Chrome has exited or either pipe has closed.
     fn next_message(&mut self) -> std::result::Result<Value, Failure> {
         loop {
             let left = remaining(self.deadline).ok_or(Failure::Timeout(self.stage))?;
             match self.browser.replies.recv_timeout(left.min(POLL)) {
-                Ok(bytes) => {
+                Ok(Incoming::Message(bytes)) => {
                     return serde_json::from_slice(&bytes).map_err(|e| {
                         let text = String::from_utf8_lossy(&bytes);
                         let shown: String = text.chars().take(SHOWN_MESSAGE).collect();
                         Failure::Other(format!("invalid DevTools message ({e}): {shown}"))
                     });
                 }
+                Ok(Incoming::WriteFailed(error)) => return Err(self.unwritable(&error)),
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(status) = self.browser.try_wait() {
                         return Err(self.exited(status));
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => return Err(self.gone()),
+                Ok(Incoming::Closed) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(self.gone());
+                }
             }
+        }
+    }
+
+    /// The failure when a command could not be written (`error`): Chrome exited, or closed
+    /// its command pipe.
+    fn unwritable(&mut self, error: &std::io::Error) -> Failure {
+        match self.browser.wait_exit(Duration::from_secs(1)) {
+            Some(status) => self.exited(status),
+            None => Failure::Other(format!(
+                "Chrome closed its DevTools command pipe ({error}) while {}",
+                self.stage
+            )),
         }
     }
 
@@ -868,16 +1038,18 @@ impl<'a> Cdp<'a> {
         Ok(())
     }
 
-    /// Answers a paused request for `http://presenter.localhost/…`: the deck for
-    /// [`DECK_URL`], 404 for anything else.
+    /// Answers a paused request for `http://presenter.localhost/…` (only a served deck
+    /// enables that): the deck for [`SERVED_DECK_URL`], 404 for anything else.
     fn serve(&mut self, session: Option<&str>, params: &Value) -> std::result::Result<(), Failure> {
         let url = params["request"]["url"].as_str().unwrap_or("");
-        let (code, body) = if url == DECK_URL {
-            let body = base64::engine::general_purpose::STANDARD.encode(self.html);
-            (200, body)
-        } else {
-            tracing::debug!("the deck requested {url}: 404");
-            (404, String::new())
+        let (code, body) = match self.deck.served {
+            Some(html) if url == SERVED_DECK_URL => {
+                (200, base64::engine::general_purpose::STANDARD.encode(html))
+            }
+            _ => {
+                tracing::debug!("the deck requested {url}: 404");
+                (404, String::new())
+            }
         };
         let response = json!({
             "requestId": params["requestId"],
@@ -934,9 +1106,9 @@ struct Browser {
     /// Messages for Chrome, written to its descriptor 3 by a writer thread. `None` once
     /// closed; the writer then closes the pipe, which makes Chrome exit.
     commands: Option<Sender<Vec<u8>>>,
-    /// Chrome's messages from its descriptor 4, read by a reader thread; disconnected when
-    /// the pipe closes.
-    replies: Receiver<Vec<u8>>,
+    /// Chrome's messages from its descriptor 4, read by a reader thread, and the writer
+    /// thread's failure.
+    replies: Receiver<Incoming>,
     /// Its last [`STDERR_TAIL`] stderr lines, filled by a reader thread.
     stderr: Arc<Mutex<VecDeque<String>>>,
     /// Disconnected when that thread reaches the end of Chrome's stderr.
@@ -971,6 +1143,7 @@ impl Browser {
         let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let (commands, to_chrome) = mpsc::channel();
         let (from_chrome, replies) = mpsc::channel();
+        let write_failures = from_chrome.clone();
         let (stderr_open, stderr_closed) = mpsc::channel::<()>();
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
         let log = Arc::clone(&stderr);
@@ -985,7 +1158,9 @@ impl Browser {
         let (Some(input), Some(output), Some(errors)) = pipes else {
             return Err(Error::Other("Chrome was started without its pipes".into()));
         };
-        spawn_thread("chrome-commands", move || write_messages(input, &to_chrome))?;
+        spawn_thread("chrome-commands", move || {
+            write_messages(input, &to_chrome, &write_failures);
+        })?;
         spawn_thread("chrome-replies", move || {
             read_messages(output, &from_chrome)
         })?;
@@ -1053,32 +1228,53 @@ fn spawn_thread(name: &str, body: impl FnOnce() + Send + 'static) -> Result<()> 
         .map_err(|e| Error::Other(format!("cannot start a thread to talk to Chrome: {e}")))
 }
 
+/// What the threads on Chrome's DevTools pipes report to [`Cdp::next_message`].
+#[derive(Debug)]
+enum Incoming {
+    /// A message from Chrome, without its NUL terminator.
+    Message(Vec<u8>),
+    /// Chrome's reply pipe reached its end (or failed).
+    Closed,
+    /// A command could not be written to Chrome's command pipe.
+    WriteFailed(std::io::Error),
+}
+
 /// The body of the writer thread: writes each message to Chrome's command pipe with its
-/// NUL terminator, until the channel closes (then the pipe is closed) or a write fails.
-fn write_messages(mut input: ChildStdin, messages: &Receiver<Vec<u8>>) {
+/// NUL terminator, until the channel closes (then the pipe is closed) or a write fails,
+/// which it reports to `failures` (so that a wait for a reply ends at once).
+fn write_messages(
+    mut input: impl std::io::Write,
+    messages: &Receiver<Vec<u8>>,
+    failures: &Sender<Incoming>,
+) {
     for mut message in messages {
         message.push(0);
         if let Err(e) = input.write_all(&message).and_then(|()| input.flush()) {
             tracing::debug!("cannot write to Chrome's DevTools pipe: {e}");
+            let _ = failures.send(Incoming::WriteFailed(e));
             return;
         }
     }
 }
 
 /// The body of the reader thread: sends each NUL-terminated message from Chrome to
-/// `messages`, until the pipe closes or nobody listens any more.
-fn read_messages(output: ChildStdout, messages: &Sender<Vec<u8>>) {
+/// `messages`, then [`Incoming::Closed`] when the pipe closes; stops early when nobody
+/// listens any more.
+fn read_messages(output: impl std::io::Read, messages: &Sender<Incoming>) {
     let mut reader = BufReader::new(output);
     loop {
         let mut message = Vec::new();
         match reader.read_until(0, &mut message) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => {
+                let _ = messages.send(Incoming::Closed);
+                return;
+            }
             Ok(_) => {}
         }
         if message.last() == Some(&0) {
             message.pop();
         }
-        if messages.send(message).is_err() {
+        if messages.send(Incoming::Message(message)).is_err() {
             return;
         }
     }
@@ -1482,15 +1678,86 @@ mod tests {
         );
         assert_eq!(snap_name(&plain), None);
 
-        // The snap's common directory, when it exists; else the system's temp directory.
+        // A snap reads the deck from its common directory when that exists; else the
+        // deck is served and the profile goes to the system's temp directory.
         let home = tempfile::tempdir().unwrap();
         let snap = Path::new("/snap/bin/chromium");
-        assert_eq!(temp_base(snap, Some(home.path())), None);
+        let served = (None, DeckSource::Served);
+        assert_eq!(placement(snap, Some(home.path())), served);
         let common = home.path().join("snap/chromium/common");
         std::fs::create_dir_all(&common).unwrap();
-        assert_eq!(temp_base(snap, Some(home.path())), Some(common));
-        assert_eq!(temp_base(snap, None), None);
-        assert_eq!(temp_base(&plain, Some(home.path())), None);
+        assert_eq!(
+            placement(snap, Some(home.path())),
+            (Some(common), DeckSource::File)
+        );
+        assert_eq!(placement(snap, None), served);
+        // Any other browser reads the deck from the system's temp directory.
+        let other = (None, DeckSource::File);
+        assert_eq!(placement(&plain, Some(home.path())), other);
+        assert_eq!(placement(Path::new("/usr/bin/chromium"), None), other);
+    }
+
+    #[test]
+    fn file_urls_are_percent_encoded() {
+        assert_eq!(
+            file_url(Path::new("/tmp/a b/#deck%?.html")),
+            "file:///tmp/a%20b/%23deck%25%3F.html"
+        );
+        assert_eq!(file_url(Path::new("/x/deck.html")), "file:///x/deck.html");
+        assert_eq!(
+            file_url(Path::new("/Users/zoë/snap~1/d.html")),
+            "file:///Users/zo%C3%AB/snap~1/d.html"
+        );
+    }
+
+    #[test]
+    fn unreadable_file_decks_suggest_another_temporary_directory() {
+        let file = Deck {
+            url: "file:///tmp/p/deck.html?print-pdf".into(),
+            served: None,
+        };
+        assert_eq!(
+            load_error(&file, "net::ERR_FILE_NOT_FOUND"),
+            "cannot load file:///tmp/p/deck.html?print-pdf: net::ERR_FILE_NOT_FOUND\n  a \
+             sandboxed browser may be unable to read the temporary directory: set TMPDIR to \
+             a directory it can read"
+        );
+        let served = Deck {
+            url: SERVED_DECK_URL.into(),
+            served: Some("<p>deck</p>"),
+        };
+        assert_eq!(
+            load_error(&served, "net::ERR_FAILED"),
+            format!("cannot load {SERVED_DECK_URL}: net::ERR_FAILED")
+        );
+    }
+
+    #[test]
+    fn served_decks_must_fit_into_one_devtools_message() {
+        assert_eq!(served_message_len(0), FULFILL_OVERHEAD);
+        assert_eq!(served_message_len(3), 4 + FULFILL_OVERHEAD);
+        assert_eq!(served_message_len(4), 8 + FULFILL_OVERHEAD);
+        // The largest servable deck: about 75 MB of HTML.
+        let limit = (MAX_MESSAGE - FULFILL_OVERHEAD) / 4 * 3;
+        assert!(served_message_len(limit) <= MAX_MESSAGE);
+        assert!(served_message_len(limit + 1) > MAX_MESSAGE);
+        let chrome = Path::new("/snap/bin/chromium");
+        let base = Path::new("/tmp");
+        assert!(check_servable(limit, chrome, base).is_ok());
+        let message = check_servable(limit + 1, chrome, base)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            message,
+            format!(
+                "the deck is too large to print with /snap/bin/chromium: {} bytes of HTML, \
+                 but this browser cannot read /tmp (a snap that has never run), so it gets \
+                 the deck in one DevTools message, which holds at most {limit} bytes\n  \
+                 run the browser once (that creates ~/snap/chromium/common, which presenter \
+                 then uses), or name a browser that is not a snap with --chrome PATH",
+                limit + 1
+            )
+        );
     }
 
     #[test]
@@ -1611,10 +1878,21 @@ mod tests {
     /// written while another test thread forks.
     #[cfg(unix)]
     fn print_with(chrome: &Path, timeout: Duration) -> (String, Duration) {
+        print_deck_with(chrome, "<p>deck</p>", DeckSource::File, timeout)
+    }
+
+    /// [`print_with`] for the deck `html`, handed over as `source` says.
+    #[cfg(unix)]
+    fn print_deck_with(
+        chrome: &Path,
+        html: &str,
+        source: DeckSource,
+        timeout: Duration,
+    ) -> (String, Duration) {
         let base = tempfile::tempdir().unwrap();
         for _ in 0..5 {
             let started = Instant::now();
-            let err = print_in(chrome, "<p>deck</p>", timeout, base.path()).unwrap_err();
+            let err = print_in(chrome, html, timeout, base.path(), source).unwrap_err();
             let elapsed = started.elapsed();
             assert!(
                 entries(base.path()).is_empty(),
@@ -1745,6 +2023,133 @@ mod tests {
             "{message}"
         );
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_command_pipe_fails_fast() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        // Reads the first command, closes the command pipe, then opens a dialog, which
+        // presenter answers: that write fails while the reply pipe stays open.
+        let fake = script(
+            dir.path(),
+            "chrome",
+            "head -c 1 <&3 >/dev/null\nexec 3<&-\n\
+             printf '{\"method\":\"Page.javascriptDialogOpening\",\
+             \"params\":{\"type\":\"alert\",\"message\":\"hi\"}}\\0' >&4\n\
+             exec sleep 30",
+        );
+        let (message, elapsed) = print_with(&fake, Duration::from_secs(20));
+        assert!(
+            message.starts_with(
+                "Chrome failed to print the deck: Chrome closed its DevTools command pipe ("
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                ") while starting Chrome\n  page errors:\n    dismissed a \
+                 JavaScript alert: hi\n"
+            ),
+            "{message}"
+        );
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn write_failures_and_closed_pipes_are_reported() {
+        /// A pipe whose reader is gone.
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (commands, to_chrome) = mpsc::channel();
+        let (from_chrome, replies) = mpsc::channel();
+        commands.send(b"{}".to_vec()).unwrap();
+        write_messages(Broken, &to_chrome, &from_chrome);
+        match replies.try_recv() {
+            Ok(Incoming::WriteFailed(e)) => assert_eq!(e.kind(), ErrorKind::BrokenPipe),
+            other => panic!("{other:?}"),
+        }
+        // Messages are delivered with their NUL terminator removed, then the end.
+        let output: &[u8] = b"{\"id\":1}\0{\"id\":2}\0";
+        read_messages(output, &from_chrome);
+        let received: Vec<Incoming> = replies.try_iter().collect();
+        assert!(
+            matches!(
+                received.as_slice(),
+                [Incoming::Message(a), Incoming::Message(b), Incoming::Closed]
+                    if a == b"{\"id\":1}" && b == b"{\"id\":2}"
+            ),
+            "{received:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deck_too_large_to_serve_is_refused_before_chrome_starts() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let fake = script(
+            dir.path(),
+            "chrome",
+            &format!("touch '{}'\nexit 1", marker.display()),
+        );
+        let limit = (MAX_MESSAGE - FULFILL_OVERHEAD) / 4 * 3;
+        let html = "x".repeat(limit + 1);
+        let (message, _) = print_deck_with(&fake, &html, DeckSource::Served, DEFAULT_TIMEOUT);
+        assert!(
+            message.starts_with("the deck is too large to print with "),
+            "{message}"
+        );
+        assert!(!marker.exists(), "the browser was started");
+    }
+
+    /// A real browser for the tests that print, or `None` after saying why the test is
+    /// skipped.
+    fn real_chrome() -> Option<PathBuf> {
+        let found = find_chrome(None);
+        if found.is_none() {
+            eprintln!("skipping: no chrome found");
+        }
+        found
+    }
+
+    /// A deck built from `markdown` like `presenter export pdf` builds it (standalone).
+    fn standalone_deck(markdown: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("deck.md");
+        std::fs::write(&input, markdown).unwrap();
+        let options = crate::pipeline::BuildOptions::new(&input);
+        crate::pipeline::build_deck(&options).unwrap().document.html
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_served_deck_prints_like_a_file_deck() {
+        let _serial = serial();
+        let Some(chrome) = real_chrome() else {
+            return;
+        };
+        // The second slide asks the served origin for an image: a 404, not a failure.
+        let html =
+            standalone_deck("# One\n\n---\n\n# Two\n\n<img src=\"/missing.png\" alt=\"gone\">\n");
+        for source in [DeckSource::Served, DeckSource::File] {
+            let base = tempfile::tempdir().unwrap();
+            let timeout = Duration::from_secs(60);
+            let pdf = print_in(&chrome, &html, timeout, base.path(), source)
+                .unwrap_or_else(|e| panic!("{source:?}: {e}"));
+            assert!(pdf.starts_with(b"%PDF-"), "{source:?}");
+            assert_eq!(page_count(&pdf), 2, "{source:?}");
+            assert!(entries(base.path()).is_empty(), "{source:?}");
+        }
     }
 
     #[test]

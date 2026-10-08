@@ -317,6 +317,112 @@ fn a_failed_print_stops_the_browser_and_cleans_up() {
     assert_cleaned_up(private_tmp.path());
 }
 
+/// Tiny PNGs with sizes no other image in a deck has: (width, height, base64).
+const PICTURES: [(u32, u32, &str); 3] = [
+    (
+        7,
+        5,
+        "iVBORw0KGgoAAAANSUhEUgAAAAcAAAAFCAIAAAAG+GGPAAAAEklEQVR4nGP4z8CAibAIUUUUAKEvIt57lX2fAAAAAElFTkSuQmCC",
+    ),
+    (
+        11,
+        3,
+        "iVBORw0KGgoAAAANSUhEUgAAAAsAAAADCAIAAADKnWIcAAAAEElEQVR4nGNgaGAggKigAgBKExCBCea1EgAAAABJRU5ErkJggg==",
+    ),
+    (
+        13,
+        2,
+        "iVBORw0KGgoAAAANSUhEUgAAAA0AAAACCAIAAAAM38H+AAAAEElEQVR4nGNgYPhPHCJOHQDyhxnnVFjAQQAAAABJRU5ErkJggg==",
+    ),
+];
+
+/// The `(width, height)` of every image in a PDF written by Chrome.
+fn pdf_image_sizes(pdf: &[u8]) -> std::collections::BTreeSet<(u32, u32)> {
+    let size =
+        regex::bytes::Regex::new(r"/Subtype\s*/Image\s*/Width\s+(\d+)\s*/Height\s+(\d+)").unwrap();
+    size.captures_iter(pdf)
+        .map(|caps| {
+            let number = |i: usize| text(&caps[i]).parse::<u32>().unwrap();
+            (number(1), number(2))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn images_by_absolute_path_and_file_url_are_printed() {
+    use base64::Engine as _;
+
+    if chrome().is_none() {
+        return;
+    }
+    // Raw HTML images stay as written in the standalone deck unless they are relative,
+    // so the PDF shows them only when the deck is a file:// page, as `presenter build`'s
+    // output opened from disk is.
+    let dir = project(&[]);
+    let pictures = dir.path().canonicalize().unwrap();
+    for ((width, height, png), name) in PICTURES.iter().zip(["rel", "abs", "url"]) {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(png)
+            .unwrap();
+        std::fs::write(pictures.join(format!("{name}.png")), bytes).unwrap();
+        assert!(width * height > 0);
+    }
+    let deck = format!(
+        "# Pictures\n\n<img src=\"rel.png\" alt=\"relative\"> \
+         <img src=\"{0}/abs.png\" alt=\"absolute\"> \
+         <img src=\"file://{0}/url.png\" alt=\"file URL\">\n",
+        pictures.display()
+    );
+    std::fs::write(dir.path().join("deck.md"), deck).unwrap();
+    let private_tmp = tempfile::tempdir().unwrap();
+    let output = presenter(dir.path())
+        .env("TMPDIR", private_tmp.path())
+        .args(["export", "pdf", "deck.md", "-o", "deck.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote(&output, "deck.pdf"), 1);
+    let sizes = pdf_image_sizes(&read_pdf(&dir.path().join("deck.pdf")));
+    for (width, height, _) in PICTURES {
+        assert!(
+            sizes.contains(&(width, height)),
+            "no {width}x{height} image in the PDF: {sizes:?}"
+        );
+    }
+    assert_cleaned_up(private_tmp.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn decks_larger_than_one_devtools_message_are_printed() {
+    if chrome().is_none() {
+        return;
+    }
+    // A 60 MiB image makes an 85 MB standalone deck: more than Chrome takes in one
+    // DevTools message (100 MiB, base64-encoded), so it must be loaded from disk.
+    let dir = project(&[("deck.md", "# Big\n\n![big](big.png)\n\n---\n\n# Two\n")]);
+    std::fs::write(dir.path().join("big.png"), vec![0u8; 60 << 20]).unwrap();
+    let private_tmp = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let output = presenter(dir.path())
+        .env("TMPDIR", private_tmp.path())
+        .args(["export", "pdf", "deck.md", "-o", "deck.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(assert_wrote(&output, "deck.pdf"), 2);
+    assert_eq!(page_count(&read_pdf(&dir.path().join("deck.pdf"))), 2);
+    assert_cleaned_up(private_tmp.path());
+}
+
 /// A deck that never gets ready to print, so that an export of it runs until its deadline.
 const STALLED_DECK: &str = "\
 # Never ready
