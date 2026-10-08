@@ -153,6 +153,41 @@ fn directory_without_manifest_is_reported() {
     );
 }
 
+#[test]
+fn wrong_case_manifest_is_not_a_manifest_on_any_platform() {
+    // A complete theme except that its manifest is `Theme.toml`: on macOS `is_file` finds
+    // it case-insensitively, but theme files are matched exactly (as on Linux), so this is
+    // the regular "no manifest" error with a hint, never a failed read.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("t");
+    write_root_theme(&dir, "name = \"t\"", &[]);
+    fs::rename(dir.join("theme.toml"), dir.join("Theme.toml")).unwrap();
+    let (name, message) = theme_error(resolve("t", &[tmp.path()]));
+    assert_eq!(name, "t");
+    assert!(message.starts_with("not found;"), "{message}");
+    assert!(
+        message.contains(&format!(
+            "{} exists but has no theme.toml; it has Theme.toml, but the name must be \
+             theme.toml exactly",
+            dir.display()
+        )),
+        "{message}"
+    );
+    assert!(!message.contains("disappeared"), "{message}");
+
+    // A wrong-case directory named like a built-in theme falls back to the built-in one.
+    let shadow = tmp.path().join("default");
+    write_root_theme(&shadow, "name = \"default\"", &[]);
+    fs::rename(shadow.join("theme.toml"), shadow.join("THEME.TOML")).unwrap();
+    let theme = resolve("default", &[tmp.path()]).unwrap();
+    assert_eq!(
+        theme.chain[0].source,
+        ThemeSource::Embedded {
+            prefix: "themes/default/".into()
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // The child-theme fixture
 

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-use super::{REQUIRED_TEMPLATES, Theme, ThemeDir, ThemeManifest, ThemeSource};
+use super::{REQUIRED_TEMPLATES, Theme, ThemeDir, ThemeManifest, ThemeSource, disk_file};
 
 /// The most themes one chain may contain (the requested theme plus seven ancestors).
 pub const MAX_CHAIN_LEN: usize = 8;
@@ -74,13 +74,18 @@ pub fn builtin_names() -> Vec<String> {
 
 /// Finds the theme `spec`: a directory with a manifest below one of `roots` (or at an
 /// absolute path), else a built-in theme. The error message says where it looked.
+///
+/// The manifest is detected with the exact-name rule [`ThemeDir::read`] uses, so a
+/// `Theme.toml` counts as no manifest on every platform, as on a case-sensitive file
+/// system (an `is_file` check would accept it on macOS and the read would then fail). The
+/// directory `spec` itself is a user path and follows the file system's own rules.
 fn locate(spec: &str, roots: &[&Path]) -> std::result::Result<ThemeSource, String> {
     if spec.trim().is_empty() {
         return Err("empty theme name".to_string());
     }
     let candidates = candidate_dirs(spec, roots);
     for candidate in &candidates {
-        if candidate.join(MANIFEST_FILE).is_file() {
+        if disk_file(candidate, MANIFEST_FILE).is_some() {
             let dir = std::fs::canonicalize(candidate)
                 .map_err(|e| format!("cannot open {}: {e}", candidate.display()))?;
             return Ok(ThemeSource::Disk { dir });
@@ -132,11 +137,27 @@ fn not_found_message(candidates: &[PathBuf], builtins: &[String]) -> String {
     );
     for candidate in candidates.iter().filter(|c| c.is_dir()) {
         message.push_str(&format!(
-            " ({} exists but has no {MANIFEST_FILE})",
+            " ({} exists but has no {MANIFEST_FILE}",
             candidate.display()
         ));
+        if let Some(found) = case_variant(candidate, MANIFEST_FILE) {
+            message.push_str(&format!(
+                "; it has {found}, but the name must be {MANIFEST_FILE} exactly"
+            ));
+        }
+        message.push(')');
     }
     message
+}
+
+/// The name of an entry of `dir` that equals `file` up to ASCII case but not exactly, if
+/// any (the smallest such name, for a deterministic message).
+fn case_variant(dir: &Path, file: &str) -> Option<String> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name != file && name.eq_ignore_ascii_case(file))
+        .min()
 }
 
 /// Locates the parent `parent` named by `child`'s `extends`.
@@ -267,11 +288,38 @@ mod tests {
             message.contains("exists but has no theme.toml"),
             "{message}"
         );
+        assert!(
+            !message.contains("but the name must be"),
+            "no case hint without a near match: {message}"
+        );
         assert!(locate("", &[tmp.path()]).unwrap_err().contains("empty"));
         assert!(
             locate("x", &[])
                 .unwrap_err()
                 .contains("no search directories")
+        );
+    }
+
+    #[test]
+    fn locate_requires_the_exact_manifest_name() {
+        // `is_file` accepts `theme.toml` for `Theme.toml` on macOS; the exact-name rule
+        // makes this "no manifest" everywhere, with a hint naming the near miss.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("t")).unwrap();
+        std::fs::write(tmp.path().join("t").join("Theme.toml"), "name = \"t\"").unwrap();
+        let message = locate("t", &[tmp.path()]).unwrap_err();
+        assert!(
+            message.contains("exists but has no theme.toml; it has Theme.toml"),
+            "{message}"
+        );
+        assert_eq!(
+            case_variant(&tmp.path().join("t"), MANIFEST_FILE).as_deref(),
+            Some("Theme.toml")
+        );
+        assert_eq!(case_variant(&tmp.path().join("t"), "Theme.toml"), None);
+        assert_eq!(
+            case_variant(&tmp.path().join("missing"), MANIFEST_FILE),
+            None
         );
     }
 
