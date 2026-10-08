@@ -127,6 +127,13 @@ text/markdown, text/latex, application/json, text/plain
 | `text/plain` | `<pre class="output-text">escaped</pre>` |
 | nothing matched | `CellOutput::Unsupported { mimes }` |
 
+> **Clarifications (T32, 2026-10-08):** `text/plain` is `<pre class="output-text">` +
+> `ansi_to_html(text)` (escaped, ANSI colours as spans, like nbconvert). Streams apply nbconvert's
+> carriage-return rule after merging (progress bars show their final state). A chosen MIME whose
+> payload cannot be rendered (bad base64, non-text payload, no renderer) warns `output-invalid` and
+> the next MIME in priority order is tried. Image sizes fall back to top-level `metadata.width/height`.
+> `text/latex` strips `\(…\)` too. Non-SGR ANSI sequences are removed.
+
 Other outputs:
 - `Stream { name, text }` → `CellOutput::Stream { name, html }` with `html = ansi_to_html::convert(&html_escape::encode_text(text))`
   — careful: convert ANSI **before** escaping would break the spans; the correct order is

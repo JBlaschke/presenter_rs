@@ -36,6 +36,10 @@ css/theme/fonts/**                                    (league-gothic, source-san
 > KaTeX fonts are unaffected (woff2). `vendor::get` normalizes paths (see `src/vendor.rs`), and
 > OS/editor junk (`.DS_Store`, `*.swp`, `*~`, …) is excluded from embedding.
 
+> **Note (T15, 2026-10-08):** only 6 of the 14 `dist/theme/*.css` files inline their fonts
+> (white, black, white-contrast, black-contrast, dracula, serif). The other 8 `@import` Google
+> Fonts; standalone builds keep those imports (fonts load when online) and warn `remote-import`.
+
 Not copied: `dist/plugin/markdown.js` (we render Markdown ourselves), `dist/plugin/math.js`
 (loads from CDN; we ship our own KaTeX init), `*.mjs`, `*.d.ts`, `index.html`, `demo.html`,
 `js/`, `css/print/*` (reveal.css already contains print rules), source maps.

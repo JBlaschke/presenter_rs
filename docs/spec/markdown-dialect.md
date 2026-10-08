@@ -166,6 +166,10 @@ Directive `info` is split on whitespace; the first token is the name, remaining 
 classes unless they contain `=`, in which case they are `key=value` args. Args that are
 not consumed by the table above are emitted as `data-<key>="<value>"`.
 
+Directive opening lines may not contain `:` after the fence (comrak 0.56 then does not open a
+directive; T12 warns `invalid-directive`); write `&#58;` instead. comrak resolves backslash
+escapes in the info string, so a value containing `"` must be single-quoted.
+
 ## 5. Code blocks
 
 ```` ```python {lines="1-2|4" .numbered start=10 trim=false escape=false #snippet .big} ````
@@ -233,8 +237,8 @@ than the reveal-compat forms are passed through unchanged.
 ## 10. What `check` reports for Markdown (T34)
 - raw `---`/`--` lines that did not become separators (setext or indentation pitfalls);
 - empty slides; separator with attributes but unknown keys; unknown `layout=` (not present in
-  the theme chain's `layouts/`); missing images; `:::include`; `:::notes` nested inside a
-  fragment (notes would be lost); duplicate slide ids.
+  the theme chain's `layouts/`); missing images; `:::include`; duplicate slide ids. (`:::notes` at any
+  depth, including inside fragments, is extracted by T12, so no lint is needed for it.)
 
 ## 11. Fixtures (`tests/fixtures/md/`, created by T01, filled in by T11/T12)
 `minimal.md` (one slide), `separators.md` (horizontal, vertical, consecutive, inside code

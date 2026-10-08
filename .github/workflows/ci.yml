@@ -27,7 +27,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       # The live-reload client is plain JS that cargo never parses: check its syntax where
       # node is installed, and its size budget everywhere: "< 8 KB unminified" (T22), read
-      # strictly as < 8000 bytes so that it holds whether KB means 1000 or 1024 bytes.
+      # as < 8 KiB (8192 bytes) by coordinator decision, leaving room for T44's error excerpt.
       - name: live-reload.js syntax and size
         shell: bash
         run: |
