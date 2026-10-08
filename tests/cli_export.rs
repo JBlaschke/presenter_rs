@@ -4,10 +4,14 @@
 //! finds one (`--chrome`-less search: `$CHROME_PATH`, app bundles, `PATH`); otherwise they
 //! print `skipping: no chrome found` and pass. The others use fake browsers (shell scripts)
 //! and need no Chrome. Every PDF is written into a temporary directory.
+//!
+//! Exports that start a browser run with `TMPDIR` set to a private directory, which must be
+//! empty afterwards, with no process left that names it (Chrome's `--user-data-dir`): the
+//! browser is always stopped and its profile removed, also when presenter is interrupted.
 
 use std::path::{Path, PathBuf};
-use std::process::Output;
-use std::time::Duration;
+use std::process::{Output, Stdio};
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use presenter::pdf::{find_chrome, page_count};
@@ -64,6 +68,59 @@ fn assert_wrote(output: &Output, path_suffix: &str) -> usize {
     caps[2].parse().unwrap()
 }
 
+/// The names in `dir` (none when it cannot be read).
+fn entries(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The running processes whose command line names `dir`: `(pid, command line)`.
+#[cfg(unix)]
+fn processes_naming(dir: &Path) -> Vec<(String, String)> {
+    let output = std::process::Command::new("ps")
+        .args(["-A", "-ww", "-o", "pid=", "-o", "args="])
+        .output()
+        .expect("ps runs");
+    let needle = dir.to_str().unwrap();
+    text(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(needle))
+        .filter_map(|line| {
+            let (pid, args) = line.trim_start().split_once(' ')?;
+            Some((pid.to_string(), args.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Waits up to 20 s until `tmp` (an export's `TMPDIR`) is empty and no process names it;
+/// otherwise kills what is left and fails.
+#[cfg(unix)]
+fn assert_cleaned_up(tmp: &Path) {
+    let started = Instant::now();
+    loop {
+        let files = entries(tmp);
+        let processes = processes_naming(tmp);
+        if files.is_empty() && processes.is_empty() {
+            return;
+        }
+        if started.elapsed() > Duration::from_secs(20) {
+            for (pid, _) in &processes {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid])
+                    .status();
+            }
+            panic!("left behind after 20 s: files {files:?}, processes {processes:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Reads a written PDF and checks its signature.
 fn read_pdf(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -77,8 +134,10 @@ fn exports_the_example_deck() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    let private_tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("nested/slides.pdf");
     let output = presenter(&root())
+        .env("TMPDIR", private_tmp.path())
         .args(["export", "pdf", "examples/basic/slides.md", "-o"])
         .arg(&out)
         .assert()
@@ -86,6 +145,8 @@ fn exports_the_example_deck() {
         .get_output()
         .clone();
     let printed = assert_wrote(&output, "slides.pdf");
+    #[cfg(unix)]
+    assert_cleaned_up(private_tmp.path());
 
     let pdf = read_pdf(&out);
     assert!(pdf.len() > 20_000, "only {} bytes", pdf.len());
@@ -171,6 +232,167 @@ fn quiet_exports_print_nothing() {
     assert_eq!(page_count(&read_pdf(&dir.path().join("out.pdf"))), 1);
 }
 
+/// A deck that opens JavaScript dialogs, with a title and an image description that
+/// mention `/Type /Page` (Chrome writes both into the PDF as strings).
+const DIALOG_DECK: &str = "\
+---
+title: Inside /Type /Page dictionaries
+---
+
+# Dialogs
+
+<script>alert('hello from the deck'); if (confirm('Continue?')) { throw new Error('accepted'); }</script>
+
+![/Type /Page alt](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==)
+";
+
+#[cfg(unix)]
+#[test]
+fn dialogs_are_dismissed_and_pdf_strings_are_not_pages() {
+    if chrome().is_none() {
+        return;
+    }
+    let dir = project(&[("deck.md", DIALOG_DECK)]);
+    let private_tmp = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let output = presenter(dir.path())
+        .env("TMPDIR", private_tmp.path())
+        .args(["export", "pdf", "deck.md", "-o", "deck.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    // A dialog no longer blocks the page until the 120 s deadline.
+    assert!(started.elapsed() < Duration::from_secs(60));
+    let stderr = text(&output.stderr);
+    for dialog in [
+        "the deck opened a JavaScript alert (\"hello from the deck\"); dismissed it",
+        "the deck opened a JavaScript confirm (\"Continue?\"); dismissed it",
+    ] {
+        assert!(stderr.contains(dialog), "{stderr}");
+    }
+    assert_eq!(assert_wrote(&output, "deck.pdf"), 1);
+    let pdf = read_pdf(&dir.path().join("deck.pdf"));
+    for string in [
+        &b"(Inside /Type /Page dictionaries)"[..],
+        &b"(/Type /Page alt)"[..],
+    ] {
+        assert!(
+            pdf.windows(string.len()).any(|window| window == string),
+            "the PDF lacks {}",
+            String::from_utf8_lossy(string)
+        );
+    }
+    assert_eq!(page_count(&pdf), 1);
+    assert_cleaned_up(private_tmp.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_print_stops_the_browser_and_cleans_up() {
+    if chrome().is_none() {
+        return;
+    }
+    let deck = "# Not printable\n\n<script>window.addEventListener('load', () => \
+                { Reveal.isPrintView = () => false; });</script>\n";
+    let dir = project(&[("deck.md", deck)]);
+    let private_tmp = tempfile::tempdir().unwrap();
+    let output = presenter(dir.path())
+        .env("TMPDIR", private_tmp.path())
+        .args(["export", "pdf", "deck.md", "-o", "deck.pdf"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "error: Chrome failed to print the deck: reveal.js did not switch to its print \
+             view (?print-pdf)\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("deck.pdf").exists());
+    assert_cleaned_up(private_tmp.path());
+}
+
+/// A deck that never gets ready to print, so that an export of it runs until its deadline.
+const STALLED_DECK: &str = "\
+# Never ready
+
+<script>window.addEventListener('load', () => { Reveal.isReady = () => false; });</script>
+";
+
+/// Waits until the export `child` (with `TMPDIR` = `tmp`) has a browser running with its
+/// profile in `tmp`.
+#[cfg(unix)]
+fn wait_for_browser(child: &mut std::process::Child, tmp: &Path) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(60) {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("presenter exited before the test interrupted it: {status}");
+        }
+        let profile_written = entries(tmp)
+            .iter()
+            .any(|name| !entries(&tmp.join(name).join("profile")).is_empty());
+        if profile_written && !processes_naming(tmp).is_empty() {
+            // Let Chrome get as far as loading the deck.
+            std::thread::sleep(Duration::from_millis(500));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("no browser started within 60 s");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_interrupted_export_leaves_no_browser_and_no_files() {
+    use std::os::unix::process::CommandExt as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    if chrome().is_none() {
+        return;
+    }
+    let dir = project(&[("stalled.md", STALLED_DECK)]);
+    // `kill <pid>` (a supervisor, an IDE's stop button), Ctrl-C in a terminal (SIGINT to the
+    // whole process group, Chrome included), and SIGKILL, which presenter cannot handle.
+    for (signal, number, group) in [("TERM", 15, false), ("INT", 2, true), ("KILL", 9, false)] {
+        let private_tmp = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+            .current_dir(dir.path())
+            .env_remove("RUST_LOG")
+            .env("TMPDIR", private_tmp.path())
+            .args(["export", "pdf", "stalled.md", "-o", "stalled.pdf"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        wait_for_browser(&mut child, private_tmp.path());
+        let target = if group {
+            format!("-{}", child.id())
+        } else {
+            child.id().to_string()
+        };
+        let sent = std::process::Command::new("kill")
+            .args(["-s", signal, "--", &target])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill -s {signal} {target}");
+        let status = child.wait().unwrap();
+        // A SIGINT that this test process inherited as ignored ends the export through
+        // Chrome's exit instead: exit 1.
+        assert!(
+            status.signal() == Some(number) || (signal == "INT" && status.code() == Some(1)),
+            "SIG{signal}: {status}"
+        );
+        assert_cleaned_up(private_tmp.path());
+        assert!(!dir.path().join("stalled.pdf").exists());
+    }
+}
+
 #[test]
 fn a_missing_browser_exits_3_with_install_hints() {
     let dir = project(&[("deck.md", "# Slide\n")]);
@@ -237,9 +459,11 @@ fn a_failing_browser_from_chrome_path_exits_1_with_its_stderr() {
         "fake-chrome",
         "echo 'fake chrome: cannot open display' >&2\nexit 4",
     );
+    let private_tmp = tempfile::tempdir().unwrap();
     let output = run_settled(|| {
         let mut cmd = presenter(dir.path());
         cmd.env("CHROME_PATH", &fake)
+            .env("TMPDIR", private_tmp.path())
             .args(["export", "pdf", "deck.md"]);
         cmd
     });
@@ -248,11 +472,12 @@ fn a_failing_browser_from_chrome_path_exits_1_with_its_stderr() {
     let stderr = text(&output.stderr);
     assert!(
         stderr.starts_with(
-            "error: Chrome failed to print the deck: Chrome exited (exit status: 4) before \
-             opening its DevTools port\n"
+            "error: Chrome failed to print the deck: Chrome exited (exit status: 4) while \
+             starting Chrome\n"
         ),
         "{stderr}"
     );
+    assert_cleaned_up(private_tmp.path());
     assert!(
         stderr.contains(&format!("browser: {}", fake.display())),
         "{stderr}"
@@ -262,6 +487,73 @@ fn a_failing_browser_from_chrome_path_exits_1_with_its_stderr() {
         "{stderr}"
     );
     assert!(!dir.path().join("dist/deck.pdf").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_browser_that_never_answers_is_killed_and_cleaned_up() {
+    let dir = project(&[("deck.md", "# Slide\n")]);
+    let pid_file = dir.path().join("chrome.pid");
+    // Starts, keeps every pipe open and never speaks the DevTools protocol; its command
+    // line keeps Chrome's arguments, --user-data-dir included.
+    let fake = fake_chrome(
+        dir.path(),
+        "fake-chrome",
+        &format!(
+            "echo $$ > '{}'\nwhile :; do sleep 1; done",
+            pid_file.display()
+        ),
+    );
+    let private_tmp = tempfile::tempdir().unwrap();
+    // SIGKILL presenter after 2 s: the fake browser ignores its pipe closing, so the
+    // watchdog has to kill it.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+        .current_dir(dir.path())
+        .env_remove("RUST_LOG")
+        .env("TMPDIR", private_tmp.path())
+        .args(["export", "pdf", "deck.md", "--chrome"])
+        .arg(&fake)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !pid_file.exists() && started.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert_cleaned_up(private_tmp.path());
+    let alive = std::process::Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !alive.success(),
+        "the fake browser {} still runs",
+        pid.trim()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bare_chrome_name_is_looked_up_on_path() {
+    let dir = project(&[("deck.md", "# Slide\n")]);
+    let output = presenter(dir.path())
+        .env("PATH", dir.path())
+        .args(["export", "pdf", "deck.md", "--chrome", "no-such-browser"])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("error: --chrome no-such-browser: not found on PATH\n"),
+        "{stderr}"
+    );
 }
 
 #[cfg(unix)]

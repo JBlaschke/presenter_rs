@@ -114,6 +114,9 @@ fn export_pdf(args: &ExportPdfArgs, global: &GlobalArgs) -> anyhow::Result<ExitC
 /// `error: …` text when no browser is found: what was looked for, then [`INSTALL_HINTS`].
 fn no_chrome_message(explicit: Option<&Path>) -> String {
     let what = match explicit {
+        Some(path) if pdf::is_bare_name(path) => {
+            format!("--chrome {}: not found on PATH", path.display())
+        }
         Some(path) => format!("--chrome {}: not an executable file", path.display()),
         None => format!(
             "no Chrome or Chromium found (searched $CHROME_PATH, the usual application \
@@ -193,6 +196,11 @@ mod tests {
         assert!(message.contains("--chrome PATH or the CHROME_PATH environment variable"));
         let message = no_chrome_message(Some(Path::new("/opt/chrome")));
         assert!(message.starts_with("--chrome /opt/chrome: not an executable file\n"));
+        let message = no_chrome_message(Some(Path::new("./chromium")));
+        assert!(message.starts_with("--chrome ./chromium: not an executable file\n"));
+        // A bare name was looked up on PATH.
+        let message = no_chrome_message(Some(Path::new("chromium")));
+        assert!(message.starts_with("--chrome chromium: not found on PATH\n"));
     }
 
     #[test]
