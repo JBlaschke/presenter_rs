@@ -179,6 +179,35 @@ fn sample_asset_id_is_reproducible_from_ok_png() {
     assert_eq!(registry.infos(&deck.source.base_dir), deck.assets);
 }
 
+/// The spellings `images.md` uses for `images/ok.png` resolve (as T12 does, with
+/// `base_dir.join(url)`) to one asset whose origin is relative to `base_dir`.
+#[test]
+fn images_fixture_spellings_share_one_asset() {
+    let base_dir = fixture_path("md");
+    let mut registry = AssetRegistry::new();
+    let ids: Vec<String> = ["images/ok.png", "./images/ok.png", "../md/images/ok.png"]
+        .iter()
+        .map(|url| {
+            let resolved = base_dir.join(url);
+            assert!(resolved.is_file(), "{}", resolved.display());
+            registry.register_file(&resolved)
+        })
+        .collect();
+    assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+    let infos = registry.infos(&base_dir);
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].origin, "file:images/ok.png");
+    assert_eq!(infos[0].mime, "image/png");
+    let text = std::fs::read_to_string(fixture_path("md/images.md")).unwrap();
+    for url in [
+        "](images/ok.png",
+        "](./images/ok.png)",
+        "](../md/images/ok.png)",
+    ] {
+        assert!(text.contains(url), "images.md lacks {url}");
+    }
+}
+
 #[test]
 fn invariant_violations_are_detected() {
     let base = sample();
@@ -215,6 +244,27 @@ fn invariant_violations_are_detected() {
         "bad span",
     );
     check(&|d| d.assets.clear(), "not in deck.assets");
+    // Placeholders in slide attributes (registered backgrounds) and in notes are checked too.
+    check(
+        &|d| {
+            d.slides[0]
+                .attrs
+                .insert("data-background-image".into(), "asset:ffffffffffff".into());
+        },
+        "slides[0].attrs[\"data-background-image\"]: placeholder asset:ffffffffffff not in deck.assets",
+    );
+    check(
+        &|d| d.slides[1].children[0].notes = Some("<p><img src=\"asset:eeeeeeeeeeee\"></p>".into()),
+        "slides[1].children[0].notes: placeholder asset:eeeeeeeeeeee not in deck.assets",
+    );
+    // A registered id in attrs/notes is fine.
+    let mut ok = base.clone();
+    let id = ok.assets[0].id.clone();
+    ok.slides[0]
+        .attrs
+        .insert("data-background-image".into(), format!("asset:{id}"));
+    ok.slides[1].children[0].notes = Some(format!("<p><img src=\"asset:{id}\"></p>"));
+    assert_eq!(ok.invariant_violations(), Vec::<String>::new());
     check(&|d| d.features.notes = false, "features.notes");
     check(&|d| d.features.math = false, "features.math");
     check(&|d| d.features.notebook = false, "features.notebook/code");

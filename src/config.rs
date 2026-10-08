@@ -15,14 +15,24 @@
 //! `Config.reveal` holds only explicitly configured reveal options; the built-in §2 values
 //! live in [`Config::builtin_reveal_defaults`] and are applied underneath by
 //! [`Config::effective_reveal`].
+//!
+//! `reveal.plugins` is validated where it enters the config: [`Config::from_toml_str`] /
+//! [`Config::load`] reject unknown names with [`Error::Config`], [`Config::merge_front_matter`]
+//! with [`Error::FrontMatter`]. [`Config::enabled_plugins`] itself never fails (it skips and
+//! logs anything invalid that came in through the theme); [`Config::validate_plugins`] is the
+//! strict check over the merged map.
+//!
+//! TOML dates (`date = 2026-10-08`) are accepted wherever a string or an arbitrary value is
+//! expected and are stored as their text, like YAML scalars in front matter (dialect §2.1).
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+use crate::assets::registry::normalize_lexically;
 use crate::error::{Error, Result};
 use crate::ir::DeckMeta;
 
@@ -43,6 +53,7 @@ pub struct Config {
     pub markdown: MarkdownConfig,
     /// `[reveal]`: explicitly configured `Reveal.initialize` options (plus `plugins`).
     /// Empty by default; see [`Config::effective_reveal`] for the merged view.
+    #[serde(deserialize_with = "json_map")]
     pub reveal: Map<String, Value>,
     /// `[math]`: KaTeX inclusion and options.
     pub math: MathConfig,
@@ -60,11 +71,17 @@ pub struct DeckConfig {
     pub theme: String,
     /// `<html lang>` when the deck does not set one. Default `"en"`.
     pub lang: String,
-    /// Default deck title; front matter overrides.
+    /// Default deck title; front matter overrides. Any TOML scalar is accepted and stored
+    /// as its text (`title = 42` → `"42"`).
+    #[serde(deserialize_with = "scalar_text")]
     pub title: Option<String>,
-    /// Default author; front matter overrides.
+    /// Default author; front matter overrides. Any TOML scalar, stored as text.
+    #[serde(deserialize_with = "scalar_text")]
     pub author: Option<String>,
-    /// Default date; front matter overrides.
+    /// Default date; front matter overrides. A TOML date/time (`date = 2026-10-08`) is
+    /// stored as its RFC 3339 text (`"2026-10-08"`; `T` as the date/time separator), any
+    /// other scalar as its text; no further parsing.
+    #[serde(deserialize_with = "scalar_text")]
     pub date: Option<String>,
 }
 
@@ -165,6 +182,7 @@ pub struct MathConfig {
     /// `"auto"`, `"always"` or `"never"`. Default `"auto"`.
     pub enabled: MathMode,
     /// Passed to `katex.render` for every element. Default `{}`.
+    #[serde(deserialize_with = "json_map")]
     pub katex_options: Map<String, Value>,
 }
 
@@ -249,9 +267,6 @@ pub struct CliOverrides {
     pub host: Option<String>,
     /// `--open` → `serve.open`.
     pub open: Option<bool>,
-    /// Reveal options from the command line, applied over every other source. No flag in
-    /// `docs/spec/cli.md` sets this yet; it completes the precedence chain for `[reveal]`.
-    pub reveal: Map<String, Value>,
 }
 
 /// A reveal.js plugin presenter knows how to include (`reveal.plugins`).
@@ -295,18 +310,21 @@ impl PluginId {
 
 impl Config {
     /// Parses a TOML document into a config (missing keys take their defaults). Unknown
-    /// keys fail with [`Error::Config`] and a "did you mean" hint when one applies.
+    /// keys fail with [`Error::Config`] and a "did you mean" hint when one applies; so does
+    /// an invalid `[reveal] plugins` list (see [`Config::validate_plugins`]).
     pub fn from_toml_str(text: &str) -> Result<Config> {
-        Ok(toml::from_str(text)?)
+        let config: Config = toml::from_str(text)?;
+        check_plugins(&config.reveal).map_err(Error::Config)?;
+        Ok(config)
     }
 
     /// Reads and parses `path` (see [`Config::from_toml_str`]); errors name the file.
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
-        toml::from_str(&text).map_err(|e| {
-            let message = with_unknown_key_hint(e.to_string());
-            Error::Config(format!("{}: {message}", path.display()))
+        Self::from_toml_str(&text).map_err(|e| match e {
+            Error::Config(message) => Error::Config(format!("{}: {message}", path.display())),
+            other => other,
         })
     }
 
@@ -334,8 +352,10 @@ impl Config {
     /// `self.reveal` key by key, and the `slides`, `markdown`, `math` and `notebook` maps in
     /// `meta.vars` (when they are objects; other values are ordinary vars) override only
     /// the keys they contain. They stay in `meta.vars`. Idempotent. Unknown or ill-typed keys
-    /// fail with [`Error::FrontMatter`] (with a "did you mean" hint) and leave `self` unchanged.
+    /// and an invalid `reveal.plugins` list fail with [`Error::FrontMatter`] (with a "did you
+    /// mean" hint) and leave `self` unchanged.
     pub fn merge_front_matter(&mut self, meta: &DeckMeta) -> Result<()> {
+        check_plugins(&meta.reveal).map_err(Error::FrontMatter)?;
         let mut next = self.clone();
         for (key, value) in &meta.reveal {
             next.reveal.insert(key.clone(), value.clone());
@@ -376,9 +396,18 @@ impl Config {
         if let Some(open) = overrides.open {
             self.serve.open = open;
         }
-        for (key, value) in &overrides.reveal {
+    }
+
+    /// Applies reveal options given on the command line over every other source (the top
+    /// of the `[reveal]` precedence chain). No flag in `docs/spec/cli.md` sets reveal options
+    /// yet, so nothing calls this today; an invalid `plugins` list fails with
+    /// [`Error::Config`] and leaves `self` unchanged.
+    pub fn apply_cli_reveal(&mut self, reveal: &Map<String, Value>) -> Result<()> {
+        check_plugins(reveal).map_err(Error::Config)?;
+        for (key, value) in reveal {
             self.reveal.insert(key.clone(), value.clone());
         }
+        Ok(())
     }
 
     /// The config.md §2 `[reveal]` values, including `plugins`.
@@ -422,50 +451,143 @@ impl Config {
     }
 
     /// The plugins named in `reveal.plugins` of [`Config::effective_reveal`], in order,
-    /// without duplicates. `"math"` is accepted and ignored (KaTeX is automatic); anything
-    /// else unknown, or a non-list value, is an [`Error::Config`].
-    pub fn enabled_plugins(&self) -> Result<Vec<PluginId>> {
-        let reveal = self.effective_reveal();
-        let Some(value) = reveal.get("plugins") else {
-            return Ok(Vec::new());
+    /// without duplicates. `"math"` is accepted and ignored (KaTeX is automatic). Never
+    /// fails: the sources that can be validated already were (see the module docs), and
+    /// anything invalid that still got in (e.g. from a theme's `[reveal]`) is skipped with a
+    /// warning. Use [`Config::validate_plugins`] for a strict check.
+    pub fn enabled_plugins(&self) -> Vec<PluginId> {
+        let Some(value) = self.effective_reveal().get("plugins").cloned() else {
+            return Vec::new();
         };
-        let Value::Array(items) = value else {
-            return Err(Error::Config(format!(
-                "reveal.plugins must be a list of plugin names, got {value}"
-            )));
-        };
-        let mut plugins = Vec::new();
-        for item in items {
-            let Some(name) = item.as_str() else {
-                return Err(Error::Config(format!(
-                    "reveal.plugins entries must be strings, got {item}"
-                )));
-            };
-            match PluginId::from_name(name) {
-                Some(id) if !plugins.contains(&id) => plugins.push(id),
-                Some(_) => {}
-                None if name == "math" => {
-                    tracing::debug!(
-                        "reveal.plugins: \"math\" ignored (KaTeX is included automatically)"
-                    );
-                }
-                None => return Err(unknown_plugin(name)),
-            }
+        let (plugins, problems) = plugin_list(&value);
+        for problem in problems {
+            tracing::warn!("{problem}; ignored");
         }
-        Ok(plugins)
+        plugins
+    }
+
+    /// Strict check of `reveal.plugins` in [`Config::effective_reveal`]: a list of known
+    /// plugin names (or `"math"`). Anything else is an [`Error::Config`] with a "did you
+    /// mean" hint.
+    pub fn validate_plugins(&self) -> Result<()> {
+        check_plugins(&self.effective_reveal()).map_err(Error::Config)
     }
 }
 
-/// Error for an unknown `reveal.plugins` entry, with a "did you mean" hint.
-fn unknown_plugin(name: &str) -> Error {
+/// The plugins in a `reveal.plugins` value (known names, in order, deduplicated) and one
+/// message per problem (not a list, a non-string entry, an unknown name).
+fn plugin_list(value: &Value) -> (Vec<PluginId>, Vec<String>) {
+    let mut plugins = Vec::new();
+    let mut problems = Vec::new();
+    let Value::Array(items) = value else {
+        problems.push(format!(
+            "reveal.plugins must be a list of plugin names, got {value}"
+        ));
+        return (plugins, problems);
+    };
+    for item in items {
+        let Some(name) = item.as_str() else {
+            problems.push(format!(
+                "reveal.plugins entries must be strings, got {item}"
+            ));
+            continue;
+        };
+        match PluginId::from_name(name) {
+            Some(id) if !plugins.contains(&id) => plugins.push(id),
+            Some(_) => {}
+            None if name == "math" => {
+                tracing::debug!(
+                    "reveal.plugins: \"math\" ignored (KaTeX is included automatically)"
+                );
+            }
+            None => problems.push(unknown_plugin(name)),
+        }
+    }
+    (plugins, problems)
+}
+
+/// `Err` with every problem of `reveal["plugins"]` joined by `"; "`; `Ok` when the key is
+/// absent or valid.
+fn check_plugins(reveal: &Map<String, Value>) -> std::result::Result<(), String> {
+    let Some(value) = reveal.get("plugins") else {
+        return Ok(());
+    };
+    let (_, problems) = plugin_list(value);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// Message for an unknown `reveal.plugins` entry, with a "did you mean" hint.
+fn unknown_plugin(name: &str) -> String {
     let known = ["highlight", "notes", "zoom", "search", "math"];
     let hint = closest(name, known)
         .map(|suggestion| format!(" (did you mean '{suggestion}'?)"))
         .unwrap_or_default();
-    Error::Config(format!(
+    format!(
         "unknown reveal plugin '{name}'{hint}; known plugins: {}",
         known.join(", ")
-    ))
+    )
+}
+
+/// Deserializes a JSON-like map, turning TOML dates/times into their text.
+fn json_map<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Map<String, Value>, D::Error> {
+    let mut map = Map::<String, Value>::deserialize(deserializer)?;
+    for value in map.values_mut() {
+        stringify_toml_datetimes(value);
+    }
+    Ok(map)
+}
+
+/// Replaces every TOML date/time inside `value` by its text (see [`toml_datetime_text`]).
+fn stringify_toml_datetimes(value: &mut Value) {
+    match value {
+        Value::Object(map) => match toml_datetime_text(map) {
+            Some(text) => *value = Value::String(text),
+            None => map.values_mut().for_each(stringify_toml_datetimes),
+        },
+        Value::Array(items) => items.iter_mut().for_each(stringify_toml_datetimes),
+        _ => {}
+    }
+}
+
+/// The `toml` deserializer hands a date/time to a `serde_json::Value` as a one-entry object
+/// (a private marker key mapped to the date text). Returns that date's text (`2026-10-08`)
+/// when `map` is such an object, recognised by `toml`'s own `Datetime` deserializer.
+fn toml_datetime_text(map: &Map<String, Value>) -> Option<String> {
+    if map.len() != 1 || !map.values().all(Value::is_string) {
+        return None;
+    }
+    serde_json::from_value::<toml::value::Datetime>(Value::Object(map.clone()))
+        .ok()
+        .map(|datetime| datetime.to_string())
+}
+
+/// Deserializes an optional string field that also accepts any other scalar (number,
+/// boolean, TOML date/time) and stores its text. Tables and arrays are errors.
+fn scalar_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let not_scalar = |kind: &str| {
+        serde::de::Error::custom(format!(
+            "expected a string, number, boolean or date, got {kind}"
+        ))
+    };
+    let text = match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(text)) => text,
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(Value::Object(map)) => {
+            toml_datetime_text(&map).ok_or_else(|| not_scalar("a table"))?
+        }
+        Some(Value::Array(_)) => return Err(not_scalar("an array")),
+    };
+    Ok(Some(text))
 }
 
 /// Overlays the object `meta.vars[name]` (if it is one) onto `table`, key by key.
@@ -518,21 +640,6 @@ fn canonical_json(value: &Value) -> Value {
 
 /// 2^53: every integer below it is exactly representable in both `f64` and `i64`.
 const MAX_EXACT_INT: f64 = 9_007_199_254_740_992.0;
-
-/// Removes `.` and resolves `..` components without touching the filesystem.
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
 
 /// For a serde "unknown field `x`, expected …" or "unknown variant `x`, expected …" message
 /// (as produced for `deny_unknown_fields` structs and enums), the expected name closest to
@@ -641,15 +748,6 @@ mod tests {
             canonical_json(&value).to_string(),
             r#"{"a":{"x":[2,-3],"y":0.5},"b":1280}"#
         );
-    }
-
-    #[test]
-    fn normalize_lexically_resolves_dots() {
-        assert_eq!(
-            normalize_lexically(Path::new("/a/b/../c/./d")),
-            PathBuf::from("/a/c/d")
-        );
-        assert_eq!(normalize_lexically(Path::new("/..")), PathBuf::from("/"));
     }
 
     #[test]

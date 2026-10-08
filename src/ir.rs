@@ -41,7 +41,8 @@ impl Deck {
     ///
     /// Checked: children have no children (1); `attrs` keys are lowercase and never `id`,
     /// `class` or `layout` (2); `layout` is non-empty (3); every `asset:<12 hex>` placeholder
-    /// in `Block::Html` / `CellOutput::Display` HTML is listed in `assets` (4); features
+    /// in `Block::Html` / `CellOutput::Display` HTML, in `attrs` values (e.g. a registered
+    /// `data-background-image`) and in `notes` is listed in `assets` (4); features
     /// implied by content are set — `notes` for notes, `notebook` and `code` for cells,
     /// `math` for `data-math-style` or `text/latex` outputs (6); spans are 1-based and
     /// ordered (8).
@@ -64,18 +65,22 @@ impl Deck {
         if slide.layout.is_empty() {
             problems.push(format!("{path}: empty layout"));
         }
-        for key in slide.attrs.keys() {
+        for (key, value) in &slide.attrs {
             if matches!(key.as_str(), "id" | "class" | "layout") || key.to_lowercase() != *key {
                 problems.push(format!("{path}: attrs key {key:?} not allowed"));
             }
+            self.check_placeholders(value, &format!("{path}.attrs[{key:?}]"), problems);
         }
         if let Some(span) = &slide.span
             && (span.start_line == 0 || span.end_line < span.start_line)
         {
             problems.push(format!("{path}: bad span {span:?}"));
         }
-        if slide.notes.is_some() && !self.features.notes {
-            problems.push(format!("{path}: has notes but features.notes is false"));
+        if let Some(notes) = &slide.notes {
+            if !self.features.notes {
+                problems.push(format!("{path}: has notes but features.notes is false"));
+            }
+            self.check_placeholders(notes, &format!("{path}.notes"), problems);
         }
         for block in &slide.blocks {
             match block {
@@ -103,8 +108,13 @@ impl Deck {
         if html.contains("data-math-style") && !self.features.math {
             problems.push(format!("{path}: math in HTML but features.math is false"));
         }
-        for (at, _) in html.match_indices("asset:") {
-            let id = &html[at + "asset:".len()..];
+        self.check_placeholders(html, path, problems);
+    }
+
+    /// Every `asset:<12 hex>` in `text` must name an entry of `self.assets`.
+    fn check_placeholders(&self, text: &str, path: &str, problems: &mut Vec<String>) {
+        for (at, _) in text.match_indices("asset:") {
+            let id = &text[at + "asset:".len()..];
             let id = id.get(..12).unwrap_or(id);
             let is_id =
                 id.len() == 12 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));

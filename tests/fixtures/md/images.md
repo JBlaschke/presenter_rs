@@ -11,8 +11,10 @@
 #   - raw HTML: relative `src="…"` / `poster="…"` in HtmlBlock and HtmlInline literals are
 #     rewritten the same way (`<img src="images/ok.png">`); remote ones are untouched;
 #   - links (`[handout](handout.pdf)`) are not assets and stay as written;
-#   - a relative `background=` slide attribute (data-background-image) is registered too.
-# The same file registered several times yields one asset id.
+#   - a relative `background=` slide attribute (data-background-image) is registered too;
+#   - `./images/ok.png` and `../md/images/ok.png` name the same file as `images/ok.png`:
+#     register_file normalizes paths lexically, so all spellings share one asset id.
+# The same file registered several times yields one asset id (deck.assets lists ok.png once).
 # Expected shape: 7 horizontal slides.
 title: Images
 ---
@@ -20,6 +22,8 @@ title: Images
 ## Local image
 
 ![A local image](images/ok.png "Local file")
+
+![Dot-relative spelling](./images/ok.png) and ![parent-relative spelling](../md/images/ok.png)
 
 ---
 

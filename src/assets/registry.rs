@@ -9,6 +9,8 @@
 //! Ids are content-derived and therefore stable across runs: the first 12 hex chars of the
 //! BLAKE3 hash of the absolute path (files) or of the bytes (in-memory assets). Registering
 //! the same path or bytes again returns the same id and keeps the first registration.
+//! File paths are normalized lexically first ([`normalize_lexically`]), so
+//! `/talk/./img.png`, `/talk/sub/../img.png` and `/talk/img.png` are one asset.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -56,21 +58,26 @@ impl AssetRegistry {
     /// (lossy for non-UTF-8 paths). MIME from the extension via `mime_guess`, default
     /// "application/octet-stream". Does NOT read the file. Returns the id.
     ///
-    /// The path is hashed as given, so callers pass the resolved absolute path (relative
-    /// paths would make ids depend on the working directory).
+    /// The path is first normalized with [`normalize_lexically`] (`.` dropped, `..`
+    /// resolved, no filesystem access), and the normalized path is what is hashed and stored
+    /// in [`AssetData::File`]: `base_dir.join("./x.png")`, `base_dir.join("a/../x.png")` and
+    /// `base_dir.join("x.png")` all get the same id. Callers pass the resolved absolute path;
+    /// a relative path is accepted and hashed as given (after normalization), which makes
+    /// the id depend on the path spelling rather than on the working directory.
     pub fn register_file(&mut self, abs_path: &Path) -> String {
-        let id = hash_id(abs_path.to_string_lossy().as_bytes());
+        let path = normalize_lexically(abs_path);
+        let id = hash_id(path.to_string_lossy().as_bytes());
         self.assets.entry(id.clone()).or_insert_with(|| Asset {
             id: id.clone(),
-            mime: mime_guess::from_path(abs_path)
+            mime: mime_guess::from_path(&path)
                 .first_or_octet_stream()
                 .essence_str()
                 .to_string(),
-            data: AssetData::File(abs_path.to_path_buf()),
-            file_name_hint: abs_path
+            file_name_hint: path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "asset".to_string()),
+            data: AssetData::File(path),
         });
         id
     }
@@ -98,15 +105,17 @@ impl AssetRegistry {
     }
 
     /// Summaries for `Deck.assets`, ordered by id. `origin` is `file:<path relative to
-    /// base_dir>` (`/`-separated; the absolute path when the file is not under `base_dir`)
-    /// or `inline:<byte length>`.
+    /// base_dir>` (`/`-separated; the full stored path when the file is not under
+    /// `base_dir`, e.g. for `base_dir.join("../shared/logo.png")`) or `inline:<byte length>`.
+    /// `base_dir` is normalized lexically before the comparison.
     pub fn infos(&self, base_dir: &Path) -> Vec<AssetInfo> {
+        let base_dir = normalize_lexically(base_dir);
         self.iter()
             .map(|asset| AssetInfo {
                 id: asset.id.clone(),
                 mime: asset.mime.clone(),
                 origin: match &asset.data {
-                    AssetData::File(path) => format!("file:{}", display_relative(path, base_dir)),
+                    AssetData::File(path) => format!("file:{}", display_relative(path, &base_dir)),
                     AssetData::Bytes(bytes) => format!("inline:{}", bytes.len()),
                 },
             })
@@ -126,18 +135,44 @@ fn hash_id(bytes: &[u8]) -> String {
 }
 
 /// `path` relative to `base`, joined with `/`; the full path when it is not under `base`.
+/// Both paths are already normalized, so `..` never appears in the relative form.
 fn display_relative(path: &Path, base: &Path) -> String {
     match path.strip_prefix(base) {
         Ok(rel) => rel
             .components()
-            .map(|c| match c {
-                Component::Normal(part) => part.to_string_lossy().into_owned(),
-                other => other.as_os_str().to_string_lossy().into_owned(),
-            })
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/"),
         Err(_) => path.to_string_lossy().into_owned(),
     }
+}
+
+/// Removes `.` components and resolves `..` against the preceding component, without
+/// touching the filesystem (so symlinks are not followed: `a/link/../b` becomes `a/b`).
+///
+/// `..` directly under the root is dropped (`/..` is `/`); leading `..` components of a
+/// relative path are kept (`../a/../b` becomes `../b`). An input that normalizes to nothing
+/// (`""`, `"."`, `"a/.."`) becomes `"."`. Shared by the registry and config discovery.
+pub fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut parts: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match parts.last() {
+                Some(Component::Normal(_)) => {
+                    parts.pop();
+                }
+                Some(Component::RootDir) => {}
+                // Empty, a drive prefix without root (Windows `C:..`) or a leading `..`.
+                _ => parts.push(component),
+            },
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return PathBuf::from(".");
+    }
+    parts.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -240,6 +275,103 @@ mod tests {
         assert_eq!(origin(&ids[2]), "file:/elsewhere/logo.svg");
         let info = infos.iter().find(|i| i.id == ids[0]).unwrap();
         assert_eq!(info.mime, "image/png");
+    }
+
+    #[test]
+    fn equivalent_spellings_of_one_file_share_an_id() {
+        let mut reg = AssetRegistry::new();
+        let base = Path::new("/abs/talk");
+        let id = reg.register_file(&base.join("images/ok.png"));
+        for spelling in [
+            "./images/ok.png",
+            "images/./ok.png",
+            "sub/../images/ok.png",
+            "images/ok.png/",
+        ] {
+            assert_eq!(reg.register_file(&base.join(spelling)), id, "{spelling}");
+        }
+        assert_eq!(
+            reg.register_file(Path::new("/abs/./talk/images/ok.png")),
+            id
+        );
+        assert_eq!(reg.iter().count(), 1);
+        // The normalized path is what is hashed and stored.
+        assert_eq!(id, blake3::hash(b"/abs/talk/images/ok.png").to_hex()[..12]);
+        let asset = reg.get(&id).unwrap();
+        assert_eq!(
+            asset.data,
+            AssetData::File(PathBuf::from("/abs/talk/images/ok.png"))
+        );
+        assert_eq!(asset.file_name_hint, "ok.png");
+        let infos = reg.infos(base);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].origin, "file:images/ok.png");
+    }
+
+    #[test]
+    fn parent_relative_paths_outside_base_get_the_absolute_origin() {
+        let mut reg = AssetRegistry::new();
+        let base = Path::new("/abs/talk");
+        let outside = reg.register_file(&base.join("../shared/logo.png"));
+        assert_eq!(
+            reg.register_file(Path::new("/abs/shared/logo.png")),
+            outside
+        );
+        assert_eq!(
+            reg.get(&outside).unwrap().data,
+            AssetData::File(PathBuf::from("/abs/shared/logo.png"))
+        );
+        // `..` that stays inside base_dir is still relative.
+        let inside = reg.register_file(&base.join("../talk/figures/plot.png"));
+        assert_eq!(reg.iter().count(), 2);
+        let infos = reg.infos(base);
+        let origin = |id: &str| infos.iter().find(|i| i.id == id).unwrap().origin.clone();
+        assert_eq!(origin(&outside), "file:/abs/shared/logo.png");
+        assert_eq!(origin(&inside), "file:figures/plot.png");
+        // A base_dir spelled with `.`/`..` is normalized before the comparison.
+        let infos = reg.infos(Path::new("/abs/./other/../talk/"));
+        assert!(infos.iter().any(|i| i.origin == "file:figures/plot.png"));
+        // A sibling directory whose name merely starts with base_dir's name is outside.
+        let sibling = reg.register_file(Path::new("/abs/talk2/x.png"));
+        let infos = reg.infos(base);
+        let info = infos.iter().find(|i| i.id == sibling).unwrap();
+        assert_eq!(info.origin, "file:/abs/talk2/x.png");
+    }
+
+    #[test]
+    fn relative_paths_are_normalized_but_not_made_absolute() {
+        let mut reg = AssetRegistry::new();
+        let id = reg.register_file(Path::new("tests/fixtures/md/./images/../images/ok.png"));
+        assert_eq!(
+            reg.get(&id).unwrap().data,
+            AssetData::File(PathBuf::from("tests/fixtures/md/images/ok.png"))
+        );
+        let infos = reg.infos(Path::new("tests/fixtures/md"));
+        assert_eq!(infos[0].origin, "file:images/ok.png");
+    }
+
+    #[test]
+    fn normalize_lexically_cases() {
+        for (input, expected) in [
+            ("/a/b/../c/./d", "/a/c/d"),
+            ("/..", "/"),
+            ("/../a", "/a"),
+            ("/a/b/", "/a/b"),
+            ("a/./b", "a/b"),
+            ("./a", "a"),
+            ("../a", "../a"),
+            ("../a/../b", "../b"),
+            ("a/../../b", "../b"),
+            ("a/..", "."),
+            (".", "."),
+            ("", "."),
+        ] {
+            assert_eq!(
+                normalize_lexically(Path::new(input)),
+                PathBuf::from(expected),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

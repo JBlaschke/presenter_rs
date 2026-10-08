@@ -157,17 +157,49 @@ impl Diagnostic {
     }
 }
 
-/// `path:line: level: message [code]`; the path and line parts are left out when unknown.
+/// The `docs/spec/cli.md` text format `path:line: level: message`, leaving out what is
+/// unknown:
+///
+/// | path | span | output |
+/// |---|---|---|
+/// | yes | Markdown | `deck.md:12: warning: msg` |
+/// | yes | notebook | `talk.ipynb: cell 7, line 2: warning: msg` |
+/// | yes | none | `deck.md: warning: msg` |
+/// | none | Markdown | `line 12: warning: msg` |
+/// | none | notebook | `cell 7, line 2: warning: msg` |
+/// | none | none | `warning: msg` |
+///
+/// A span's line is `start_line`; for notebooks (`span.cell` set) it counts within the
+/// cell's source, so it is never printed as a line of the `.ipynb` file. The alternate form
+/// (`{:#}`) appends the code: `deck.md:12: warning: msg [missing-asset]`.
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(path) = &self.path {
-            write!(f, "{}:", path.display())?;
-            if let Some(span) = &self.span {
-                write!(f, "{}:", span.start_line)?;
+        match (&self.path, &self.span) {
+            (Some(path), Some(span @ SourceSpan { cell: None, .. })) => {
+                write!(f, "{}:{}: ", path.display(), span.start_line)?;
             }
-            f.write_str(" ")?;
+            (Some(path), Some(span)) => write!(f, "{}: {}: ", path.display(), SpanText(span))?,
+            (Some(path), None) => write!(f, "{}: ", path.display())?,
+            (None, Some(span)) => write!(f, "{}: ", SpanText(span))?,
+            (None, None) => {}
         }
-        write!(f, "{}: {} [{}]", self.level, self.message, self.code)
+        write!(f, "{}: {}", self.level, self.message)?;
+        if f.alternate() {
+            write!(f, " [{}]", self.code)?;
+        }
+        Ok(())
+    }
+}
+
+/// A span without a path: `line N`, or `cell C, line N` for notebooks.
+struct SpanText<'a>(&'a SourceSpan);
+
+impl fmt::Display for SpanText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(cell) = self.0.cell {
+            write!(f, "cell {cell}, ")?;
+        }
+        write!(f, "line {}", self.0.start_line)
     }
 }
 
@@ -387,11 +419,13 @@ mod tests {
         let d = Diagnostic::warning("missing-asset", "image not found: x.png")
             .with_path("deck.md")
             .with_span(span(12));
+        assert_eq!(d.to_string(), "deck.md:12: warning: image not found: x.png");
         assert_eq!(
-            d.to_string(),
+            format!("{d:#}"),
             "deck.md:12: warning: image not found: x.png [missing-asset]"
         );
-        assert_eq!(Diagnostic::error("e", "m").to_string(), "error: m [e]");
+        assert_eq!(Diagnostic::error("e", "m").to_string(), "error: m");
+        assert_eq!(format!("{:#}", Diagnostic::error("e", "m")), "error: m [e]");
         let json = serde_json::to_value(Diagnostics::from(vec![d])).unwrap();
         assert_eq!(
             json,
@@ -402,6 +436,49 @@ mod tests {
                 "path": "deck.md",
                 "span": { "start_line": 12, "end_line": 12, "cell": null }
             }])
+        );
+    }
+
+    #[test]
+    fn diagnostic_display_keeps_whatever_location_is_known() {
+        let cell_span = SourceSpan {
+            start_line: 2,
+            end_line: 4,
+            cell: Some(7),
+        };
+        let md = Diagnostic::warning("empty-slide", "slide 3 is empty");
+        let cases = [
+            (
+                md.clone().with_span(span(3)),
+                "line 3: warning: slide 3 is empty",
+            ),
+            (
+                md.clone().with_path("deck.md"),
+                "deck.md: warning: slide 3 is empty",
+            ),
+            (
+                md.clone().with_path("deck.md").with_span(span(3)),
+                "deck.md:3: warning: slide 3 is empty",
+            ),
+            (
+                md.clone().with_span(cell_span.clone()),
+                "cell 7, line 2: warning: slide 3 is empty",
+            ),
+            (
+                md.with_path("talk.ipynb").with_span(cell_span),
+                "talk.ipynb: cell 7, line 2: warning: slide 3 is empty",
+            ),
+        ];
+        for (diagnostic, expected) in cases {
+            assert_eq!(diagnostic.to_string(), expected);
+        }
+        let mut diags = Diagnostics::new();
+        diags
+            .warn("unknown-slide-attr", "unknown attribute foo")
+            .span = Some(span(9));
+        assert_eq!(
+            format!("{:#}", diags.iter().next().unwrap()),
+            "line 9: warning: unknown attribute foo [unknown-slide-attr]"
         );
     }
 }

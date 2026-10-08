@@ -203,10 +203,7 @@ fn fixture_sets_every_key_to_a_non_default_value() {
     let ServeConfig { host, port, open } = &c.serve;
     assert_eq!((host.as_str(), *port, *open), ("0.0.0.0", 8080, true));
 
-    assert_eq!(
-        c.enabled_plugins().unwrap(),
-        [PluginId::Notes, PluginId::Zoom]
-    );
+    assert_eq!(c.enabled_plugins(), [PluginId::Notes, PluginId::Zoom]);
     assert_eq!(
         c.reveal_options_json(),
         r#"{"center":false,"controls":false,"hash":false,"height":1080,"progress":false,"slideNumber":"c/t","transition":"fade","width":1920}"#
@@ -267,9 +264,11 @@ fn far_unknown_keys_fail_without_a_hint() {
 fn type_errors_are_config_errors() {
     let message = config_message(Config::from_toml_str("[serve]\nport = \"x\"\n").unwrap_err());
     assert!(message.contains("line 2"), "{message}");
+    assert!(message.contains("expected u16"), "{message}");
     let message = config_message(Config::from_toml_str("[serve]\nport = 70000\n").unwrap_err());
+    assert!(message.contains("line 2, column 8"), "{message}");
     assert!(
-        message.contains("port") || message.contains("line 2"),
+        message.contains("invalid value: integer `70000`, expected u16"),
         "{message}"
     );
 }
@@ -368,10 +367,10 @@ fn config_with_sources(mask: u8, front_matter_first: bool) -> Config {
         config.merge_front_matter(&front).unwrap();
     }
     if set(3) {
-        config.apply_cli(&CliOverrides {
-            reveal: object(json!({"transition": "cli"})),
-            ..CliOverrides::default()
-        });
+        config.apply_cli(&CliOverrides::default());
+        config
+            .apply_cli_reveal(&object(json!({"transition": "cli"})))
+            .unwrap();
     }
     config
 }
@@ -429,6 +428,8 @@ fn theme_reveal_only_fills_absent_keys() {
 #[test]
 fn cli_overrides_file_values() {
     let mut config = Config::load(&fixture()).unwrap();
+    // Exactly the six fields of config.md §4, so a struct literal written from the spec
+    // compiles.
     config.apply_cli(&CliOverrides {
         theme: Some("cli-theme".into()),
         out: Some(PathBuf::from("ignored.html")),
@@ -436,7 +437,6 @@ fn cli_overrides_file_values() {
         port: Some(0),
         host: Some("localhost".into()),
         open: Some(false),
-        reveal: Map::new(),
     });
     assert_eq!(config.deck.theme, "cli-theme");
     assert!(config.build.standalone);
@@ -586,7 +586,7 @@ fn reveal_options_json_sorts_strips_plugins_and_integral_floats() {
 #[test]
 fn enabled_plugins_default_order() {
     assert_eq!(
-        Config::default().enabled_plugins().unwrap(),
+        Config::default().enabled_plugins(),
         [
             PluginId::Highlight,
             PluginId::Notes,
@@ -603,29 +603,169 @@ fn enabled_plugins_ignore_math_and_duplicates() {
     )
     .unwrap();
     assert_eq!(
-        config.enabled_plugins().unwrap(),
+        config.enabled_plugins(),
         [PluginId::Notes, PluginId::Highlight]
     );
+    config.validate_plugins().unwrap();
     let none = Config::from_toml_str("[reveal]\nplugins = []\n").unwrap();
-    assert!(none.enabled_plugins().unwrap().is_empty());
+    assert!(none.enabled_plugins().is_empty());
 }
 
 #[test]
-fn enabled_plugins_reject_unknown_and_malformed() {
-    let typo = Config::from_toml_str("[reveal]\nplugins = [\"hightlight\"]\n").unwrap();
-    let message = config_message(typo.enabled_plugins().unwrap_err());
-    assert!(message.contains("hightlight"), "{message}");
-    assert!(message.contains("did you mean 'highlight'"), "{message}");
+fn presenter_toml_rejects_unknown_and_malformed_plugins() {
+    let message = config_message(
+        Config::from_toml_str("[reveal]\nplugins = [\"hightlight\"]\n").unwrap_err(),
+    );
+    assert!(
+        message.contains("unknown reveal plugin 'hightlight' (did you mean 'highlight'?)"),
+        "{message}"
+    );
+    for (toml, needle) in [
+        (
+            "[reveal]\nplugins = [\"markdown\"]\n",
+            "unknown reveal plugin 'markdown'",
+        ),
+        ("[reveal]\nplugins = \"notes\"\n", "must be a list"),
+        (
+            "[reveal]\nplugins = [1]\n",
+            "entries must be strings, got 1",
+        ),
+    ] {
+        let message = config_message(Config::from_toml_str(toml).unwrap_err());
+        assert!(message.contains(needle), "{toml:?}: {message}");
+    }
 
-    let unknown = Config::from_toml_str("[reveal]\nplugins = [\"markdown\"]\n").unwrap();
-    assert!(matches!(unknown.enabled_plugins(), Err(Error::Config(_))));
-    let not_list = Config::from_toml_str("[reveal]\nplugins = \"notes\"\n").unwrap();
-    assert!(matches!(not_list.enabled_plugins(), Err(Error::Config(_))));
-    let not_string = Config::from_toml_str("[reveal]\nplugins = [1]\n").unwrap();
-    assert!(matches!(
-        not_string.enabled_plugins(),
-        Err(Error::Config(_))
-    ));
+    // Config::load names the file.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("presenter.toml");
+    std::fs::write(&path, "[reveal]\nplugins = [\"zoom\", \"serach\"]\n").unwrap();
+    let message = config_message(Config::load(&path).unwrap_err());
+    assert!(
+        message.starts_with(&format!("{}: ", path.display())),
+        "{message}"
+    );
+    assert!(message.contains("did you mean 'search'"), "{message}");
+}
+
+#[test]
+fn front_matter_and_cli_reject_unknown_plugins_and_change_nothing() {
+    let mut config = Config::default();
+    let meta = meta_with(
+        json!({"plugins": ["notes", "zom"], "transition": "fade"}),
+        json!({}),
+    );
+    let err = config.merge_front_matter(&meta).unwrap_err();
+    let Error::FrontMatter(message) = &err else {
+        panic!("expected Error::FrontMatter, got {err:?}");
+    };
+    assert!(message.contains("did you mean 'zoom'"), "{message}");
+    assert_eq!(config, Config::default());
+
+    let bad = object(json!({"plugins": "zoom", "transition": "fade"}));
+    let message = config_message(config.apply_cli_reveal(&bad).unwrap_err());
+    assert!(message.contains("must be a list"), "{message}");
+    assert_eq!(config, Config::default());
+
+    config
+        .apply_cli_reveal(&object(json!({"plugins": ["zoom", "math"]})))
+        .unwrap();
+    assert_eq!(config.enabled_plugins(), [PluginId::Zoom]);
+}
+
+#[test]
+fn enabled_plugins_skip_invalid_theme_entries_and_validate_reports_them() {
+    // A theme's [reveal] is merged without validation; enabled_plugins() stays usable.
+    let mut config = Config::default();
+    config.merge_theme_reveal(&object(json!({"plugins": ["zoom", "bogus", 3, "notes"]})));
+    assert_eq!(config.enabled_plugins(), [PluginId::Zoom, PluginId::Notes]);
+    let message = config_message(config.validate_plugins().unwrap_err());
+    assert!(
+        message.contains("unknown reveal plugin 'bogus'"),
+        "{message}"
+    );
+    assert!(
+        message.contains("entries must be strings, got 3"),
+        "{message}"
+    );
+
+    let mut not_list = Config::default();
+    not_list.merge_theme_reveal(&object(json!({"plugins": "zoom"})));
+    assert!(not_list.enabled_plugins().is_empty());
+    assert!(matches!(not_list.validate_plugins(), Err(Error::Config(_))));
+
+    // Without `plugins` anywhere but the built-ins, all four are enabled and valid.
+    Config::default().validate_plugins().unwrap();
+}
+
+// ---------------------------------------------------------------------------------------
+// TOML dates and other scalars
+
+#[test]
+fn deck_strings_accept_toml_dates_and_scalars() {
+    let config =
+        Config::from_toml_str("[deck]\ndate = 2026-10-08\ntitle = 42\nauthor = true\n").unwrap();
+    assert_eq!(config.deck.date.as_deref(), Some("2026-10-08"));
+    assert_eq!(config.deck.title.as_deref(), Some("42"));
+    assert_eq!(config.deck.author.as_deref(), Some("true"));
+
+    for (toml, text) in [
+        ("date = 1979-05-27T07:32:00Z", "1979-05-27T07:32:00Z"),
+        (
+            "date = 1979-05-27T00:32:00-07:00",
+            "1979-05-27T00:32:00-07:00",
+        ),
+        ("date = 07:32:00", "07:32:00"),
+        ("date = \"Spring 2026\"", "Spring 2026"),
+        ("date = 2.5", "2.5"),
+    ] {
+        let config = Config::from_toml_str(&format!("[deck]\n{toml}\n")).unwrap();
+        assert_eq!(config.deck.date.as_deref(), Some(text), "{toml}");
+    }
+
+    for (toml, kind) in [
+        ("title = [1]", "an array"),
+        ("author = { a = 1 }", "a table"),
+    ] {
+        let message =
+            config_message(Config::from_toml_str(&format!("[deck]\n{toml}\n")).unwrap_err());
+        assert!(
+            message.contains(&format!(
+                "expected a string, number, boolean or date, got {kind}"
+            )),
+            "{toml}: {message}"
+        );
+        assert!(message.contains("line 2"), "{toml}: {message}");
+    }
+}
+
+#[test]
+fn toml_dates_in_free_form_maps_become_strings() {
+    let config = Config::from_toml_str(
+        "[reveal]\nreleased = 2026-10-08\nnested = { at = [07:32:00] }\n\
+         [math.katex_options]\nwhen = 1979-05-27T07:32:00Z\n",
+    )
+    .unwrap();
+    assert_eq!(config.reveal["released"], json!("2026-10-08"));
+    assert_eq!(config.reveal["nested"], json!({"at": ["07:32:00"]}));
+    assert_eq!(
+        config.math.katex_options["when"],
+        json!("1979-05-27T07:32:00Z")
+    );
+    let options = config.reveal_options_json();
+    assert!(options.contains(r#""released":"2026-10-08""#), "{options}");
+    assert!(!options.contains("toml_private"), "{options}");
+
+    // One-entry string maps that are not dates stay maps, from TOML and from front matter.
+    let macros = json!({"macros": {"\\R": "\\mathbb{R}"}, "d": {"x": "2026-10-08"}});
+    let mut config = Config::from_toml_str(
+        "[math.katex_options]\nmacros = { \"\\\\R\" = \"\\\\mathbb{R}\" }\nd = { x = \"2026-10-08\" }\n",
+    )
+    .unwrap();
+    assert_eq!(Value::Object(config.math.katex_options.clone()), macros);
+    config.math.katex_options.clear();
+    let meta = meta_with(json!({}), json!({"math": {"katex_options": macros}}));
+    config.merge_front_matter(&meta).unwrap();
+    assert_eq!(Value::Object(config.math.katex_options.clone()), macros);
 }
 
 #[test]
