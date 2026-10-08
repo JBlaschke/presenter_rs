@@ -1,0 +1,9 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, Some(\"slides.md\"), \"slides.md\", deck)"
+---
+error: front matter: mapping values are not allowed in this context at line 2 column 19
+ --> slides.md:2:19
+  |
+2 | title: Diagnostics: a talk
+  |                   ^

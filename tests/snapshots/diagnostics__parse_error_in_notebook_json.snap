@@ -1,0 +1,9 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, None, \"talk.ipynb\", json)"
+---
+error: invalid notebook JSON: key must be a string at line 2 column 28
+ --> talk.ipynb:2:28
+  |
+2 |   {"cell_type": "markdown",, }
+  |                            ^

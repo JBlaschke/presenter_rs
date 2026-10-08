@@ -693,7 +693,8 @@ fn a_parse_error_of_the_pipeline_has_the_shape_of_the_spec() {
         assert_eq!(
             serde_json::to_value(&payload).unwrap(),
             json!({"message": "slides.md:3: unbalanced \" quote in attribute block {title=\"ab}",
-                   "file": "slides.md", "line": 3, "kind": "parse"}),
+                   "file": "slides.md", "line": 3, "kind": "parse",
+                   "excerpt": "--- {title=\"ab}"}),
             "base {}",
             base.display()
         );

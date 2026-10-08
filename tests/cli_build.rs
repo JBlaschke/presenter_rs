@@ -279,8 +279,9 @@ fn missing_asset_is_a_build_error_with_its_location() {
         .args(["build", "deck.md"])
         .assert()
         .code(1)
-        .stderr(contains("error: deck.md:3: asset not found: "))
-        .stderr(contains("nope.png"));
+        .stderr(contains(
+            "error: asset not found: nope.png\n --> deck.md:3\n  |\n3 | ![x](nope.png)\n",
+        ));
     assert!(!tmp.path().join("dist").exists());
 }
 
@@ -447,7 +448,7 @@ fn failed_builds_print_the_warnings_and_other_missing_assets_first() {
         .clone();
     let stderr = stderr_of(&output);
     let lines: Vec<&str> = stderr.lines().collect();
-    assert_eq!(lines.len(), 4, "{stderr}");
+    assert_eq!(lines.len(), 8, "{stderr}");
     assert!(lines[0].starts_with("two.md:1: warning: "), "{stderr}");
     assert!(lines[0].contains("bogus"), "{stderr}");
     assert!(lines[1].starts_with("two.md:5: warning: "), "{stderr}");
@@ -455,8 +456,15 @@ fn failed_builds_print_the_warnings_and_other_missing_assets_first() {
         lines[2].starts_with("two.md:9: error: ") && lines[2].contains("b2.png"),
         "{stderr}"
     );
-    assert!(
-        lines[3].starts_with("error: two.md:3: asset not found: ") && lines[3].ends_with("a1.png"),
+    assert_eq!(
+        lines[3..],
+        [
+            "error: asset not found: a1.png",
+            " --> two.md:3",
+            "  |",
+            "3 | ![a](a1.png)",
+            "  |      ^^^^^^"
+        ],
         "{stderr}"
     );
     assert!(!tmp.path().join("two.html").exists());
@@ -540,12 +548,13 @@ fn rejected_front_matter_prints_the_warnings_first() {
                 .clone();
             let stderr = stderr_of(&output);
             let lines: Vec<&str> = stderr.lines().collect();
-            assert_eq!(lines.len(), 2, "{args:?}: {stderr}");
+            assert_eq!(lines.len(), 3, "{args:?}: {stderr}");
             assert_eq!(lines[0], warning, "{args:?}");
             assert!(
-                lines[1].starts_with(&format!("error: {deck}: {error}")),
+                lines[1].starts_with(&format!("error: {error}")),
                 "{args:?}: {stderr}"
             );
+            assert_eq!(lines[2], format!(" --> {deck}"), "{args:?}");
         }
         assert!(!tmp.path().join(&out).exists());
     }
@@ -569,8 +578,9 @@ fn missing_image_in_markdown_filter_input_fails_the_build() {
         .assert()
         .code(1)
         .stdout("")
-        .stderr(contains("error: sub.md: asset not found: "))
-        .stderr(contains("nologo.png"));
+        .stderr(contains(
+            "error: asset not found: nologo.png\n --> sub.md\n",
+        ));
     assert!(!tmp.path().join("sub.html").exists());
 
     // dump --context does not render the templates, so the filter never runs: no error.
@@ -665,7 +675,8 @@ fn dump_errors_name_the_input_and_suggest_no_missing_flag() {
             .args(args)
             .assert()
             .code(1)
-            .stderr(contains("error: fm.md: front matter: "));
+            .stderr(contains("error: front matter: "))
+            .stderr(contains("\n --> fm.md:2:8\n"));
     }
 }
 

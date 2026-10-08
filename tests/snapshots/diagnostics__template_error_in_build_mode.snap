@@ -1,0 +1,5 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, None, \"\", \"\")"
+---
+error: template 'layouts/title.html' line 3: syntax error: unexpected `/`

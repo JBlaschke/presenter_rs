@@ -12,11 +12,12 @@
 //! data: {"status":"ok","build_id":18,"kind":"css","duration_ms":42}
 //!
 //! event: build
-//! data: {"status":"error","build_id":20,"error":{"message":"…","file":"slides.md","line":41,"kind":"parse"}}
+//! data: {"status":"error","build_id":20,"error":{"message":"…","file":"slides.md","line":41,"kind":"parse","excerpt":":::include other.md"}}
 //! ```
 //!
 //! When the latest build failed, `hello` carries the same `error` object as a failed
-//! `build` event (§2 addition, 2026-10-08).
+//! `build` event (§2 addition, 2026-10-08). The error's `excerpt` (T44, additive) is the
+//! offending source line, shown by the client's overlay; it is left out when unknown.
 
 use std::path::{Path, PathBuf};
 
@@ -59,7 +60,8 @@ impl BuildEvent {
     }
 }
 
-/// A build error as shown in the browser overlay: `{"message","file","line","kind"}`.
+/// A build error as shown in the browser overlay: `{"message","file","line","kind"}`, plus
+/// `"excerpt"` when the offending line is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ErrorPayload {
     /// The full error message: for a parse error `file:line: message` (live-reload.md §2),
@@ -73,6 +75,14 @@ pub struct ErrorPayload {
     /// The error's category in kebab-case: `parse`, `front-matter`, `config`, `theme`,
     /// `template`, `style`, `missing-asset`, `io`, `json` or `other`.
     pub kind: String,
+    /// The offending source line as the overlay shows it (T44): for a parse error the line
+    /// of the source file (of the cell's source for a notebook cell), read when the payload
+    /// is made ([`Error::excerpt`]: tabs expanded, a long line cut around the error); else
+    /// the line the message quotes ([`Error::quoted_line`]: a template error's minijinja
+    /// debug info in serve mode, a `toml` or `grass` excerpt). Left out of the JSON when
+    /// unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
 }
 
 /// The overlay payload of a library error, with the source file of a parse error relative
@@ -94,7 +104,8 @@ impl ErrorPayload {
     /// message) and keeps the Markdown line of its span in `line`.
     ///
     /// `message` of a parse error is `file:line: message` (`file: message` without a line),
-    /// as in live-reload.md §2; every other error's is its `Display` form.
+    /// as in live-reload.md §2; every other error's is its `Display` form. `excerpt` is the
+    /// offending line, see [`ErrorPayload::excerpt`].
     pub fn relative_to(err: &Error, base: Option<&Path>) -> Self {
         let (file, line, message) = match err {
             Error::Parse {
@@ -127,8 +138,19 @@ impl ErrorPayload {
             file,
             line,
             kind: error_kind(err).to_string(),
+            excerpt: excerpt(err),
         }
     }
+}
+
+/// The offending line of `err` for [`ErrorPayload::excerpt`]: read from the file it names,
+/// else quoted in its message.
+fn excerpt(err: &Error) -> Option<String> {
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    err.path()
+        .and_then(|file| err.excerpt(file, &read))
+        .map(|excerpt| excerpt.text)
+        .or_else(|| err.quoted_line().map(|line| line.trim_end().to_string()))
 }
 
 /// `path` relative to `base` when it is strictly below it, else as is. The paths are
@@ -264,6 +286,7 @@ mod tests {
                 file: Some("slides.md".into()),
                 line: Some(41),
                 kind: "parse".into(),
+                excerpt: None,
             }
         );
         let template = Error::Template {
@@ -333,6 +356,58 @@ mod tests {
         let from_cwd = ErrorPayload::from(&parse(cwd.join("talk/slides.md"), Some(41)));
         assert_eq!(from_cwd.file.as_deref(), Some("talk/slides.md"));
         assert!(from_cwd.message.ends_with(":41: unbalanced \" quote"));
+    }
+
+    #[test]
+    fn payloads_carry_the_offending_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deck = tmp.path().join("slides.md");
+        std::fs::write(&deck, "# A\n\n--- {title=\"ab}\n").unwrap();
+        let parse = Error::Parse {
+            path: deck.clone(),
+            line: Some(3),
+            message: "unbalanced \" quote".into(),
+        };
+        let payload = ErrorPayload::relative_to(&parse, Some(tmp.path()));
+        assert_eq!(payload.excerpt.as_deref(), Some("--- {title=\"ab}"));
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap()["excerpt"],
+            json!("--- {title=\"ab}")
+        );
+        // A notebook cell's line comes from the cell's source.
+        let notebook = tmp.path().join("talk.ipynb");
+        std::fs::write(
+            &notebook,
+            r##"{"cells": [{"cell_type": "markdown", "source": ["# T\n", "--- {x=\"y}"]}]}"##,
+        )
+        .unwrap();
+        let in_cell = Error::Parse {
+            path: notebook,
+            line: None,
+            message: "cell 0, line 2: unbalanced \" quote".into(),
+        };
+        assert_eq!(
+            ErrorPayload::from(&in_cell).excerpt.as_deref(),
+            Some("--- {x=\"y}")
+        );
+        // A template error in serve mode quotes the line in minijinja's debug info.
+        let mut env = minijinja::Environment::new();
+        env.set_debug(true);
+        let err = env
+            .add_template("slide.html", "<a>\n{{ x </a>\n")
+            .unwrap_err();
+        let template = ErrorPayload::from(&Error::from(err));
+        assert_eq!(
+            (template.file.as_deref(), template.line),
+            (Some("slide.html"), Some(2))
+        );
+        assert_eq!(template.excerpt.as_deref(), Some("{{ x </a>"));
+        // No line known (or the file is gone): no `excerpt` key.
+        std::fs::remove_file(&deck).unwrap();
+        let gone = ErrorPayload::relative_to(&parse, Some(tmp.path()));
+        assert_eq!(gone.excerpt, None);
+        let json = serde_json::to_value(&gone).unwrap();
+        assert!(json.get("excerpt").is_none(), "{json}");
     }
 
     #[test]

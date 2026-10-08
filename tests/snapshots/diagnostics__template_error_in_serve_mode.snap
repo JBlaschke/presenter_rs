@@ -1,0 +1,14 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, None, \"\", \"\")"
+---
+error: template 'layouts/title.html' line 3: syntax error: unexpected `/`
+--------------------------------- title.html ----------------------------------
+   1 | {% extends "layouts/default.html" %}
+   2 | {% block content %}
+   3 > <h1>{{ slide.title </h1>
+     i                     ^ syntax error
+   4 | {% endblock %}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+No referenced variables
+-------------------------------------------------------------------------------
