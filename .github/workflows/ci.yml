@@ -25,6 +25,19 @@ jobs:
         run: cargo fmt --check
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      # The live-reload client is plain JS that cargo never parses: check its syntax where
+      # node is installed, and its size budget (< 8 KiB unminified, T22) everywhere.
+      - name: live-reload.js syntax and size
+        shell: bash
+        run: |
+          if command -v node >/dev/null 2>&1; then
+            node --check assets/presenter/live-reload.js
+          else
+            echo "node not found; skipping node --check"
+          fi
+          size=$(wc -c < assets/presenter/live-reload.js)
+          echo "live-reload.js: $size bytes"
+          test "$size" -lt 8192
       # OS/editor junk must never be listed, served or embedded (src/vendor.rs excludes it);
       # plant some so the vendor_smoke tests exercise the excludes in both build modes.
       - name: plant junk files under assets/
