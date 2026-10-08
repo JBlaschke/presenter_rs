@@ -677,10 +677,13 @@ entries = ["scripts/extra.js"]
         "{}",
         doc.theme_css
     );
-    // Found through the §5 assets/ fallback: named by its assets-form helper path.
+    // Found through the §5 assets/ fallback: named by its theme-root helper path.
     assert!(
+        doc.theme_css.contains(
+            ".logo { background: url('/__presenter/asset/@mine/assets/logo.png?v=2#x'); }"
+        ),
+        "{}",
         doc.theme_css
-            .contains(".logo { background: url('/__presenter/asset/logo.png?v=2#x'); }")
     );
     let served = |url: &str| {
         let path = url.strip_prefix(render::html::SERVE_HELPER_PREFIX).unwrap();
@@ -693,7 +696,10 @@ entries = ["scripts/extra.js"]
         served("/__presenter/asset/@mine/assets/bg.png"),
         b"bg-bytes"
     );
-    assert_eq!(served("/__presenter/asset/logo.png"), b"logo-bytes");
+    assert_eq!(
+        served("/__presenter/asset/@mine/assets/logo.png"),
+        b"logo-bytes"
+    );
     assert!(
         doc.theme_css
             .find("/* @default/styles/theme.css */")
@@ -766,6 +772,99 @@ fn theme_stylesheet_errors() {
         matches!(&err, Error::Style { file, message } if file == "@missing/styles/x.css" && message.contains("url(nope.png)")),
         "{err:?}"
     );
+}
+
+#[test]
+fn style_entry_assets_fallback_takes_any_reference() {
+    // §5: a [styles] entry's url(rel) falls back to assets/<rel> in the chain, child first,
+    // also when rel starts with vendor/, presenter/ or @ (helper paths that would name the
+    // embedded tree or a theme root). The hit is named @<theme>/assets/<rel>.
+    let tmp = tempfile::tempdir().unwrap();
+    disk_theme(
+        &tmp.path().join("p"),
+        "name = \"p\"\nextends = \"default\"\n",
+        &[
+            ("assets/vendor/a.png", b"parent-a"),
+            ("assets/presenter/b.png", b"parent-b"),
+        ],
+    );
+    let css = ".a { background: url(vendor/a.png); }\n\
+               .b { background: url(presenter/b.png); }\n\
+               .c { background: url('@x/c.png'); }\n";
+    let theme = disk_theme(
+        &tmp.path().join("v"),
+        "name = \"v\"\nextends = \"../p\"\n[styles]\nentries = [\"styles/x.css\"]\n",
+        &[
+            ("styles/x.css", css.as_bytes()),
+            ("assets/vendor/a.png", b"child-a"),
+            ("assets/@x/c.png", b"child-c"),
+        ],
+    );
+    assert_eq!(theme.chain.len(), 3);
+    // (selector, expected bytes, helper path of the hit)
+    let expected: [(&str, &[u8], &str); 3] = [
+        (".a", b"child-a", "@v/assets/vendor/a.png"),
+        (".b", b"parent-b", "@p/assets/presenter/b.png"),
+        (".c", b"child-c", "@v/assets/@x/c.png"),
+    ];
+    let deck = sample_deck();
+    let url_of = |css: &str, selector: &str| -> String {
+        let pattern = format!(
+            r#"{} \{{ background: url\('?([^')]*)'?\); \}}"#,
+            regex::escape(selector)
+        );
+        Regex::new(&pattern)
+            .unwrap()
+            .captures(css)
+            .unwrap_or_else(|| panic!("{selector} in {css}"))[1]
+            .to_string()
+    };
+
+    let doc = render_with(&deck, &theme, &Config::default(), OutputMode::Standalone);
+    for (selector, bytes, _) in expected {
+        assert_eq!(
+            url_of(&doc.theme_css, selector),
+            data_uri("image/png", bytes)
+        );
+    }
+    assert!(doc.html.contains(&data_uri("image/png", b"child-c")));
+
+    let doc = render_with(&deck, &theme, &Config::default(), site());
+    for (selector, bytes, _) in expected {
+        let name = url_of(&doc.theme_css, selector);
+        let file = doc
+            .files
+            .iter()
+            .find(|f| f.path.file_name().unwrap().to_string_lossy() == name)
+            .unwrap_or_else(|| panic!("{name} is emitted"));
+        assert_eq!(file.bytes, bytes, "{selector}");
+    }
+
+    // serve: the URL names the theme file, which the asset route serves; the same paths
+    // in the vendor/presenter form would name the embedded tree.
+    let doc = render_with(&deck, &theme, &Config::default(), OutputMode::Serve);
+    for (selector, bytes, path) in expected {
+        let url = url_of(&doc.theme_css, selector);
+        assert_eq!(url, format!("/__presenter/asset/{path}"));
+        let served = render::resolve_helper_path(&theme, path).unwrap().unwrap();
+        assert_eq!(served, (bytes.to_vec(), "image/png".to_string()));
+    }
+
+    // Still only for [styles] entries, and a reference that is nowhere is still an error.
+    let missing = disk_theme(
+        &tmp.path().join("w"),
+        "name = \"w\"\nextends = \"../p\"\n[styles]\nentries = [\"styles/x.css\"]\n",
+        &[("styles/x.css", b".x { background: url(vendor/nope.png); }")],
+    );
+    for output in [OutputMode::Standalone, site(), OutputMode::Serve] {
+        let err = try_render_with(&deck, &missing, &Config::default(), output.clone())
+            .expect_err("unresolvable url()");
+        assert!(
+            matches!(&err, Error::Style { file, message } if file == "@w/styles/x.css"
+                && message == "url(vendor/nope.png) not found next to the stylesheet or in the theme chain's assets/ directories"),
+            "{output:?}: {err:?}"
+        );
+    }
 }
 
 #[test]

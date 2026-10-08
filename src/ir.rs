@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 
 use crate::assets::registry::AssetRegistry;
 use crate::error::Diagnostics;
+use crate::markdown::render::has_math_markup;
 
 /// A whole presentation. One source file produces one `Deck`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,8 +45,13 @@ impl Deck {
     /// in `Block::Html` / `CellOutput::Display` HTML, in `attrs` values (e.g. a registered
     /// `data-background-image`) and in `notes` is listed in `assets` (4); features
     /// implied by content are set — `notes` for notes, `notebook` and `code` for cells,
-    /// `math` for `data-math-style` or `text/latex` outputs (6); spans are 1-based and
-    /// ordered (8).
+    /// `math` for `text/latex` outputs and for HTML with an element carrying a
+    /// `data-math-style` attribute (6); spans are 1-based and ordered (8).
+    ///
+    /// Math is detected exactly as the Markdown frontend derives `features.math`
+    /// ([`has_math_markup`]: a start tag with that attribute, outside comments and raw-text
+    /// elements such as `<script>`/`<style>`), so the literal text `data-math-style`, e.g.
+    /// in inline code, is not math.
     pub fn invariant_violations(&self) -> Vec<String> {
         let mut problems = Vec::new();
         for (i, slide) in self.slides.iter().enumerate() {
@@ -105,7 +111,7 @@ impl Deck {
     }
 
     fn check_html(&self, html: &str, path: &str, problems: &mut Vec<String>) {
-        if html.contains("data-math-style") && !self.features.math {
+        if !self.features.math && has_math_markup(html) {
             problems.push(format!("{path}: math in HTML but features.math is false"));
         }
         self.check_placeholders(html, path, problems);
@@ -361,4 +367,110 @@ pub struct Parsed {
     pub assets: AssetRegistry,
     /// Warnings (and non-fatal errors) found while parsing, e.g. `missing-asset`.
     pub diagnostics: Diagnostics,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deck with one slide holding `html`, with `features.math` set to `math`.
+    fn deck_with(html: &str, math: bool) -> Deck {
+        let mut slide = Slide::new();
+        slide.blocks.push(Block::html(html.to_string()));
+        Deck {
+            meta: DeckMeta::default(),
+            slides: vec![slide],
+            features: Features {
+                math,
+                ..Features::default()
+            },
+            source: SourceInfo {
+                path: PathBuf::from("/x/deck.md"),
+                kind: SourceKind::Markdown,
+                base_dir: PathBuf::from("/x"),
+            },
+            assets: vec![],
+        }
+    }
+
+    fn math_problems(deck: &Deck) -> Vec<String> {
+        deck.invariant_violations()
+            .into_iter()
+            .filter(|p| p.contains("features.math"))
+            .collect()
+    }
+
+    #[test]
+    fn math_markup_without_features_math_is_a_violation() {
+        for html in [
+            r#"<p><span data-math-style="inline">x^2</span></p>"#,
+            r#"<div data-math-style="display">\\int</div>"#,
+            r#"<P><SPAN class="m" DATA-MATH-STYLE='inline'>x</SPAN></P>"#,
+            "<!-- c --><span data-math-style=inline>x</span>",
+            "<script>a</script><span data-math-style>x</span>",
+        ] {
+            assert_eq!(
+                math_problems(&deck_with(html, false)),
+                ["slides[0]: math in HTML but features.math is false"],
+                "{html}"
+            );
+            assert_eq!(
+                deck_with(html, true).invariant_violations(),
+                Vec::<String>::new()
+            );
+        }
+        // A notebook output's HTML is checked the same way.
+        let mut deck = deck_with("<p>x</p>", false);
+        deck.features.code = true;
+        deck.features.notebook = true;
+        deck.slides[0].blocks.push(Block::Cell(NotebookCell {
+            outputs: vec![CellOutput::Display {
+                mime: "text/html".into(),
+                html: r#"<span data-math-style="inline">y</span>"#.into(),
+                execution_count: None,
+            }],
+            ..NotebookCell::default()
+        }));
+        assert_eq!(math_problems(&deck).len(), 1);
+    }
+
+    #[test]
+    fn literal_math_attribute_text_is_not_math() {
+        for html in [
+            "<p><code>data-math-style</code></p>",
+            r#"<pre><code>&lt;span data-math-style="inline"&gt;</code></pre>"#,
+            r#"<p title="data-math-style=inline">x</p>"#,
+            r#"<!-- <span data-math-style="inline">x</span> -->"#,
+            r#"<script>document.write('<span data-math-style>x</span>')</script>"#,
+            r#"<style>[data-math-style] { color: red }</style>"#,
+        ] {
+            assert_eq!(
+                deck_with(html, false).invariant_violations(),
+                Vec::<String>::new(),
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_frontend_and_invariant_agree_on_math() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/md");
+        let source = SourceInfo {
+            path: dir.join("unit.md"),
+            kind: SourceKind::Markdown,
+            base_dir: dir,
+        };
+        let config = crate::config::Config::default();
+        let parse = |text: &str| crate::markdown::parse(&source, text, &config).unwrap();
+        // Only literal text: the frontend derives no math and the invariant agrees.
+        let parsed = parse("# A\n\nThe attribute `data-math-style` marks math.\n");
+        assert!(!parsed.deck.features.math);
+        assert_eq!(parsed.deck.invariant_violations(), Vec::<String>::new());
+        // Real math: features.math is set; clearing it is a violation.
+        let mut parsed = parse("# A\n\nInline $x^2$ math.\n");
+        assert!(parsed.deck.features.math);
+        assert_eq!(parsed.deck.invariant_violations(), Vec::<String>::new());
+        parsed.deck.features.math = false;
+        assert_eq!(math_problems(&parsed.deck).len(), 1);
+    }
 }

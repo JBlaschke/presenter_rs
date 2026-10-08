@@ -7,19 +7,20 @@ const KEY = 'presenter:build_id:' + location.pathname + location.search;
 const state = { buildId: null, connected: false, retryMs: 500, lastStatus: 'ok', errorId: null };
 let source = null;
 let timer = null;
-let queue = Promise.resolve();
 const log = (...a) => console.debug('[presenter]', ...a);
 
-// What a swap cannot update, sans ?v= (scripts add head elements after the theme).
+// GET / parsed; null if it fails.
+const getDoc = () => fetch('/', { cache: 'no-store' }).then((r) => (r.ok ? r.text() : null))
+  .then((t) => t && new DOMParser().parseFromString(t, 'text/html'), () => null);
+// What a swap cannot update, sans ?v=.
 const signature = (doc) => Array.from(doc.querySelectorAll('head>*,body>*'))
-  .filter((el) => !el.matches('title,meta,#presenter-overlay,#presenter-theme~*,.reveal') &&
-    !el.querySelector('.reveal'))
+  .filter((el) => !el.matches('title,meta,#presenter-overlay,.reveal') && !el.querySelector('.reveal'))
   .map((el) => el.outerHTML).join('\n').replace(/\?v=\d+/g, '') + doc.documentElement.lang;
-// Once parsed: deck.html's body_end follows this script. '' reloads.
+// Baseline: this page as served, not as scripts changed it (e.g. on 'ready'), if GET / is
+// still its build. '' reloads.
 let assets = '';
-const snap = () => { assets = signature(document); };
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', snap);
-else snap();
+const ver = (d) => d.querySelector('#presenter-theme')?.getAttribute('href');
+let queue = getDoc().then((d) => { if (d && ver(d) === ver(document)) assets = signature(d); });
 
 function store(id) {
   state.buildId = id;
@@ -97,13 +98,12 @@ function restore(R, s, id) {
 }
 
 async function swapContent(id) {
-  const html = await fetch('/', { cache: 'no-store' }).then((r) => (r.ok ? r.text() : null), () => null);
-  if (html === null) {
+  const next = await getDoc();
+  if (!next) {
     state.lastStatus = 'stale';
     log('GET / failed, update postponed');
     return false;
   }
-  const next = new DOMParser().parseFromString(html, 'text/html');
   const fresh = next.querySelector('.reveal .slides');
   const slides = document.querySelector('.reveal .slides');
   const R = window.Reveal;

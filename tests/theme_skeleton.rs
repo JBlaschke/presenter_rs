@@ -48,12 +48,20 @@ const ALLOWED_FILTERS: &str = "attrs markdown \
 const MINIJINJA_CALLABLES: &str =
     "range dict debug namespace super self caller loop varargs kwargs";
 
-/// Template syntax keywords that may directly precede `(` (an operand, a tuple target, a
-/// `call(…)` signature, a parenthesized template name). Keywords that never do (`block`,
-/// `filter`, `macro`, `recursive`, `ignore`, `missing`, `with`, `as`, `is`) are left out:
-/// a template can use such a name for a value (`{% for block in slide.blocks %}`), so
-/// `block(…)` is a call like any other and, where no value is bound, reaches a global helper.
-const KEYWORDS: &str = "and or not in if elif else for set call include import extends from";
+/// Statement keywords that may directly precede `(` as the first word of a `{% … %}` tag:
+/// before a tuple target (`{% for (a, b) in … %}`, `set`, `{% with (a, b) = … %}`), a
+/// `{% call(x) row() %}` signature, or a parenthesized expression (`if`, `elif`, `include`,
+/// `import`, `extends`, `from`, `do`). minijinja 2.24 reserves none of these names (only
+/// `true false none loop self` and their capitalized forms), so anywhere else `with(…)`
+/// calls a value or global named `with`, and the scan treats it as a call
+/// ([`is_keyword_use`]).
+const STATEMENT_KEYWORDS: &str = "for set with call if elif include import extends from do";
+
+/// Operator keywords that may directly precede `(` after an operand: `a and (b)`,
+/// `a or (b)`, `x in (1, 2)`, `x not in (…)`, `a if (b) else (c)`, `{% for x in y if (z) %}`.
+/// In operand position (`{{ and(1) }}`) minijinja reads them as names, so there they are
+/// calls. The unary `not` is exempt everywhere.
+const OPERATOR_KEYWORDS: &str = "and or in if else";
 
 /// The only expressions allowed to bypass auto-escaping: IR HTML (ir.md invariant 5).
 const SAFE_EXPRESSIONS: [&str; 3] = ["block.html", "slide.notes", "out.html"];
@@ -1254,10 +1262,12 @@ fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, 
     let safe = Regex::new(r"(\S+)\s*\|\s*safe\b").expect("regex");
     let filter = Regex::new(r"\|\s*([A-Za-z_]\w*)(?:\s*\([^()]*\))?").expect("regex");
     let test = Regex::new(r"\bis\s+(?:not\s+)?[A-Za-z_]\w*(?:\s*\([^()]*\))?").expect("regex");
-    let call = Regex::new(r"(?:^|[^\w.])([A-Za-z_]\w*)\s*\(").expect("regex");
+    // Every name directly followed by `(` (also nested: `f(g(1))`); `.name(` is a method.
+    let call = Regex::new(r"\b([A-Za-z_]\w*)\s*\(").expect("regex");
     let escaping_off = Regex::new(r"^\{%-?\s*(?:autoescape\b|filter\b.*\bsafe\b)").expect("regex");
     let allowed_filters: BTreeSet<&str> = ALLOWED_FILTERS.split_whitespace().collect();
 
+    let statement = region.trim_start().starts_with("{%");
     if escaping_off.is_match(region.trim()) {
         scan.problems
             .push(format!("{name}: `{region}` turns escaping off"));
@@ -1277,12 +1287,51 @@ fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, 
     let region = filter.replace_all(&region, "");
     let region = test.replace_all(&region, "");
     for m in call.captures_iter(&region) {
-        let ident = &m[1];
+        let found = m.get(1).expect("group 1");
+        let (ident, before) = (found.as_str(), &region[..found.start()]);
+        if before.trim_end().ends_with('.') || is_keyword_use(ident, before, statement) {
+            continue;
+        }
         if SPEC_HELPERS.contains(&ident) {
             scan.helpers.insert(ident.to_string());
         } else if !allowed_calls.contains(ident) {
             scan.problems.push(format!("{name}: helper `{ident}`"));
         }
+    }
+}
+
+/// True when `word`, directly followed by `(` in a tag region whose text up to `word` is
+/// `before` (delimiters and string literals blanked), is minijinja syntax rather than a call:
+/// a [`STATEMENT_KEYWORDS`] word opening a `{% … %}` tag (`statement`), `not`, or an
+/// [`OPERATOR_KEYWORDS`] word after an operand (a name, number, string literal or closing
+/// bracket; `in` also after `not`).
+fn is_keyword_use(word: &str, before: &str, statement: bool) -> bool {
+    let is_in = |list: &str, word: &str| list.split_whitespace().any(|k| k == word);
+    let before = before.trim_end();
+    if before.is_empty() {
+        return (statement && is_in(STATEMENT_KEYWORDS, word)) || word == "not";
+    }
+    if word == "not" {
+        return true;
+    }
+    if !is_in(OPERATOR_KEYWORDS, word) {
+        return false;
+    }
+    let previous = before
+        .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or_default();
+    match before.chars().last() {
+        Some(')' | ']' | '}' | '"' | '\'') => true,
+        // A keyword before `word` leaves an operand to come, except `not in`. A statement's
+        // first word is its keyword.
+        Some(_) if !previous.is_empty() => {
+            let keyword = is_in(OPERATOR_KEYWORDS, previous)
+                || matches!(previous, "not" | "is")
+                || (statement && before.trim_start() == previous);
+            !keyword || (previous == "not" && word == "in")
+        }
+        _ => false,
     }
 }
 
@@ -1292,7 +1341,6 @@ fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, 
 fn scan_templates(templates: &[(String, String)]) -> Scan {
     let builtin: BTreeSet<String> = MINIJINJA_CALLABLES
         .split_whitespace()
-        .chain(KEYWORDS.split_whitespace())
         .map(str::to_string)
         .collect();
     let mut scan = Scan::default();
@@ -1345,10 +1393,33 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
         "{% for a, b in x|items %}{{ loop.cycle(1, 2) }}{% endfor %}",
         "{{ x is divisibleby(3) }}{{ caller() }}{{ super() }}{{ style(\"a.css\") }}",
         "{{ block.html|safe }}{{ slide.notes | safe }}{{-out.html|safe-}}",
+        // Keywords directly before `(` where minijinja reads them as keywords.
+        "{% with (a, b) = (1, 2) %}{{ a }}-{{ b }}{% endwith %}",
+        "{%- with x = range(3), (y, z) = (1, 2) -%}{{ x|join }}{% endwith %}",
+        r#"{% include "m.html" with context %}{% include ["m.html"] ignore missing without context %}"#,
+        "{% for (a, b) in x|items if (a) %}{{ a }}{% endfor %}{% set (c, d) = (1, 2) %}",
+        "{% if (a) and (b) or (c) %}{% elif not (d) %}{% endif %}{{ x if (y) else (z) }}",
+        r#"{{ x in (1, 2) }}{{ x not in ("a", 'b') }}{{ 1 in (1,) }}{{ x|length in [1] }}"#,
+        "{{ not(x) }}{{ (a) and not (b) }}{{ x is defined and (y) }}{{ [x][0] in (y) }}",
+        "{% macro row(x) %}{{ caller(x) }}{% endmacro %}{% call(v) row(1) %}{{ v }}{% endcall %}",
+        r#"{% import ("m" ~ ".html") as m %}{{ m.fmt(1) }}{{ loop . cycle(1) }}"#,
+        r#"{% include ("m" ~ ".html") %}{% set ns = namespace(a=[]) %}{% do (ns.a.append)(1) %}"#,
     ] {
         let result = scan(ok);
         assert!(result.problems.is_empty(), "{ok}: {:?}", result.problems);
+        assert_parses(ok);
     }
+    // minijinja binds the tuple target of `with (…)`.
+    let mut env = Environment::new();
+    env.add_template(
+        "t.html",
+        "{% with (a, b) = (1, 2) %}{{ a }}-{{ b }}{% endwith %}",
+    )
+    .expect("parses");
+    assert_eq!(
+        env.get_template("t.html").unwrap().render(()).unwrap(),
+        "1-2"
+    );
     for bad in [
         "{{ helper(1) }}",
         // Values bound by set/with/for are not callables (a dead `date()` call is a helper).
@@ -1365,6 +1436,19 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
         "{% with recursive = 1 %}{{ recursive() }}{% endwith %}",
         "{% for ignore in x %}{{ ignore() }}{% endfor %}",
         "{% set macro = 1 %}{{ macro() }}",
+        // ... and when it is a keyword that minijinja does not read as one there.
+        "{% set with = 1 %}{{ with() }}",
+        "{% with with = 1 %}{{ with(2) }}{% endwith %}",
+        "{% for call in x %}{{ call() }}{% endfor %}",
+        "{% set include = 1 %}{{ include(2) }}",
+        "{% for (a, b) in x %}{{ for(1) }}{% endfor %}",
+        "{% set and = 1 %}{{ and(2) }}{{ x if (and(3)) }}",
+        "{% if x and and(1) %}{% endif %}",
+        "{% if and(1) %}{% endif %}",
+        "{% include in(1) %}",
+        "{{ x if y else (or(1)) }}",
+        // Nested calls are found too.
+        r#"{{ style(helper("x")) }}"#,
         // An import binds its alias, not the imported name.
         r#"{% from "m.html" import fmt as f %}{{ fmt(1) }}"#,
         r#"{% import "m.html" as m %}{{ fmt(1) }}"#,
@@ -1382,6 +1466,7 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
         "{% filter safe %}{{ cell.source }}{% endfilter %}",
     ] {
         assert!(!scan(bad).problems.is_empty(), "{bad} passed the scan");
+        assert_parses(bad);
     }
     // Callables are scoped to the template that defines or imports them.
     let two = |caller: &str| {
@@ -1426,6 +1511,15 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
            {% include "layouts/" ~ slide.layout ~ ".html" %}{# {% include "d.html" %} #}"#,
     );
     assert_eq!(refs, ["partials/a.html", "b.html", "c.html"]);
+}
+
+/// `source` is valid minijinja 2.24 syntax (with this crate's features), so the scan alone
+/// decides whether it passes.
+fn assert_parses(source: &str) {
+    let mut env = Environment::new();
+    if let Err(err) = env.add_template("t.html", source) {
+        panic!("{source} does not parse: {err}");
+    }
 }
 
 #[test]
