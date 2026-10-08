@@ -1,0 +1,135 @@
+---
+source: tests/render.rs
+expression: region
+---
+<div class="slides">
+<section id="intro" class="layout-title">
+<h1>Rust for data people</h1>
+
+<p class="subtitle">Fast tools without the footguns</p>
+<p class="author">J. Blaschke</p>
+<p class="date">2026-10-08</p>
+<aside class="notes"><p>Welcome everyone. Say who you are and what the audience will take home.</p>
+</aside>
+</section>
+<section>
+<section class="layout-default">
+<h2>Agenda</h2>
+<ul>
+<li>Why Rust</li>
+<li>Tooling</li>
+<li>Live demo</li>
+</ul>
+
+</section>
+<section class="layout-default">
+<h2>A vertical sub-slide</h2>
+<div class="fragment">
+<p>Appears on click.</p>
+</div>
+<div class="fragment fade-up" data-fragment-index="1">
+<p>Then this one fades up.</p>
+</div>
+
+</section>
+<section id="tooling" class="layout-default" data-auto-animate="">
+<h2>Tooling</h2>
+<p><code>cargo</code>, <code>clippy</code> and <code>rustfmt</code> ship with the toolchain.</p>
+
+</section>
+</section>
+<section class="layout-default dark" data-background-color="#111">
+<h2>Code</h2>
+<pre><code class="language-python" data-trim data-line-numbers="1-2|4">import polars as pl
+df = pl.read_csv("data.csv")
+
+print(df.describe())</code></pre>
+
+<aside class="notes"><p>Mention compile times.</p>
+</aside>
+</section>
+<section class="layout-default">
+<h2>Math</h2>
+<p>Inline <span data-math-style="inline">E = mc^2</span>, escaped <span data-math-style="inline">a &lt; b</span>, and display:</p>
+<p><span data-math-style="display">\int_0^1 x^2 \, dx = \frac{1}{3}</span></p>
+<div data-math-style="display">\sum_{i=1}^{n} i = \frac{n(n+1)}{2}</div>
+
+</section>
+<section class="layout-default">
+<h2>Two columns</h2>
+<div class="columns" style="grid-template-columns: 1fr 2fr">
+<div class="column">
+<p>Left: <span data-math-style="inline">x^2</span> grows fast.</p>
+</div>
+<div class="column">
+<p><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mPQKrv7HwAEyAJ9hkpg4wAAAABJRU5ErkJggg==" alt="A one-pixel plot" /></p>
+</div>
+</div>
+
+</section>
+<section class="layout-default">
+<h2>Notebook output</h2>
+
+
+<div class="cell" data-cell-index="4">
+<div class="cell-input">
+<div class="cell-prompt">In [3]:</div>
+<pre><code class="language-python" data-trim>print(&quot;rows:&quot;, len(df))
+print(&quot;\033[33mwarning\033[0m: 3 null values&quot;, file=sys.stderr)
+display(df.head(2))
+display(IntSlider())
+1 &#x2f; 0</code></pre>
+</div>
+<div class="cell-outputs">
+<pre class="output output-stream stdout">rows: 1000
+</pre>
+<pre class="output output-stream stderr"><span style='color:var(--yellow,#a50)'>warning</span>: 3 null values
+</pre>
+<div class="output output-display" data-mime="text&#x2f;html">
+<table class="dataframe">
+<thead><tr><th></th><th>city</th><th>price</th></tr></thead>
+<tbody>
+<tr><th>0</th><td>Berlin</td><td>12.5</td></tr>
+<tr><th>1</th><td>Paris</td><td>9.0</td></tr>
+</tbody>
+</table>
+</div>
+<div class="output output-unsupported">No renderable output (application&#x2f;vnd.jupyter.widget-view+json)</div>
+<pre class="output output-error"><span style='color:var(--red,#a00)'>---------------------------------------------------------------------------</span>
+<span style='color:var(--red,#a00)'>ZeroDivisionError</span>                         Traceback (most recent call last)
+Cell <span style='color:var(--green,#0a0)'>In[3]</span>, line <span style='color:var(--green,#0a0)'>5</span>
+<span style='color:var(--green,#0a0)'>----&gt; 5</span> 1 / 0
+
+<span style='color:var(--red,#a00)'>ZeroDivisionError</span>: division by zero</pre>
+</div>
+</div>
+<aside class="notes"><p>The widget has no static rendering; it shows as unsupported.</p>
+</aside>
+</section>
+<section class="layout-default">
+
+<div class="cell fragment hide-input" data-cell-index="5">
+<div class="cell-input">
+<div class="cell-prompt">In [4]:</div>
+<pre><code class="language-python" data-trim>display(Math(r&quot;\hat{y} = 0.42x + 1.7&quot;))
+fig, ax = plt.subplots()
+ax.plot(df[&quot;price&quot;])
+fig</code></pre>
+</div>
+<div class="cell-outputs">
+<div class="output output-display" data-mime="text&#x2f;latex">
+<div data-math-style="display">\hat{y} = 0.42x + 1.7</div>
+</div>
+<div class="output output-display" data-mime="image&#x2f;png">
+<div class="cell-prompt">Out [4]:</div>
+<img class="output-image" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mPQKrv7HwAEyAJ9hkpg4wAAAABJRU5ErkJggg==" alt="">
+</div>
+</div>
+</div>
+</section>
+<section id="questions" class="layout-section inverted" data-transition="zoom">
+<h1>Questions?</h1>
+<p>Slides and code: <a href="https://example.org/rust-data">example.org/rust-data</a></p>
+
+</section>
+</div>

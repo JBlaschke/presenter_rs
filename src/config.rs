@@ -617,7 +617,7 @@ fn overlay_table<T: Serialize + DeserializeOwned>(
 }
 
 /// Sorts object keys recursively and turns integral floats (`1280.0`) into integers.
-fn canonical_json(value: &Value) -> Value {
+pub(crate) fn canonical_json(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let sorted: BTreeMap<&String, &Value> = map.iter().collect();
