@@ -1323,6 +1323,80 @@ fn attachment_diagnostics_name_the_attachment_as_written() {
 }
 
 #[test]
+fn attachment_urls_spelled_differently_from_the_name_resolve() {
+    // Spellings the source rewrite does not know: `+` percent-encoded, lower-case hex, an
+    // HTML entity in raw HTML. Once decoded they name an attachment and resolve to it.
+    let svg = |width: u32| format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\"/>");
+    let attachments = json!({
+        "a+b.png": {"image/png": PIXEL_PNG},
+        "ü.png": {"image/svg+xml": svg(1)},
+        "a&b.png": {"image/svg+xml": svg(2)},
+        "bad+.png": {"image/png": "!!!"},
+    });
+    let source = "![a](attachment:a%2Bb.png) ![u](attachment:%c3%bc.png) \
+                  <img src=\"attachment:a&amp;b.png\">\n\n\
+                  ![bad](attachment:bad%2B.png) ![bad](attachment:bad+.png) \
+                  ![n](attachment:none%2B.png)\n\n\
+                  :::notes\n![notes](attachment:a%2bb.png)\n:::\n";
+    let cell = json!({"cell_type": "markdown", "metadata": {}, "source": source, "attachments": attachments});
+    let raw_cell = json!({
+        "cell_type": "raw",
+        "metadata": {"raw_mimetype": "text/html"},
+        "source": "<img src=\"attachment:a&amp;b.png\"> <img src='attachment:%c3%a4.png'> \
+                   <img src=\"attachment:a%26b.png \">",
+        "attachments": {"a&b.png": {"image/svg+xml": svg(2)}, "ä.png": {"image/png": PIXEL_PNG}},
+    });
+    let parsed = inline(json!([cell, raw_cell]));
+    let slide = &parsed.deck.slides[0];
+    let first = html(&slide.blocks[0]);
+    assert_eq!(first.matches("src=\"asset:").count(), 3, "{first}");
+    assert!(!first.contains("attachment:a"), "{first}");
+    assert!(!first.contains("attachment:%"), "{first}");
+    // A skipped attachment stays as written (reported once, under any spelling).
+    assert!(first.contains("src=\"attachment:bad%2B.png\""), "{first}");
+    assert!(first.contains("src=\"attachment:bad+.png\""), "{first}");
+    assert!(first.contains("src=\"attachment:none%2B.png\""), "{first}");
+    let notes = slide.notes.as_deref().unwrap_or_default();
+    assert!(notes.contains("src=\"asset:"), "{notes}");
+    assert!(!notes.contains("attachment:"), "{notes}");
+    let raw_html = html(&slide.blocks[1]);
+    assert_eq!(raw_html.matches("asset:").count(), 3, "{raw_html}");
+    assert!(!raw_html.contains("attachment:"), "{raw_html}");
+    // a+b.png and ä.png share their bytes; the two SVGs differ.
+    assert_eq!(parsed.deck.assets.len(), 3);
+    assert_eq!(
+        codes(&parsed),
+        [
+            ("notebook-attachment-skipped", Some(0), 1),
+            ("missing-attachment", Some(0), 1),
+        ]
+    );
+    assert_eq!(
+        parsed.diagnostics.iter().nth(1).map(|d| d.message.as_str()),
+        Some("`attachment:none+.png`: the cell has no attachment `none+.png`")
+    );
+
+    // Split markdown cells resolve every part.
+    let mut config = Config::default();
+    config.notebook.split_markdown_cells = true;
+    let split = json!({
+        "cell_type": "markdown", "metadata": {},
+        "source": "# One\n\n![a](attachment:a%2Bb.png)\n\n---\n\n# Two\n\n![b](attachment:a%2bb.png)\n",
+        "attachments": {"a+b.png": {"image/png": PIXEL_PNG}},
+    });
+    let parsed = parse_inline(&notebook(json!([split]), python()), &config).unwrap();
+    assert_eq!(parsed.deck.slides.len(), 2);
+    for slide in &parsed.deck.slides {
+        let body = html(&slide.blocks[0]);
+        assert!(
+            body.contains("src=\"asset:") && !body.contains("attachment:"),
+            "{body}"
+        );
+    }
+    assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
+}
+
+#[test]
 fn notes_in_markdown_outputs_are_speaker_notes() {
     let outputs = json!([
         {"output_type": "display_data", "metadata": {},

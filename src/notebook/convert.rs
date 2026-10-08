@@ -43,9 +43,13 @@
 //!   onto `cur` only while `cur` has no blocks yet. One cell is one [`Block::Html`], wrapped
 //!   in `<div class="fragment">` for fragments. `:::notes` go to `cur.notes`. Attachments
 //!   (`attachment:NAME` in the source) are registered as inline assets and the URL becomes
-//!   `asset:<id>`. With `[notebook] split_markdown_cells = true`, `---` / `--` separators
-//!   inside a cell open new slides exactly as in a Markdown deck ([`split_with_source`]);
-//!   the part before the first separator continues `cur`.
+//!   `asset:<id>`: the name as written and its `encodeURI` spelling in the source, any
+//!   other spelling that names the attachment once HTML entities and percent escapes are
+//!   decoded in the rendered HTML (body and notes). An `attachment:` URL left after that is
+//!   a skipped attachment (`notebook-attachment-skipped`, reported once) or warns
+//!   [`codes::MISSING_ATTACHMENT`]. With `[notebook] split_markdown_cells = true`, `---` /
+//!   `--` separators inside a cell open new slides exactly as in a Markdown deck
+//!   ([`split_with_source`]); the part before the first separator continues `cur`.
 //! - **Code cells**: [`Block::Cell`] with the outputs of [`render_outputs`] (T32); relative
 //!   `src`/`poster` URLs in `text/html` outputs go through T12's raw-HTML asset rewriting.
 //!   `hide_input` / `hide_output` come from the configured tag lists and
@@ -122,7 +126,8 @@ pub mod codes {
     pub const OVERRIDE_INVALID: &str = "presenter-override-invalid";
     /// A raw cell whose `raw_mimetype` is not `text/html`; not rendered.
     pub const RAW_CELL_SKIPPED: &str = "raw-cell-skipped";
-    /// An `attachment:NAME` URL whose name is not among the cell's attachments.
+    /// An `attachment:NAME` URL whose name, as written or decoded, is not among the cell's
+    /// attachments.
     pub const MISSING_ATTACHMENT: &str = "missing-attachment";
     /// A `---` front matter block that sets deck metadata at the start of a markdown cell
     /// that is not the first markdown cell; it is removed from the cell and does not change
@@ -144,8 +149,13 @@ const SEPARATOR_NOT_RECOGNIZED: &str = "separator-not-recognized";
 /// The splitter's report of a leading `--`, which in a cell opens a vertical slide.
 const ORPHAN_VERTICAL: &str = "orphan-vertical";
 
+/// The scheme of a notebook attachment URL (`attachment:NAME`).
+const ATTACHMENT_SCHEME: &str = "attachment:";
+
 /// `src`, `href` or `poster` values (double- or single-quoted) that still point at an
-/// attachment after rewriting; the name is group 1 or 2, as written in the HTML.
+/// attachment after the source rewrite; the name is group 1 or 2, as written in the HTML,
+/// and [`ATTACHMENT_SCHEME`] directly precedes it. Unquoted values are not matched: in
+/// rendered Markdown they would also match HTML shown in code (`&lt;img src=attachment:…`).
 static ATTACHMENT_URL: LazyLock<Regex> = LazyLock::new(|| {
     // A constant pattern covered by the unit tests: compiling it cannot fail.
     Regex::new(r#"(?i:src|href|poster)\s*=\s*(?:"attachment:([^"]*)"|'attachment:([^']*)')"#)
@@ -403,6 +413,9 @@ struct Converter<'a> {
     /// one of its separators opens.
     deferred: Option<(SourceSpan, &'a Value)>,
     features: Features,
+    /// Attachments registered so far, by (cell index, name): the asset id, or `None` when
+    /// the attachment was skipped (and reported once).
+    attachment_ids: BTreeMap<(usize, String), Option<String>>,
 }
 
 impl<'a> Converter<'a> {
@@ -428,6 +441,7 @@ impl<'a> Converter<'a> {
             pending: Vec::new(),
             deferred: None,
             features: Features::default(),
+            attachment_ids: BTreeMap::new(),
         }
     }
 
@@ -724,13 +738,13 @@ impl<'a> Converter<'a> {
         }
         let lift = self.cur_is_empty();
         let span = cell.span(index);
-        let (rendered, lifted) = self.render(Some(&span), offset, |ctx, opts| {
+        let (mut rendered, lifted) = self.render(Some(&span), offset, |ctx, opts| {
             render_fragment_with_lift(&text, opts, ctx, lift)
         })?;
         if let Some(attrs) = lifted {
             self.apply_attrs(SlideAttrs::from_parsed(attrs), &span);
         }
-        self.check_attachments(&rendered.html, cell, &span);
+        self.resolve_rendered(index, cell, &mut rendered, &span);
         self.push_rendered(rendered, fragment);
         Ok(())
     }
@@ -833,10 +847,10 @@ impl<'a> Converter<'a> {
         span: &SourceSpan,
     ) -> Result<()> {
         let arena = part.arena;
-        let rendered = self.render(Some(span), part.offset, |ctx, opts| {
+        let mut rendered = self.render(Some(span), part.offset, |ctx, opts| {
             render_nodes(arena, nodes, opts, ctx)
         })?;
-        self.check_attachments(&rendered.html, part.cell, span);
+        self.resolve_rendered(part.index, part.cell, &mut rendered, span);
         self.push_rendered(rendered, part.fragment);
         Ok(())
     }
@@ -968,7 +982,7 @@ impl<'a> Converter<'a> {
         self.render(Some(&span), 0, |ctx, _| {
             rewrite_html_assets(&mut html, Some(&span), ctx)
         })?;
-        self.check_attachments(&html, cell, &span);
+        self.resolve_attachments(index, cell, &mut html, &span);
         self.features.math |= has_math_markup(&html);
         Ok(Some(html))
     }
@@ -979,10 +993,10 @@ impl<'a> Converter<'a> {
             CellType::Markdown => {
                 let (text, offset) = self.markdown_text(index, cell);
                 let span = cell.span(index);
-                let rendered = self.render(Some(&span), offset, |ctx, opts| {
+                let mut rendered = self.render(Some(&span), offset, |ctx, opts| {
                     render_fragment(&text, opts, ctx)
                 })?;
-                self.check_attachments(&rendered.html, cell, &span);
+                self.resolve_rendered(index, cell, &mut rendered, &span);
                 self.features.merge(rendered.features);
                 rendered.html + rendered.notes.as_deref().unwrap_or_default()
             }
@@ -997,10 +1011,12 @@ impl<'a> Converter<'a> {
     }
 
     /// `text` with every `attachment:NAME` URL of an attachment of `cell` replaced by the
-    /// `asset:<id>` of the registered attachment.
+    /// `asset:<id>` of the registered attachment. Only the name as written and its `encodeURI`
+    /// spelling are known here; [`Self::resolve_attachments`] handles other spellings in the
+    /// rendered HTML.
     fn with_attachments(&mut self, index: usize, cell: &Cell, text: &'a str) -> Cow<'a, str> {
         let mut text = Cow::Borrowed(text);
-        for (name, bundle) in &cell.attachments {
+        for name in cell.attachments.keys() {
             let needles = attachment_needles(name);
             if !needles
                 .iter()
@@ -1008,7 +1024,7 @@ impl<'a> Converter<'a> {
             {
                 continue;
             }
-            let Some(id) = self.register_attachment(index, cell, name, bundle) else {
+            let Some(id) = self.attachment_id(index, cell, name) else {
                 continue;
             };
             let url = AssetRegistry::placeholder(&id);
@@ -1054,20 +1070,80 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Warns about `attachment:` URLs left in rendered HTML whose name the cell lacks. The
-    /// name is compared and reported as written in the source (HTML entities and percent
-    /// escapes decoded); one whose attachment exists was already reported as skipped.
-    fn check_attachments(&mut self, html: &str, cell: &Cell, span: &SourceSpan) {
-        let missing: Vec<String> = ATTACHMENT_URL
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)))
-            .filter_map(|written| {
-                let written = written.as_str();
-                let decoded = percent_decode(&html_escape::decode_html_entities(written));
-                let known = |name: &str| cell.attachments.contains_key(name);
-                (!known(written) && !known(&decoded)).then_some(decoded)
-            })
-            .collect();
+    /// The asset id of `cell`'s attachment `name`, registered on first use
+    /// ([`Self::register_attachment`]); `None` when it is not an attachment of `cell` or was
+    /// skipped (reported once per cell and name, whichever spelling asks again).
+    fn attachment_id(&mut self, index: usize, cell: &Cell, name: &str) -> Option<String> {
+        let key = (index, name.to_owned());
+        if let Some(id) = self.attachment_ids.get(&key) {
+            return id.clone();
+        }
+        let id = cell
+            .attachments
+            .get(name)
+            .and_then(|bundle| self.register_attachment(index, cell, name, bundle));
+        self.attachment_ids.insert(key, id.clone());
+        id
+    }
+
+    /// [`Self::resolve_attachments`] on a rendered markdown cell's body and notes.
+    fn resolve_rendered(
+        &mut self,
+        index: usize,
+        cell: &Cell,
+        rendered: &mut Rendered,
+        span: &SourceSpan,
+    ) {
+        self.resolve_attachments(index, cell, &mut rendered.html, span);
+        if let Some(notes) = &mut rendered.notes {
+            self.resolve_attachments(index, cell, notes, span);
+        }
+    }
+
+    /// Resolves the `attachment:` URLs left in `html` ([`ATTACHMENT_URL`]) after
+    /// [`Self::with_attachments`], which knows only two spellings of each name. A URL that
+    /// names an attachment of `cell` as written, or once HTML entities and percent escapes
+    /// are decoded (`attachment:a%2Bb.png` for `a+b.png`, lower-case hex, `a&amp;b.png` in raw
+    /// HTML), becomes that attachment's `asset:<id>`. One whose attachment was skipped stays
+    /// as written (already reported). Any other gets a [`codes::MISSING_ATTACHMENT`] warning
+    /// naming it decoded, as written in the source; so no `attachment:` URL is left
+    /// unreported.
+    fn resolve_attachments(
+        &mut self,
+        index: usize,
+        cell: &Cell,
+        html: &mut String,
+        span: &SourceSpan,
+    ) {
+        let mut resolved = String::new();
+        let mut copied = None;
+        let mut missing = Vec::new();
+        for caps in ATTACHMENT_URL.captures_iter(html) {
+            let Some(value) = caps.get(1).or_else(|| caps.get(2)) else {
+                continue;
+            };
+            let written = value.as_str().trim_end();
+            let unescaped = html_escape::decode_html_entities(written);
+            let decoded = percent_decode(&unescaped);
+            let found = [written, &unescaped, &decoded]
+                .into_iter()
+                .find(|name| cell.attachments.contains_key(*name))
+                .map(str::to_owned);
+            let Some(name) = found else {
+                missing.push(decoded);
+                continue;
+            };
+            if let Some(id) = self.attachment_id(index, cell, &name) {
+                let start = value.start() - ATTACHMENT_SCHEME.len();
+                resolved.push_str(&html[copied.unwrap_or(0)..start]);
+                resolved.push_str(&AssetRegistry::placeholder(&id));
+                copied = Some(value.start() + written.len());
+            }
+        }
+        if let Some(copied) = copied {
+            resolved.push_str(&html[copied..]);
+            *html = resolved;
+        }
         for name in missing {
             let message = format!("`attachment:{name}`: the cell has no attachment `{name}`");
             self.warn(codes::MISSING_ATTACHMENT, message, span);
@@ -1506,15 +1582,20 @@ mod tests {
         assert_eq!(decode_attachment("<svg/>").unwrap(), b"<svg/>");
         assert!(decode_attachment("  ").is_err());
         assert!(decode_attachment("!!!").is_err());
+        let html = "<img src=\"attachment:x.png\" /> <img src='attachment:y z.png'> \
+                    <a HREF = \"attachment:w.svg\"> src=\"other:attachment:no\" \
+                    <img src=\"attachment:s.png \"> <img src=attachment:u.png> \
+                    <code>&lt;img src=attachment:c.png&gt; src=&quot;attachment:q.png&quot;</code>";
         let names: Vec<&str> = ATTACHMENT_URL
-            .captures_iter(
-                "<img src=\"attachment:x.png\" /> <img src='attachment:y z.png'> \
-                 <a HREF = \"attachment:w.svg\"> src=\"other:attachment:no\"",
-            )
+            .captures_iter(html)
             .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)))
-            .map(|name| name.as_str())
+            .map(|name| {
+                let at = name.start() - ATTACHMENT_SCHEME.len();
+                assert_eq!(&html[at..name.start()], ATTACHMENT_SCHEME);
+                name.as_str()
+            })
             .collect();
-        assert_eq!(names, ["x.png", "y z.png", "w.svg"]);
+        assert_eq!(names, ["x.png", "y z.png", "w.svg", "s.png "]);
         assert_eq!(percent_decode("my%20plot.png"), "my plot.png");
         assert_eq!(percent_decode("%C3%BC.png"), "ü.png");
         // T12's decoder (shared with missing-asset resolution): exactly two hex digits.

@@ -7,7 +7,7 @@
 //! diagnostic), never errors. The context is the one `presenter build` would render with:
 //! the theme resolved, the effective config, and `build` for the output mode of
 //! `[build] standalone`. Errors carry the input's location like `build`'s ([`locate`]), and
-//! a failed `--context` still prints the frontend's diagnostics first.
+//! a failed dump (e.g. rejected front matter) still prints the frontend's diagnostics first.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -41,7 +41,13 @@ pub fn run(args: &DumpArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
 
 /// The deck IR, keys sorted.
 fn deck(opts: &BuildOptions, global: &GlobalArgs) -> anyhow::Result<Value> {
-    let (parsed, _, _) = pipeline::parse_only(opts).map_err(|err| locate(err, &opts.input))?;
+    let (parsed, _, _) = match pipeline::try_parse_only(opts) {
+        Ok(parsed) => parsed,
+        Err(BuildFailure { error, diagnostics }) => {
+            report_diagnostics(&diagnostics, global);
+            return Err(locate(error, &opts.input));
+        }
+    };
     report_diagnostics(&parsed.diagnostics, global);
     Ok(sort_keys(serde_json::to_value(&parsed.deck)?))
 }

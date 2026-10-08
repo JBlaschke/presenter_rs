@@ -463,6 +463,38 @@ fn failed_builds_print_the_warnings_and_other_missing_assets_first() {
 }
 
 #[test]
+fn rejected_front_matter_prints_the_warnings_first() {
+    let tmp = project(&[(
+        "fp.md",
+        "---\nreveal:\n  plugins: [bogus]\n---\n# One\n\n---\n\n---\n\n# Three\n",
+    )]);
+    let commands: [&[&str]; 3] = [
+        &["build", "fp.md", "-o", "fp.html"],
+        &["dump", "fp.md"],
+        &["dump", "fp.md", "--context"],
+    ];
+    for args in commands {
+        let output = presenter()
+            .current_dir(tmp.path())
+            .args(args)
+            .assert()
+            .code(1)
+            .stdout("")
+            .get_output()
+            .clone();
+        let stderr = stderr_of(&output);
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2, "{args:?}: {stderr}");
+        assert_eq!(lines[0], "fp.md:7: warning: slide 2 is empty", "{args:?}");
+        assert!(
+            lines[1].starts_with("error: fp.md: front matter: unknown reveal plugin 'bogus'"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(!tmp.path().join("fp.html").exists());
+}
+
+#[test]
 fn missing_image_in_markdown_filter_input_fails_the_build() {
     let layout = "{%- extends \"layouts/default.html\" %}{%- block content %}\
                   <p class=\"subtitle\">{{ meta.subtitle|markdown }}</p>{%- endblock %}";
@@ -597,6 +629,23 @@ fn rust_log_adds_to_the_verbosity_flags() {
         "RUST_LOG applies with -v: {stderr}"
     );
     assert!(stderr.contains("INFO"), "{stderr}");
+
+    // A bare RUST_LOG level: -v and -vv never hide presenter's own debug lines.
+    for flags in [&[][..], &["-v"][..], &["-vv"][..]] {
+        let output = presenter()
+            .current_dir(tmp.path())
+            .env("RUST_LOG", "debug")
+            .args(flags)
+            .args(["build", "a.md", "-o", "a.html"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr = stderr_of(&output);
+        for line in ["DEBUG parsed ", "DEBUG rendered "] {
+            assert!(stderr.contains(line), "{flags:?}: no `{line}`: {stderr}");
+        }
+    }
 
     // -q ignores RUST_LOG.
     presenter()
