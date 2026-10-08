@@ -1,0 +1,7 @@
+---
+source: tests/notebook_snapshots.rs
+expression: diagnostics
+---
+[
+  "cell 7, lines 1-1 [missing-asset] warning: file `clip.mp4` not found (looked for [root]/tests/fixtures/ipynb/clip.mp4)"
+]

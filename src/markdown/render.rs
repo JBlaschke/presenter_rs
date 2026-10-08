@@ -248,6 +248,18 @@ pub fn has_math_markup(html: &str) -> bool {
     found
 }
 
+/// Every start tag of `html` outside comments and raw-text elements, in order: its
+/// ASCII-lowercased name and the byte offset just after it (the tokenizer of
+/// [`rewrite_html_assets`]). The notebook frontend reads raw HTML slide titles with it.
+pub(crate) fn html_start_tags(html: &str) -> Vec<(String, usize)> {
+    let mut tags = Vec::new();
+    let Ok(()) = HtmlScan::default().start_tags(html, |tag| {
+        tags.push((tag.name.clone(), tag.end));
+        Ok::<(), Infallible>(())
+    });
+    tags
+}
+
 /// Registers the local files named by a slide's `data-background-image`,
 /// `data-background-video` (a comma-separated list; each entry is resolved) and
 /// `data-background-iframe` attributes (dialect §6) and replaces them with `asset:<id>`.
@@ -714,14 +726,16 @@ fn is_relative_url(url: &str) -> bool {
     !(url.is_empty() || scheme || url.starts_with(['/', '\\', '#', '?']))
 }
 
-/// Decodes `%XX` escapes; the input unchanged when the result is not UTF-8.
-fn percent_decode(path: &str) -> String {
+/// Decodes `%XX` escapes (exactly two hex digits: `%+F` stays as written); the input
+/// unchanged when the result is not UTF-8. Also used for notebook attachment names.
+pub(crate) fn percent_decode(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let hex = bytes
             .get(i + 1..i + 3)
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
             .and_then(|h| std::str::from_utf8(h).ok());
         match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
             Some(byte) if bytes[i] == b'%' => {

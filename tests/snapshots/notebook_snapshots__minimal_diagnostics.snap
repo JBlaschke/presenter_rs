@@ -1,0 +1,5 @@
+---
+source: tests/notebook_snapshots.rs
+expression: diagnostics
+---
+[]

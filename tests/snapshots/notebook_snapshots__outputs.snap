@@ -1,0 +1,553 @@
+---
+source: tests/notebook_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": null,
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Outputs",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Outputs</h1>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 0
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 1,
+          "id": "html-table",
+          "language": "python",
+          "source": "df = pd.DataFrame({\"x\": [1, 3], \"y\": [2, 4]})\ndf",
+          "execution_count": 1,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "text/html",
+              "html": "<div>\n<table border=\"1\" class=\"dataframe\">\n  <thead>\n    <tr style=\"text-align: right;\">\n      <th></th>\n      <th>x</th>\n      <th>y</th>\n    </tr>\n  </thead>\n  <tbody>\n    <tr>\n      <th>0</th>\n      <td>1</td>\n      <td>2</td>\n    </tr>\n    <tr>\n      <th>1</th>\n      <td>3</td>\n      <td>4</td>\n    </tr>\n  </tbody>\n</table>\n</div>",
+              "execution_count": 1
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 2,
+        "cell": 1
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 2,
+          "id": "png",
+          "language": "python",
+          "source": "plt.figure(figsize=(1, 1))",
+          "execution_count": 2,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "image/png",
+              "html": "<img class=\"output-image\" src=\"asset:000000000001\" alt=\"\">",
+              "execution_count": null
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 2
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 3,
+          "id": "png-size",
+          "language": "python",
+          "source": "Image(\"pixel.png\", width=64, height=64)",
+          "execution_count": 3,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "image/png",
+              "html": "<img class=\"output-image\" src=\"asset:000000000001\" alt=\"\" width=\"64\" height=\"64\">",
+              "execution_count": 3
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 3
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 4,
+          "id": "svg",
+          "language": "python",
+          "source": "display(SVG(svg_source), metadata={\"width\": 120, \"height\": 60})",
+          "execution_count": 4,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "image/svg+xml",
+              "html": "<figure class=\"output-image\"><svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 60\" width=\"120\" height=\"60\">\n  <rect width=\"120\" height=\"60\" fill=\"#2a7ae2\"/>\n  <text x=\"60\" y=\"36\" text-anchor=\"middle\" fill=\"white\">SVG</text>\n</svg></figure>",
+              "execution_count": null
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 4
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 5,
+          "id": "latex",
+          "language": "python",
+          "source": "display(Latex(r\"$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$\"))",
+          "execution_count": 5,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "text/latex",
+              "html": "<div data-math-style=\"display\">\\int_0^1 x^2\\,dx = \\frac{1}{3}</div>",
+              "execution_count": null
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 5
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 6,
+          "id": "markdown",
+          "language": "python",
+          "source": "display(Markdown(\"**Bold** and *italic* from `Markdown()`\"))",
+          "execution_count": 6,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "text/markdown",
+              "html": "<p><strong>Bold</strong> and <em>italic</em> from <code>Markdown()</code></p>\n",
+              "execution_count": null
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 6
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 7,
+          "id": "json",
+          "language": "python",
+          "source": "display(JSON({\"name\": \"presenter\", \"nested\": {\"ok\": True}, \"values\": [1, 2, 3]}))",
+          "execution_count": 7,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "application/json",
+              "html": "<pre class=\"output-json\">{\n  \"name\": \"presenter\",\n  \"nested\": {\n    \"ok\": true\n  },\n  \"values\": [\n    1,\n    2,\n    3\n  ]\n}</pre>",
+              "execution_count": null
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 7
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 8,
+          "id": "plain",
+          "language": "python",
+          "source": "\"<b>not bold</b> & co\"",
+          "execution_count": 8,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "text/plain",
+              "html": "<pre class=\"output-text\">&#39;&lt;b&gt;not bold&lt;/b&gt; &amp; co&#39;</pre>",
+              "execution_count": 8
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 8
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 9,
+          "id": "streams",
+          "language": "python",
+          "source": "print(\"a\")\nprint(\"b\")\nprint(\"\\x1b[31mred\\x1b[0m warning: x < y\", file=sys.stderr)",
+          "execution_count": 9,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "a\nb\n"
+            },
+            {
+              "kind": "stream",
+              "name": "stderr",
+              "html": "<span style='color:var(--red,#a00)'>red</span> warning: x &lt; y\n"
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 3,
+        "cell": 9
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 10,
+          "id": "error",
+          "language": "python",
+          "source": "1/0",
+          "execution_count": 10,
+          "outputs": [
+            {
+              "kind": "error",
+              "ename": "ZeroDivisionError",
+              "evalue": "division by zero",
+              "html": "<span style='color:var(--red,#a00)'>---------------------------------------------------------------------------</span>\n<span style='color:var(--red,#a00)'>ZeroDivisionError</span>                         Traceback (most recent call last)\nCell <span style='color:var(--green,#0a0)'>In[10], line 1</span>\n<span style='color:var(--green,#0a0)'>----&gt; 1</span> <span style='color:#626262'><span style='background:var(--yellow,#a60)'>1/0</span></span>\n\n<span style='color:var(--red,#a00)'>ZeroDivisionError</span>: division by zero"
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 10
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 11,
+          "id": "widget-only",
+          "language": "python",
+          "source": "display(slider._repr_mimebundle_(include=[\"application/vnd.jupyter.widget-view+json\"]), raw=True)",
+          "execution_count": 11,
+          "outputs": [
+            {
+              "kind": "unsupported",
+              "mimes": [
+                "application/vnd.jupyter.widget-view+json"
+              ]
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 11
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 12,
+          "id": "widget-plain",
+          "language": "python",
+          "source": "IntSlider(value=5)",
+          "execution_count": 12,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "text/plain",
+              "html": "<pre class=\"output-text\">IntSlider(value=5)</pre>",
+              "execution_count": 12
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 12
+      }
+    }
+  ],
+  "features": {
+    "math": true,
+    "code": true,
+    "notes": false,
+    "notebook": true
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "notebook",
+    "base_dir": "[path]"
+  },
+  "assets": [
+    {
+      "id": "000000000001",
+      "mime": "image/png",
+      "origin": "inline:70"
+    }
+  ]
+}

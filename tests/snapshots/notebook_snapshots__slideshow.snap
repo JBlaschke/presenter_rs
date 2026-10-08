@@ -1,0 +1,144 @@
+---
+source: tests/notebook_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": null,
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "title",
+      "classes": [],
+      "attrs": {},
+      "title": "Analysis",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Analysis</h1>\n"
+        },
+        {
+          "type": "html",
+          "html": "<p>Some intro</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 0
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": null,
+      "blocks": [
+        {
+          "type": "cell",
+          "index": 2,
+          "id": "load",
+          "language": "python",
+          "source": "df = load()",
+          "execution_count": 1,
+          "outputs": [],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "slide"
+            }
+          }
+        },
+        {
+          "type": "cell",
+          "index": 3,
+          "id": "describe",
+          "language": "python",
+          "source": "df.describe()",
+          "execution_count": 2,
+          "outputs": [
+            {
+              "kind": "display",
+              "mime": "text/plain",
+              "html": "<pre class=\"output-text\">       value\ncount    3.0\nmean     2.0</pre>",
+              "execution_count": 2
+            }
+          ],
+          "hide_input": true,
+          "hide_output": false,
+          "fragment": true,
+          "tags": [
+            "hide-input"
+          ],
+          "metadata": {
+            "slideshow": {
+              "slide_type": "fragment"
+            },
+            "tags": [
+              "hide-input"
+            ]
+          }
+        }
+      ],
+      "notes": null,
+      "children": [
+        {
+          "id": null,
+          "layout": "default",
+          "classes": [],
+          "attrs": {},
+          "title": "Details",
+          "blocks": [
+            {
+              "type": "html",
+              "html": "<h2>Details</h2>\n"
+            },
+            {
+              "type": "html",
+              "html": "<video src=\"clip.mp4\" controls></video>"
+            }
+          ],
+          "notes": "<p>Remember to mention caching</p>\n",
+          "children": [],
+          "span": {
+            "start_line": 1,
+            "end_line": 1,
+            "cell": 4
+          }
+        }
+      ],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 2
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": true,
+    "notes": true,
+    "notebook": true
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "notebook",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}
