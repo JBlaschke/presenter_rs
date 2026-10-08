@@ -42,3 +42,12 @@ by a child theme through one template and a handful of tokens.
 
 ## Out of scope
 Execution inside `presenter`, widgets, plotly.
+
+## Amendments (coordinator, 2026-10-08)
+- Put the "child theme that overrides only `cell.html`" in a NEW fixture directory (e.g.
+  `tests/fixtures/themes/cell-override/`), not in T13's `child-theme/` fixture, whose shape T13's
+  tests assert.
+- T17's `tests/theme_tokens.rs` checks every `--p-*` token of every `[styles]` entry against the
+  theme README: document the notebook tokens there (additive README section).
+- T34's `check` asserts `examples/notebook/analysis.ipynb` reports no warnings once the file
+  exists; keep it clean (e.g. `notebook-no-outputs` must not fire).

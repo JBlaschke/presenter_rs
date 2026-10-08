@@ -38,3 +38,9 @@ Any change to the protocol or client.
 
 ## Hints
 - Use `std::process::Command` + `BufReader` on stdout in the test; set `kill_on_drop` semantics by wrapping the child in a guard struct that kills in `Drop`.
+
+## Amendments (coordinator, 2026-10-08)
+- Build on T20's `serve::watch::{Watcher, watch_set_for, watch_set_before_build, watch_set_for_failed, classify}`
+  and T21's `serve::server::{ServeState, Shared, router, serve/serve_until, apply_build, apply_error}`,
+  `serve::events::BuildEvent` (see their notes). Run T22's QA checklist (docs/dev/live-reload-qa.md)
+  against the REAL server with the CDP helper and record the results there (additive section).

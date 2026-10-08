@@ -30,3 +30,13 @@ the browser overlay; template errors include the template name and line.
 - Snapshot test of `print_error` output for a `Parse` error with line, a `Template` error, a `MissingAsset`, and a `Theme` error (no color).
 - Serve: introduce a template syntax error in a child theme → overlay shows template name, line and excerpt (manual, recorded).
 - `NO_COLOR=1` disables colors (test by capturing output with `assert_cmd` and asserting no `\x1b[`).
+
+## Amendments (coordinator, 2026-10-08)
+- T16 already routes all stderr printing through `src/cli/report.rs` (`report_error`,
+  `report_diagnostics`, a no-op `install_panic_hook()` called from `main`): build on it.
+- Adding `excerpt` to `ErrorPayload` breaks exact-JSON assertions in T21's tests (`tests/server.rs`
+  and unit tests in `src/serve/`): update them (additive, listed).
+- `assets/presenter/live-reload.js` is 7959 bytes; the CI gate is < 8192. Fit the excerpt display in
+  that budget (tighten existing code if needed); do not raise the gate.
+- T23 (`presenter serve`) runs in parallel: verify the overlay through T21's server API or T22's mock
+  server; the coordinator re-checks end to end after merging.
