@@ -86,3 +86,17 @@ returning `Error::Other("notebook support arrives in T31")` — add that stub in
 - Theme resolution: `cli.theme` → `meta.theme` → `config.deck.theme`; then
   `config.merge_theme_reveal(&theme.reveal_defaults())`, then `config.merge_front_matter(&deck.meta)`,
   then `config.apply_cli(...)`.
+- Wave-3 facts (T15): `RenderInput.config` must be the **effective** config. Call
+  `render::context::effective_config(&config, &deck.meta, &theme)` (merge_theme_reveal +
+  merge_front_matter), then `apply_cli(...)`, then render. `build_context(input, &mut Diagnostics)`
+  replaced the task file's `(input, theme_css_url)`; `dump --context` prints
+  `render::context::context_json(input, &mut diags)` (same object, keys in theme-format §4 order).
+  `RenderedDocument.diagnostics` must be merged into `Build.diagnostics`.
+- `notebook::parse` already exists as a coordinator stub with the final signature (T31 fills it
+  in, in parallel with you): call it, do not edit `src/notebook/`.
+- Missing assets: a `missing-asset` diagnostic's `path` is the SOURCE file; the missing file is in
+  the message, parsed by `markdown::render::missing_asset_path(&Diagnostic) -> Option<PathBuf>`.
+  Use it for `Error::MissingAsset { path, span }` (the span from the diagnostic).
+- The example deck must nest directives with a longer outer fence (`::::columns` … `::::`).
+- Switch the `markdown` template filter to `markdown::render::render_fragment` (T15 implemented it
+  with comrak directly; keep its inline behaviour: a single `<p>…</p>` result is unwrapped).

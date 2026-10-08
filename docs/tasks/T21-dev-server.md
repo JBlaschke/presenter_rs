@@ -69,3 +69,7 @@ Watching files (T20), the client script (T22), CLI (T23).
 ## Amendments (coordinator, 2026-10-08)
 - Use `crate::serve::watch::ChangeKind` (defined by T00; T20 owns the rest of `watch.rs`).
 - Resolve `/__presenter/asset/{*path}` with T15's `render::resolve_helper_path` (all four path forms of theme-format.md §4, including `@<theme>/…`).
+- Serve-mode theme CSS references theme assets as `/__presenter/asset/<helper path>` (T15), so
+  `ServeState.assets` = the deck registry (`Build.assets`) for `/__presenter/deck-asset/{id}`.
+- `hello` may carry the same optional `error` object as a failed `build` event when the last
+  build failed (live-reload.md §2 addition); T22's client already shows it.

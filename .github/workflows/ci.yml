@@ -38,7 +38,7 @@ jobs:
           fi
           size=$(wc -c < assets/presenter/live-reload.js)
           echo "live-reload.js: $size bytes"
-          test "$size" -lt 8000
+          test "$size" -lt 8192
       # OS/editor junk must never be listed, served or embedded (src/vendor.rs excludes it);
       # plant some so the vendor_smoke tests exercise the excludes in both build modes.
       - name: plant junk files under assets/

@@ -33,6 +33,10 @@ event: build
 data: {"build_id": 20, "status": "error", "error": {"message": "slides.md:41: unknown directive 'include'", "file": "slides.md", "line": 41, "kind": "parse"}}
 ```
 
+When the latest build failed, `hello` also carries the `error` object
+(`{"build_id": 20, "status": "error", "error": {...}}`) so a freshly opened page can show the
+overlay (addition, 2026-10-08, from T22).
+
 `kind` classification (T20): if **every** changed path is a stylesheet (`.css`, `.scss`,
 `.sass`) or lives under a theme's `styles/` or `assets/` directory → `css`; otherwise →
 `content`. A change to `theme.toml`, `presenter.toml`, any template, the source file, or a

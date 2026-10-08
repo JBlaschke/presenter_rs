@@ -39,3 +39,11 @@ lints, print them as `path:line: level: message` or JSON, with exit codes per th
 
 ## Out of scope
 Fixing issues automatically; theme file validation (T41 `theme check`).
+
+## Amendments (coordinator, 2026-10-08)
+- Drop the "`:::notes` nested inside a fragment" lint: T12 extracts `:::notes` at any depth, so
+  nothing is lost (markdown-dialect §10 amended). T12 already emits `invalid-directive`,
+  `invalid-directive-arg`, `duplicate-footnote`, `footnote-elsewhere`; T11 emits
+  `separator-not-recognized` (for `---{` lines) and `invalid-slide-attr` — pass them through.
+- `check` may warn "interactive widget rendered as text" (notebook-mapping §4) for bundles with
+  `application/vnd.jupyter.widget-view+json` that fell back to text: T32 does not emit it.

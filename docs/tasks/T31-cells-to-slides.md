@@ -48,3 +48,16 @@ pub fn convert(nb: &Notebook, source: &SourceInfo, config: &mut Config, assets: 
 
 ## Out of scope
 Output HTML (T32), cell template (T33), lints (T34).
+
+## Amendments (coordinator, 2026-10-08)
+- `notebook::parse` exists as a coordinator stub in `src/notebook/mod.rs`; replace its body.
+- Use T30's `nbformat::parse_notebook(path, json)` (lenient; returns warnings/diagnostics),
+  T32's `outputs::render_outputs`, T12's `markdown::render::render_fragment_with_lift` (notebook-mode
+  heading lifting only while the current slide is empty), T10's `frontmatter::split_front_matter`
+  / `parse_front_matter` / `meta_from_json` (for `metadata.presenter`).
+- ir.md §2 invariant 4 vs. notebook-mapping §4: `text/html` outputs and raw HTML cells may contain
+  relative `src`/`poster` URLs (e.g. `<img src="fig.png">`, IPython `Video("clip.mp4")`). Run them
+  through T12's raw-HTML asset rewriting (the same tokenizer T12 uses for HtmlBlock literals; make it
+  `pub` additively if needed) with `source.base_dir`, so standalone builds stay self-contained and
+  missing files produce `missing-asset` warnings.
+- `CellType::Unknown` cells are skipped with a warning; `""`/null slide types count as `"-"`.

@@ -58,3 +58,5 @@ Converting the default theme to SCSS (deliberately kept plain CSS); Sass `@impor
 - reveal 6.0.2's theme fonts are vendored as `.woff` (vendored-assets.md contract change), so the
   second acceptance criterion reads: standalone output contains `data:font/woff` (reveal fonts
   via the example's `@use "reveal/theme/..."`) and no `url(fonts/` / `url(./fonts/`.
+- T15 moved the theme stylesheet compilation into `src/render/styles.rs` (not `html.rs`): replace
+  its `Error::Style("SCSS support arrives in T42")` branch there (you own that hook additively).
