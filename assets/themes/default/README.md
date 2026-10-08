@@ -195,3 +195,82 @@ complete `mytheme/styles/theme.css`:
 - **Templates:** put a file with the same name in `mytheme/templates/` to replace one, or
   extend the original: `{% extends "@default/layouts/title.html" %}`.
 - **A complete copy** to edit freely: `presenter theme eject default ./mytheme`.
+
+## SCSS
+
+A theme's `[styles] entries` may be `.scss` or `.sass` files as well as `.css`. presenter
+compiles them with [grass](https://crates.io/crates/grass) (Dart Sass compatible, built into
+the binary; no Node.js) and adds the result to the one theme stylesheet in entry order,
+parent first. `examples/custom-theme-scss/` is a complete example.
+
+The usual way to write one is to derive it from reveal.js's own theme template, exactly
+like reveal's stock themes are:
+
+```scss
+// mytheme/styles/theme.scss   (theme.toml: entries = ["styles/theme.scss"], reveal_theme = "none")
+@use "reveal/theme/template/settings" with (
+  $background-color: #0b1021,
+  $main-color: #e6e6e6,
+  $heading-font: "Georgia, serif",
+  $link-color: #ffb454
+);
+@use "reveal/theme/template/theme";
+@use "reveal/theme/template/mixins";
+
+.reveal strong { color: #ffb454; }
+```
+
+Set `reveal_theme = "none"` when the SCSS builds the whole reveal theme; otherwise the stock
+theme's CSS is included as well (before the theme stylesheet). The settings become `--r-*`
+custom properties on `:root`, after the default theme's `styles/theme.css` (parent entries
+come first), so they win over the values in the table above; set
+`$heading-text-transform: none` and the like to keep the default theme's look. A stock theme as it is: `@use "reveal/theme/white";` (any of the 14 names).
+Its settings are already configured, so it cannot be combined with
+`@use "reveal/theme/template/settings" with (…)`: copy the stock theme's settings into your
+own `with (…)` instead.
+
+**What Sass can load.** `@use`, `@forward` and `@import` see the theme chain, not the file
+system:
+
+| URL | finds |
+|---|---|
+| `"palette"`, `"parts/box"` | next to the file that loads it (`_palette.scss`, `palette.scss`, `palette.sass`, `palette.css`, `palette/index.scss`, …), then in the `styles/` directory of each theme of the chain, child first |
+| `"reveal/theme/template/settings"`, `…/theme`, `…/mixins` | reveal.js's theme template, shipped with presenter (`reveal/…` is reveal's `css/` directory) |
+| `"reveal/theme/<name>"` | a stock reveal theme's source |
+| `"@<theme>/styles/x"` | a file of that theme of the chain |
+| absolute paths, `../` out of the themes | nothing: a theme cannot read other files |
+
+**CSS imports are inlined.** Sass leaves CSS imports (`@import url("x.css")`,
+`@import "x.css"`) in its output, and so do `.css` entries; presenter replaces every import
+of a relative URL with the imported file, so a standalone deck needs nothing else. The file
+is looked up next to the stylesheet that imports it, then, for `reveal/…` and `fonts/…`, in
+reveal's theme sources: `@import url("reveal/theme/fonts/source-sans-pro/source-sans-pro.css")`
+brings reveal's Source Sans Pro, and the stock themes' own `@import url('./fonts/…')` works
+too. Imports nest at most 5 levels and must not form a cycle; an import with media queries
+becomes an `@media` block; `layer()` and `supports()` imports cannot be inlined (an error).
+Imports of `https://…` URLs stay as written but move to the top of the theme stylesheet
+(CSS ignores an `@import` after other rules): the fonts load when the deck is online, and a
+standalone build warns `remote-import`.
+
+**`url()`s.** Sass does not rewrite URLs, so a `url()` anywhere in the compiled SCSS is
+relative to the **entry** file (`styles/theme.scss`), then the chain's `assets/` directories
+as for CSS entries, and last, for `reveal/…` and `fonts/…`, reveal's theme sources. A
+`url()` in an imported CSS file is relative to that file (reveal's font files are found next
+to their CSS). In a standalone build every font and image becomes a `data:` URI (reveal's
+fonts are `data:font/woff`).
+
+**Errors** name the file and the position, with the line:
+
+```text
+error: style '@mytheme/styles/theme.scss': line 5, column 14: Expected expression.
+ 5 |   .b { color: ; }
+   |              ^^
+```
+
+`@warn` messages are logged as warnings and `@debug` with `-vv`, which also shows how long
+each compilation took (`compiled Sass stylesheet=… elapsed_ms=…`). `random()` and
+`unique-id()` are not available: the output is deterministic.
+
+**Live reload.** `presenter serve` watches the theme directory: saving a `.scss` (or
+`.sass`, `.css`) file recompiles the theme stylesheet and swaps it in the browser without
+reloading the page; a Sass error shows in the browser overlay until it is fixed.
