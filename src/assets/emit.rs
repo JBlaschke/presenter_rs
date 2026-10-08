@@ -312,15 +312,21 @@ pub fn hashed_file_name(hint: &str, id: &str) -> String {
 ///   whitespace inside the parentheses and CSS escapes (`url(a\(1\).png)`). The rewritten
 ///   reference keeps its quote style: `url("fonts/a.woff2")` → `url("asset:<id>")`.
 /// - Left untouched: references with a scheme (`data:`, `http:`, `https:`, `asset:`, …),
-///   protocol-relative `//…`, root-absolute `/…`, fragment-only `#…`, empty references,
-///   `@import url(…)` (imports are not followed here; T42 inlines local imports before
-///   calling this function), and everything inside `/* comments */` and string literals
-///   (`content: "url(x.png)"` is text). A function whose name merely ends in `url`
-///   (`myurl(…)`) is not a `url()`.
+///   protocol-relative `//…`, root-absolute `/…` (or `\…`, which URL parsers read as `/`),
+///   fragment-only `#…`, empty references, `@import url(…)` (imports are not followed here;
+///   T42 inlines local imports before calling this function), and everything inside
+///   `/* comments */` and string literals (`content: "url(x.png)"` is text). A function whose
+///   name merely ends in `url` (`myurl(…)`) is not a `url()`. These checks hold for the
+///   percent-decoded path too (`url(%2Fetc%2Fx.png)`, `url(C%3A/x.png)` stay untouched), and
+///   a path whose `%XX` sequences encode a `/`, `\` or NUL (`url(..%2Fx.png)`) is left
+///   untouched as well: a browser keeps `%2F` inside one path segment.
 /// - `resolve_rel` receives the path without its `?query#fragment`, with CSS escapes undone
 ///   and `%XX` sequences percent-decoded (kept as written when they do not decode to UTF-8):
-///   `fonts/My Font.woff2` for `url("fonts/My%20Font.woff2?v=1#x")`. The suffix is kept,
-///   as written, after the placeholder. The resolver is called once per distinct path.
+///   `fonts/My Font.woff2` for `url("fonts/My%20Font.woff2?v=1#x")`. The resolver is called
+///   once per distinct path. The suffix follows the placeholder: the fragment as written, the
+///   query as written unless it has CSS escapes or characters a `url()` must escape, which
+///   are undone and percent-encoded (`?v=\31` → `?v=1`, `?x=\(1\)` → `?x=%281%29`), so a
+///   standalone [`Emitter`] can drop it whole.
 /// - [`AssetData::File`] is registered with [`AssetRegistry::register_file`];
 ///   [`AssetData::Bytes`] with the MIME type guessed from the path's extension and its last
 ///   segment as file-name hint.
@@ -364,6 +370,7 @@ pub fn register_css_urls(
             });
         };
         out.push_str(&css[last..whole.start()]);
+        let suffix = plain_query(suffix);
         out.push_str(&format!("url({quote}asset:{id}{suffix}{quote})"));
         last = whole.end();
     }
@@ -521,32 +528,91 @@ struct LocalRef<'r> {
 /// Splits a raw `url()` argument into a [`LocalRef`] when it is a relative local reference;
 /// `None` for references that stay untouched. The suffix starts at the first `?` or `#`
 /// that is not escaped (an escaped one counts as part of the path).
+///
+/// The path must be relative and local ([`is_relative_local`]) both as written (CSS escapes
+/// undone) and percent-decoded, so `%2F…` cannot turn into a root-absolute path or `C%3A…`
+/// into a scheme. A path in which decoding produces a `/`, a `\` or a NUL (`..%2Fx.png`,
+/// `a%5Cb.png`, `a%00.png`) is left untouched as well: a browser keeps `%2F` inside one path
+/// segment, so the decoded path would name a different file.
 fn local_reference(reference: &str) -> Option<LocalRef<'_>> {
     let reference = reference.trim();
-    let (raw_path, suffix) = reference.split_at(suffix_start(reference));
-    let path = css_unescape(raw_path);
-    if path.is_empty() || path.starts_with('/') || has_scheme(&path) {
+    let (raw_path, suffix) = reference.split_at(first_unescaped(reference, &['?', '#']));
+    let unescaped = css_unescape(raw_path);
+    let path = percent_decode(&unescaped);
+    let separators = |p: &str| p.matches(['/', '\\']).count();
+    let same_segments = separators(&path) == separators(&unescaped) && !path.contains('\0');
+    if !(is_relative_local(&unescaped) && is_relative_local(&path) && same_segments) {
         return None;
     }
     Some(LocalRef {
-        path: percent_decode(&path).into_owned(),
+        path: path.into_owned(),
         suffix,
     })
 }
 
-/// Byte offset of the first unescaped `?` or `#` of a raw CSS reference (its length if none).
-fn suffix_start(reference: &str) -> usize {
-    let mut chars = reference.char_indices();
+/// A path the resolver may see: not empty, not root-absolute (`/…`, `//…`, or `\…`, which
+/// URL parsers read as `/`) and without a URL scheme.
+fn is_relative_local(path: &str) -> bool {
+    !path.is_empty() && !path.starts_with(['/', '\\']) && !has_scheme(path)
+}
+
+/// Byte offset of the first of `targets` in a raw CSS text that is not escaped with `\`
+/// (its length if none).
+fn first_unescaped(text: &str, targets: &[char]) -> usize {
+    let mut chars = text.char_indices();
     while let Some((i, c)) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            '?' | '#' => return i,
-            _ => {}
+        if c == '\\' {
+            chars.next();
+        } else if targets.contains(&c) {
+            return i;
         }
     }
-    reference.len()
+    text.len()
+}
+
+/// The `?query#fragment` suffix of a CSS reference as [`register_css_urls`] writes it after
+/// the placeholder: the fragment as written, the query with CSS escapes undone and every
+/// character percent-encoded that would need a CSS escape in some quote style or would end
+/// the emitter's query scan early (whitespace, controls, quotes, parentheses, `\`, `#`, `<`,
+/// `>`, a `&` starting an HTML reference for a quote or `#`, trailing commas). A standalone
+/// emitter can then drop the whole query instead of gluing the rest of `?v=\31` onto the
+/// `data:` URI. A query without escapes or such characters is kept as written.
+fn plain_query(suffix: &str) -> Cow<'_, str> {
+    let Some(rest) = suffix.strip_prefix('?') else {
+        return Cow::Borrowed(suffix);
+    };
+    let (query, fragment) = rest.split_at(first_unescaped(rest, &['#']));
+    let unescaped = css_unescape(query);
+    // Would `c` at byte `i` of the unescaped query need encoding? (An HTML reference may
+    // run on into the fragment: `?a&#35;b` is the query `a&` and the fragment `#35;b`.)
+    let encode = |i: usize, c: char| {
+        let rest = &unescaped[i..];
+        let quote_reference = || {
+            let text = format!("{rest}{fragment}");
+            char_reference(&text).is_some_and(|(d, _)| "\"'#".contains(d))
+        };
+        c.is_whitespace()
+            || c.is_control()
+            || "\"'()\\#<>".contains(c)
+            || (c == '&' && quote_reference())
+            || (c == ',' && rest.trim_end_matches(',').is_empty())
+    };
+    if !query.contains('\\') && !unescaped.char_indices().any(|(i, c)| encode(i, c)) {
+        return Cow::Borrowed(suffix);
+    }
+    let mut out = String::from("?");
+    for (i, c) in unescaped.char_indices() {
+        if encode(i, c) {
+            let mut buf = [0; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push_str(fragment);
+    Cow::Owned(out)
 }
 
 /// Undoes CSS escapes: `\` + 1–6 hex digits (+ one optional whitespace) is that code point
@@ -844,6 +910,71 @@ mod tests {
             let actual = local_reference(reference);
             let actual = actual.as_ref().map(|r| (r.path.as_str(), r.suffix));
             assert_eq!(actual, expected, "{reference:?}");
+        }
+    }
+
+    /// Percent-decoding cannot smuggle a reference past the local-path checks: decoded
+    /// root-absolute paths, schemes, and encoded separators or NULs stay untouched.
+    #[test]
+    fn decoded_references_are_checked_like_written_ones() {
+        for (reference, expected) in [
+            ("%2Fetc%2Fx.png", None),
+            ("%2fetc%2fx.png", None),
+            ("%2F%2Fexample.com%2Fbg.png", None),
+            ("%5C%5Cserver%5Cshare%5Cx.png", None),
+            ("..%2F..%2Fbg.png", None),
+            ("..%2Fx.png", None),
+            ("fonts%2Fa.woff2", None),
+            ("a%5Cb.png", None),
+            ("a%00.png", None),
+            ("C%3A/x/bg.png", None),
+            ("C%3a%5Cx.png", None),
+            ("d%61ta:x", None),
+            ("h%74tps://example.com/a.png", None),
+            // a written `\` start is root-absolute for URL parsers, like `/`
+            ("\\\\server/x.png", None),
+            // what decodes to an ordinary relative path still resolves
+            ("%2E%2E/img/a.png", Some(("../img/a.png", ""))),
+            ("a%2Bb.png?v=1", Some(("a+b.png", "?v=1"))),
+            ("100%25.png", Some(("100%.png", ""))),
+        ] {
+            let actual = local_reference(reference);
+            let actual = actual.as_ref().map(|r| (r.path.as_str(), r.suffix));
+            assert_eq!(actual, expected, "{reference:?}");
+        }
+    }
+
+    #[test]
+    fn plain_queries_have_no_escapes_and_nothing_that_ends_the_query_scan() {
+        for (suffix, expected) in [
+            ("", ""),
+            ("#frag", "#frag"),
+            ("?v=1", "?v=1"),
+            ("?#iefix", "?#iefix"),
+            ("?a=1&amp;b=2", "?a=1&amp;b=2"),
+            ("?é=1", "?é=1"),
+            ("?v=\\31", "?v=1"),
+            ("?x=\\(1\\)", "?x=%281%29"),
+            ("?a\\ b", "?a%20b"),
+            ("?a b", "?a%20b"),
+            ("?x='1'\"", "?x=%271%27%22"),
+            ("?a\\\\b", "?a%5Cb"),
+            ("?a<b>", "?a%3Cb%3E"),
+            ("?a\\#b#c", "?a%23b#c"),
+            ("?a=1&quot;b&#39;c", "?a=1%26quot;b%26#39;c"),
+            // `&#35;` is a query `…&` and a fragment `#35;…` that the scan must not join
+            ("?a&#35;b", "?a%26#35;b"),
+            ("?a,b,", "?a,b%2C"),
+            ("?a\\9 b", "?a%09b"),
+            // the fragment stays as written
+            ("?v=\\31#ic\\on", "?v=1#ic\\on"),
+        ] {
+            assert_eq!(plain_query(suffix), expected, "{suffix:?}");
+            // what the standalone emitter drops is the whole query
+            let text = format!("asset:{ID}{}", plain_query(suffix));
+            let p = &find_placeholders(&text)[0];
+            let query = expected.split('#').next().unwrap_or_default();
+            assert_eq!(&text[p.id_end..p.query_end], query, "{suffix:?}");
         }
     }
 

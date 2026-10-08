@@ -289,12 +289,17 @@ fn context(deck: &Deck) -> serde_json::Value {
     })
 }
 
-fn render_with(context: &serde_json::Value, undefined: UndefinedBehavior) -> String {
+fn try_render(
+    context: &serde_json::Value,
+    undefined: UndefinedBehavior,
+) -> Result<String, minijinja::Error> {
     let env = environment(context, undefined);
     let template = env.get_template("deck.html").expect("deck.html loads");
-    template
-        .render(Value::from_serialize(context))
-        .unwrap_or_else(|e| panic!("deck.html renders: {e:#}"))
+    template.render(Value::from_serialize(context))
+}
+
+fn render_with(context: &serde_json::Value, undefined: UndefinedBehavior) -> String {
+    try_render(context, undefined).unwrap_or_else(|e| panic!("deck.html renders: {e:#}"))
 }
 
 /// Renders the fixture and rewrites its asset placeholder to a path relative to
@@ -905,6 +910,66 @@ fn undecorated_slides_resolve_their_layout_by_name() {
     assert!(title_meta(intro).is_empty());
 }
 
+/// Every message in an error's source chain, outermost first.
+fn error_chain(error: &minijinja::Error) -> Vec<String> {
+    let mut messages = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        messages.push(inner.to_string());
+        source = inner.source();
+    }
+    messages
+}
+
+/// A decoration is used as it is: one naming a missing template fails the render (it is never
+/// silently replaced by the by-name or the default layout), in each of slide.html's three
+/// includes. A null decoration counts as none.
+#[test]
+fn a_decorated_missing_layout_is_an_error_in_every_include() {
+    let decorated = context(&sample_deck());
+    let expected = render_with(&decorated, UndefinedBehavior::Strict);
+    let not_found =
+        Regex::new(r#"^template not found: .*"layouts/missing\.html" \(in (slide\.html:\d+)\)$"#)
+            .expect("regex");
+    // slides[0] has no children; slides[1] is a stack: its own include, then its children's.
+    let mut sites = BTreeMap::new();
+    for pointer in [
+        "/slides/0",
+        "/slides/1",
+        "/slides/1/children/0",
+        "/slides/1/children/1",
+    ] {
+        let mut context = decorated.clone();
+        let slide = context.pointer_mut(pointer).expect("fixture slide");
+        slide["layout_template"] = json!("layouts/missing.html");
+        for undefined in [UndefinedBehavior::Strict, UndefinedBehavior::Lenient] {
+            let Err(error) = try_render(&context, undefined) else {
+                panic!("{pointer}: rendered although its decorated layout is missing");
+            };
+            let chain = error_chain(&error);
+            let site = chain
+                .iter()
+                .find_map(|message| Some(not_found.captures(message)?[1].to_string()))
+                .unwrap_or_else(|| panic!("{pointer}: {chain:#?}"));
+            sites.insert(pointer, site);
+        }
+
+        // null is "not decorated": resolved by name, byte-identical to the decorated render.
+        let mut context = decorated.clone();
+        let slide = context.pointer_mut(pointer).expect("fixture slide");
+        slide["layout_template"] = serde_json::Value::Null;
+        assert_eq!(
+            render_with(&context, UndefinedBehavior::Strict),
+            expected,
+            "{pointer}"
+        );
+    }
+    // Three different include sites failed: leaf slide, stack member, child.
+    let distinct: BTreeSet<&String> = sites.values().collect();
+    assert_eq!(distinct.len(), 3, "{sites:#?}");
+    assert_eq!(sites["/slides/1/children/0"], sites["/slides/1/children/1"]);
+}
+
 #[test]
 fn renders_without_optional_meta_and_layout_template() {
     let mut deck = sample_deck();
@@ -1120,26 +1185,32 @@ struct Scan {
     helpers: BTreeSet<String>,
 }
 
-/// Names the templates define themselves (macros, imports, `set`/`with`/`for` targets);
-/// calling them is not calling a helper.
-fn defined_names(templates: &[(String, String)]) -> BTreeSet<String> {
-    let simple = Regex::new(r"^\{%-?\s*(?:macro|set|with)\s+([A-Za-z_]\w*)").expect("regex");
-    let for_targets = Regex::new(r"^\{%-?\s*for\s+([A-Za-z_][\w\s,]*?)\s+in\b").expect("regex");
-    let import = Regex::new(r"^\{%-?\s*from\s+.*?\bimport\s+(.*?)-?%\}$").expect("regex");
+/// The callables one template defines or imports itself: its macros (`{% macro NAME(`) and
+/// the names bound by `{% from … import a, b as c %}` and `{% import … as NAME %}`. Calling one
+/// of these is not calling a helper, but only in that template: a macro of another template
+/// needs an import. Names bound by `set`, `with` or `for` are values, never exempt.
+fn callable_names(source: &str) -> BTreeSet<String> {
+    let macro_def = Regex::new(r"^\{%-?\s*macro\s+([A-Za-z_]\w*)\s*\(").expect("regex");
+    let from_import =
+        Regex::new(r"(?s)^\{%-?\s*from\s.*?\bimport\s+(.*?)\s*-?%\}$").expect("regex");
+    let import_as = Regex::new(r"(?s)^\{%-?\s*import\s.*?\bas\s+([A-Za-z_]\w*)\b").expect("regex");
+    let context_marker = Regex::new(r"\s*\b(?:with|without)\s+context$").expect("regex");
     let mut names = BTreeSet::new();
-    for (_, source) in templates {
-        for region in tag_regions(source) {
-            let region = region.trim();
-            if let Some(c) = simple.captures(region) {
-                names.insert(c[1].to_string());
-            }
-            if let Some(c) = for_targets.captures(region) {
-                names.extend(c[1].split(',').map(|n| n.trim().to_string()));
-            }
-            if let Some(c) = import.captures(region) {
-                for item in c[1].split(',') {
-                    let alias = item.split_whitespace().last().unwrap_or_default();
-                    names.insert(alias.to_string());
+    for region in tag_regions(source) {
+        // Template names are string literals; they must not look like syntax.
+        let region = string_literal().replace_all(region.trim(), "\"\"");
+        if let Some(c) = macro_def.captures(&region) {
+            names.insert(c[1].to_string());
+        }
+        if let Some(c) = import_as.captures(&region) {
+            names.insert(c[1].to_string());
+        }
+        if let Some(c) = from_import.captures(&region) {
+            let list = context_marker.replace(&c[1], "");
+            for item in list.split(',') {
+                // `name` or `name as alias`: the last word is what the template can call.
+                if let Some(bound) = item.split_whitespace().last() {
+                    names.insert(bound.to_string());
                 }
             }
         }
@@ -1148,7 +1219,8 @@ fn defined_names(templates: &[(String, String)]) -> BTreeSet<String> {
 }
 
 /// Checks one tag region: `|safe` only on IR HTML, filters from the allowlist, and every
-/// call either a §4 helper or a name minijinja or the templates define.
+/// call either a §4 helper or one of `allowed_calls` (minijinja's callables and the
+/// template's own macros and imports).
 fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, name: &str) {
     let delimiters = Regex::new(r"\{\{-?|-?\}\}|\{%-?|-?%\}").expect("regex");
     let safe = Regex::new(r"(\S+)\s*\|\s*safe\b").expect("regex");
@@ -1187,15 +1259,18 @@ fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, 
 }
 
 /// The static scan behind "no helper other than those of §4 is used": every tag of every
-/// template, including branches the fixture never executes.
+/// template, including branches the fixture never executes. Each template may call minijinja's
+/// own callables and the macros it defines or imports ([`callable_names`]).
 fn scan_templates(templates: &[(String, String)]) -> Scan {
-    let mut allowed_calls = defined_names(templates);
-    let builtin = MINIJINJA_CALLABLES
+    let builtin: BTreeSet<String> = MINIJINJA_CALLABLES
         .split_whitespace()
-        .chain(KEYWORDS.split_whitespace());
-    allowed_calls.extend(builtin.map(str::to_string));
+        .chain(KEYWORDS.split_whitespace())
+        .map(str::to_string)
+        .collect();
     let mut scan = Scan::default();
     for (name, source) in templates {
+        let mut allowed_calls = callable_names(source);
+        allowed_calls.extend(builtin.iter().cloned());
         for region in tag_regions(source) {
             scan_region(&region, &allowed_calls, &mut scan, name);
         }
@@ -1226,6 +1301,9 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
     for ok in [
         r#"{% macro prompt(label, n) %}{{ label }} [{{ n }}]{% endmacro %}{{ prompt("In", 1) }}"#,
         r#"{% from "m.html" import fmt as f, other %}{{ f(1) }}{{ other() }}"#,
+        r#"{%- from "m.html" import fmt, other as o with context -%}{{ fmt(1) }}{{ o() }}"#,
+        r#"{% import "m.html" as m %}{{ m(1) }}{{ m.fmt(1) }}"#,
+        r#"{% macro row(x) %}{{ x }}{% endmacro %}{% call row(1) %}{{ caller() }}{% endcall %}"#,
         r#"{%- set mimes = out.mimes %}{{ mimes|join(", ") }}{{ out.mimes|join(', ') }}"#,
         "{{ range(3)|join }}{% set ns = namespace(n=1) %}{{ dict(a=1)|tojson }}",
         "{% for a, b in x|items %}{{ loop.cycle(1, 2) }}{% endfor %}",
@@ -1237,6 +1315,16 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
     }
     for bad in [
         "{{ helper(1) }}",
+        // Values bound by set/with/for are not callables (a dead `date()` call is a helper).
+        "{% set date = 1 %}{{ date(2) }}",
+        "{% set title_meta %}x{% endset %}{{ title_meta() }}",
+        "{% with name = slide.id %}{{ name() }}{% endwith %}",
+        "{% for path in theme.scripts %}{{ path(\"x\") }}{% endfor %}",
+        "{% for a, b in x|items %}{{ b() }}{% endfor %}",
+        "{% if false %}{{ date(meta.date, \"%Y\") }}{% endif %}",
+        // An import binds its alias, not the imported name.
+        r#"{% from "m.html" import fmt as f %}{{ fmt(1) }}"#,
+        r#"{% import "m.html" as m %}{{ fmt(1) }}"#,
         "{{ x|unknown_filter }}",
         "{{ (out.name ~ out.html)|safe }}",
         "{{ cell.source|safe }}",
@@ -1246,6 +1334,40 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
     ] {
         assert!(!scan(bad).problems.is_empty(), "{bad} passed the scan");
     }
+    // Callables are scoped to the template that defines or imports them.
+    let two = |caller: &str| {
+        scan_templates(&[
+            (
+                "m.html".to_string(),
+                "{% macro fmt(x) %}{{ x }}{% endmacro %}{{ fmt(0) }}".to_string(),
+            ),
+            ("t.html".to_string(), caller.to_string()),
+        ])
+        .problems
+    };
+    assert_eq!(two("{{ fmt(1) }}"), ["t.html: helper `fmt`"]);
+    assert_eq!(
+        two(r#"{% from "m.html" import fmt %}{{ fmt(1) }}"#),
+        Vec::<String>::new()
+    );
+    // A dead branch in a real template calling names that other templates bind with
+    // set/for (title.html's `date`, scripts.html's `path`, default.html's `name`).
+    let mut real = templates();
+    let (_, cell) = real
+        .iter_mut()
+        .find(|(name, _)| name == "cell.html")
+        .expect("cell.html");
+    cell.push_str(
+        r#"{% if false %}{{ date(meta.date, "%Y") }}{{ path("x") }}{{ name() }}{% endif %}"#,
+    );
+    assert_eq!(
+        scan_templates(&real).problems,
+        [
+            "cell.html: helper `date`",
+            "cell.html: helper `path`",
+            "cell.html: helper `name`"
+        ]
+    );
     let refs = template_references(
         r#"{% include 'partials/a.html' %}{% include ["b.html", "@default/c.html"] %}
            {% include "layouts/" ~ slide.layout ~ ".html" %}{# {% include "d.html" %} #}"#,

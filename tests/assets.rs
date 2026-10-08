@@ -555,3 +555,131 @@ fn per_call_emitters_in_static_template_helpers_emit_each_id_once() {
     assert!(format!("{err:#}").contains("0123456789ab"), "{err:#}");
     assert_eq!(state.lock().unwrap().files.len(), 2);
 }
+
+/// A resolver like the theme's (T15): the reference joined to the theme directory, if that
+/// is a file. Records what it was asked for.
+fn theme_resolver<'a>(
+    theme_dir: &'a Path,
+    calls: &'a mut Vec<String>,
+) -> impl FnMut(&str) -> Option<AssetData> + 'a {
+    move |reference: &str| {
+        calls.push(reference.to_string());
+        let path = theme_dir.join(reference);
+        path.is_file().then_some(AssetData::File(path))
+    }
+}
+
+/// Percent-decoding happens before the resolver sees a path, but the root-absolute, scheme
+/// and separator checks apply to the decoded path too: `url(%2F…)` cannot reach a file
+/// outside the theme through `Path::join` (which an absolute path replaces), and a
+/// `url(/…)`-equivalent stays untouched exactly like the written form.
+#[test]
+fn percent_encoded_references_cannot_escape_the_relative_path_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "TOP SECRET").unwrap();
+    let theme_dir = dir.path().join("theme");
+    std::fs::create_dir_all(theme_dir.join("img")).unwrap();
+    std::fs::write(theme_dir.join("img/bg.png"), GIF).unwrap();
+
+    let absolute = secret.to_str().unwrap().to_string();
+    let encoded = absolute.replace('/', "%2F").replace('\\', "%5C");
+    let untouched = [
+        format!("url({encoded})"),
+        format!("url(\"{encoded}\")"),
+        "url(..%2Fsecret.txt)".to_string(),
+        "url(img%2F..%2F..%2Fsecret.txt)".to_string(),
+        "url(%2F%2Fexample.com%2Fbg.png)".to_string(),
+        "url(%5C%5Cexample.com%5Cbg.png)".to_string(),
+        "url(C%3A/secret.txt)".to_string(),
+        "url(h%74tps://example.com/bg.png)".to_string(),
+        format!("url({absolute})"),
+    ];
+    let css = format!(
+        "a{{b:{}}} c{{d:url(img%2Fbg.png) url(img/b%67.png)}}",
+        untouched.join(" ")
+    );
+    let mut calls = Vec::new();
+    let mut registry = AssetRegistry::new();
+    let out = register_css_urls(
+        &css,
+        &mut registry,
+        &mut theme_resolver(&theme_dir, &mut calls),
+        false,
+    )
+    .unwrap();
+    // Only the plain relative reference was resolved; `img%2Fbg.png` is one segment for a
+    // browser, so it is not `img/bg.png` either.
+    assert_eq!(calls, ["img/bg.png"]);
+    assert_eq!(registry.len(), 1);
+    let id = registry.iter().next().unwrap().id.clone();
+    let expected = format!(
+        "a{{b:{}}} c{{d:url(img%2Fbg.png) url(asset:{id})}}",
+        untouched.join(" ")
+    );
+    assert_eq!(out, expected);
+
+    let mode = OutputMode::Standalone;
+    let inlined = Emitter::new(&registry, &mode).resolve_css(&out).unwrap();
+    assert!(!inlined.contains(&data_uri("text/plain", b"TOP SECRET")));
+    assert!(inlined.contains(&data_uri("image/png", GIF)));
+}
+
+/// A query written with CSS escapes after a reference is stored without them, so standalone
+/// output drops it whole instead of gluing its tail onto the `data:` URI (which would make the
+/// base64 payload invalid); site output keeps an equivalent query.
+#[test]
+fn standalone_drops_css_escaped_queries_whole() {
+    let mut resolver =
+        |reference: &str| (reference == "bg.png").then(|| AssetData::Bytes(b"x".to_vec()));
+    let uri = data_uri("image/png", b"x");
+    for (css, standalone, site_query) in [
+        (
+            r"a{b:url(bg.png?v=\31)}",
+            format!("a{{b:url({uri})}}"),
+            "?v=1",
+        ),
+        (
+            r"a{b:url(bg.png?x=\(1\))}",
+            format!("a{{b:url({uri})}}"),
+            "?x=%281%29",
+        ),
+        (
+            r#"a{b:url("bg.png?v=\31")}"#,
+            format!("a{{b:url(\"{uri}\")}}"),
+            "?v=1",
+        ),
+        (
+            r"a{b:url(bg.png?a\ b)}",
+            format!("a{{b:url({uri})}}"),
+            "?a%20b",
+        ),
+        (
+            r"a{b:url('bg.png?x=(1) y')}",
+            format!("a{{b:url('{uri}')}}"),
+            "?x=%281%29%20y",
+        ),
+        (
+            r"a{b:url(bg.png?v=\31#f\(1\))}",
+            format!(r"a{{b:url({uri}#f\(1\))}}"),
+            "?v=1",
+        ),
+    ] {
+        let mut registry = AssetRegistry::new();
+        let out = register_css_urls(css, &mut registry, &mut resolver, false).unwrap();
+        assert!(!out.contains(r"?v=\"), "{css}: {out}");
+        let mode = OutputMode::Standalone;
+        let inlined = Emitter::new(&registry, &mode).resolve_css(&out).unwrap();
+        assert_eq!(inlined, standalone, "{css}");
+
+        let mode = site_mode();
+        let site = Emitter::new(&registry, &mode)
+            .resolve_css_in_assets_dir(&out)
+            .unwrap();
+        let id = registry.iter().next().unwrap().id.clone();
+        assert!(
+            site.contains(&format!("bg-{id}.png{site_query}")),
+            "{css}: {site}"
+        );
+    }
+}

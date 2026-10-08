@@ -5,25 +5,36 @@
 //! `Document`'s direct children, so `---`/`--` inside code fences, lists, block quotes or
 //! directives are never separators. Nothing is rendered here (T12 renders each [`RawSlide`]).
 //!
-//! Two entry points, which differ only in how a top-level `Paragraph` is read:
-//! - [`split_with_source`] (preferred) also gets the Markdown text and reads the paragraph's
-//!   **raw source lines** (its sourcepos line range, each line trimmed of spaces and tabs,
-//!   joined with `\n`). Exactly `--` is a vertical separator; `^(---|--)\s*\{(.*)\}$` is a
-//!   separator with attributes, and the brace contents go to [`parse_attr_block`] verbatim:
-//!   the same text comrak's heading-attribute parser reads, so backslash escapes, entities,
-//!   emphasis delimiters (`bg_draft_.png`) and smart punctuation (`parse.smart`) cannot
-//!   change or hide a separator. A `--` paragraph spelled any other way (`\--`) is the escape
-//!   for a literal `--`.
-//! - [`split`] (the task-file signature) has only the AST and reads the paragraph's inlines:
-//!   `Text`, line breaks and autolinks. Any other inline (emphasis, code, math, raw HTML, an
-//!   ordinary link) or a leading escape means "not a separator". A bare `--` must be one
-//!   `Text` covering exactly the two source columns where the paragraph starts (so `\--`,
-//!   `-\-` and `&#45;&#45;` stay content). comrak's smart punctuation is undone (a leading
-//!   `–`/`—` is `--`/`---`, then curly quotes are straight and `…` is `...`). Limitation:
-//!   escapes and entities inside the braces are already resolved (`title="a \"b\""` reads
-//!   as `title="a "b""`), so values that need them should use [`split_with_source`].
+//! The entry points differ only in how a top-level `Paragraph` is read:
+//! - [`split_with_source`] (preferred; T12 calls it) also gets the Markdown text and reads the
+//!   paragraph's **raw source lines** (the lines of its text, see below, each trimmed of spaces
+//!   and tabs, joined with `\n`). Exactly `--` is a vertical separator;
+//!   `^(---|--)\s*\{(.*)\}$` is a separator with attributes, and the brace contents go to
+//!   [`parse_attr_block`] verbatim: the same text comrak's heading-attribute parser reads, so
+//!   backslash escapes, entities, emphasis delimiters (`bg_draft_.png`) and smart punctuation
+//!   (`parse.smart`) cannot change or hide a separator. It is the only exact reading when
+//!   smart punctuation is on. A `--` paragraph spelled any other way (`\--`) is the escape for
+//!   a literal `--`.
+//! - [`split_ast`] has only the AST and the `parse.smart` flag comrak ran with, and reads the
+//!   paragraph's inlines: `Text`, line breaks and autolinks. Any other inline (emphasis, code,
+//!   math, raw HTML, an ordinary link) or a leading escape means "not a separator". A bare `--`
+//!   must be one `Text` covering exactly the two source columns where the paragraph starts (so
+//!   `\--`, `-\-` and `&#45;&#45;` stay content). Escapes and entities inside the braces are
+//!   already resolved (`title="a \"b\""` reads as `title="a "b""`). Smart punctuation is
+//!   undone only with `smart = true`: a candidate must then start with comrak's `–`/`—` (ASCII
+//!   dashes there were escaped, so the line is content), and every `—`, `–`, curly quote and
+//!   `…` in it is mapped back to `---`, `--`, `"`/`'` and `...` (so `bg--v2.png` survives).
+//!   That cannot be exact: such a character *typed* in a value comes back as ASCII too. With
+//!   `smart = false` the inlines are the typed text, so a typed `— {…}` line stays content.
+//! - [`split`] (the task-file signature) is [`split_ast`] with `smart = false`, the
+//!   `markdown.smart_punctuation` default.
 //!
-//! Rules implemented by both:
+//! The text of a paragraph is its sourcepos line range minus leading link reference
+//! definitions: comrak removes them from the paragraph's content but not from its sourcepos,
+//! so `[x]: http://a` directly followed by a `--- {.a}` line is still a separator (opened on
+//! the `--- {.a}` line), as dialect §2.2 reads the paragraph's text.
+//!
+//! Rules implemented by all of them:
 //! - `FrontMatter` is skipped (neither a slide nor a separator).
 //! - `ThematicBreak` (`---`, `***`, `___`) opens a horizontal slide; a `--` paragraph opens a
 //!   vertical slide under the current horizontal one; the `{…}` forms do the same and carry
@@ -38,9 +49,10 @@
 //! - Attributes on a slide's first node, when it is a heading, are lifted onto the slide
 //!   ([`lift_heading_attrs`]); they win over the separator's attributes.
 //! - A line of an ordinary top-level paragraph that looks like an attribute separator
-//!   (`^---?\s*\{`) but is not one (no blank line around it, trailing text, or for [`split`]
-//!   inline syntax) is reported as `separator-not-recognized`, so a slide boundary is never
-//!   lost silently. (T34 reports raw `---`/`--` lines; this covers the `{…}` forms.)
+//!   (`^---?\s*\{`) but is not one (no blank line around it, trailing text, or for
+//!   [`split_ast`] inline syntax) is reported as `separator-not-recognized`, so a slide
+//!   boundary is never lost silently. (T34 reports raw `---`/`--` lines; this covers the
+//!   `{…}` forms.)
 //! - Footnote definitions, which comrak moves to the end of the document, belong to the slide
 //!   whose source range they are written in (they count for its span, and footnotes before
 //!   the first separator make slide 1). They stay last among its nodes, in comrak's order, as
@@ -116,9 +128,11 @@ pub struct RawDeck<'a> {
 }
 
 /// Splits a parsed document (`root` is comrak's `Document` node) into slides, reading
-/// separator paragraphs from their inlines. Prefer [`split_with_source`], which reads them
-/// from the source text and is exact for escapes, entities and inline syntax inside `{…}`
-/// (the module docs list the differences).
+/// separator paragraphs from their inlines, for a document parsed **without** smart
+/// punctuation (`parse.smart = false`, the `markdown.smart_punctuation` default): exactly
+/// [`split_ast`]`(root, mode, false)`. Prefer [`split_with_source`], which reads separators
+/// from the source text and is exact for escapes, entities, inline syntax inside `{…}` and
+/// smart punctuation (the module docs list the differences).
 ///
 /// Heading attributes that are lifted onto a slide are removed from the heading node
 /// (`attrs = None`), so the rendered `<h1>` is clean.
@@ -128,33 +142,49 @@ pub struct RawDeck<'a> {
 /// attribute block has an unbalanced quote. `split` does not know the file, so the caller
 /// fills in `path`.
 pub fn split<'a>(root: &'a AstNode<'a>, mode: SplitMode) -> Result<RawDeck<'a>> {
-    split_impl(root, None, mode)
+    split_ast(root, mode, false)
+}
+
+/// Like [`split`], for a document comrak parsed with `parse.smart = smart`
+/// (`markdown.smart_punctuation`). With `smart = true` separator candidates are read with
+/// comrak's smart punctuation mapped back (`—` → `---`, `–` → `--`, curly quotes → straight,
+/// `…` → `...`); with `false` the inlines are taken as typed. Passing the wrong flag misreads
+/// separators: `smart = true` is needed to see `-- {…}`/`--- {…}` in a smart document, and in
+/// a document without it, it would read a typed `— {…}` line as a separator. Additive to the
+/// T11 task-file API; errors as [`split`].
+pub fn split_ast<'a>(root: &'a AstNode<'a>, mode: SplitMode, smart: bool) -> Result<RawDeck<'a>> {
+    split_impl(root, None, mode, smart)
 }
 
 /// Like [`split`], but classifies separator paragraphs by their raw source lines in `source`,
 /// the exact text `root` was parsed from (dialect §2.2 "text matches", §3.1 "the two must
-/// agree"). Additive to the T11 task-file API; T12 should call this one.
+/// agree"), with or without smart punctuation. Additive to the T11 task-file API; T12 calls
+/// this one.
 ///
 /// If a node's sourcepos lies outside `source` (wrong text passed), that node is read from
-/// its inlines as [`split`] does. Errors as [`split`].
+/// its inlines as [`split`] does (as if parsed without smart punctuation). Errors as [`split`].
 pub fn split_with_source<'a>(
     root: &'a AstNode<'a>,
     source: &str,
     mode: SplitMode,
 ) -> Result<RawDeck<'a>> {
     let lines = source_lines(source);
-    split_impl(root, Some(&lines), mode)
+    split_impl(root, Some(&lines), mode, false)
 }
 
+/// The shared walk: `lines` is the source ([`split_with_source`]) or `None` ([`split_ast`]);
+/// `smart` tells how to read a paragraph from its inlines (always without `lines`, else only
+/// for a node outside them).
 fn split_impl<'a>(
     root: &'a AstNode<'a>,
     lines: Option<&[&str]>,
     mode: SplitMode,
+    smart: bool,
 ) -> Result<RawDeck<'a>> {
     if let SplitMode::Headings { .. } = mode {
         return Err(Error::Other("headings mode: T43".into()));
     }
-    let mut builder = Builder::new(root, lines);
+    let mut builder = Builder::new(root, lines, smart);
     for node in root.children() {
         builder.visit(node)?;
     }
@@ -234,8 +264,9 @@ struct Separator {
 }
 
 /// Classifies a top-level node (dialect §2.2). With `lines` (the source, see
-/// [`source_lines`]) a paragraph is read from its raw source, otherwise from its inlines.
-fn separator<'a>(node: &'a AstNode<'a>, lines: Option<&[&str]>) -> Option<Separator> {
+/// [`source_lines`]) a paragraph is read from its raw source, otherwise from its inlines as
+/// parsed with `parse.smart = smart`.
+fn separator<'a>(node: &'a AstNode<'a>, lines: Option<&[&str]>, smart: bool) -> Option<Separator> {
     match node.data().value {
         NodeValue::ThematicBreak => {
             return Some(Separator {
@@ -248,7 +279,7 @@ fn separator<'a>(node: &'a AstNode<'a>, lines: Option<&[&str]>) -> Option<Separa
     }
     match lines.and_then(|lines| raw_lines(lines, node)) {
         Some(raw) => separator_in_text(&join_lines(&raw)),
-        None => separator_in_inlines(node),
+        None => separator_in_inlines(node, smart),
     }
 }
 
@@ -268,15 +299,15 @@ fn separator_in_text(text: &str) -> Option<Separator> {
 }
 
 /// A separator read from a paragraph's inlines (no source text; see the module docs).
-fn separator_in_inlines<'a>(paragraph: &'a AstNode<'a>) -> Option<Separator> {
-    if is_bare_vertical(paragraph) {
+fn separator_in_inlines<'a>(paragraph: &'a AstNode<'a>, smart: bool) -> Option<Separator> {
+    if is_bare_vertical(paragraph, smart) {
         return Some(Separator {
             direction: Direction::Vertical,
             attrs: None,
         });
     }
     let text = inline_separator_text(paragraph)?;
-    let text = unsmart(&text);
+    let text = typed_text(&text, smart)?;
     let (direction, inner) = match_attr_separator(&text)?;
     Some(Separator {
         direction,
@@ -284,14 +315,45 @@ fn separator_in_inlines<'a>(paragraph: &'a AstNode<'a>) -> Option<Separator> {
     })
 }
 
-/// The 1-based numbers and trimmed text of a top-level block's source lines; `None` when
-/// its sourcepos lies outside `lines`.
-fn raw_lines<'s>(lines: &[&'s str], node: &AstNode<'_>) -> Option<Vec<(usize, &'s str)>> {
-    let pos = node.data().sourcepos;
-    let first = pos.start.line;
-    let block = lines.get(first.checked_sub(1)?..pos.end.line)?;
+/// The 1-based numbers and trimmed text of the source lines of a top-level block's text (see
+/// [`text_lines`]); `None` when they lie outside `lines`.
+fn raw_lines<'a, 's>(lines: &[&'s str], node: &'a AstNode<'a>) -> Option<Vec<(usize, &'s str)>> {
+    let (first, last) = text_lines(node);
+    let block = lines.get(first.checked_sub(1)?..last)?;
     let trimmed = block.iter().map(|line| line.trim_matches([' ', '\t']));
     Some((first..).zip(trimmed).collect())
+}
+
+/// The 1-based first and last line of a top-level block's own text: its sourcepos lines,
+/// except that a paragraph starting with link reference definitions (`[x]: http://a` directly
+/// followed by text) does not include them. comrak removes the definitions from the
+/// paragraph's content but keeps its sourcepos start on the first one, and numbers the
+/// inlines from that start as if the definitions were not there. The content is therefore
+/// the paragraph's last `n` lines, `n` being the inlines' line count (last inline's end line
+/// minus the paragraph's start line, plus one; at least one more than the number of line
+/// breaks). If that does not fit the paragraph, the whole range is returned.
+fn text_lines<'a>(node: &'a AstNode<'a>) -> (usize, usize) {
+    let (start, end, paragraph) = {
+        let data = node.data();
+        let pos = data.sourcepos;
+        let paragraph = matches!(data.value, NodeValue::Paragraph);
+        (pos.start.line, pos.end.line, paragraph)
+    };
+    let last_inline = node
+        .last_child()
+        .map(|child| child.data().sourcepos.end.line);
+    let (Some(last_inline), true) = (last_inline, paragraph) else {
+        return (start, end);
+    };
+    let breaks = node
+        .descendants()
+        .filter(|n| matches!(n.data().value, NodeValue::SoftBreak | NodeValue::LineBreak))
+        .count();
+    let count = (last_inline + 1).saturating_sub(start).max(breaks + 1);
+    match end.checked_sub(count) {
+        Some(before) if before + 1 >= start => (before + 1, end),
+        _ => (start, end),
+    }
 }
 
 fn join_lines(raw: &[(usize, &str)]) -> String {
@@ -317,9 +379,10 @@ fn source_lines(source: &str) -> Vec<&str> {
     lines
 }
 
-/// A paragraph that is one `Text("--")` (or `–`, comrak's smart form of it) covering exactly
-/// the two source columns where the paragraph starts, i.e. its source is literally `--`.
-fn is_bare_vertical<'a>(paragraph: &'a AstNode<'a>) -> bool {
+/// A paragraph that is one `Text("--")` (with `smart`, `–`: comrak's smart form of it)
+/// covering exactly the two source columns where the paragraph starts, i.e. its source is
+/// literally `--`.
+fn is_bare_vertical<'a>(paragraph: &'a AstNode<'a>, smart: bool) -> bool {
     let Some(child) = paragraph.first_child() else {
         return false;
     };
@@ -329,7 +392,8 @@ fn is_bare_vertical<'a>(paragraph: &'a AstNode<'a>) -> bool {
     let start = paragraph.data().sourcepos.start;
     let data = child.data();
     let pos = data.sourcepos;
-    matches!(&data.value, NodeValue::Text(t) if t == "--" || t == "–")
+    let dashes = if smart { "–" } else { "--" };
+    matches!(&data.value, NodeValue::Text(t) if t == dashes)
         && pos.start == start
         && pos.end.line == start.line
         && pos.end.column == start.column + 1
@@ -375,21 +439,34 @@ fn autolink_text<'a>(link: &'a AstNode<'a>, url: &str) -> Option<String> {
     autolink.then(|| text.to_string())
 }
 
-/// Undoes comrak's smart punctuation (`parse.smart`) on a separator candidate read from the
-/// AST: a leading em dash is `---`, a leading en dash `--`, and after it curly quotes are
-/// straight and `…` is `...`. Text starting with ASCII dashes was parsed without smart
-/// punctuation and is returned unchanged.
+/// A separator candidate read from the AST, as its author typed it. Without smart
+/// punctuation the inlines are the typed text. With it, comrak turned every run of two or
+/// more `-` into `–`/`—`, so a candidate starting with an ASCII dash had its dashes escaped
+/// or written as entities (content, as `\--` is in the source): `None`. Anything else goes
+/// through [`unsmart`].
+fn typed_text(text: &str, smart: bool) -> Option<Cow<'_, str>> {
+    if !smart {
+        return Some(Cow::Borrowed(text));
+    }
+    text.starts_with(['—', '–']).then(|| unsmart(text))
+}
+
+/// Maps comrak's smart punctuation (`parse.smart`) back in a separator candidate that starts
+/// with a smart dash: every `—` is `---` and every `–` is `--` (comrak turns a run of `n`
+/// hyphens into em and en dashes worth exactly `n` hyphens), curly quotes are straight and
+/// `…` is `...`, anywhere in the text, so values such as `bg--v2.png` survive. Text that does
+/// not start with a smart dash is returned unchanged. Only for text parsed with
+/// `parse.smart` on ([`typed_text`]); not exact there either, since these characters typed as
+/// Unicode come back as ASCII.
 fn unsmart(text: &str) -> Cow<'_, str> {
-    let (dashes, rest) = if let Some(rest) = text.strip_prefix('—') {
-        ("---", rest)
-    } else if let Some(rest) = text.strip_prefix('–') {
-        ("--", rest)
-    } else {
+    if !text.starts_with(['—', '–']) {
         return Cow::Borrowed(text);
-    };
-    let mut out = String::from(dashes);
-    for c in rest.chars() {
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
         match c {
+            '—' => out.push_str("---"),
+            '–' => out.push_str("--"),
             '“' | '”' => out.push('"'),
             '‘' | '’' => out.push('\''),
             '…' => out.push_str("..."),
@@ -418,11 +495,14 @@ fn looks_like_attr_separator(line: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with('{'))
 }
 
-/// The start of each source line of a paragraph, read from its inlines: the first `Text`
-/// (when it starts where the paragraph does) and every `Text` right after a line break, with
-/// their lines and smart punctuation undone.
-fn inline_line_starts<'a>(paragraph: &'a AstNode<'a>) -> Vec<(usize, String)> {
+/// The start of each source line of a paragraph, read from its inlines (parsed with
+/// `parse.smart = smart`): the first `Text` (when it starts where the paragraph does) and
+/// every `Text` right after a line break, as typed ([`typed_text`]), with their source lines
+/// (inlines are numbered as if leading link reference definitions were not there; see
+/// [`text_lines`]).
+fn inline_line_starts<'a>(paragraph: &'a AstNode<'a>, smart: bool) -> Vec<(usize, String)> {
     let start = paragraph.data().sourcepos.start;
+    let shift = text_lines(paragraph).0 - start.line;
     let mut out = Vec::new();
     let mut line_start = true;
     for (i, node) in paragraph.children().enumerate() {
@@ -433,7 +513,9 @@ fn inline_line_starts<'a>(paragraph: &'a AstNode<'a>) -> Vec<(usize, String)> {
                 continue;
             }
             NodeValue::Text(text) if line_start && (i > 0 || data.sourcepos.start == start) => {
-                out.push((data.sourcepos.start.line, unsmart(text).into_owned()));
+                if let Some(typed) = typed_text(text, smart) {
+                    out.push((data.sourcepos.start.line + shift, typed.into_owned()));
+                }
             }
             _ => {}
         }
@@ -444,8 +526,10 @@ fn inline_line_starts<'a>(paragraph: &'a AstNode<'a>) -> Vec<(usize, String)> {
 
 /// Accumulates slides while walking the document's top-level nodes.
 struct Builder<'a, 's> {
-    /// The source split into lines ([`split_with_source`]), or `None` ([`split`]).
+    /// The source split into lines ([`split_with_source`]), or `None` ([`split_ast`]).
     lines: Option<&'s [&'s str]>,
+    /// comrak's `parse.smart`, for paragraphs read from their inlines.
+    smart: bool,
     /// Finished horizontal slides with their children.
     done: Vec<(RawSlide<'a>, Vec<RawSlide<'a>>)>,
     /// The open horizontal slide and its children; nodes go to its last child, if any.
@@ -460,7 +544,7 @@ struct Builder<'a, 's> {
 }
 
 impl<'a, 's> Builder<'a, 's> {
-    fn new(root: &'a AstNode<'a>, lines: Option<&'s [&'s str]>) -> Self {
+    fn new(root: &'a AstNode<'a>, lines: Option<&'s [&'s str]>, smart: bool) -> Self {
         let footnotes: Vec<&'a AstNode<'a>> = root
             .children()
             .filter(|node| matches!(node.data().value, NodeValue::FootnoteDefinition(_)))
@@ -475,6 +559,7 @@ impl<'a, 's> Builder<'a, 's> {
         pending.sort_by_key(|&(_, start, _)| std::cmp::Reverse(start));
         Builder {
             lines,
+            smart,
             done: Vec::new(),
             current: (RawSlide::empty(1), Vec::new()),
             implicit: true,
@@ -501,11 +586,13 @@ impl<'a, 's> Builder<'a, 's> {
             }
         };
         self.flush_footnotes(start);
-        let Some(separator) = separator(node, self.lines) else {
+        let Some(separator) = separator(node, self.lines, self.smart) else {
             self.report_lookalikes(node);
             self.push(node, start, end);
             return Ok(());
         };
+        // The separator's own line, after any link reference definitions in its paragraph.
+        let start = text_lines(node).0;
         let attrs = match separator.attrs {
             Some(text) => {
                 SlideAttrs::from_parsed(parse_attr_block(&text).map_err(|err| Error::Parse {
@@ -587,7 +674,7 @@ impl<'a, 's> Builder<'a, 's> {
                 (starts.collect(), "")
             }
             None => (
-                inline_line_starts(node),
+                inline_line_starts(node, self.smart),
                 " and contain no Markdown inline syntax",
             ),
         };
@@ -740,7 +827,8 @@ mod tests {
     /// Which entry point a test runs.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Via {
-        /// [`split`]: AST only.
+        /// [`split_ast`] with the `parse.smart` the text was parsed with (without it, that is
+        /// [`split`]): AST only.
         Ast,
         /// [`split_with_source`]: raw source lines.
         Source,
@@ -751,7 +839,7 @@ mod tests {
     fn run_with<'a>(arena: &'a Arena<'a>, text: &str, via: Via, smart: bool) -> RawDeck<'a> {
         let root = parse_document(arena, text, &dialect_options_with(smart));
         let deck = match via {
-            Via::Ast => split(root, SplitMode::Rules),
+            Via::Ast => split_ast(root, SplitMode::Rules, smart),
             Via::Source => split_with_source(root, text, SplitMode::Rules),
         };
         deck.unwrap_or_else(|e| panic!("{via:?} {text:?}: {e}"))
@@ -883,7 +971,7 @@ mod tests {
             let root = parse(&arena, &text);
             let separator_lines: Vec<(usize, usize)> = root
                 .children()
-                .filter(|node| separator(node, Some(&lines)).is_some())
+                .filter(|node| separator(node, Some(&lines), false).is_some())
                 .map(line_range)
                 .collect();
             let deck = split_with_source(root, &text, SplitMode::Rules).unwrap();
@@ -1682,5 +1770,189 @@ mod tests {
         let deck = split_with_source(root, "", SplitMode::Rules).unwrap();
         assert_eq!(shape(&deck), "1-1 | 3-5");
         assert_eq!(deck.slides[1].0.attrs.classes, ["x"]);
+    }
+    /// comrak keeps leading link reference definitions in a paragraph's sourcepos but not in
+    /// its text: `[x]: http://a` directly followed by a separator line is still a separator,
+    /// opened on its own line, with and without smart punctuation.
+    #[test]
+    fn separator_after_a_link_reference_definition() {
+        let cases: &[(&str, &str, &str, Diags)] = &[
+            (
+                "`{…}` form (the issue's repro)",
+                "# A\n\n[x]: http://a\n--- {.a}\n\n# B\n",
+                "1-1 | 4-6",
+                &[],
+            ),
+            (
+                "two definitions",
+                "# A\n\n[x]: http://a\n[y]: http://b\n-- {.a}\n\n# B\n",
+                "1-1 [5-7]",
+                &[],
+            ),
+            (
+                "a definition continued over three lines",
+                "# A\n\n[x]:\n  http://a\n  \"t\"\n-- {.a}\n\n# B\n",
+                "1-1 [6-8]",
+                &[],
+            ),
+            (
+                "bare `--`",
+                "# A\n\n[x]: http://a\n--\n\n# B\n",
+                "1-1 [4-6]",
+                &[],
+            ),
+            (
+                "text after the definition: content, reported on the right line",
+                "# A\n\n[x]: http://a\ntext\n--- {.a}\n",
+                "1-5",
+                &[("separator-not-recognized", 5)],
+            ),
+        ];
+        for smart in [false, true] {
+            for (what, text, expected_shape, expected_diags) in cases {
+                for via in BOTH {
+                    let arena = Arena::new();
+                    let deck = run_with(&arena, text, via, smart);
+                    let label = format!("{what} ({via:?}, smart = {smart})");
+                    assert_eq!(shape(&deck), *expected_shape, "{label}");
+                    assert_eq!(diags(&deck), *expected_diags, "{label}");
+                    // The separator's attributes reach the slide it opened.
+                    if let Some(opened) = flatten(&deck).get(1) {
+                        let expected: &[&str] = if text.contains("{.a}") { &["a"] } else { &[] };
+                        assert_eq!(opened.attrs.classes, expected, "{label}");
+                    }
+                }
+            }
+        }
+        // A code span over the definition's following lines is one inline: never a
+        // separator, although its last line alone would match.
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run(&arena, "# A\n\n[x]: http://a\n`a\n--- {`}\n", via);
+            assert_eq!(shape(&deck), "1-5", "{via:?}");
+        }
+        // Errors point at the separator's line.
+        for via in BOTH {
+            let text = "# A\n\n[x]: http://a\n--- {k=\"v}\n";
+            let arena = Arena::new();
+            let root = parse(&arena, text);
+            let result = match via {
+                Via::Ast => split(root, SplitMode::Rules),
+                Via::Source => split_with_source(root, text, SplitMode::Rules),
+            };
+            assert!(
+                matches!(result, Err(Error::Parse { line: Some(4), .. })),
+                "{via:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_lines_skip_leading_link_reference_definitions() {
+        let text = "[x]: http://a\n[y]:\n  http://b\nfirst `code\nspan` end\nlast\n\nplain\npara\n";
+        let arena = Arena::new();
+        let nodes: Vec<_> = parse(&arena, text).children().collect();
+        assert_eq!(line_range(nodes[0]), (1, 6));
+        assert_eq!(text_lines(nodes[0]), (4, 6));
+        assert_eq!(text_lines(nodes[1]), (8, 9));
+        // every paragraph of the fixtures (none starts with a definition) keeps its range
+        for (name, _, _) in FIXTURE_SHAPES {
+            let text = fixture(name);
+            let arena = Arena::new();
+            for node in parse(&arena, &text).descendants() {
+                if matches!(node.data().value, NodeValue::Paragraph) {
+                    assert_eq!(text_lines(node), line_range(node), "{name}");
+                }
+            }
+        }
+    }
+
+    /// The AST-only reading undoes smart punctuation only for a document parsed with it:
+    /// without it, typed dashes are content; with it, dashes inside values are restored.
+    #[test]
+    fn ast_reading_follows_the_smart_flag() {
+        // smart = false: typed Unicode dashes are text, as in the source reading.
+        for text in [
+            "# A\n\n— {author}\n\n# B\n",
+            "# A\n\n– {.x}\n\n# B\n",
+            "# A\n\n–\n\n# B\n",
+            "# A\n\nText\n— {.x}\n",
+        ] {
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run_with(&arena, text, via, false);
+                assert_eq!(flatten(&deck).len(), 1, "{text:?} {via:?}");
+                assert!(deck.diagnostics.is_empty(), "{text:?} {via:?}");
+            }
+        }
+        // smart = true: values with `--`/`---` come back unchanged.
+        let text = "# A\n\n--- {background=bg--v2.png data-x=a---b data-y=c-----d}\n\n# B\n\n\
+                    -- {data-z=e--f}\n\n# C\n";
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run_with(&arena, text, via, true);
+            assert_eq!(shape(&deck), "1-1 | 3-5 [7-9]", "{via:?}");
+            assert_eq!(
+                deck.slides[1].0.attrs.attrs,
+                BTreeMap::from([
+                    (
+                        "data-background-image".to_string(),
+                        "bg--v2.png".to_string()
+                    ),
+                    ("data-x".to_string(), "a---b".to_string()),
+                    ("data-y".to_string(), "c-----d".to_string()),
+                ]),
+                "{via:?}"
+            );
+            assert_eq!(deck.slides[1].1[0].attrs.attrs["data-z"], "e--f", "{via:?}");
+        }
+        // smart = true: dashes that are not comrak's (escaped here) start no separator.
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run_with(&arena, "# A\n\n-\\-- {.x}\n\n# B\n", via, true);
+            assert_eq!(shape(&deck), "1-5", "{via:?}");
+        }
+        // Pinned limitation: with smart = true a dash typed as `—` reads as `---` from the AST;
+        // only the source reading keeps it content.
+        let text = "# A\n\n— {.typed}\n";
+        let arena = Arena::new();
+        assert_eq!(shape(&run_with(&arena, text, Via::Ast, true)), "1-1 | 3-3");
+        assert_eq!(shape(&run_with(&arena, text, Via::Source, true)), "1-3");
+        // `split` is `split_ast(…, false)`: on a smart document it needs the flag.
+        let text = "# A\n\n-- {.x}\n\n# B\n";
+        let arena = Arena::new();
+        let root = parse_document(&arena, text, &dialect_options_with(true));
+        let smart = split_ast(root, SplitMode::Rules, true).unwrap();
+        assert_eq!(shape(&smart), "1-1 [3-5]");
+        assert_eq!(smart.slides[0].1[0].attrs.classes, ["x"]);
+        let plain = split(root, SplitMode::Rules).unwrap();
+        let unsmart = split_ast(root, SplitMode::Rules, false).unwrap();
+        assert_eq!(summary(&plain), summary(&unsmart));
+        assert_eq!(shape(&plain), "1-5");
+    }
+
+    #[test]
+    fn unsmart_maps_every_dash_back_and_typed_text_needs_a_smart_dash() {
+        for (text, expected) in [
+            ("— {background=bg–v2.png}", "--- {background=bg--v2.png}"),
+            ("— {data-x=a—b}", "--- {data-x=a---b}"),
+            // 8 hyphens: comrak writes two em dashes and an en dash
+            ("– {x=a——–b}", "-- {x=a--------b}"),
+        ] {
+            assert_eq!(unsmart(text), expected, "{text:?}");
+        }
+        for (text, smart, expected) in [
+            ("— {author}", false, Some("— {author}")),
+            ("--- {x}", false, Some("--- {x}")),
+            ("— {k=“v”}", true, Some("--- {k=\"v\"}")),
+            ("--- {x}", true, None),
+            ("plain", true, None),
+        ] {
+            assert_eq!(
+                typed_text(text, smart).as_deref(),
+                expected,
+                "{text:?} {smart}"
+            );
+        }
     }
 }
