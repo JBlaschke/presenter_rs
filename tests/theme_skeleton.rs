@@ -48,9 +48,12 @@ const ALLOWED_FILTERS: &str = "attrs markdown \
 const MINIJINJA_CALLABLES: &str =
     "range dict debug namespace super self caller loop varargs kwargs";
 
-/// Template syntax keywords that may directly precede `(`.
-const KEYWORDS: &str = "and or not in is if elif else for call include import extends from as \
-    with set block filter macro recursive ignore missing";
+/// Template syntax keywords that may directly precede `(` (an operand, a tuple target, a
+/// `call(…)` signature, a parenthesized template name). Keywords that never do (`block`,
+/// `filter`, `macro`, `recursive`, `ignore`, `missing`, `with`, `as`, `is`) are left out:
+/// a template can use such a name for a value (`{% for block in slide.blocks %}`), so
+/// `block(…)` is a call like any other and, where no value is bound, reaches a global helper.
+const KEYWORDS: &str = "and or not in if elif else for set call include import extends from";
 
 /// The only expressions allowed to bypass auto-escaping: IR HTML (ir.md invariant 5).
 const SAFE_EXPRESSIONS: [&str; 3] = ["block.html", "slide.notes", "out.html"];
@@ -1185,33 +1188,58 @@ struct Scan {
     helpers: BTreeSet<String>,
 }
 
-/// The callables one template defines or imports itself: its macros (`{% macro NAME(`) and
-/// the names bound by `{% from … import a, b as c %}` and `{% import … as NAME %}`. Calling one
-/// of these is not calling a helper, but only in that template: a macro of another template
-/// needs an import. Names bound by `set`, `with` or `for` are values, never exempt.
-fn callable_names(source: &str) -> BTreeSet<String> {
+/// The macros a template defines (`{% macro NAME(`).
+fn macro_names(source: &str) -> BTreeSet<String> {
     let macro_def = Regex::new(r"^\{%-?\s*macro\s+([A-Za-z_]\w*)\s*\(").expect("regex");
+    tag_regions(source)
+        .iter()
+        .filter_map(|region| Some(macro_def.captures(region.trim())?[1].to_string()))
+        .collect()
+}
+
+/// The callables one template defines or imports itself: its macros ([`macro_names`]), the
+/// module bound by `{% import … as NAME %}`, and the names bound by
+/// `{% from "<template>" import a, b as c %}` for which `<template>` (looked up by its literal
+/// name among `templates`) defines that macro. Calling one of these is not calling a helper,
+/// but only in that template: a macro of another template needs an import. Names bound by
+/// `set`, `with` or `for` are values, never exempt; so is a name imported from a template
+/// that does not define it (minijinja binds nothing then, and the call reaches a global
+/// helper) or from a computed template name.
+fn callable_names(source: &str, templates: &[(String, String)]) -> BTreeSet<String> {
+    let from_target =
+        Regex::new(r#"^\{%-?\s*from\s+(?:"([^"]*)"|'([^']*)')\s+import\b"#).expect("regex");
     let from_import =
         Regex::new(r"(?s)^\{%-?\s*from\s.*?\bimport\s+(.*?)\s*-?%\}$").expect("regex");
     let import_as = Regex::new(r"(?s)^\{%-?\s*import\s.*?\bas\s+([A-Za-z_]\w*)\b").expect("regex");
     let context_marker = Regex::new(r"\s*\b(?:with|without)\s+context$").expect("regex");
-    let mut names = BTreeSet::new();
+    let mut names = macro_names(source);
     for region in tag_regions(source) {
+        let target = from_target.captures(region.trim()).map(|c| {
+            let name = c.get(1).or(c.get(2)).expect("literal body").as_str();
+            name.strip_prefix("@default/").unwrap_or(name).to_string()
+        });
         // Template names are string literals; they must not look like syntax.
         let region = string_literal().replace_all(region.trim(), "\"\"");
-        if let Some(c) = macro_def.captures(&region) {
-            names.insert(c[1].to_string());
-        }
         if let Some(c) = import_as.captures(&region) {
             names.insert(c[1].to_string());
         }
-        if let Some(c) = from_import.captures(&region) {
-            let list = context_marker.replace(&c[1], "");
-            for item in list.split(',') {
-                // `name` or `name as alias`: the last word is what the template can call.
-                if let Some(bound) = item.split_whitespace().last() {
-                    names.insert(bound.to_string());
-                }
+        let Some(c) = from_import.captures(&region) else {
+            continue;
+        };
+        let defined = templates
+            .iter()
+            .find(|(name, _)| Some(name) == target.as_ref())
+            .map(|(_, imported)| macro_names(imported))
+            .unwrap_or_default();
+        let list = context_marker.replace(&c[1], "");
+        for item in list.split(',') {
+            // `name` or `name as alias`: the alias, if any, is what the template can call.
+            let mut words = item.split_whitespace();
+            let (Some(imported), alias) = (words.next(), words.last()) else {
+                continue;
+            };
+            if defined.contains(imported) {
+                names.insert(alias.unwrap_or(imported).to_string());
             }
         }
     }
@@ -1269,7 +1297,7 @@ fn scan_templates(templates: &[(String, String)]) -> Scan {
         .collect();
     let mut scan = Scan::default();
     for (name, source) in templates {
-        let mut allowed_calls = callable_names(source);
+        let mut allowed_calls = callable_names(source, templates);
         allowed_calls.extend(builtin.iter().cloned());
         for region in tag_regions(source) {
             scan_region(&region, &allowed_calls, &mut scan, name);
@@ -1297,11 +1325,19 @@ fn templates_use_only_spec_helpers_and_filters() {
 /// The static scans on synthetic templates: ordinary minijinja passes, bypasses do not.
 #[test]
 fn static_scans_accept_minijinja_and_catch_bypasses() {
-    let scan = |source: &str| scan_templates(&[("t.html".to_string(), source.to_string())]);
+    // `t.html` is the template under test; `m.html` defines the macros `fmt` and `other`.
+    let macros = "{% macro fmt(x) %}{{ x }}{% endmacro %}{% macro other() %}{% endmacro %}";
+    let scan = |source: &str| {
+        scan_templates(&[
+            ("m.html".to_string(), macros.to_string()),
+            ("t.html".to_string(), source.to_string()),
+        ])
+    };
     for ok in [
         r#"{% macro prompt(label, n) %}{{ label }} [{{ n }}]{% endmacro %}{{ prompt("In", 1) }}"#,
         r#"{% from "m.html" import fmt as f, other %}{{ f(1) }}{{ other() }}"#,
         r#"{%- from "m.html" import fmt, other as o with context -%}{{ fmt(1) }}{{ o() }}"#,
+        r#"{% from '@default/m.html' import fmt %}{{ fmt(1) }}"#,
         r#"{% import "m.html" as m %}{{ m(1) }}{{ m.fmt(1) }}"#,
         r#"{% macro row(x) %}{{ x }}{% endmacro %}{% call row(1) %}{{ caller() }}{% endcall %}"#,
         r#"{%- set mimes = out.mimes %}{{ mimes|join(", ") }}{{ out.mimes|join(', ') }}"#,
@@ -1322,9 +1358,22 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
         "{% for path in theme.scripts %}{{ path(\"x\") }}{% endfor %}",
         "{% for a, b in x|items %}{{ b() }}{% endfor %}",
         "{% if false %}{{ date(meta.date, \"%Y\") }}{% endif %}",
+        // ... also when the value's name is a keyword that never precedes `(`.
+        "{% for block in slide.blocks %}{{ block(1) }}{% endfor %}",
+        "{% set filter = 1 %}{{ filter(2) }}",
+        "{% set missing = 1 %}{{ missing() }}",
+        "{% with recursive = 1 %}{{ recursive() }}{% endwith %}",
+        "{% for ignore in x %}{{ ignore() }}{% endfor %}",
+        "{% set macro = 1 %}{{ macro() }}",
         // An import binds its alias, not the imported name.
         r#"{% from "m.html" import fmt as f %}{{ fmt(1) }}"#,
         r#"{% import "m.html" as m %}{{ fmt(1) }}"#,
+        // An import binds only macros its template defines; nothing from an unknown or
+        // computed template name.
+        r#"{% from "m.html" import date %}{{ date(1) }}"#,
+        r#"{% from "m.html" import date as fmt %}{{ fmt(1) }}"#,
+        r#"{% from "other.html" import fmt %}{{ fmt(1) }}"#,
+        r#"{% from "m" ~ ".html" import fmt %}{{ fmt(1) }}"#,
         "{{ x|unknown_filter }}",
         "{{ (out.name ~ out.html)|safe }}",
         "{{ cell.source|safe }}",
@@ -1351,21 +1400,25 @@ fn static_scans_accept_minijinja_and_catch_bypasses() {
         Vec::<String>::new()
     );
     // A dead branch in a real template calling names that other templates bind with
-    // set/for (title.html's `date`, scripts.html's `path`, default.html's `name`).
+    // set/for (title.html's `date`, scripts.html's `path`, default.html's `name`, title.html's
+    // and default.html's `block`), and a name imported from a template without that macro.
     let mut real = templates();
     let (_, cell) = real
         .iter_mut()
         .find(|(name, _)| name == "cell.html")
         .expect("cell.html");
-    cell.push_str(
-        r#"{% if false %}{{ date(meta.date, "%Y") }}{{ path("x") }}{{ name() }}{% endif %}"#,
-    );
+    cell.push_str(concat!(
+        r#"{% from "block.html" import title_meta %}{% if false %}{{ date(meta.date, "%Y") }}"#,
+        r#"{{ path("x") }}{{ name() }}{{ block() }}{{ title_meta() }}{% endif %}"#,
+    ));
     assert_eq!(
         scan_templates(&real).problems,
         [
             "cell.html: helper `date`",
             "cell.html: helper `path`",
-            "cell.html: helper `name`"
+            "cell.html: helper `name`",
+            "cell.html: helper `block`",
+            "cell.html: helper `title_meta`",
         ]
     );
     let refs = template_references(

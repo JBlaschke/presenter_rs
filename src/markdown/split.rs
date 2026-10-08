@@ -32,7 +32,13 @@
 //! The text of a paragraph is its sourcepos line range minus leading link reference
 //! definitions: comrak removes them from the paragraph's content but not from its sourcepos,
 //! so `[x]: http://a` directly followed by a `--- {.a}` line is still a separator (opened on
-//! the `--- {.a}` line), as dialect §2.2 reads the paragraph's text.
+//! the `--- {.a}` line), as dialect §2.2 reads the paragraph's text. [`split_with_source`]
+//! finds those definition lines exactly (comrak parses the paragraph's first lines again).
+//! [`split_ast`] infers them from the inlines' line numbers, and only for a paragraph whose
+//! inlines are all text, breaks, code spans, raw HTML, math, emphasis or autolinks (always
+//! true for a separator): another link or image can hide line endings from those numbers, so
+//! for such a paragraph after definitions a lookalike line (below) is reported up to that
+//! many lines early.
 //!
 //! Rules implemented by all of them:
 //! - `FrontMatter` is skipped (neither a slide nor a separator).
@@ -318,7 +324,7 @@ fn separator_in_inlines<'a>(paragraph: &'a AstNode<'a>, smart: bool) -> Option<S
 /// The 1-based numbers and trimmed text of the source lines of a top-level block's text (see
 /// [`text_lines`]); `None` when they lie outside `lines`.
 fn raw_lines<'a, 's>(lines: &[&'s str], node: &'a AstNode<'a>) -> Option<Vec<(usize, &'s str)>> {
-    let (first, last) = text_lines(node);
+    let (first, last) = text_lines(node, Some(lines));
     let block = lines.get(first.checked_sub(1)?..last)?;
     let trimmed = block.iter().map(|line| line.trim_matches([' ', '\t']));
     Some((first..).zip(trimmed).collect())
@@ -327,33 +333,113 @@ fn raw_lines<'a, 's>(lines: &[&'s str], node: &'a AstNode<'a>) -> Option<Vec<(us
 /// The 1-based first and last line of a top-level block's own text: its sourcepos lines,
 /// except that a paragraph starting with link reference definitions (`[x]: http://a` directly
 /// followed by text) does not include them. comrak removes the definitions from the
-/// paragraph's content but keeps its sourcepos start on the first one, and numbers the
-/// inlines from that start as if the definitions were not there. The content is therefore
-/// the paragraph's last `n` lines, `n` being the inlines' line count (last inline's end line
-/// minus the paragraph's start line, plus one; at least one more than the number of line
-/// breaks). If that does not fit the paragraph, the whole range is returned.
-fn text_lines<'a>(node: &'a AstNode<'a>) -> (usize, usize) {
-    let (start, end, paragraph) = {
-        let data = node.data();
-        let pos = data.sourcepos;
-        let paragraph = matches!(data.value, NodeValue::Paragraph);
-        (pos.start.line, pos.end.line, paragraph)
+/// paragraph's content but keeps its sourcepos start on the first one.
+///
+/// [`unnumbered_lines`] bounds how many lines that can be (0 for almost every paragraph).
+/// With the source (`lines`, when the paragraph lies inside them) comrak itself tells which
+/// of those lines are definitions ([`definition_lines`]). Without it, all of them are taken
+/// to be definitions when the inlines number every line ([`inlines_number_every_line`]), and
+/// none otherwise.
+fn text_lines<'a>(node: &'a AstNode<'a>, lines: Option<&[&str]>) -> (usize, usize) {
+    let (start, end) = {
+        let pos = node.data().sourcepos;
+        (pos.start.line, pos.end.line)
     };
-    let last_inline = node
-        .last_child()
-        .map(|child| child.data().sourcepos.end.line);
-    let (Some(last_inline), true) = (last_inline, paragraph) else {
+    let unnumbered = unnumbered_lines(node);
+    if unnumbered == 0 {
         return (start, end);
+    }
+    let skipped = match lines.and_then(|lines| lines.get(start.checked_sub(1)?..end)) {
+        Some(block) => definition_lines(block, unnumbered),
+        None if inlines_number_every_line(node) => unnumbered,
+        None => 0,
     };
+    (start + skipped, end)
+}
+
+/// How many of a paragraph's sourcepos lines its inlines' line numbers do not account for
+/// (0 for other blocks): the range's length minus the inlines' line count, which is the last
+/// inline's end line minus the paragraph's start line plus one, and at least one more than
+/// the number of line breaks. comrak numbers the inlines from the paragraph's start line
+/// after removing leading link reference definitions, and only ever advances that number on
+/// a line ending of the remaining text. So this is at least the number of definition lines:
+/// exactly that when every line ending is numbered, more when a link or image hides some in
+/// its destination, title or reference label (`[l](u "a` + newline + `b")`), as an inline
+/// attribute block also does. Always less than the range's length.
+fn unnumbered_lines<'a>(node: &'a AstNode<'a>) -> usize {
+    let (start, end) = {
+        let data = node.data();
+        if !matches!(data.value, NodeValue::Paragraph) {
+            return 0;
+        }
+        (data.sourcepos.start.line, data.sourcepos.end.line)
+    };
+    let Some(last_inline) = node.last_child() else {
+        return 0;
+    };
+    let last_line = last_inline.data().sourcepos.end.line;
     let breaks = node
         .descendants()
         .filter(|n| matches!(n.data().value, NodeValue::SoftBreak | NodeValue::LineBreak))
         .count();
-    let count = (last_inline + 1).saturating_sub(start).max(breaks + 1);
-    match end.checked_sub(count) {
-        Some(before) if before + 1 >= start => (before + 1, end),
-        _ => (start, end),
+    let numbered = (last_line + 1).saturating_sub(start).max(breaks + 1);
+    (end + 1).saturating_sub(start).saturating_sub(numbered)
+}
+
+/// How many of a paragraph's first source lines are link reference definitions, given its
+/// source lines (`block`, untrimmed) and an upper bound (`limit`, see [`unnumbered_lines`]):
+/// the largest `k <= limit` for which comrak parses the first `k` lines on their own as
+/// nothing but definitions (an empty document). comrak removes definitions from the start
+/// of a paragraph greedily, and each one reads the same text in the full paragraph as in
+/// such a prefix (a title it looks for on the next line can only make it longer), so that
+/// `k` is the number of lines it removed; 0 when the paragraph cannot start with one (its
+/// first line does not start with `[`). The definitions themselves do not depend on the
+/// extensions, so the prefixes are parsed with comrak's default options.
+fn definition_lines(block: &[&str], limit: usize) -> usize {
+    let label_first = block
+        .first()
+        .is_some_and(|line| line.trim_start_matches([' ', '\t']).starts_with('['));
+    if !label_first {
+        return 0;
     }
+    let options = comrak::Options::default();
+    let most = limit.min(block.len().saturating_sub(1));
+    (1..=most)
+        .rev()
+        .find(|&k| {
+            let arena = comrak::Arena::new();
+            let root = comrak::parse_document(&arena, &block[..k].join("\n"), &options);
+            root.first_child().is_none()
+        })
+        .unwrap_or(0)
+}
+
+/// Whether comrak numbered every line ending of a paragraph's inlines, so that
+/// [`unnumbered_lines`] is exactly its number of link reference definition lines: true when
+/// all of them are text, line breaks, code spans, raw HTML, math, emphasis, strikethrough or
+/// autolinks, without inline attributes. Any other link or image may hide line endings in its
+/// destination, title or label; footnote references and the rest are not trusted either.
+fn inlines_number_every_line<'a>(paragraph: &'a AstNode<'a>) -> bool {
+    paragraph.descendants().skip(1).all(|node| {
+        let data = node.data();
+        if data.attrs.is_some() {
+            return false;
+        }
+        match &data.value {
+            NodeValue::Text(_)
+            | NodeValue::SoftBreak
+            | NodeValue::LineBreak
+            | NodeValue::Code(_)
+            | NodeValue::HtmlInline(_)
+            | NodeValue::Math(_)
+            | NodeValue::Emph
+            | NodeValue::Strong
+            | NodeValue::Strikethrough
+            | NodeValue::Escaped => true,
+            NodeValue::Link(link) => autolink_text(node, &link.url).is_some(),
+            _ => false,
+        }
+    })
 }
 
 fn join_lines(raw: &[(usize, &str)]) -> String {
@@ -499,10 +585,10 @@ fn looks_like_attr_separator(line: &str) -> bool {
 /// `parse.smart = smart`): the first `Text` (when it starts where the paragraph does) and
 /// every `Text` right after a line break, as typed ([`typed_text`]), with their source lines
 /// (inlines are numbered as if leading link reference definitions were not there; see
-/// [`text_lines`]).
+/// [`text_lines`], which is exact here only when the inlines number every line).
 fn inline_line_starts<'a>(paragraph: &'a AstNode<'a>, smart: bool) -> Vec<(usize, String)> {
     let start = paragraph.data().sourcepos.start;
-    let shift = text_lines(paragraph).0 - start.line;
+    let shift = text_lines(paragraph, None).0 - start.line;
     let mut out = Vec::new();
     let mut line_start = true;
     for (i, node) in paragraph.children().enumerate() {
@@ -592,7 +678,7 @@ impl<'a, 's> Builder<'a, 's> {
             return Ok(());
         };
         // The separator's own line, after any link reference definitions in its paragraph.
-        let start = text_lines(node).0;
+        let start = text_lines(node, self.lines).0;
         let attrs = match separator.attrs {
             Some(text) => {
                 SlideAttrs::from_parsed(parse_attr_block(&text).map_err(|err| Error::Parse {
@@ -1849,19 +1935,123 @@ mod tests {
 
     #[test]
     fn text_lines_skip_leading_link_reference_definitions() {
-        let text = "[x]: http://a\n[y]:\n  http://b\nfirst `code\nspan` end\nlast\n\nplain\npara\n";
+        let text = "[x]: http://a\n[y]:\n  http://b\nfirst `code\nspan` *em\nph* $a\nb$ <b\nc=\"d\">\
+                    \nlast\n\nplain\npara\n\n[z]: http://c\n[l](u \"t\nt\") text\n";
+        let lines = source_lines(text);
         let arena = Arena::new();
         let nodes: Vec<_> = parse(&arena, text).children().collect();
-        assert_eq!(line_range(nodes[0]), (1, 6));
-        assert_eq!(text_lines(nodes[0]), (4, 6));
-        assert_eq!(text_lines(nodes[1]), (8, 9));
-        // every paragraph of the fixtures (none starts with a definition) keeps its range
-        for (name, _, _) in FIXTURE_SHAPES {
-            let text = fixture(name);
+        assert_eq!(line_range(nodes[0]), (1, 9));
+        assert_eq!(line_range(nodes[2]), (14, 16));
+        for source in [None, Some(&lines[..])] {
+            // code spans, emphasis, math and raw HTML over several lines are all numbered
+            assert_eq!(text_lines(nodes[0], source), (4, 9), "{source:?}");
+            assert_eq!(text_lines(nodes[1], source), (11, 12), "{source:?}");
+        }
+        // A link whose title spans lines hides a line ending: only the source tells that line
+        // 14 alone is a definition; from the AST the whole range is kept.
+        assert_eq!(unnumbered_lines(nodes[2]), 2);
+        assert_eq!(text_lines(nodes[2], Some(&lines)), (15, 16));
+        assert_eq!(text_lines(nodes[2], None), (14, 16));
+        // A paragraph without definitions keeps its range, also when such links hide line
+        // endings: every paragraph of the fixtures (none starts with a definition), and these.
+        let mut texts: Vec<String> = FIXTURE_SHAPES.iter().map(|(n, _, _)| fixture(n)).collect();
+        texts.extend(
+            [
+                "--- {.x}\nSee [d](http://e\n\"T\").\n",
+                "[l](u (x\n--- {.a))}\n",
+                "[l](u \"x\n--- {\")}\n",
+                "[l][x\ny] and ![i](a.png\n'alt')\n\n[x y]: http://a\n",
+                "[l](u){.a\n.b} `c`{.d\n.e}\n",
+            ]
+            .map(String::from),
+        );
+        for text in &texts {
+            let lines = source_lines(text);
             let arena = Arena::new();
-            for node in parse(&arena, &text).descendants() {
+            for node in parse(&arena, text).descendants() {
                 if matches!(node.data().value, NodeValue::Paragraph) {
-                    assert_eq!(text_lines(node), line_range(node), "{name}");
+                    let range = line_range(node);
+                    assert_eq!(text_lines(node, Some(&lines)), range, "{text:?}");
+                    assert_eq!(text_lines(node, None), range, "{text:?}");
+                }
+            }
+        }
+    }
+
+    /// Links and images whose destination, title or reference label spans lines hide line
+    /// endings from comrak's inline line numbers. That is not mistaken for link reference
+    /// definitions: a lookalike line next to them is still reported, on its own line, and
+    /// text inside such a title never becomes a separator.
+    #[test]
+    fn multi_line_link_titles_are_not_definitions() {
+        // (what, text, shape, diagnostics from the source, diagnostics from the AST)
+        let cases: &[(&str, &str, &str, Diags, Diags)] = &[
+            (
+                "a lookalike, then a link whose title is on the next line",
+                "# A\n\n--- {.x}\nSee [d](http://e\n\"T\").\n",
+                "1-5",
+                &[("separator-not-recognized", 3)],
+                &[("separator-not-recognized", 3)],
+            ),
+            (
+                "an image with its title on the next line",
+                "# A\n\n-- {.x}\n![i](a.png\n'alt').\n",
+                "1-5",
+                &[("separator-not-recognized", 3)],
+                &[("separator-not-recognized", 3)],
+            ),
+            (
+                "two such links after the lookalike",
+                "# A\n\nfirst\n--- {.x}\n[d](http://e\n\"T\") [f](http://g\n\"U\")\n",
+                "1-7",
+                &[("separator-not-recognized", 4)],
+                &[("separator-not-recognized", 4)],
+            ),
+            (
+                "a title spanning two lines",
+                "# A\n\n--- {.a}\n[l](u \"t\nt\")\n",
+                "1-5",
+                &[("separator-not-recognized", 3)],
+                &[("separator-not-recognized", 3)],
+            ),
+            (
+                "a wrapped reference label",
+                "# A\n\n--- {.a}\n[l][x\ny]\n\n[x y]: http://a\n",
+                "1-5",
+                &[("separator-not-recognized", 3)],
+                &[("separator-not-recognized", 3)],
+            ),
+            (
+                "a separator-like line inside a link title is content (the AST cannot see it)",
+                "# A\n\n[l](u (x\n--- {.a))}\n\n# B\n",
+                "1-6",
+                &[("separator-not-recognized", 4)],
+                &[],
+            ),
+            (
+                "an unbalanced quote there is content too, not a parse error",
+                "# A\n\n[l](u \"x\n--- {\")}\n\n# B\n",
+                "1-6",
+                &[("separator-not-recognized", 4)],
+                &[],
+            ),
+            (
+                "a definition, then a lookalike before such a link (pinned AST limitation: \
+                 reported one line early)",
+                "# A\n\n[x]: http://a\n--- {.a}\n[l](u \"t\nt\")\n",
+                "1-6",
+                &[("separator-not-recognized", 4)],
+                &[("separator-not-recognized", 3)],
+            ),
+        ];
+        for smart in [false, true] {
+            for (what, text, expected_shape, from_source, from_ast) in cases {
+                for (via, expected_diags) in [(Via::Source, from_source), (Via::Ast, from_ast)] {
+                    let arena = Arena::new();
+                    let deck = run_with(&arena, text, via, smart);
+                    let label = format!("{what} ({via:?}, smart = {smart})");
+                    assert_eq!(shape(&deck), *expected_shape, "{label}");
+                    assert_eq!(diags(&deck), *expected_diags, "{label}");
                 }
             }
         }
