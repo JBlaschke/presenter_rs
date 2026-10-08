@@ -29,9 +29,9 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T14 | Asset registry and emitter | M1 | M | T01 | done |
 | T15 | HTML renderer, context, helpers, reveal config | M1 | M | T13, T14 | done |
 | T16 | Pipeline, `build` and `dump` CLI, example deck, e2e snapshots | M1 | M | T10–T15 | done |
-| T17 | Default theme v1 | M1 | L | T02, T16 | todo |
-| T20 | File watcher and rebuild loop | M2 | M | T16 | todo |
-| T21 | Dev server with SSE | M2 | M | T16 | todo |
+| T17 | Default theme v1 | M1 | L | T02, T16 | done |
+| T20 | File watcher and rebuild loop | M2 | M | T16 | done |
+| T21 | Dev server with SSE | M2 | M | T16 | done |
 | T22 | Live-reload client script | M2 | M | — (protocol only) | done |
 | T23 | `serve` CLI and integration tests | M2 | S | T20, T21, T22 | todo |
 | T24 | Headless-browser smoke tests (opt-in) | M2 | S | T16 | todo |
@@ -39,15 +39,15 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T31 | Cells → slides | M3 | M | T30, T12 | done |
 | T32 | Output rendering | M3 | M | T30, T14 | done |
 | T33 | Notebook theming and executed example notebook | M3 | M | T32, T17 | todo |
-| T34 | `check` command and lints | M3 | M | T16, T31 | todo |
-| T40 | `init` scaffold | M4 | S | T16 | todo |
+| T34 | `check` command and lints | M3 | M | T16, T31 | done |
+| T40 | `init` scaffold | M4 | S | T16 | done |
 | T41 | `theme list/eject/new/check` | M4 | S | T13 | done |
 | T42 | SCSS themes via grass, reveal template imports, CSS asset inlining | M4 | M | T14, T17 | todo |
 | T43 | Heading-split mode, incremental lists, reveal compat comments | M4 | M | T11, T12 | done |
 | T44 | Diagnostics quality | M4 | S | T16, T22 | todo |
-| T45 | PDF export via headless Chrome | M4 | S | T16 | todo |
+| T45 | PDF export via headless Chrome | M4 | S | T16 | done |
 | T46 | User documentation | M4 | M | M1–M3 | todo |
-| T47 | Release builds | M4 | S | T16 | todo |
+| T47 | Release builds | M4 | S | T16 | done |
 
 ## Order of execution (suggested waves)
 
