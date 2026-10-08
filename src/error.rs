@@ -88,11 +88,14 @@ impl From<toml::de::Error> for Error {
     }
 }
 
-/// minijinja errors become [`Error::Template`] without debug info; use [`template_error`]
-/// with `env.debug()` where the environment's debug flag should decide.
+/// minijinja errors become [`Error::Template`] via [`template_error`]`(err, true)`: the
+/// message includes minijinja's debug info whenever it was captured. minijinja captures it
+/// for runtime errors only in a debug environment (`Environment::set_debug(true)`, serve
+/// mode), so `?` gives "debug info in debug mode"; syntax errors always carry their source
+/// excerpt, in build mode too. Call [`template_error`] with `false` to leave it out.
 impl From<minijinja::Error> for Error {
     fn from(err: minijinja::Error) -> Self {
-        template_error(err, false)
+        template_error(err, true)
     }
 }
 
@@ -101,15 +104,18 @@ impl From<minijinja::Error> for Error {
 /// minijinja reports an error raised inside an included template (or a `super()` block)
 /// as an error located at the include site whose source is the original error. The
 /// conversion walks that chain and reports the innermost located error: `template` and
-/// `line` are where the problem is (e.g. `layouts/title.html`, line 4; `<unknown>` when
-/// minijinja does not know, as for a top-level `get_template` of a missing name), and
-/// `message` is its kind and detail, any further causes (`: cause`), then the include
-/// sites from the inside out (`(via slide.html line 3, deck.html line 12)`). minijinja's
-/// own `(in name:line)` suffix is left out since the location is in the other fields.
+/// `line` are where the problem is (e.g. `layouts/title.html`, line 4). For a top-level
+/// "template not found" (`get_template` of a missing name) `template` is the missing name;
+/// `<unknown>` only when minijinja names no template at all. `message` is the error's kind
+/// and detail, any further causes (`: cause`), then the include sites from the inside out
+/// (`(via slide.html line 3, deck.html line 12)`; repeated sites, as in a recursive
+/// include, are collapsed to `site ×N`, and a list longer than four entries is shortened
+/// to the first three, `… N more` and the last). minijinja's own `(in name:line)` suffix
+/// is left out since the location is in the other fields.
 ///
-/// With `debug` (serve mode: pass `env.debug()`), the message also contains that error's
-/// `display_debug_info()`: the template source around the line and the referenced
-/// variables, when minijinja captured them.
+/// With `debug`, the message also contains that error's `display_debug_info()`: the
+/// template source around the line and the referenced variables, when minijinja captured
+/// them (see `From<minijinja::Error>`).
 pub fn template_error(err: minijinja::Error, debug: bool) -> Error {
     use std::fmt::Write as _;
 
@@ -145,16 +151,70 @@ pub fn template_error(err: minijinja::Error, debug: bool) -> Error {
         .filter_map(|frame| Some(format!("{} line {}", frame.name()?, frame.line()?)))
         .collect();
     if !sites.is_empty() {
-        let _ = write!(message, " (via {})", sites.join(", "));
+        let _ = write!(message, " (via {})", include_sites(&sites));
     }
     if debug {
         let _ = write!(message, "{}", origin.display_debug_info());
     }
+    let template = match origin.name() {
+        Some(name) => name.to_string(),
+        None => missing_template_name(origin).unwrap_or_else(|| "<unknown>".to_string()),
+    };
     Error::Template {
-        template: origin.name().unwrap_or("<unknown>").to_string(),
+        template,
         line: origin.line(),
         message: message.trim_end().to_string(),
     }
+}
+
+/// The most include sites [`include_sites`] lists before shortening the list.
+const MAX_INCLUDE_SITES: usize = 4;
+
+/// Formats include sites (innermost first) for the `(via …)` suffix: consecutive repeats
+/// collapse to `site ×N`, and more than [`MAX_INCLUDE_SITES`] entries are shortened to the
+/// first three, `… N more`, and the last.
+fn include_sites(sites: &[String]) -> String {
+    let mut runs: Vec<(&str, usize)> = Vec::new();
+    for site in sites {
+        match runs.last_mut() {
+            Some((last, count)) if *last == site.as_str() => *count += 1,
+            _ => runs.push((site, 1)),
+        }
+    }
+    let mut shown: Vec<String> = runs
+        .iter()
+        .map(|&(site, count)| match count {
+            1 => site.to_string(),
+            n => format!("{site} ×{n}"),
+        })
+        .collect();
+    if shown.len() > MAX_INCLUDE_SITES {
+        // Keep the first MAX - 1 and the last entry.
+        let hidden = shown.len() - MAX_INCLUDE_SITES;
+        let end = shown.len() - 1;
+        shown.splice(MAX_INCLUDE_SITES - 1..end, [format!("… {hidden} more")]);
+    }
+    shown.join(", ")
+}
+
+/// The name in minijinja's `template "<name>" does not exist`, for a "template not found"
+/// error that carries no template name of its own (a top-level `get_template`).
+fn missing_template_name(err: &minijinja::Error) -> Option<String> {
+    if err.kind() != minijinja::ErrorKind::TemplateNotFound {
+        return None;
+    }
+    let quoted = err
+        .detail()?
+        .strip_prefix("template ")?
+        .strip_suffix(" does not exist")?;
+    // minijinja formats the name with `{:?}`, which matches JSON string syntax for every
+    // name without unusual escapes; fall back to stripping the quotes.
+    serde_json::from_str::<String>(quoted).ok().or_else(|| {
+        quoted
+            .strip_prefix('"')?
+            .strip_suffix('"')
+            .map(str::to_string)
+    })
 }
 
 /// Severity of a [`Diagnostic`].
@@ -549,5 +609,38 @@ mod tests {
             format!("{:#}", diags.iter().next().unwrap()),
             "line 9: warning: unknown attribute foo [unknown-slide-attr]"
         );
+    }
+
+    #[test]
+    fn include_sites_collapse_repeats_and_shorten_long_lists() {
+        let sites =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        assert_eq!(include_sites(&sites(&["a", "b"])), "a, b");
+        assert_eq!(include_sites(&sites(&["a", "b", "b", "c"])), "a, b ×2, c");
+        assert_eq!(
+            include_sites(&sites(&["a", "a", "a", "b", "c", "d"])),
+            "a ×3, b, c, d"
+        );
+        assert_eq!(
+            include_sites(&sites(&["a", "b", "c", "c", "d", "e", "f"])),
+            "a, b, c ×2, … 2 more, f"
+        );
+    }
+
+    #[test]
+    fn top_level_missing_templates_are_named() {
+        let env = minijinja::Environment::new();
+        let err = env.get_template("layouts/no \"pe\".html").unwrap_err();
+        match Error::from(err) {
+            Error::Template { template, line, .. } => {
+                assert_eq!((template.as_str(), line), ("layouts/no \"pe\".html", None))
+            }
+            other => panic!("expected Error::Template, got {other:?}"),
+        }
+        let err = minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "x");
+        let Error::Template { template, .. } = Error::from(err) else {
+            panic!("expected Error::Template");
+        };
+        assert_eq!(template, "<unknown>");
     }
 }

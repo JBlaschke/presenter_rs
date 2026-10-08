@@ -78,11 +78,7 @@ fn locate(spec: &str, roots: &[&Path]) -> std::result::Result<ThemeSource, Strin
     if spec.trim().is_empty() {
         return Err("empty theme name".to_string());
     }
-    let candidates: Vec<PathBuf> = if Path::new(spec).is_absolute() {
-        vec![PathBuf::from(spec)]
-    } else {
-        roots.iter().map(|root| root.join(spec)).collect()
-    };
+    let candidates = candidate_dirs(spec, roots);
     for candidate in &candidates {
         if candidate.join(MANIFEST_FILE).is_file() {
             let dir = std::fs::canonicalize(candidate)
@@ -97,6 +93,26 @@ fn locate(spec: &str, roots: &[&Path]) -> std::result::Result<ThemeSource, Strin
         });
     }
     Err(not_found_message(&candidates, &builtins))
+}
+
+/// The directories `spec` may be: `spec` itself if absolute, else `spec` below each root,
+/// made absolute (against the CWD) and without duplicates, in order. The pipeline's roots
+/// (config dir, source dir, CWD) often coincide; each directory is tried and reported once.
+fn candidate_dirs(spec: &str, roots: &[&Path]) -> Vec<PathBuf> {
+    let joined: Vec<PathBuf> = if Path::new(spec).is_absolute() {
+        vec![PathBuf::from(spec)]
+    } else {
+        roots.iter().map(|root| root.join(spec)).collect()
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for path in joined {
+        // `absolute` only fails for an empty path or an unavailable CWD; keep it as is then.
+        let path = std::path::absolute(&path).unwrap_or(path);
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates
 }
 
 /// "not found" with every directory tried and the built-in names.

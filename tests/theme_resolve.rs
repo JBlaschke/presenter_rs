@@ -114,6 +114,35 @@ fn unknown_theme_lists_the_search_roots() {
 }
 
 #[test]
+fn coinciding_search_roots_are_tried_and_reported_once() {
+    // The pipeline passes config dir, source dir and CWD, which are often the same.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir(tmp.path().join("nope")).unwrap();
+    let roots = [tmp.path(), tmp.path(), tmp.path()];
+    let (_, message) = theme_error(resolve("nope", &roots));
+    let tried = tmp.path().join("nope").display().to_string();
+    assert_eq!(
+        message.matches(&tried).count(),
+        2,
+        "listed + note: {message}"
+    );
+    assert_eq!(
+        message.matches("exists but has no theme.toml").count(),
+        1,
+        "{message}"
+    );
+
+    // Relative roots are reported as absolute directories, once.
+    let spec = "no-such-theme-dir";
+    let (_, message) = theme_error(resolve(spec, &[Path::new(""), Path::new(".")]));
+    let absolute = std::env::current_dir().unwrap().join(spec);
+    assert!(
+        message.contains(&format!("in: {}; built-in", absolute.display())),
+        "{message}"
+    );
+}
+
+#[test]
 fn directory_without_manifest_is_reported() {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir(tmp.path().join("mytheme")).unwrap();
@@ -188,11 +217,21 @@ fn child_theme_template_lookup_walks_the_chain() {
         "stays in templates/"
     );
     assert!(!theme.has_template("../theme.toml"));
-    let (from, _) = theme
-        .read_template("./layouts//title.html")
-        .unwrap()
-        .unwrap();
-    assert_eq!(from, "child-theme", "normalized");
+    // A template has exactly one name: no `.`/`..`/empty segments (like minijinja's
+    // path_loader), so `layouts/../slide.html` is not another name for `slide.html`.
+    for name in [
+        "./layouts//title.html",
+        "layouts/./title.html",
+        "layouts//title.html",
+        "/layouts/title.html",
+        "layouts/../slide.html",
+        "@default/layouts/../slide.html",
+        "layouts\\title.html",
+    ] {
+        assert_eq!(theme.read_template(name).unwrap(), None, "{name}");
+        assert!(!theme.has_template(name), "{name}");
+    }
+    assert!(theme.has_template("slide.html"));
     assert!(!theme.has_template("layouts/nope.html"));
 
     let (name, message) = match theme.read_template("@nope/deck.html") {
@@ -385,6 +424,21 @@ fn duplicate_names_in_a_chain_are_rejected() {
 }
 
 #[test]
+fn theme_names_must_work_in_at_template_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (dir, name) in [("slash", "acme/dark"), ("at", "@acme"), ("space", " acme")] {
+        write_root_theme(
+            &tmp.path().join(dir),
+            &format!("name = {}", json!(name)),
+            &[],
+        );
+        let (_, message) = theme_error(resolve(dir, &[tmp.path()]));
+        assert!(message.contains("invalid theme name"), "{name}: {message}");
+        assert!(message.contains("theme.toml"), "{message}");
+    }
+}
+
+#[test]
 fn chains_longer_than_eight_themes_are_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_theme(&tmp.path().join("t0"), r#"name = "t0""#, &[]);
@@ -535,6 +589,102 @@ fn missing_style_entry_is_a_theme_error() {
         }
         other => panic!("expected Error::Theme, got {other:?}"),
     }
+}
+
+#[test]
+fn entries_outside_the_theme_directory_are_reported_as_such() {
+    let tmp = tempfile::tempdir().unwrap();
+    disk_chain(tmp.path());
+    // The file exists, but entries must stay inside their theme's directory.
+    write_files(tmp.path(), &[("shared/base.css", "shared")]);
+    let child = tmp.path().join("child/theme.toml");
+    let manifest = fs::read_to_string(&child).unwrap();
+    let absolute = tmp.path().join("shared/base.css").display().to_string();
+    for (entry, problem) in [
+        ("../shared/base.css", "must stay inside the theme directory"),
+        (absolute.as_str(), "must be a relative path"),
+        ("styles/..", "does not name a file"),
+    ] {
+        let edited = manifest.replace("\"styles/c.css\"", &json!(entry).to_string());
+        fs::write(&child, edited).unwrap();
+        let theme = resolve("child", &[tmp.path()]).unwrap();
+        match theme.style_entries() {
+            Err(Error::Theme { name, message }) => {
+                assert_eq!(name, "child");
+                assert!(message.contains(entry), "{message}");
+                assert!(message.contains(problem), "{entry}: {message}");
+                assert!(!message.contains("not found"), "{message}");
+            }
+            other => panic!("expected Error::Theme for {entry}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn disk_lookups_match_file_names_exactly() {
+    // On a case-insensitive file system (macOS) `is_file` would accept these; the embedded
+    // tree and Linux do not, so disk themes must not either.
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = disk_chain(tmp.path());
+    assert!(theme.has_template("layouts/two-up.html"));
+    assert!(!theme.has_template("layouts/TWO-UP.html"));
+    assert!(!theme.has_template("Layouts/two-up.html"));
+    assert_eq!(theme.read_template("layouts/Two-Up.html").unwrap(), None);
+    assert!(!theme.has_template("@child/layouts/TWO-UP.html"));
+    assert_eq!(theme.read_asset("LOGO.svg").unwrap(), None);
+    assert_eq!(
+        theme.read_asset("Fonts/x.woff2").unwrap(),
+        None,
+        "directories too"
+    );
+    assert!(theme.chain[0].list("TEMPLATES").is_empty());
+    assert!(!theme.chain[0].exists("STYLES/c.css"));
+
+    let child = child_theme();
+    assert!(!child.has_template("layouts/TITLE.html"));
+    assert!(!child.has_template("@default/layouts/TITLE.html"));
+    assert!(!child.has_layout("TITLE"));
+}
+
+#[test]
+fn has_layout_agrees_with_layouts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = disk_chain(tmp.path());
+    write_files(
+        &tmp.path().join("child/templates/layouts"),
+        &[("sub/x.html", "nested"), (".hidden.html", "hidden")],
+    );
+    let child = child_theme();
+    let candidates = [
+        "default",
+        "section",
+        "two-up",
+        "title",
+        "blank",
+        "nope",
+        "TWO-UP",
+        "Title",
+        "../slide",
+        "../deck",
+        "sub/x",
+        "sub",
+        ".hidden",
+        "",
+        "two-up.html",
+    ];
+    for theme in [&theme, &child] {
+        let layouts = theme.layouts();
+        for name in candidates {
+            assert_eq!(
+                theme.has_layout(name),
+                layouts.contains(&name.to_string()),
+                "{name} in {:?}: {layouts:?}",
+                chain_names(theme)
+            );
+        }
+    }
+    assert_eq!(theme.layouts(), ["default", "section", "two-up"]);
+    assert!(child.has_layout("title") && child.has_layout("blank"));
 }
 
 #[test]

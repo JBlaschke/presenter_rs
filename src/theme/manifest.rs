@@ -83,8 +83,9 @@ impl ThemeManifest {
     /// `theme` (the theme name or path as requested) and `origin` (where the text came
     /// from, e.g. the file path) only label errors. Fails with [`Error::Theme`] on TOML
     /// syntax errors and unknown keys (the message keeps the `line N, column M` from
-    /// `toml` and adds a "did you mean" hint), a missing or empty `name`, and an unknown
-    /// `reveal_theme`.
+    /// `toml` and adds a "did you mean" hint), a missing or empty `name`, a `name` that
+    /// cannot be used in `@<name>/` template names (see [`check_theme_name`]), and an
+    /// unknown `reveal_theme`.
     pub fn from_toml_str(text: &str, theme: &str, origin: &str) -> Result<ThemeManifest> {
         let error = |message: String| Error::Theme {
             name: theme.to_string(),
@@ -95,6 +96,7 @@ impl ThemeManifest {
         if manifest.name.trim().is_empty() {
             return Err(error("missing required key 'name'".to_string()));
         }
+        check_theme_name(&manifest.name).map_err(error)?;
         if let Some(reveal_theme) = &manifest.styles.reveal_theme
             && reveal_theme != "none"
             && !REVEAL_THEMES.contains(&reveal_theme.as_str())
@@ -106,6 +108,27 @@ impl ThemeManifest {
         }
         Ok(manifest)
     }
+}
+
+/// Checks that `name` can be a theme name. It is the `<name>` of `@<name>/<path>` template
+/// names, which end at the first `/`, so it must be non-empty and must not contain `/`,
+/// `\`, `@` or control characters, nor start or end with whitespace. The error message
+/// says why.
+pub fn check_theme_name(name: &str) -> std::result::Result<(), String> {
+    let problem = if name.trim().is_empty() {
+        "is empty"
+    } else if name.trim() != name {
+        "starts or ends with whitespace"
+    } else if name.contains(['/', '\\', '@']) {
+        "contains '/', '\\' or '@'"
+    } else if name.chars().any(char::is_control) {
+        "contains a control character"
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "invalid theme name {name:?}: it {problem} (the name is used in '@<name>/…' template names)"
+    ))
 }
 
 /// Deserializes a TOML table into a JSON map, turning dates/times into their text.
@@ -241,6 +264,33 @@ mod tests {
         let message = theme_message(parse("description = \"no name\"").unwrap_err());
         assert!(message.contains("missing required key 'name'"), "{message}");
         assert!(parse("name = \"  \"").is_err());
+    }
+
+    #[test]
+    fn names_must_be_usable_in_at_template_names() {
+        for ok in ["default", "child-theme", "My Theme", "thème_2"] {
+            assert_eq!(check_theme_name(ok), Ok(()), "{ok}");
+        }
+        for bad in [
+            "acme/dark",
+            "a\\b",
+            "@acme",
+            "a@b",
+            " x",
+            "x ",
+            "",
+            "a\tb",
+            "a\nb",
+        ] {
+            assert!(check_theme_name(bad).is_err(), "{bad:?}");
+        }
+        let message = theme_message(parse("name = \"acme/dark\"").unwrap_err());
+        assert!(message.starts_with("t/theme.toml: "), "{message}");
+        assert!(
+            message.contains("invalid theme name \"acme/dark\""),
+            "{message}"
+        );
+        assert!(message.contains("contains '/'"), "{message}");
     }
 
     #[test]

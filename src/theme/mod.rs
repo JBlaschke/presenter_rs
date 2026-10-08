@@ -10,6 +10,10 @@
 //! the chain child → root: templates under `templates/`, assets under `assets/`.
 //! Style and script entries are concatenated parent-first; `[reveal]` and `[vars]`
 //! deep-merge with the child winning; `reveal_theme`/`highlight_style` are plain overrides.
+//!
+//! File names match exactly, including case, for both sources: the embedded tree has exact
+//! keys, and disk lookups check the real directory entries, so `layouts/TITLE.html` does not
+//! find `layouts/title.html` on a case-insensitive file system (macOS) either.
 
 pub mod manifest;
 pub mod resolve;
@@ -17,7 +21,7 @@ pub mod styles;
 pub mod templates;
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -50,7 +54,7 @@ pub enum ThemeSource {
         /// Path prefix of the theme's files in [`crate::vendor`].
         prefix: String,
     },
-    /// A theme directory on disk (canonicalized by [`resolve`]).
+    /// A theme directory on disk (canonicalized by [`resolve()`]).
     Disk {
         /// The directory containing `theme.toml`.
         dir: PathBuf,
@@ -83,7 +87,7 @@ pub struct ThemeFile {
 /// A resolved theme: the inheritance chain, child first, root last.
 #[derive(Debug, Clone)]
 pub struct Theme {
-    /// The chain, ordered child → … → root. [`resolve`] never returns an empty chain.
+    /// The chain, ordered child → … → root. [`resolve()`] never returns an empty chain.
     pub chain: Vec<ThemeDir>,
 }
 
@@ -92,8 +96,9 @@ impl ThemeDir {
     ///
     /// `rel` is normalized lexically (`.` and empty segments dropped, `..` removes the
     /// previous segment); a path that is empty or climbs out of the theme directory yields
-    /// `Ok(None)`, as does a missing file or a directory. Disk themes are read from disk on
-    /// every call. Fails with [`Error::Theme`] only when an existing file cannot be read.
+    /// `Ok(None)`, as does a missing file or a directory. The file name must match exactly,
+    /// including case (see the module docs). Disk themes are read from disk on every call.
+    /// Fails with [`Error::Theme`] only when an existing file cannot be read.
     pub fn read(&self, rel: &str) -> Result<Option<Vec<u8>>> {
         let Some(rel) = normalize_rel(rel).filter(|r| !r.is_empty()) else {
             return Ok(None);
@@ -103,10 +108,9 @@ impl ThemeDir {
                 Ok(crate::vendor::get(&format!("{prefix}{rel}")).map(|data| data.into_owned()))
             }
             ThemeSource::Disk { dir } => {
-                let path = dir.join(&rel);
-                if !path.is_file() {
+                let Some(path) = disk_file(dir, &rel) else {
                     return Ok(None);
-                }
+                };
                 std::fs::read(&path).map(Some).map_err(|e| Error::Theme {
                     name: self.name.clone(),
                     message: format!("cannot read {}: {e}", path.display()),
@@ -124,7 +128,7 @@ impl ThemeDir {
             ThemeSource::Embedded { prefix } => {
                 crate::vendor::get(&format!("{prefix}{rel}")).is_some()
             }
-            ThemeSource::Disk { dir } => dir.join(rel).is_file(),
+            ThemeSource::Disk { dir } => disk_file(dir, &rel).is_some(),
         }
     }
 
@@ -162,10 +166,37 @@ impl ThemeDir {
     }
 }
 
+/// `dir/rel` (`rel` normalized and non-empty) if it is a file whose name matches exactly.
+fn disk_file(dir: &Path, rel: &str) -> Option<PathBuf> {
+    let path = dir.join(rel);
+    (path.is_file() && exact_names(dir, rel)).then_some(path)
+}
+
+/// True if every segment of the normalized `rel` is the exact name (case included) of an
+/// entry of its parent directory below `dir`. A plain `is_file`/`is_dir` would accept
+/// `layouts/TITLE.html` for `layouts/title.html` on a case-insensitive file system, which
+/// the embedded tree (exact keys) and a case-sensitive file system (Linux CI) reject.
+fn exact_names(dir: &Path, rel: &str) -> bool {
+    let mut parent = dir.to_path_buf();
+    for segment in rel.split('/').filter(|s| !s.is_empty()) {
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            return false;
+        };
+        if !entries
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name() == segment)
+        {
+            return false;
+        }
+        parent.push(segment);
+    }
+    true
+}
+
 /// Files below `dir/rel_dir` on disk, relative to `dir`, following symlinks.
-fn list_disk(dir: &std::path::Path, rel_dir: &str) -> Vec<String> {
+fn list_disk(dir: &Path, rel_dir: &str) -> Vec<String> {
     let start = dir.join(rel_dir);
-    if !start.is_dir() {
+    if !start.is_dir() || !exact_names(dir, rel_dir) {
         return Vec::new();
     }
     walkdir::WalkDir::new(&start)
@@ -250,8 +281,9 @@ impl Theme {
     }
 
     /// The `[styles] entries` of the whole chain, parent-first (root's entries first, in
-    /// manifest order), each read from the theme that lists it. A missing entry is an
-    /// [`Error::Theme`].
+    /// manifest order), each read from the theme that lists it. An entry must be a relative
+    /// path that stays inside its theme's directory (so `serve` never exposes files outside
+    /// a theme); such an entry, or a missing file, is an [`Error::Theme`].
     pub fn style_entries(&self) -> Result<Vec<ThemeFile>> {
         self.entries("style", |manifest| &manifest.styles.entries)
     }
@@ -270,10 +302,14 @@ impl Theme {
         let mut files = Vec::new();
         for dir in self.chain.iter().rev() {
             for entry in list(&dir.manifest) {
-                let bytes = dir.read(entry)?.ok_or_else(|| Error::Theme {
+                let found = match entry_path_problem(entry) {
+                    Some(problem) => Err(problem),
+                    None => dir.read(entry)?.ok_or("not found"),
+                };
+                let bytes = found.map_err(|problem| Error::Theme {
                     name: dir.name.clone(),
                     message: format!(
-                        "{kind} entry '{entry}' not found in {} (entries are relative to the theme directory)",
+                        "{kind} entry '{entry}' {problem} ({}; entries are relative to the theme directory)",
                         dir.location()
                     ),
                 })?;
@@ -289,9 +325,14 @@ impl Theme {
 
     /// The template `name` as `(theme name, source)`: `templates/<name>` of the first
     /// theme (child → root) that has it. `@<theme>/<path>` reads `templates/<path>` of that
-    /// theme only. The path is normalized like in [`ThemeDir::read`] and must stay inside
-    /// `templates/`. `Ok(None)` if no theme has it; [`Error::Theme`] for an `@` name that does
-    /// not name a theme of the chain, [`Error::Template`] for a file that is not UTF-8.
+    /// theme only.
+    ///
+    /// The path is taken as written, like minijinja's own `path_loader`: `/`-separated
+    /// segments, none of them empty or starting with `.`, no `\`. Any other name
+    /// (`../theme.toml`, `layouts/../slide.html`, `./deck.html`) finds nothing, so a
+    /// template can never be reached under a second name. File names match exactly,
+    /// including case. `Ok(None)` if no theme has it; [`Error::Theme`] for an `@` name that
+    /// does not name a theme of the chain, [`Error::Template`] for a file that is not UTF-8.
     pub fn read_template(&self, name: &str) -> Result<Option<(String, String)>> {
         let (dirs, path) = self.template_dirs(name)?;
         let Some(file) = template_file(path) else {
@@ -302,7 +343,10 @@ impl Theme {
                 let source = String::from_utf8(bytes).map_err(|e| Error::Template {
                     template: name.to_string(),
                     line: None,
-                    message: format!("not valid UTF-8 (theme '{}'): {e}", dir.name),
+                    message: format!(
+                        "template '{name}' is not valid UTF-8 (theme '{}'): {e}",
+                        dir.name
+                    ),
                 })?;
                 return Ok(Some((dir.name.clone(), source)));
             }
@@ -316,6 +360,16 @@ impl Theme {
             return false;
         };
         template_file(path).is_some_and(|file| dirs.iter().any(|dir| dir.exists(&file)))
+    }
+
+    /// True if `layout` is one of [`Theme::layouts`], i.e. a single path segment (see
+    /// [`is_layout_name`]) for which `templates/layouts/<layout>.html` exists in the chain.
+    ///
+    /// The renderer (choosing `layout_template`) and `check` (`unknown-layout`) should both
+    /// use this, so they agree on every name: `../slide`, `sub/x` or `TITLE` (for a file
+    /// `title.html`) are never layouts.
+    pub fn has_layout(&self, layout: &str) -> bool {
+        is_layout_name(layout) && self.has_template(&format!("layouts/{layout}.html"))
     }
 
     /// The themes to search for template `name` and the path below `templates/`.
@@ -343,16 +397,16 @@ impl Theme {
         Ok((vec![dir], path))
     }
 
-    /// Layout names: the union of `templates/layouts/*.html` file stems across the chain,
-    /// sorted.
+    /// Layout names: the union of `templates/layouts/*.html` file stems across the chain
+    /// that are valid layout names ([`is_layout_name`]; files in subdirectories are not
+    /// layouts), sorted. `layouts().contains(x)` equals [`Theme::has_layout`]`(x)`.
     pub fn layouts(&self) -> Vec<String> {
         let mut names = BTreeSet::new();
         for dir in &self.chain {
             for path in dir.list("templates/layouts") {
                 let file = &path["templates/layouts/".len()..];
                 if let Some(stem) = file.strip_suffix(".html")
-                    && !stem.is_empty()
-                    && !stem.contains('/')
+                    && is_layout_name(stem)
                 {
                     names.insert(stem.to_string());
                 }
@@ -394,12 +448,38 @@ impl Theme {
     }
 }
 
-/// `templates/<path>` for a template path, or `None` if `path` is empty or climbs out of
-/// `templates/` (so `{% include "../theme.toml" %}` finds nothing).
+/// True if `segment` may appear in a template name: non-empty, not starting with `.` (which
+/// also excludes `.` and `..`) and without `\`; the rule of minijinja's `path_loader`.
+fn is_name_segment(segment: &str) -> bool {
+    !segment.is_empty() && !segment.starts_with('.') && !segment.contains('\\')
+}
+
+/// True if `name` can be a layout name: one template-name segment ([`Theme::read_template`]),
+/// so no `/`, `\`, leading `.` or empty name.
+pub fn is_layout_name(name: &str) -> bool {
+    !name.contains('/') && is_name_segment(name)
+}
+
+/// `templates/<path>` for a template path made of valid segments ([`is_name_segment`]),
+/// else `None` (so `{% include "../theme.toml" %}` and `layouts/../slide.html` find
+/// nothing).
 fn template_file(path: &str) -> Option<String> {
-    normalize_rel(path)
-        .filter(|p| !p.is_empty())
-        .map(|p| format!("templates/{p}"))
+    path.split('/')
+        .all(is_name_segment)
+        .then(|| format!("templates/{path}"))
+}
+
+/// Why a `[styles]`/`[scripts]` entry is not a usable path inside the theme directory, if
+/// it is not: absolute, climbing out of the directory, or naming the directory itself.
+fn entry_path_problem(entry: &str) -> Option<&'static str> {
+    if entry.starts_with(['/', '\\']) || Path::new(entry).has_root() {
+        return Some("must be a relative path");
+    }
+    match normalize_rel(entry) {
+        None => Some("must stay inside the theme directory"),
+        Some(rel) if rel.is_empty() => Some("does not name a file"),
+        Some(_) => None,
+    }
 }
 
 /// Merges `over` into `base`: objects present on both sides merge recursively, anything
