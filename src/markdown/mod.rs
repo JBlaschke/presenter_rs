@@ -52,12 +52,39 @@ use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
 /// rejects), `Error::Parse { path: source.path, line, .. }` for a separator attribute block
 /// or `<!-- .slide: -->` comment with an unbalanced quote.
 pub fn parse(source: &SourceInfo, text: &str, config: &Config) -> Result<Parsed> {
+    parse_with(source, text, config, false)
+}
+
+/// [`parse`] for a caller that merges the front matter into its own config afterwards (the
+/// pipeline, ir.md §4): only the front matter's `slides` and `markdown` tables, the ones
+/// that change how the deck is split and rendered, are merged into the config clone, so a
+/// `reveal`, `math` or `notebook` value the config rejects does not fail the parse. The
+/// caller's merge reports it, together with the deck's diagnostics. Otherwise as [`parse`].
+pub(crate) fn parse_deferring_config(
+    source: &SourceInfo,
+    text: &str,
+    config: &Config,
+) -> Result<Parsed> {
+    parse_with(source, text, config, true)
+}
+
+/// [`parse`]; with `defer`, [`parse_deferring_config`].
+fn parse_with(source: &SourceInfo, text: &str, config: &Config, defer: bool) -> Result<Parsed> {
     let arena = Arena::new();
     let first_opts = comrak_options(&config.markdown);
     let mut root = parse_document(&arena, text, &first_opts);
     let meta = deck_meta(root)?;
     let mut deck_config = config.clone();
-    deck_config.merge_front_matter(&meta)?;
+    if defer {
+        let mut parse_meta = meta.clone();
+        parse_meta.reveal.clear();
+        parse_meta
+            .vars
+            .retain(|key, _| !matches!(key.as_str(), "math" | "notebook"));
+        deck_config.merge_front_matter(&parse_meta)?;
+    } else {
+        deck_config.merge_front_matter(&meta)?;
+    }
     let opts = comrak_options(&deck_config.markdown);
     if opts.parse.smart != first_opts.parse.smart {
         root = parse_document(&arena, text, &opts);

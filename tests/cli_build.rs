@@ -463,6 +463,95 @@ fn failed_builds_print_the_warnings_and_other_missing_assets_first() {
 }
 
 #[test]
+fn rejected_front_matter_prints_the_warnings_first() {
+    let notebook = r#"{"nbformat": 4, "nbformat_minor": 5, "metadata": METADATA, "cells": [
+        {"cell_type": "markdown", "metadata": {}, "source": FIRST},
+        {"cell_type": "raw", "metadata": {"raw_mimetype": "text/latex"}, "source": "x"}]}"#;
+    let notebook = |metadata: &str, first: &str| {
+        notebook
+            .replace("METADATA", metadata)
+            .replace("FIRST", first)
+    };
+    let plugins_nb = notebook(
+        r#"{"presenter": {"reveal": {"plugins": ["bogus"]}}}"#,
+        r##""# One""##,
+    );
+    let front_nb = notebook("{}", r##""---\nmath:\n  enable: never\n---\n# One""##);
+    let tmp = project(&[
+        (
+            "fp.md",
+            "---\nreveal:\n  plugins: [bogus]\n---\n# One\n\n---\n\n---\n\n# Three\n",
+        ),
+        (
+            "mt.md",
+            "---\nmath:\n  enable: never\n---\n# One\n\n---\n\n---\n\n# Three\n",
+        ),
+        (
+            "nbt.md",
+            "---\nnotebook: {hide_inputs: []}\n---\n# One\n\n---\n\n---\n\n# Three\n",
+        ),
+        ("fp.ipynb", &plugins_nb),
+        ("fm.ipynb", &front_nb),
+    ]);
+    let raw_skipped = "cell 1, line 1: warning: raw cell skipped: its raw_mimetype is `text/latex`; \
+                       only `text/html` raw cells are shown";
+    let cases = [
+        (
+            "fp.md",
+            "fp.md:7: warning: slide 2 is empty".to_owned(),
+            "front matter: unknown reveal plugin 'bogus'",
+        ),
+        (
+            "mt.md",
+            "mt.md:7: warning: slide 2 is empty".to_owned(),
+            "front matter: math: unknown field `enable`",
+        ),
+        (
+            "nbt.md",
+            "nbt.md:6: warning: slide 2 is empty".to_owned(),
+            "front matter: notebook: unknown field `hide_inputs`",
+        ),
+        (
+            "fp.ipynb",
+            format!("fp.ipynb: {raw_skipped}"),
+            "front matter: metadata.presenter: unknown reveal plugin 'bogus'",
+        ),
+        (
+            "fm.ipynb",
+            format!("fm.ipynb: {raw_skipped}"),
+            "front matter: cell 0: math: unknown field `enable`",
+        ),
+    ];
+    for (deck, warning, error) in cases {
+        let out = format!("{deck}.html");
+        let commands: [&[&str]; 3] = [
+            &["build", deck, "-o", &out],
+            &["dump", deck],
+            &["dump", deck, "--context"],
+        ];
+        for args in commands {
+            let output = presenter()
+                .current_dir(tmp.path())
+                .args(args)
+                .assert()
+                .code(1)
+                .stdout("")
+                .get_output()
+                .clone();
+            let stderr = stderr_of(&output);
+            let lines: Vec<&str> = stderr.lines().collect();
+            assert_eq!(lines.len(), 2, "{args:?}: {stderr}");
+            assert_eq!(lines[0], warning, "{args:?}");
+            assert!(
+                lines[1].starts_with(&format!("error: {deck}: {error}")),
+                "{args:?}: {stderr}"
+            );
+        }
+        assert!(!tmp.path().join(&out).exists());
+    }
+}
+
+#[test]
 fn missing_image_in_markdown_filter_input_fails_the_build() {
     let layout = "{%- extends \"layouts/default.html\" %}{%- block content %}\
                   <p class=\"subtitle\">{{ meta.subtitle|markdown }}</p>{%- endblock %}";
@@ -597,6 +686,23 @@ fn rust_log_adds_to_the_verbosity_flags() {
         "RUST_LOG applies with -v: {stderr}"
     );
     assert!(stderr.contains("INFO"), "{stderr}");
+
+    // A bare RUST_LOG level: -v and -vv never hide presenter's own debug lines.
+    for flags in [&[][..], &["-v"][..], &["-vv"][..]] {
+        let output = presenter()
+            .current_dir(tmp.path())
+            .env("RUST_LOG", "debug")
+            .args(flags)
+            .args(["build", "a.md", "-o", "a.html"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr = stderr_of(&output);
+        for line in ["DEBUG parsed ", "DEBUG rendered "] {
+            assert!(stderr.contains(line), "{flags:?}: no `{line}`: {stderr}");
+        }
+    }
 
     // -q ignores RUST_LOG.
     presenter()

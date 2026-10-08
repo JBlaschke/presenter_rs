@@ -260,6 +260,23 @@ pub(crate) fn html_start_tags(html: &str) -> Vec<(String, usize)> {
     tags
 }
 
+/// Every attribute value of the start tags [`html_start_tags`] finds, in order: the
+/// attribute's ASCII-lowercased name and the byte range of its value (quotes excluded,
+/// entities not decoded; bare attributes are left out). The notebook frontend resolves
+/// attachment URLs with it.
+pub(crate) fn html_attr_values(html: &str) -> Vec<(String, Range<usize>)> {
+    let mut values = Vec::new();
+    let Ok(()) = HtmlScan::default().start_tags(html, |tag| {
+        let valued = tag
+            .attrs
+            .iter()
+            .filter_map(|attr| Some((attr.name.clone(), attr.value.clone()?)));
+        values.extend(valued);
+        Ok::<(), Infallible>(())
+    });
+    values
+}
+
 /// Registers the local files named by a slide's `data-background-image`,
 /// `data-background-video` (a comma-separated list; each entry is resolved) and
 /// `data-background-iframe` attributes (dialect §6) and replaces them with `asset:<id>`.

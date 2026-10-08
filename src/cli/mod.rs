@@ -52,7 +52,9 @@
 //!
 //! Logging ([`log_directives`]): the base level is warn; `-v` raises presenter's own
 //! modules to info and `-vv` to debug; `RUST_LOG` (when set) is applied on top of that, so it
-//! can add targets or set any level, including presenter's. `-q` logs only errors and
+//! can add targets or set any level, including presenter's (`presenter=error`). The flags
+//! never lower the level a bare `RUST_LOG` level (or a target prefix of `presenter`) gives
+//! presenter: `RUST_LOG=debug` with `-v` logs presenter at debug. `-q` logs only errors and
 //! ignores `RUST_LOG`. Logs and diagnostics go to stderr, in color when stderr is a terminal
 //! and `NO_COLOR` is not set. Stdout carries only a command's result.
 
@@ -508,20 +510,84 @@ pub fn print_stdout(text: &str) -> anyhow::Result<()> {
     }
 }
 
-/// The `EnvFilter` directives for `global` and the value of `RUST_LOG`: the flags' level
-/// first, then `RUST_LOG` (a later directive for the same target replaces an earlier one, so
-/// `RUST_LOG=presenter=debug` with `-v` logs presenter at debug). `-q` ignores `RUST_LOG`.
+/// presenter's own log target: the crate name, which every module's target starts with.
+const LOG_TARGET: &str = "presenter";
+
+/// The `EnvFilter` directives for `global` and the value of `RUST_LOG`: `warn`, the flags'
+/// `presenter=<level>`, then `RUST_LOG`. A later directive for the same target replaces an
+/// earlier one, so a `RUST_LOG` directive naming presenter wins (`RUST_LOG=presenter=debug`
+/// with `-v` logs presenter at debug). When a `RUST_LOG` directive without span or field
+/// filters covers presenter without naming it (a bare level such as `debug`, which
+/// `presenter=info` would otherwise shadow for presenter's targets) and is more verbose
+/// than the flags, the flags' directive takes its level, so the flags never make
+/// presenter's own logs less verbose than such a directive. Directives with span or field
+/// filters are not taken into account: with a field directive such as
+/// `[{diagnostics}]=debug`, the flags' more specific `presenter=<level>` decides for
+/// presenter's events. `-q` gives `error` and ignores `RUST_LOG`.
 pub fn log_directives(global: &GlobalArgs, rust_log: Option<&str>) -> String {
-    let base = match (global.quiet, global.verbose) {
-        (true, _) => return "error".to_string(),
-        (false, 0) => "warn",
-        (false, 1) => "warn,presenter=info",
-        (false, _) => "warn,presenter=debug",
-    };
-    match rust_log.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(rust_log) => format!("{base},{rust_log}"),
-        None => base.to_string(),
+    use tracing_subscriber::filter::LevelFilter;
+
+    if global.quiet {
+        return "error".to_string();
     }
+    let rust_log = rust_log.map(str::trim).filter(|value| !value.is_empty());
+    let mut directives = vec!["warn".to_string()];
+    let flags = match global.verbose {
+        0 => None,
+        1 => Some(LevelFilter::INFO),
+        _ => Some(LevelFilter::DEBUG),
+    };
+    if let Some(flags) = flags {
+        let level = rust_log
+            .and_then(inherited_log_level)
+            .map_or(flags, |inherited| inherited.max(flags));
+        directives.push(format!("{LOG_TARGET}={level}"));
+    }
+    directives.extend(rust_log.map(str::to_string));
+    directives.join(",")
+}
+
+/// The level `rust_log` gives presenter's targets through a directive that does not name
+/// presenter: the most specific (last among equals) directive without span or field filters
+/// whose target is absent (a bare level) or a proper prefix of [`LOG_TARGET`] (`EnvFilter`
+/// matches targets by prefix). Directives are read as `EnvFilter` reads them: split at commas
+/// and not trimmed; a word that is not a level is a target at `trace`; invalid ones are
+/// skipped.
+fn inherited_log_level(rust_log: &str) -> Option<tracing_subscriber::filter::LevelFilter> {
+    use tracing_subscriber::filter::LevelFilter;
+
+    let mut found: Option<(usize, LevelFilter)> = None;
+    for directive in rust_log.split(',').filter(|d| !d.is_empty()) {
+        if directive.contains(['[', ']', '{', '}']) {
+            continue;
+        }
+        let (target, level) = match directive.split_once('=') {
+            Some((target, "")) => (Some(target), LevelFilter::TRACE),
+            Some((target, level)) => match level.parse() {
+                Ok(level) => (Some(target), level),
+                Err(_) => continue,
+            },
+            None => match directive.parse() {
+                Ok(level) => (None, level),
+                Err(_) => (Some(directive), LevelFilter::TRACE),
+            },
+        };
+        let specificity = match target {
+            None => 0,
+            Some(target)
+                if !target.is_empty()
+                    && target.len() < LOG_TARGET.len()
+                    && LOG_TARGET.starts_with(target) =>
+            {
+                target.len()
+            }
+            Some(_) => continue,
+        };
+        if found.is_none_or(|(best, _)| specificity >= best) {
+            found = Some((specificity, level));
+        }
+    }
+    found.map(|(_, level)| level)
 }
 
 /// Installs the tracing subscriber (see the module docs). Does nothing when one is
@@ -772,6 +838,110 @@ mod tests {
         let shown = filter.to_string();
         assert!(shown.contains("presenter=debug"), "{shown}");
         assert!(!shown.contains("presenter=info"), "{shown}");
+
+        // A bare RUST_LOG level more verbose than the flags raises their directive (it would
+        // otherwise shadow the bare level for presenter's targets).
+        assert_eq!(
+            log_directives(&flags(1, false), Some("debug")),
+            "warn,presenter=debug,debug"
+        );
+        assert_eq!(
+            log_directives(&flags(2, false), Some("trace")),
+            "warn,presenter=trace,trace"
+        );
+        assert_eq!(
+            log_directives(&flags(2, false), Some("info,hyper=warn")),
+            "warn,presenter=debug,info,hyper=warn"
+        );
+        assert_eq!(
+            log_directives(&flags(0, false), Some("debug")),
+            "warn,debug"
+        );
+        // Span and field directives are not read (documented): the flags' level stays.
+        assert_eq!(
+            log_directives(&flags(1, false), Some("[{diagnostics}]=debug")),
+            "warn,presenter=info,[{diagnostics}]=debug"
+        );
+    }
+
+    /// The most verbose level that the filter for `-v`×`verbose` and `rust_log` enables for
+    /// `target` (`"off"` for none), asked through a real subscriber.
+    fn enabled_level(verbose: u8, rust_log: Option<&str>, target: &str) -> &'static str {
+        use tracing::Level;
+        let global = GlobalArgs {
+            verbose,
+            ..GlobalArgs::default()
+        };
+        let filter =
+            tracing_subscriber::EnvFilter::builder().parse_lossy(log_directives(&global, rust_log));
+        let subscriber = tracing_subscriber::fmt().with_env_filter(filter).finish();
+        // `enabled!` takes a constant target and level: one call site for each.
+        macro_rules! most_verbose {
+            ($target:literal) => {
+                [
+                    tracing::enabled!(target: $target, Level::TRACE).then_some("trace"),
+                    tracing::enabled!(target: $target, Level::DEBUG).then_some("debug"),
+                    tracing::enabled!(target: $target, Level::INFO).then_some("info"),
+                    tracing::enabled!(target: $target, Level::WARN).then_some("warn"),
+                    tracing::enabled!(target: $target, Level::ERROR).then_some("error"),
+                ]
+                .into_iter()
+                .flatten()
+                .next()
+                .unwrap_or("off")
+            };
+        }
+        tracing::subscriber::with_default(subscriber, || match target {
+            "presenter::pipeline" => most_verbose!("presenter::pipeline"),
+            "globset" => most_verbose!("globset"),
+            other => panic!("no call sites for target {other}"),
+        })
+    }
+
+    #[test]
+    fn verbosity_flags_never_lower_presenters_log_level() {
+        const OWN: &str = "presenter::pipeline";
+        const OTHER: &str = "globset";
+        // (RUST_LOG, -v count, presenter's level, another crate's level)
+        let cases: [(Option<&str>, u8, &str, &str); 17] = [
+            (None, 0, "warn", "warn"),
+            (None, 1, "info", "warn"),
+            (None, 2, "debug", "warn"),
+            // Bare levels: the more verbose of RUST_LOG and the flags.
+            (Some("debug"), 0, "debug", "debug"),
+            (Some("debug"), 1, "debug", "debug"),
+            (Some("debug"), 2, "debug", "debug"),
+            (Some("trace"), 2, "trace", "trace"),
+            (Some("info"), 2, "debug", "info"),
+            (Some("error"), 1, "info", "error"),
+            (Some("off"), 1, "info", "off"),
+            // A shorter target covers presenter like a bare level.
+            (Some("pres=trace"), 1, "trace", "warn"),
+            // Target-qualified: RUST_LOG names presenter and wins, also to lower it.
+            (Some("presenter=debug"), 1, "debug", "warn"),
+            (Some("presenter=trace"), 2, "trace", "warn"),
+            (Some("presenter=info"), 2, "info", "warn"),
+            (Some("presenter=error,debug"), 1, "error", "debug"),
+            (Some("globset=debug"), 1, "info", "debug"),
+            (Some("debug,presenter=warn"), 2, "warn", "debug"),
+        ];
+        for (rust_log, verbose, own, other) in cases {
+            let label = format!("RUST_LOG={rust_log:?} -v×{verbose}");
+            assert_eq!(enabled_level(verbose, rust_log, OWN), own, "{label}");
+            assert_eq!(enabled_level(verbose, rust_log, OTHER), other, "{label}");
+            // Adding -v never makes presenter's own logs less verbose.
+            let rank = |name: &str| {
+                ["off", "error", "warn", "info", "debug", "trace"]
+                    .iter()
+                    .position(|n| *n == name)
+            };
+            for fewer in 0..verbose {
+                assert!(
+                    rank(enabled_level(fewer, rust_log, OWN)) <= rank(own),
+                    "{label} vs -v×{fewer}"
+                );
+            }
+        }
     }
 
     #[test]

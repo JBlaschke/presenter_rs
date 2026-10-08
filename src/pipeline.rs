@@ -25,9 +25,10 @@
 //! 5. [`write_output`]: writes the document (one file, or `index.html` plus the site's
 //!    `assets/`); nothing before this stage touches the disk.
 //!
-//! [`try_prepare`] and [`try_build_deck`] are [`prepare`] and [`build_deck`] that keep the
-//! diagnostics collected before a failure ([`BuildFailure`]), so a failed build can still
-//! report its warnings and every missing asset. [`resolve_theme`] is stage 3's theme
+//! [`try_parse_only`], [`try_prepare`] and [`try_build_deck`] are [`parse_only`],
+//! [`prepare`] and [`build_deck`] that keep the diagnostics collected before a failure
+//! ([`BuildFailure`]), so a failed build can still report its warnings and every missing
+//! asset, also when the front matter is rejected. [`resolve_theme`] is stage 3's theme
 //! lookup on its own (for commands that lint without rendering).
 //!
 //! Output locations: [`default_output_path`] is `<out_dir>/<stem>.html` (standalone) or
@@ -156,8 +157,8 @@ pub struct Build {
     pub diagnostics: Diagnostics,
 }
 
-/// A failed [`try_prepare`] or [`try_build_deck`]: the error and the diagnostics collected
-/// before it, so that a failed build still reports its warnings.
+/// A failed [`try_parse_only`], [`try_prepare`] or [`try_build_deck`]: the error and the
+/// diagnostics collected before it, so that a failed build still reports its warnings.
 #[derive(Debug)]
 pub struct BuildFailure {
     /// What stopped the build.
@@ -165,7 +166,9 @@ pub struct BuildFailure {
     /// Every diagnostic collected before `error` (the frontend's; when `error` is a missing
     /// asset found while rendering, the renderer's too). When `error` is an escalated
     /// missing asset, the other `missing-asset` diagnostics are here with level error (each
-    /// is an error in that build) and the one that became `error` is left out.
+    /// is an error in that build) and the one that became `error` is left out. When `error`
+    /// is rejected front matter, which [`try_prepare`] meets before the escalation, every
+    /// `missing-asset` diagnostic is here with level error if `missing_asset_is_error`.
     pub diagnostics: Diagnostics,
 }
 
@@ -240,7 +243,8 @@ pub fn prepare(opts: &BuildOptions) -> Result<Prepared> {
 
 /// [`prepare`], keeping the diagnostics collected before a failure ([`BuildFailure`]).
 pub fn try_prepare(opts: &BuildOptions) -> std::result::Result<Prepared, BuildFailure> {
-    let (parsed, config, config_path) = parse_only(opts)?;
+    let (parsed, config, config_path) = try_parse_only(opts)
+        .map_err(|failure| raise_missing_assets(failure, opts.missing_asset_is_error))?;
     let Parsed {
         deck,
         assets,
@@ -294,8 +298,25 @@ fn theme_and_config(
 /// matter merged ([`Config::merge_front_matter`]) and the command line applied; the theme's
 /// `[reveal]` defaults are not in it (the theme is not resolved here; see [`prepare`]).
 /// Missing assets are never errors here: they are `missing-asset` diagnostics in
-/// [`Parsed::diagnostics`]. For `dump` and `check`.
+/// [`Parsed::diagnostics`]. For `dump` and `check`; [`try_parse_only`] keeps the frontend's
+/// diagnostics when the front matter is rejected.
 pub fn parse_only(opts: &BuildOptions) -> Result<(Parsed, Config, Option<PathBuf>)> {
+    try_parse_only(opts).map_err(|failure| failure.error)
+}
+
+/// [`parse_only`], keeping the frontend's diagnostics when the config rejects the deck's
+/// front matter ([`Config::merge_front_matter`] fails): the failure's diagnostics are the
+/// parsed deck's, so the deck's warnings are reported with the error. The frontends merge
+/// only the front matter tables that change how they parse (Markdown: `slides`,
+/// `markdown`; notebooks: `markdown`, `notebook`) before they parse, and leave the rest
+/// (`reveal`, `math`, …) to this merge, so only a rejected table that changes the parse
+/// fails the frontend itself, before it has diagnostics. A notebook's error still names
+/// the metadata layer it came from (`metadata.presenter: …`, `cell N: …`). Every other
+/// error (reading the input, `presenter.toml`, the frontend's errors) comes without
+/// diagnostics.
+pub fn try_parse_only(
+    opts: &BuildOptions,
+) -> std::result::Result<(Parsed, Config, Option<PathBuf>), BuildFailure> {
     let kind = match opts.format {
         Some(kind) => kind,
         None => detect_kind(&opts.input)?,
@@ -303,17 +324,29 @@ pub fn parse_only(opts: &BuildOptions) -> Result<(Parsed, Config, Option<PathBuf
     let text = read_source(&opts.input)?;
     let source = source_info(&opts.input, kind)?;
     let (mut config, config_path) = load_config(opts)?;
-    let parsed = match kind {
-        SourceKind::Markdown => crate::markdown::parse(&source, &text, &config)?,
-        SourceKind::Notebook => crate::notebook::parse(&source, &text, &config)?,
+    let (parsed, deferred) = match kind {
+        SourceKind::Markdown => (
+            crate::markdown::parse_deferring_config(&source, &text, &config)?,
+            None,
+        ),
+        SourceKind::Notebook => crate::notebook::parse_deferring_config(&source, &text, &config)?,
     };
-    config.merge_front_matter(&parsed.deck.meta)?;
-    config.apply_cli(&opts.cli);
     tracing::debug!(
         diagnostics = parsed.diagnostics.len(),
         "parsed {} ({kind:?})",
         source.path.display()
     );
+    let merged = match deferred {
+        Some(error) => Err(error),
+        None => config.merge_front_matter(&parsed.deck.meta),
+    };
+    if let Err(error) = merged {
+        return Err(BuildFailure {
+            error,
+            diagnostics: parsed.diagnostics,
+        });
+    }
+    config.apply_cli(&opts.cli);
     Ok((parsed, config, config_path))
 }
 
@@ -516,6 +549,29 @@ fn escalate_missing_assets(
         error,
         diagnostics: rest,
     })
+}
+
+/// `failure` (from before the `missing-asset` escalation, e.g. rejected front matter) with
+/// every `missing-asset` diagnostic raised to level error when `missing_asset_is_error`:
+/// each is an error in that build, as in an escalated failure.
+fn raise_missing_assets(failure: BuildFailure, missing_asset_is_error: bool) -> BuildFailure {
+    if !missing_asset_is_error {
+        return failure;
+    }
+    let diagnostics = failure
+        .diagnostics
+        .into_iter()
+        .map(|mut diagnostic| {
+            if diagnostic.code == MISSING_ASSET {
+                diagnostic.level = Level::Error;
+            }
+            diagnostic
+        })
+        .collect();
+    BuildFailure {
+        error: failure.error,
+        diagnostics,
+    }
 }
 
 /// The first `missing-asset` diagnostic as [`Error::MissingAsset`] (the missing file from
@@ -897,6 +953,176 @@ mod tests {
         // build_deck and prepare report only the error.
         assert!(matches!(build_deck(&opts), Err(Error::Theme { .. })));
         assert!(matches!(prepare(&opts), Err(Error::Theme { .. })));
+    }
+
+    /// `(code, level, start line)` of a failure's diagnostics.
+    fn found(failure: &BuildFailure) -> Vec<(&'static str, Level, usize)> {
+        let line = |d: &Diagnostic| d.span.as_ref().map_or(0, |s| s.start_line);
+        failure
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.level, line(d)))
+            .collect()
+    }
+
+    #[test]
+    fn rejected_front_matter_keeps_the_diagnostics_found_before_the_error() {
+        let dir = project(&[
+            (
+                "fp.md",
+                "---\nreveal:\n  plugins: [bogus]\n---\n# A\n\n![a](a1.png)\n\n---\n\n---\n\n# C\n",
+            ),
+            (
+                "table.md",
+                "---\nslides:\n  splt: rules\n---\n# A\n\n---\n\n---\n",
+            ),
+        ]);
+        let opts = BuildOptions::new(dir.path().join("fp.md"));
+        let rejected = |failure: &BuildFailure| {
+            matches!(&failure.error, Error::FrontMatter(message)
+                if message.contains("unknown reveal plugin 'bogus'"))
+        };
+
+        // The frontend's warnings come with the error; `build` (missing assets are errors)
+        // raises the missing asset to an error, as in an escalated failure.
+        let failure = try_build_deck(&opts).unwrap_err();
+        assert!(rejected(&failure), "{failure:?}");
+        assert_eq!(
+            found(&failure),
+            [
+                ("missing-asset", Level::Error, 7),
+                ("empty-slide", Level::Warning, 9)
+            ]
+        );
+        assert_eq!(found(&try_prepare(&opts).unwrap_err()), found(&failure));
+        let failure = try_parse_only(&opts).unwrap_err();
+        assert!(rejected(&failure), "{failure:?}");
+        assert_eq!(
+            found(&failure),
+            [
+                ("missing-asset", Level::Warning, 7),
+                ("empty-slide", Level::Warning, 9)
+            ],
+            "parse_only never treats missing assets as errors"
+        );
+        let lenient = BuildOptions {
+            missing_asset_is_error: false,
+            ..opts.clone()
+        };
+        assert_eq!(
+            found(&try_build_deck(&lenient).unwrap_err()),
+            found(&failure)
+        );
+        // The plain functions report only the error.
+        assert!(matches!(parse_only(&opts), Err(Error::FrontMatter(_))));
+        assert!(matches!(prepare(&opts), Err(Error::FrontMatter(_))));
+        assert!(matches!(build_deck(&opts), Err(Error::FrontMatter(_))));
+
+        // A rejected config table changes the parse, so the frontend fails before it has
+        // any diagnostics (its warnings would describe a deck split another way).
+        let failure = try_build_deck(&BuildOptions::new(dir.path().join("table.md")));
+        let failure = failure.unwrap_err();
+        assert!(
+            matches!(&failure.error, Error::FrontMatter(message) if message.contains("splt")),
+            "{failure:?}"
+        );
+        assert!(failure.diagnostics.is_empty(), "{failure:?}");
+    }
+
+    #[test]
+    fn rejected_tables_the_frontend_does_not_read_keep_the_diagnostics() {
+        // A notebook whose first markdown cell is `first` and whose raw LaTeX cell warns.
+        let notebook = |metadata: serde_json::Value, first: &str| {
+            serde_json::json!({
+                "nbformat": 4, "nbformat_minor": 5, "metadata": metadata,
+                "cells": [
+                    {"cell_type": "markdown", "metadata": {}, "source": first},
+                    {"cell_type": "raw", "metadata": {"raw_mimetype": "text/latex"}, "source": "x"},
+                ],
+            })
+            .to_string()
+        };
+        let presenter_plugins = notebook(
+            serde_json::json!({"presenter": {"reveal": {"plugins": ["bogus"]}}}),
+            "# A",
+        );
+        let front_tables = notebook(
+            serde_json::json!({}),
+            "---\nslides:\n  splt: rules\nmath:\n  enable: never\n---\n# A",
+        );
+        let presenter_table = notebook(
+            serde_json::json!({"presenter": {"notebook": {"hide_inputs": []}}}),
+            "# A",
+        );
+        let dir = project(&[
+            (
+                "math.md",
+                "---\nmath:\n  enable: never\n---\n# A\n\n---\n\n---\n",
+            ),
+            (
+                "nb.md",
+                "---\nnotebook: {hide_inputs: []}\n---\n# A\n\n---\n\n---\n",
+            ),
+            ("plugins.ipynb", &presenter_plugins),
+            ("tables.ipynb", &front_tables),
+            ("table.ipynb", &presenter_table),
+        ]);
+        let raw_skipped = ("raw-cell-skipped", Level::Warning, 1);
+        let empty = |line| ("empty-slide", Level::Warning, line);
+        let cases = [
+            // Markdown reads only the `slides` and `markdown` tables.
+            (
+                "math.md",
+                "math: unknown field `enable`",
+                vec![empty(7), empty(9)],
+            ),
+            (
+                "nb.md",
+                "notebook: unknown field `hide_inputs`",
+                vec![empty(6), empty(8)],
+            ),
+            // Notebooks read only `markdown` and `notebook`; the error still names the layer.
+            (
+                "plugins.ipynb",
+                "metadata.presenter: unknown reveal plugin 'bogus'",
+                vec![raw_skipped],
+            ),
+            (
+                "tables.ipynb",
+                "cell 0: slides: unknown field `splt`",
+                vec![raw_skipped],
+            ),
+            // A table the conversion reads fails it, before there are diagnostics.
+            (
+                "table.ipynb",
+                "metadata.presenter: notebook: unknown field `hide_inputs`",
+                vec![],
+            ),
+        ];
+        for (name, error, diagnostics) in cases {
+            let path = dir.path().join(name);
+            let failure = try_build_deck(&BuildOptions::new(path.clone())).unwrap_err();
+            assert!(
+                matches!(&failure.error, Error::FrontMatter(message) if message.starts_with(error)),
+                "{name}: {failure:?}"
+            );
+            assert_eq!(found(&failure), diagnostics, "{name}");
+            // The public frontends still reject the front matter themselves (ir.md §4).
+            let kind = detect_kind(&path).unwrap();
+            let (source, text) = (
+                source_info(&path, kind).unwrap(),
+                read_source(&path).unwrap(),
+            );
+            let config = Config::default();
+            let strict = match kind {
+                SourceKind::Markdown => crate::markdown::parse(&source, &text, &config).err(),
+                SourceKind::Notebook => crate::notebook::parse(&source, &text, &config).err(),
+            };
+            assert!(
+                matches!(&strict, Some(Error::FrontMatter(message)) if message.starts_with(error)),
+                "{name}: {strict:?}"
+            );
+        }
     }
 
     /// A project whose child theme `t` (next to the deck, so `theme: t` finds it without a
