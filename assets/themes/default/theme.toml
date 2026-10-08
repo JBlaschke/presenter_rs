@@ -1,0 +1,19 @@
+# The built-in theme (docs/spec/theme-format.md). It is the root of every theme chain, so it
+# provides every required template: deck.html, slide.html, block.html, cell.html and
+# layouts/default.html.
+name = "default"
+description = "Built-in presenter theme: reveal's white theme plus structural rules"
+
+[styles]
+entries = ["styles/theme.css"]
+reveal_theme = "white"
+highlight_style = "monokai"
+
+[scripts]
+entries = []
+
+[layouts]
+default = "Heading and content; the fallback for unknown layout names"
+title = "Title slide: the first block (the heading), then meta.subtitle, meta.author and meta.date, then the rest"
+section = "Section divider"
+blank = "No chrome, for full-bleed images and iframes"

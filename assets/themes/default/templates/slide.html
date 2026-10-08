@@ -1,0 +1,20 @@
+{#- One top-level slide (docs/spec/theme-format.md §7). Receives `slide`.
+    With children: a plain <section> wrapper (a reveal vertical stack) holding the slide
+    itself and then each child, every one rendered through its own layout. Without
+    children: just the layout. Never more than two levels.
+    Layout choice: `slide.layout_template` when the renderer decorated the slide (§4),
+    else `layouts/<slide.layout>.html` when that template exists in the chain, else
+    `layouts/default.html`. The include list picks the first existing template, so a child
+    the renderer did not decorate still gets its own layout. -#}
+{%- if slide.children -%}
+<section>
+{% include [slide.layout_template|default("layouts/" ~ slide.layout ~ ".html"), "layouts/default.html"] %}
+{%- for child in slide.children %}
+{%- with slide = child %}
+{% include [slide.layout_template|default("layouts/" ~ slide.layout ~ ".html"), "layouts/default.html"] %}
+{%- endwith %}
+{%- endfor %}
+</section>
+{%- else -%}
+{% include [slide.layout_template|default("layouts/" ~ slide.layout ~ ".html"), "layouts/default.html"] %}
+{%- endif %}

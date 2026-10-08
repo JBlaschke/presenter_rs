@@ -1,0 +1,34 @@
+{#- A notebook code cell (docs/spec/theme-format.md §6–§7, notebook-mapping.md §4).
+    Receives `cell` (an ir::NotebookCell). Hidden input/output is still emitted and hidden
+    by CSS (`.cell.hide-input .cell-input`, `.cell.hide-output .cell-outputs`), so a theme
+    can choose to show it faintly instead. Output `html` is already rendered by the
+    notebook frontend and inserted unescaped. -#}
+{%- set show_prompts = config.notebook.show_prompts|default(true) %}
+<div class="cell{% if cell.fragment %} fragment{% endif %}{% if cell.hide_input %} hide-input{% endif %}{% if cell.hide_output %} hide-output{% endif %}" data-cell-index="{{ cell.index }}">
+<div class="cell-input">
+{%- if show_prompts %}
+<div class="cell-prompt">In [{{ cell.execution_count if cell.execution_count is not none else " " }}]:</div>
+{%- endif %}
+<pre><code class="language-{{ cell.language }}" data-trim>{{ cell.source }}</code></pre>
+</div>
+{%- if cell.outputs %}
+<div class="cell-outputs">
+{%- for out in cell.outputs %}
+{%- if out.kind == "stream" %}
+<pre class="output output-stream {{ out.name }}">{{ out.html|safe }}</pre>
+{%- elif out.kind == "error" %}
+<pre class="output output-error">{{ out.html|safe }}</pre>
+{%- elif out.kind == "display" %}
+<div class="output output-display" data-mime="{{ out.mime }}">
+{%- if show_prompts and out.execution_count is not none %}
+<div class="cell-prompt">Out [{{ out.execution_count }}]:</div>
+{%- endif %}
+{{ out.html|safe }}
+</div>
+{%- elif out.kind == "unsupported" %}
+<div class="output output-unsupported">No renderable output ({{ out.mimes|join(", ") }})</div>
+{%- endif %}
+{%- endfor %}
+</div>
+{%- endif %}
+</div>

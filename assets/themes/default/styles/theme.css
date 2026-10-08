@@ -1,0 +1,66 @@
+/*
+ * presenter default theme: structural rules only (docs/spec/theme-format.md §6).
+ * Loaded after reveal's reset/core/stock-theme CSS, so plain rules win.
+ * Visual design arrives with T17 (default theme v1) and T33 (notebook styling).
+ *
+ * Custom properties: override these in a child theme before overriding rules.
+ */
+:root {
+  --p-column-gap: 1em;                                /* gap between .column elements */
+  --p-cell-gap: 0.5em;                                /* vertical space around a .cell */
+  --p-cell-border: 1px solid rgba(128, 128, 128, 0.4); /* frame of .cell and its output area */
+  --p-output-max-height: 40vh;                        /* longer cell outputs scroll */
+}
+
+/* :::columns → CSS grid. One equal track per .column; a `widths="1fr 2fr"` argument sets
+   grid-template-columns inline, which takes precedence over the implicit tracks. */
+.reveal .columns {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: var(--p-column-gap);
+  align-items: start;
+}
+
+.reveal .columns > .column {
+  min-width: 0;
+}
+
+/* KaTeX targets: display math is a block even when the element is a <span>. */
+.reveal [data-math-style="display"] {
+  display: block;
+}
+
+/* Notebook cells (cell.html). */
+.reveal .cell {
+  margin: var(--p-cell-gap) 0;
+  border: var(--p-cell-border);
+  text-align: left;
+}
+
+.reveal .cell pre {
+  width: auto;
+  margin: 0;
+  box-shadow: none;
+}
+
+.reveal .cell-prompt {
+  font-family: var(--r-code-font, monospace);
+  font-size: 0.5em;
+}
+
+.reveal .cell-outputs {
+  max-height: var(--p-output-max-height);
+  overflow: auto;
+  border-top: var(--p-cell-border);
+}
+
+/* Hidden parts stay in the markup; a theme may show them faintly instead. */
+.reveal .cell.hide-input .cell-input,
+.reveal .cell.hide-output .cell-outputs {
+  display: none;
+}
+
+.reveal .cell.hide-input .cell-outputs {
+  border-top: 0;
+}

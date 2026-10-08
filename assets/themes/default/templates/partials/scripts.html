@@ -1,0 +1,21 @@
+{#- Scripts at the end of <body>; included by the `scripts` block of deck.html.
+    Order: reveal, plugins, KaTeX + math init (when math is on), theme scripts
+    (theme.toml [scripts], "after plugins, before Reveal.initialize"), then
+    Reveal.initialize and the live-reload client (empty outside serve).
+    Each theme.scripts entry is passed to script() unchanged (as deck.html does with a
+    path-valued theme.highlight_style and style()), so the renderer must put names there
+    that §4 path resolution finds: a theme-relative "scripts/x.js" is not below the
+    chain's assets/ directories. -#}
+{{ script("vendor/reveal/dist/reveal.js") }}
+{%- for path in reveal.plugin_scripts %}
+{{ script(path) }}
+{%- endfor %}
+{%- if config.math.enabled == "always" or (features.math and config.math.enabled != "never") %}
+{{ script("vendor/katex/katex.min.js") }}
+{{ script("presenter/math.js") }}
+{%- endif %}
+{%- for path in theme.scripts %}
+{{ script(path) }}
+{%- endfor %}
+{{ reveal_init() }}
+{{ live_reload() }}
