@@ -57,13 +57,16 @@
 //! Relative image paths resolve against the deck's directory and are registered with the
 //! helpers' files, so they are inlined (standalone), emitted (site) or, in serve mode, also
 //! inlined as `data:` URIs (the dev server only serves the deck's own assets). Its warnings
-//! (e.g. `missing-asset`) join the render diagnostics without a span (the lines would be
-//! those of the template value). `json` is minijinja's `tojson` under the name §4 lists
-//! (its output is safe in HTML and inside `<script>`).
+//! (e.g. `missing-asset`) join the render diagnostics with the deck's source file as their
+//! path and without a span (the lines would be those of the template value), once each
+//! however often the filter meets the same text; a missing image is never an error here
+//! (`pipeline::build_deck` escalates it in `presenter build`, as it does the frontend's).
+//! `json` is minijinja's `tojson` under the name §4 lists (its output is safe in HTML and
+//! inside `<script>`).
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use minijinja::value::ValueKind;
@@ -119,8 +122,11 @@ pub fn render(input: RenderInput<'_>) -> Result<RenderedDocument> {
         reveal_init: Arc::from(init_script(&input).as_str()),
         live_reload: input.build.live_reload,
         build_id: input.build.id,
-        smart_punctuation: input.config.markdown.smart_punctuation,
-        base_dir: Arc::from(input.deck.source.base_dir.as_path()),
+        markdown: Arc::new(FilterDeck {
+            smart_punctuation: input.config.markdown.smart_punctuation,
+            base_dir: input.deck.source.base_dir.clone(),
+            source: input.deck.source.path.clone(),
+        }),
     };
     let state = Arc::new(Mutex::new(state));
     let html = render_deck(&input, &state, extras, &ctx)?;
@@ -235,9 +241,17 @@ struct Extras {
     reveal_init: Arc<str>,
     live_reload: bool,
     build_id: u64,
+    markdown: Arc<FilterDeck>,
+}
+
+/// What the `markdown` filter needs to know about the deck.
+struct FilterDeck {
+    /// `config.markdown.smart_punctuation`.
     smart_punctuation: bool,
-    /// The deck's directory: relative image paths in `markdown` filter input resolve here.
-    base_dir: Arc<Path>,
+    /// The deck's directory: relative image paths in the filter's input resolve here.
+    base_dir: PathBuf,
+    /// The deck's source file: the path of the filter's diagnostics.
+    source: PathBuf,
 }
 
 impl HelperState {
@@ -408,8 +422,7 @@ fn register_helpers(
         reveal_init,
         live_reload,
         build_id,
-        smart_punctuation,
-        base_dir,
+        markdown,
     } = extras;
     let st = Arc::clone(state);
     env.add_function("style", move |path: String| call(&st, |s| s.style(&path)));
@@ -435,7 +448,7 @@ fn register_helpers(
     env.add_filter("attrs", attrs_filter);
     let st = Arc::clone(state);
     env.add_filter("markdown", move |text: Value| {
-        markdown_filter(&st, text, smart_punctuation, &base_dir)
+        markdown_filter(&st, text, &markdown)
     });
     // §4 lists `json` among the built-in filters; minijinja names its JSON filter `tojson`.
     env.add_filter("json", minijinja::filters::tojson);
@@ -588,18 +601,18 @@ fn text_of(value: &Value) -> String {
 
 /// `markdown`: renders a string with the Markdown frontend (see the module docs);
 /// none/undefined → empty. Local images are registered with the helpers' files and their
-/// placeholders resolved at once; warnings go to the helpers' diagnostics without a span.
+/// placeholders resolved at once; warnings go to the helpers' diagnostics (the deck's
+/// path, no span, no duplicates).
 fn markdown_filter(
     state: &Mutex<HelperState>,
     text: Value,
-    smart_punctuation: bool,
-    base_dir: &Path,
+    deck: &FilterDeck,
 ) -> std::result::Result<Value, minijinja::Error> {
     if text.is_undefined() || text.is_none() {
         return Ok(Value::from_safe_string(String::new()));
     }
     let opts = comrak_options(&MarkdownConfig {
-        smart_punctuation,
+        smart_punctuation: deck.smart_punctuation,
         sourcepos: false,
     });
     let mut guard = state
@@ -608,7 +621,7 @@ fn markdown_filter(
     let mut diagnostics = Diagnostics::new();
     let mut ctx = RenderCtx {
         assets: &mut guard.registry,
-        base_dir,
+        base_dir: &deck.base_dir,
         mode: RenderMode::Notebook,
         diagnostics: &mut diagnostics,
         missing_asset_is_error: false,
@@ -624,8 +637,11 @@ fn markdown_filter(
     .map_err(|err| helper_error(format!("markdown filter: {err}")))?;
     for mut diagnostic in diagnostics {
         diagnostic.span = None;
+        diagnostic.path = Some(deck.source.clone());
         diagnostic.message = format!("markdown filter: {}", diagnostic.message);
-        guard.diagnostics.push(diagnostic);
+        if !guard.diagnostics.iter().any(|seen| *seen == diagnostic) {
+            guard.diagnostics.push(diagnostic);
+        }
     }
     Ok(Value::from_safe_string(unwrap_paragraph(&html).to_string()))
 }
@@ -728,16 +744,21 @@ mod tests {
         })
     }
 
-    fn fixtures_md() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/md")
+    /// A deck in `tests/fixtures/md` (where `images/ok.png` exists).
+    fn filter_deck(smart_punctuation: bool) -> FilterDeck {
+        let base_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/md");
+        FilterDeck {
+            smart_punctuation,
+            source: base_dir.join("deck.md"),
+            base_dir,
+        }
     }
 
     #[test]
     fn markdown_filter_unwraps_single_paragraphs() {
         let state = helper_state(OutputMode::Standalone);
-        let base_dir = fixtures_md();
         let filter = |text: Value, smart: bool| {
-            let out = markdown_filter(&state, text, smart, &base_dir).unwrap();
+            let out = markdown_filter(&state, text, &filter_deck(smart)).unwrap();
             assert!(out.is_safe());
             out.to_string()
         };
@@ -758,10 +779,10 @@ mod tests {
 
     #[test]
     fn markdown_filter_resolves_images_for_the_output_mode() {
-        let base_dir = fixtures_md();
+        let deck = filter_deck(false);
         let render = |mode: OutputMode, text: &str| {
             let state = helper_state(mode);
-            let html = markdown_filter(&state, Value::from(text), false, &base_dir)
+            let html = markdown_filter(&state, Value::from(text), &deck)
                 .unwrap()
                 .to_string();
             let state = state.into_inner().unwrap();
@@ -793,11 +814,20 @@ mod tests {
         let diagnostic = diagnostics.iter().next().expect("a missing-asset warning");
         assert_eq!(diagnostic.code, "missing-asset");
         assert!(diagnostic.span.is_none());
+        assert_eq!(diagnostic.path.as_deref(), Some(deck.source.as_path()));
         assert!(
             diagnostic.message.starts_with("markdown filter: "),
             "{}",
             diagnostic.message
         );
+
+        // The same text twice (e.g. a subtitle used in two places): one warning.
+        let state = helper_state(OutputMode::Standalone);
+        for _ in 0..2 {
+            markdown_filter(&state, Value::from("![x](images/missing.png)"), &deck).unwrap();
+        }
+        markdown_filter(&state, Value::from("![y](images/gone.png)"), &deck).unwrap();
+        assert_eq!(state.into_inner().unwrap().diagnostics.len(), 2);
     }
 
     #[test]

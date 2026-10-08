@@ -28,14 +28,33 @@
 //! [`run`] prints as `error: …` and maps with [`exit_code_for`]: [`UsageError`] and
 //! [`Error::Config`] → 2, everything else → 1. Helpers for commands:
 //! [`report_diagnostics`] (prints `path:line: level: message` on stderr, paths relative to
-//! the current directory, honouring `-q`), [`print_stdout`] and [`input_format`].
+//! the current directory, honouring `-q`), [`locate`] (adds the input's location to an
+//! error that lacks it), [`print_stdout`], [`display_path`], [`input_kind`] (the input's
+//! format by extension) and [`input_format`] (the same for a command with `--format md|ipynb`).
+//!
+//! Stub commands are tested in their own module (a `#[cfg(test)]` test that the owning task
+//! deletes with the stub), never end to end.
+//!
+//! # Hooks for later tasks
+//!
+//! Besides the stub bodies, later tasks change behaviour defined here only through files
+//! they own:
+//!
+//! - all printing on stderr goes through [`report`] (T44: source excerpts, panic hook);
+//! - `--version` prints [`version`], which appends ` (<sha>)` when the build script sets
+//!   `PRESENTER_GIT_SHA` (T47 adds the build script only);
+//! - `presenter export pdf --help` ends with [`export::PDF_LIMITATIONS`] (T45).
+//!
+//! A new flag still means a new field in this file (e.g. T46's optional
+//! `dump --default-config`, which cli.md does not list): that needs the coordinator.
 //!
 //! # Global behaviour
 //!
-//! `-v` logs at info level, `-vv` at debug level (both for presenter's own modules; other
-//! crates stay at warn), `-q` only errors; without these flags `RUST_LOG` is honoured, and
-//! without it the level is warn. Logs and diagnostics go to stderr, in color when stderr is
-//! a terminal and `NO_COLOR` is not set. Stdout carries only a command's result.
+//! Logging ([`log_directives`]): the base level is warn; `-v` raises presenter's own
+//! modules to info and `-vv` to debug; `RUST_LOG` (when set) is applied on top of that, so it
+//! can add targets or set any level, including presenter's. `-q` logs only errors and
+//! ignores `RUST_LOG`. Logs and diagnostics go to stderr, in color when stderr is a terminal
+//! and `NO_COLOR` is not set. Stdout carries only a command's result.
 
 pub mod build;
 pub mod check;
@@ -48,14 +67,17 @@ pub mod theme;
 
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
-use crate::error::{Diagnostic, Diagnostics, Error, Level};
+use crate::error::Error;
 use crate::ir::SourceKind;
+
+pub use report::report_diagnostics;
 
 /// Exit code: success.
 pub const EXIT_OK: u8 = 0;
@@ -66,7 +88,7 @@ pub const EXIT_USAGE: u8 = 2;
 
 /// Turn Markdown files and Jupyter notebooks into reveal.js presentations.
 #[derive(Debug, Parser)]
-#[command(name = "presenter", version, about)]
+#[command(name = "presenter", version = version(), about)]
 pub struct Cli {
     /// Flags that apply to every command.
     #[command(flatten)]
@@ -79,10 +101,10 @@ pub struct Cli {
 /// Flags accepted before (or after) any command.
 #[derive(Debug, Clone, Default, Args)]
 pub struct GlobalArgs {
-    /// Log more: -v info, -vv debug (without -v/-q, RUST_LOG is honoured)
+    /// Log more: -v info, -vv debug (RUST_LOG directives apply on top)
     #[arg(short, long, action = ArgAction::Count, global = true)]
     pub verbose: u8,
-    /// Print only errors (no warnings, no summary line)
+    /// Print only errors (no warnings, no summary line; RUST_LOG is ignored)
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
     /// Use this presenter.toml instead of searching for one next to the input
@@ -139,7 +161,8 @@ pub struct BuildArgs {
         long = "out",
         value_name = "PATH",
         help = "Output file (standalone) or directory (site) [default: <build.out_dir>/<stem>.html, \
-                or <build.out_dir>/<stem>/ with --site, next to the input]"
+                or <build.out_dir>/<stem>/ with --site; out_dir is relative to presenter.toml, \
+                or to the input's directory without one]"
     )]
     pub out: Option<PathBuf>,
     /// Theme name or directory (overrides front matter and presenter.toml)
@@ -314,6 +337,7 @@ pub struct ExportArgs {
 #[derive(Debug, Clone, Subcommand)]
 pub enum ExportCommand {
     /// Export a deck to PDF with headless Chrome
+    #[command(after_help = export::PDF_LIMITATIONS)]
     Pdf(ExportPdfArgs),
 }
 
@@ -347,8 +371,27 @@ impl fmt::Display for UsageError {
 impl std::error::Error for UsageError {}
 
 /// Runs the command line of this process and returns its exit code (`main` calls this).
+/// Installs the panic hook first ([`report::install_panic_hook`]).
 pub fn run() -> ExitCode {
+    report::install_panic_hook();
     run_from(std::env::args_os())
+}
+
+/// What `presenter --version` prints after the program name: the crate version, followed by
+/// ` (<build>)` when `PRESENTER_GIT_SHA` is set at compile time (by T47's build script, e.g.
+/// `presenter 0.1.0 (abc1234)`); `tests/cli_version.rs` accepts both forms.
+pub fn version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| version_text(env!("CARGO_PKG_VERSION"), option_env!("PRESENTER_GIT_SHA")))
+}
+
+/// `version`, plus ` (<sha>)` when `sha` is given and not blank.
+fn version_text(version: &str, sha: Option<&str>) -> String {
+    match sha.map(str::trim).filter(|sha| !sha.is_empty()) {
+        Some(sha) => format!("{version} ({sha})"),
+        None => version.to_string(),
+    }
 }
 
 /// Runs the command line `args` (the first item is the program name). Help and version
@@ -370,7 +413,7 @@ where
     match dispatch(&cli) {
         Ok(code) => code,
         Err(err) => {
-            report_error(&err);
+            report::report_error(&err);
             ExitCode::from(exit_code_for(&err))
         }
     }
@@ -406,14 +449,52 @@ pub fn not_implemented(command: &str) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(EXIT_USAGE))
 }
 
-/// The input format: `--format` when given, else by extension; an unknown extension is a
-/// [`UsageError`].
+/// The input format for a command with `--format md|ipynb` (`build`): the flag when given,
+/// else [`input_kind`], whose error then suggests the flag.
 pub fn input_format(path: &Path, format: Option<InputFormat>) -> anyhow::Result<SourceKind> {
     match format {
         Some(format) => Ok(format.into()),
-        None => {
-            crate::pipeline::detect_kind(path).map_err(|err| UsageError(err.to_string()).into())
-        }
+        None => crate::pipeline::detect_kind(path)
+            .map_err(|err| UsageError(format!("{err}; use --format md|ipynb")).into()),
+    }
+}
+
+/// The input format by extension, for commands without `--format` (`dump`, `serve`,
+/// `check`, `export`): an unknown extension is a [`UsageError`] (exit 2) without a flag hint.
+pub fn input_kind(path: &Path) -> anyhow::Result<SourceKind> {
+    crate::pipeline::detect_kind(path).map_err(|err| UsageError(err.to_string()).into())
+}
+
+/// Adds the input's location to an error that does not name it itself: a missing asset
+/// (`slides.md:12: asset not found: …`, or `talk.ipynb: cell 5, line 2: …` for a notebook,
+/// like [`crate::error::Diagnostic`]'s Display) and front matter errors (`slides.md: front matter: …`).
+/// Other errors are passed through.
+pub fn locate(err: Error, input: &Path) -> anyhow::Error {
+    let location = match &err {
+        Error::MissingAsset {
+            span: Some(span), ..
+        } => match span.cell {
+            Some(cell) => format!("{}: cell {cell}, line {}", input.display(), span.start_line),
+            None => format!("{}:{}", input.display(), span.start_line),
+        },
+        Error::MissingAsset { .. } | Error::FrontMatter(_) => input.display().to_string(),
+        _ => return err.into(),
+    };
+    anyhow::Error::new(err).context(location)
+}
+
+/// `path` for messages: relative to the current directory when it is an absolute path below
+/// it (as diagnostics print paths), else unchanged.
+pub fn display_path(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().ok();
+    relative_to(path, cwd.as_deref())
+}
+
+/// `path` relative to `cwd` when it is below it, else `path`.
+fn relative_to(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    match cwd.map(|cwd| path.strip_prefix(cwd)) {
+        Some(Ok(relative)) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -427,67 +508,20 @@ pub fn print_stdout(text: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Prints `diagnostics` on stderr, one `path:line: level: message` line each (cli.md),
-/// with paths relative to the current directory when they are below it. With `-q` only
-/// error-level diagnostics are printed.
-pub fn report_diagnostics(diagnostics: &Diagnostics, global: &GlobalArgs) {
-    let cwd = std::env::current_dir().ok();
-    let color = stderr_color();
-    let mut err = std::io::stderr().lock();
-    for diagnostic in diagnostics {
-        if global.quiet && diagnostic.level != Level::Error {
-            continue;
-        }
-        let line = diagnostic_line(diagnostic, cwd.as_deref(), color);
-        let _ = writeln!(err, "{line}");
-    }
-}
-
-/// One diagnostic as printed by [`report_diagnostics`].
-fn diagnostic_line(diagnostic: &Diagnostic, cwd: Option<&Path>, color: bool) -> String {
-    let mut diagnostic = diagnostic.clone();
-    if let (Some(cwd), Some(path)) = (cwd, &diagnostic.path)
-        && let Ok(relative) = path.strip_prefix(cwd)
-    {
-        diagnostic.path = Some(relative.to_path_buf());
-    }
-    let text = diagnostic.to_string();
-    if !color {
-        return text;
-    }
-    // Display is `<location>: <level>: <message>`; color the level.
-    let tail = format!("{}: {}", diagnostic.level, diagnostic.message);
-    match text.strip_suffix(&tail) {
-        Some(location) => format!(
-            "{location}{}: {}",
-            paint(diagnostic.level, &diagnostic.level.to_string(), true),
-            diagnostic.message
-        ),
-        None => text,
-    }
-}
-
-/// Prints a failed command's error chain as `error: outer: inner` on stderr.
-fn report_error(err: &anyhow::Error) {
-    let label = paint(Level::Error, "error", stderr_color());
-    let _ = writeln!(std::io::stderr().lock(), "{label}: {err:#}");
-}
-
-/// `text` in the color of `level` (bold red / bold yellow) when `color`.
-fn paint(level: Level, text: &str, color: bool) -> String {
-    if !color {
-        return text.to_string();
-    }
-    let code = match level {
-        Level::Error => "1;31",
-        Level::Warning => "1;33",
+/// The `EnvFilter` directives for `global` and the value of `RUST_LOG`: the flags' level
+/// first, then `RUST_LOG` (a later directive for the same target replaces an earlier one, so
+/// `RUST_LOG=presenter=debug` with `-v` logs presenter at debug). `-q` ignores `RUST_LOG`.
+pub fn log_directives(global: &GlobalArgs, rust_log: Option<&str>) -> String {
+    let base = match (global.quiet, global.verbose) {
+        (true, _) => return "error".to_string(),
+        (false, 0) => "warn",
+        (false, 1) => "warn,presenter=info",
+        (false, _) => "warn,presenter=debug",
     };
-    format!("\x1b[{code}m{text}\x1b[0m")
-}
-
-/// Whether stderr gets ANSI colors: a terminal, and `NO_COLOR` unset or empty.
-fn stderr_color() -> bool {
-    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+    match rust_log.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(rust_log) => format!("{base},{rust_log}"),
+        None => base.to_string(),
+    }
 }
 
 /// Installs the tracing subscriber (see the module docs). Does nothing when one is
@@ -495,20 +529,13 @@ fn stderr_color() -> bool {
 fn init_logging(global: &GlobalArgs) {
     use tracing_subscriber::EnvFilter;
 
-    let level = match (global.quiet, global.verbose) {
-        (true, _) => Some("error"),
-        (false, 0) => None,
-        (false, 1) => Some("warn,presenter=info"),
-        (false, _) => Some("warn,presenter=debug"),
-    };
-    let filter = match level {
-        Some(directives) => EnvFilter::new(directives),
-        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-    };
+    let rust_log = std::env::var("RUST_LOG").ok();
+    // Invalid RUST_LOG directives are skipped with a note on stderr.
+    let filter = EnvFilter::builder().parse_lossy(log_directives(global, rust_log.as_deref()));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .with_ansi(stderr_color())
+        .with_ansi(report::stderr_color())
         .with_target(false)
         .without_time()
         .try_init();
@@ -531,7 +558,15 @@ mod tests {
 
     #[test]
     fn version_string() {
-        assert_eq!(Cli::command().render_version(), "presenter 0.1.0\n");
+        let rendered = Cli::command().render_version().to_string();
+        assert_eq!(rendered, format!("presenter {}\n", version()));
+        assert!(rendered.starts_with("presenter 0.1.0"), "{rendered}");
+        assert_eq!(version_text("0.1.0", None), "0.1.0");
+        assert_eq!(version_text("0.1.0", Some(" ")), "0.1.0");
+        assert_eq!(version_text("0.1.0", Some("abc1234")), "0.1.0 (abc1234)");
+        if option_env!("PRESENTER_GIT_SHA").is_none() {
+            assert_eq!(rendered, "presenter 0.1.0\n");
+        }
     }
 
     #[test]
@@ -681,39 +716,146 @@ mod tests {
         );
         let err = input_format(path, None).unwrap_err();
         assert_eq!(exit_code_for(&err), EXIT_USAGE);
+        assert!(
+            err.to_string().ends_with("; use --format md|ipynb"),
+            "{err}"
+        );
         assert_eq!(
             input_format(Path::new("x.ipynb"), None).unwrap(),
             SourceKind::Notebook
         );
+        // Commands without --format do not suggest it.
+        let err = input_kind(path).unwrap_err();
+        assert_eq!(exit_code_for(&err), EXIT_USAGE);
+        assert!(err.to_string().contains("deck.txt"), "{err}");
+        assert!(!err.to_string().contains("--format"), "{err}");
+        assert_eq!(input_kind(Path::new("a.md")).unwrap(), SourceKind::Markdown);
     }
 
     #[test]
-    fn diagnostics_print_relative_paths_and_color_only_the_level() {
-        let diagnostic = Diagnostic::warning("missing-asset", "image `x.png` not found")
-            .with_path("/work/talk/slides.md")
-            .with_span(SourceSpan {
-                start_line: 7,
-                end_line: 7,
+    fn stubs_print_not_implemented_and_exit_2() {
+        assert_eq!(
+            not_implemented("serve").unwrap(),
+            ExitCode::from(EXIT_USAGE)
+        );
+    }
+
+    #[test]
+    fn rust_log_applies_on_top_of_the_verbosity_flags() {
+        let flags = |verbose: u8, quiet: bool| GlobalArgs {
+            verbose,
+            quiet,
+            config: None,
+        };
+        assert_eq!(log_directives(&flags(0, false), None), "warn");
+        assert_eq!(
+            log_directives(&flags(1, false), None),
+            "warn,presenter=info"
+        );
+        assert_eq!(
+            log_directives(&flags(3, false), Some("  ")),
+            "warn,presenter=debug"
+        );
+        assert_eq!(
+            log_directives(&flags(0, false), Some("presenter=trace")),
+            "warn,presenter=trace"
+        );
+        assert_eq!(
+            log_directives(&flags(1, false), Some("presenter=debug,hyper=info")),
+            "warn,presenter=info,presenter=debug,hyper=info"
+        );
+        assert_eq!(log_directives(&flags(0, true), Some("debug")), "error");
+
+        // EnvFilter keeps the last directive for a target: RUST_LOG wins over -v.
+        let filter = tracing_subscriber::EnvFilter::builder()
+            .parse_lossy(log_directives(&flags(1, false), Some("presenter=debug")));
+        let shown = filter.to_string();
+        assert!(shown.contains("presenter=debug"), "{shown}");
+        assert!(!shown.contains("presenter=info"), "{shown}");
+    }
+
+    #[test]
+    fn export_pdf_help_documents_the_limitations() {
+        let mut command = Cli::command();
+        let pdf = command
+            .find_subcommand_mut("export")
+            .and_then(|export| export.find_subcommand_mut("pdf"))
+            .expect("export pdf");
+        let help = pdf.render_long_help().to_string();
+        assert!(help.contains("pdfSeparateFragments"), "{help}");
+        assert!(help.contains("static"), "{help}");
+        assert!(help.contains("exits with code 3"), "{help}");
+    }
+
+    #[test]
+    fn paths_are_shown_relative_to_the_current_directory() {
+        let cwd = Some(Path::new("/work"));
+        assert_eq!(
+            relative_to(Path::new("/work/talk/dist/s.html"), cwd),
+            PathBuf::from("talk/dist/s.html")
+        );
+        assert_eq!(
+            relative_to(Path::new("/elsewhere/s.html"), cwd),
+            PathBuf::from("/elsewhere/s.html")
+        );
+        assert_eq!(
+            relative_to(Path::new("out/s.html"), cwd),
+            PathBuf::from("out/s.html")
+        );
+        assert_eq!(relative_to(Path::new("/work"), cwd), PathBuf::from("/work"));
+        assert_eq!(
+            relative_to(Path::new("/work/x"), None),
+            PathBuf::from("/work/x")
+        );
+    }
+
+    #[test]
+    fn missing_assets_and_front_matter_errors_name_the_input() {
+        let input = Path::new("talk/slides.md");
+        let missing = Error::MissingAsset {
+            path: PathBuf::from("/abs/talk/x.png"),
+            span: Some(SourceSpan {
+                start_line: 12,
+                end_line: 12,
                 cell: None,
-            });
-        let cwd = Path::new("/work");
+            }),
+        };
         assert_eq!(
-            diagnostic_line(&diagnostic, Some(cwd), false),
-            "talk/slides.md:7: warning: image `x.png` not found"
+            format!("{:#}", locate(missing, input)),
+            "talk/slides.md:12: asset not found: /abs/talk/x.png"
         );
+        let in_cell = Error::MissingAsset {
+            path: PathBuf::from("/abs/fig.png"),
+            span: Some(SourceSpan {
+                start_line: 2,
+                end_line: 2,
+                cell: Some(5),
+            }),
+        };
         assert_eq!(
-            diagnostic_line(&diagnostic, Some(Path::new("/elsewhere")), false),
-            "/work/talk/slides.md:7: warning: image `x.png` not found"
+            format!("{:#}", locate(in_cell, Path::new("talk.ipynb"))),
+            "talk.ipynb: cell 5, line 2: asset not found: /abs/fig.png"
         );
-        let plain = Diagnostic::error("e", "boom");
-        assert_eq!(diagnostic_line(&plain, None, false), "error: boom");
+        let no_span = Error::MissingAsset {
+            path: PathBuf::from("/abs/logo.png"),
+            span: None,
+        };
         assert_eq!(
-            diagnostic_line(&diagnostic, Some(cwd), true),
-            "talk/slides.md:7: \x1b[1;33mwarning\x1b[0m: image `x.png` not found"
+            format!("{:#}", locate(no_span, input)),
+            "talk/slides.md: asset not found: /abs/logo.png"
         );
+        let front = Error::FrontMatter("expected a mapping".into());
         assert_eq!(
-            diagnostic_line(&plain, None, true),
-            "\x1b[1;31merror\x1b[0m: boom"
+            format!("{:#}", locate(front, input)),
+            "talk/slides.md: front matter: expected a mapping"
+        );
+        let theme = Error::Theme {
+            name: "nope".into(),
+            message: "not found".into(),
+        };
+        assert_eq!(
+            format!("{:#}", locate(theme, input)),
+            "theme 'nope': not found"
         );
     }
 }

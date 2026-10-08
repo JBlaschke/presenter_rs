@@ -13,3 +13,25 @@ pub fn run(args: &InitArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let _ = (args, global);
     not_implemented("init")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::cli::EXIT_USAGE;
+
+    /// The stub's contract (`init: not implemented yet` on stderr, exit 2); T40 deletes
+    /// this test together with the stub.
+    #[test]
+    fn stub_exits_2() {
+        let args = InitArgs {
+            dir: PathBuf::from("talk"),
+            name: None,
+            notebook: false,
+            full_theme: false,
+        };
+        let code = run(&args, &GlobalArgs::default()).unwrap();
+        assert_eq!(code, ExitCode::from(EXIT_USAGE));
+    }
+}

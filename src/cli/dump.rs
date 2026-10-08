@@ -6,21 +6,22 @@
 //! config, reveal, theme, build`). Missing assets are warnings here (on stderr, like every
 //! diagnostic), never errors. The context is the one `presenter build` would render with:
 //! the theme resolved, the effective config, and `build` for the output mode of
-//! `[build] standalone`.
+//! `[build] standalone`. Errors carry the input's location like `build`'s ([`locate`]), and
+//! a failed `--context` still prints the frontend's diagnostics first.
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use serde_json::Value;
 
-use super::{DumpArgs, GlobalArgs, input_format, print_stdout, report_diagnostics};
-use crate::pipeline::{self, BuildOptions};
+use super::{DumpArgs, GlobalArgs, input_kind, locate, print_stdout, report_diagnostics};
+use crate::pipeline::{self, BuildFailure, BuildOptions};
 use crate::render::{BuildInfo, context::context_json};
 
 /// Runs `presenter dump`.
 pub fn run(args: &DumpArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let mut opts = BuildOptions::new(&args.input);
-    opts.format = Some(input_format(&args.input, None)?);
+    opts.format = Some(input_kind(&args.input)?);
     opts.config_path = global.config.clone();
     opts.cli.theme = args.theme.clone();
     opts.missing_asset_is_error = false;
@@ -40,19 +41,25 @@ pub fn run(args: &DumpArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
 
 /// The deck IR, keys sorted.
 fn deck(opts: &BuildOptions, global: &GlobalArgs) -> anyhow::Result<Value> {
-    let (parsed, _, _) = pipeline::parse_only(opts)?;
+    let (parsed, _, _) = pipeline::parse_only(opts).map_err(|err| locate(err, &opts.input))?;
     report_diagnostics(&parsed.diagnostics, global);
     Ok(sort_keys(serde_json::to_value(&parsed.deck)?))
 }
 
 /// The template context: top-level keys in §4 order, nested keys sorted.
 fn context(opts: &BuildOptions, global: &GlobalArgs) -> anyhow::Result<Value> {
-    let prepared = pipeline::prepare(opts)?;
+    let prepared = match pipeline::try_prepare(opts) {
+        Ok(prepared) => prepared,
+        Err(BuildFailure { error, diagnostics }) => {
+            report_diagnostics(&diagnostics, global);
+            return Err(locate(error, &opts.input));
+        }
+    };
     let standalone = prepared.config.build.standalone;
     let output = pipeline::output_mode(standalone, Path::new(""));
     let mut diagnostics = prepared.diagnostics.clone();
     let input = prepared.render_input(output, BuildInfo::build(standalone));
-    let context = context_json(&input, &mut diagnostics)?;
+    let context = context_json(&input, &mut diagnostics).map_err(|err| locate(err, &opts.input))?;
     report_diagnostics(&diagnostics, global);
     Ok(match context {
         Value::Object(map) => Value::Object(

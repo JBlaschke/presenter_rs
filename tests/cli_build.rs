@@ -22,11 +22,29 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The binary, run from the crate root.
+/// The binary, run from the crate root, without the developer's `RUST_LOG` / `NO_COLOR`
+/// (stderr assertions must not depend on them).
 fn presenter() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_presenter"));
-    cmd.current_dir(root());
+    cmd.current_dir(root())
+        .env_remove("RUST_LOG")
+        .env_remove("NO_COLOR");
     cmd
+}
+
+/// A temporary directory with `files` (path, contents) written into it.
+fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, contents) in files {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    dir
+}
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("UTF-8 stderr")
 }
 
 fn stdout_of(cmd: &mut Command) -> String {
@@ -414,24 +432,179 @@ fn usage_and_config_errors_exit_2() {
 }
 
 #[test]
-fn watch_and_later_commands_are_not_implemented_yet() {
+fn failed_builds_print_the_warnings_and_other_missing_assets_first() {
+    let tmp = project(&[(
+        "two.md",
+        "# A {bogus=1}\n\n![a](a1.png)\n\n---\n\n---\n\n![b](b2.png)\n",
+    )]);
+    let output = presenter()
+        .current_dir(tmp.path())
+        .args(["build", "two.md", "-o", "two.html"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 4, "{stderr}");
+    assert!(lines[0].starts_with("two.md:1: warning: "), "{stderr}");
+    assert!(lines[0].contains("bogus"), "{stderr}");
+    assert!(lines[1].starts_with("two.md:5: warning: "), "{stderr}");
+    assert!(
+        lines[2].starts_with("two.md:9: error: ") && lines[2].contains("b2.png"),
+        "{stderr}"
+    );
+    assert!(
+        lines[3].starts_with("error: two.md:3: asset not found: ") && lines[3].ends_with("a1.png"),
+        "{stderr}"
+    );
+    assert!(!tmp.path().join("two.html").exists());
+}
+
+#[test]
+fn missing_image_in_markdown_filter_input_fails_the_build() {
+    let layout = "{%- extends \"layouts/default.html\" %}{%- block content %}\
+                  <p class=\"subtitle\">{{ meta.subtitle|markdown }}</p>{%- endblock %}";
+    let tmp = project(&[
+        ("t/theme.toml", "name = \"t\"\nextends = \"default\"\n"),
+        ("t/templates/layouts/title.html", layout),
+        (
+            "sub.md",
+            "---\ntheme: t\nsubtitle: \"![logo](nologo.png) hi\"\n---\n# Title {layout=title}\n",
+        ),
+    ]);
     presenter()
-        .args(["build", "examples/basic/slides.md", "--watch"])
+        .current_dir(tmp.path())
+        .args(["build", "sub.md", "-o", "sub.html"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains("error: sub.md: asset not found: "))
+        .stderr(contains("nologo.png"));
+    assert!(!tmp.path().join("sub.html").exists());
+
+    // dump --context does not render the templates, so the filter never runs: no error.
+    let output = presenter()
+        .current_dir(tmp.path())
+        .args(["dump", "sub.md", "--context"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(stderr.is_empty(), "the context is not rendered: {stderr}");
+}
+
+#[test]
+fn bad_plugins_in_a_theme_are_theme_errors() {
+    let tmp = project(&[
+        (
+            "bt/theme.toml",
+            "name = \"bt\"\nextends = \"default\"\n[reveal]\nplugins = [\"highlight\", \"bogus\"]\n",
+        ),
+        ("p.md", "# One\n"),
+    ]);
+    presenter()
+        .current_dir(tmp.path())
+        .args(["build", "p.md", "--theme", "./bt", "-o", "p.html"])
+        .assert()
+        .code(1)
+        .stderr(contains(
+            "error: theme 'bt': theme.toml [reveal]: unknown reveal plugin 'bogus'",
+        ));
+}
+
+#[test]
+fn out_dir_is_relative_to_the_presenter_toml() {
+    let tmp = project(&[
+        ("proj/presenter.toml", "[build]\nout_dir = \"public\"\n"),
+        ("proj/talks/one/a.md", "# One\n"),
+    ]);
+    let proj = tmp.path().join("proj");
+    let stdout = stdout_of(
+        presenter()
+            .current_dir(&proj)
+            .args(["build", "talks/one/a.md"]),
+    );
+    assert!(
+        stdout.starts_with("Wrote public/a.html (1 slide, "),
+        "{stdout}"
+    );
+    assert!(proj.join("public/a.html").is_file());
+    assert!(!proj.join("talks/one/public").exists());
+
+    // --config from elsewhere: still relative to that file.
+    let stdout = stdout_of(
+        presenter()
+            .current_dir(tmp.path())
+            .args([
+                "--config",
+                "proj/presenter.toml",
+                "build",
+                "proj/talks/one/a.md",
+            ])
+            .arg("--site"),
+    );
+    assert!(
+        stdout.starts_with("Wrote proj/public/a/index.html (1 slide, "),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn dump_errors_name_the_input_and_suggest_no_missing_flag() {
+    let tmp = project(&[
+        ("deck.txt", "# One\n"),
+        ("fm.md", "---\ntitle: [1, 2]\n---\n# One\n"),
+    ]);
+    let output = presenter()
+        .current_dir(tmp.path())
+        .args(["dump", "deck.txt"])
         .assert()
         .code(2)
-        .stderr(contains("watch arrives in T20"));
-    for (args, name) in [
-        (&["serve", "examples/basic/slides.md"][..], "serve"),
-        (&["init", "talk"][..], "init"),
-        (&["theme", "list"][..], "theme"),
-        (&["check", "examples/basic/slides.md"][..], "check"),
-        (&["export", "pdf", "examples/basic/slides.md"][..], "export"),
-    ] {
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("deck.txt"), "{stderr}");
+    assert!(!stderr.contains("--format"), "{stderr}");
+
+    for args in [&["dump", "fm.md"][..], &["dump", "fm.md", "--context"][..]] {
         presenter()
+            .current_dir(tmp.path())
             .args(args)
             .assert()
-            .code(2)
-            .stdout("")
-            .stderr(format!("{name}: not implemented yet\n"));
+            .code(1)
+            .stderr(contains("error: fm.md: front matter: "));
     }
+}
+
+#[test]
+fn rust_log_adds_to_the_verbosity_flags() {
+    let tmp = project(&[("a.md", "# One\n")]);
+    let output = presenter()
+        .current_dir(tmp.path())
+        .env("RUST_LOG", "presenter=debug")
+        .args(["-v", "build", "a.md", "-o", "a.html"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("DEBUG"),
+        "RUST_LOG applies with -v: {stderr}"
+    );
+    assert!(stderr.contains("INFO"), "{stderr}");
+
+    // -q ignores RUST_LOG.
+    presenter()
+        .current_dir(tmp.path())
+        .env("RUST_LOG", "presenter=debug")
+        .args(["-q", "build", "a.md", "-o", "a.html"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
 }
