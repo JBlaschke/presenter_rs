@@ -1,0 +1,307 @@
+---
+source: tests/notebook_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": null,
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "two-column",
+      "classes": [
+        "dark",
+        "wide"
+      ],
+      "attrs": {
+        "data-background-color": "#102030"
+      },
+      "title": "Tags and hidden cells",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Tags and hidden cells</h1>\n"
+        },
+        {
+          "type": "cell",
+          "index": 1,
+          "id": "remove-cell",
+          "language": "python",
+          "source": "secret = 42",
+          "execution_count": 1,
+          "outputs": [],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [
+            "remove-cell"
+          ],
+          "metadata": {
+            "tags": [
+              "remove-cell"
+            ]
+          }
+        },
+        {
+          "type": "cell",
+          "index": 2,
+          "id": "skip-tag",
+          "language": "python",
+          "source": "skipped()",
+          "execution_count": 2,
+          "outputs": [],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [
+            "skip"
+          ],
+          "metadata": {
+            "tags": [
+              "skip"
+            ]
+          }
+        },
+        {
+          "type": "cell",
+          "index": 3,
+          "id": "hide-cell",
+          "language": "python",
+          "source": "hidden_cell()",
+          "execution_count": 3,
+          "outputs": [],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [
+            "hide-cell"
+          ],
+          "metadata": {
+            "tags": [
+              "hide-cell"
+            ]
+          }
+        },
+        {
+          "type": "cell",
+          "index": 4,
+          "id": "remove-input",
+          "language": "python",
+          "source": "print(\"remove-input: output shown, source hidden\")",
+          "execution_count": 4,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "remove-input: output shown, source hidden\n"
+            }
+          ],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [
+            "remove-input"
+          ],
+          "metadata": {
+            "tags": [
+              "remove-input"
+            ]
+          }
+        },
+        {
+          "type": "cell",
+          "index": 5,
+          "id": "hide-input",
+          "language": "python",
+          "source": "print(\"hide-input: output shown, source hidden\")",
+          "execution_count": 5,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "hide-input: output shown, source hidden\n"
+            }
+          ],
+          "hide_input": true,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [
+            "hide-input",
+            "unrelated"
+          ],
+          "metadata": {
+            "tags": [
+              "hide-input",
+              "unrelated"
+            ]
+          }
+        },
+        {
+          "type": "cell",
+          "index": 6,
+          "id": "source-hidden",
+          "language": "python",
+          "source": "print(\"source_hidden: output shown, source hidden\")",
+          "execution_count": 6,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "source_hidden: output shown, source hidden\n"
+            }
+          ],
+          "hide_input": true,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "jupyter": {
+              "source_hidden": true
+            }
+          }
+        },
+        {
+          "type": "cell",
+          "index": 7,
+          "id": "remove-output",
+          "language": "python",
+          "source": "print(\"remove-output: this output is hidden\")",
+          "execution_count": 7,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "remove-output: this output is hidden\n"
+            }
+          ],
+          "hide_input": false,
+          "hide_output": true,
+          "fragment": false,
+          "tags": [
+            "remove-output"
+          ],
+          "metadata": {
+            "tags": [
+              "remove-output"
+            ]
+          }
+        },
+        {
+          "type": "cell",
+          "index": 8,
+          "id": "hide-output",
+          "language": "python",
+          "source": "print(\"hide-output: this output is hidden\")",
+          "execution_count": 8,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "hide-output: this output is hidden\n"
+            }
+          ],
+          "hide_input": false,
+          "hide_output": true,
+          "fragment": false,
+          "tags": [
+            "hide-output"
+          ],
+          "metadata": {
+            "tags": [
+              "hide-output"
+            ]
+          }
+        },
+        {
+          "type": "cell",
+          "index": 9,
+          "id": "outputs-hidden",
+          "language": "python",
+          "source": "print(\"outputs_hidden: this output is hidden\")",
+          "execution_count": 9,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "outputs_hidden: this output is hidden\n"
+            }
+          ],
+          "hide_input": false,
+          "hide_output": true,
+          "fragment": false,
+          "tags": [],
+          "metadata": {
+            "jupyter": {
+              "outputs_hidden": true
+            }
+          }
+        },
+        {
+          "type": "html",
+          "html": "<div class=\"fragment\">\n<p>This paragraph is a fragment (tag <code>fragment</code>).</p>\n</div>\n"
+        },
+        {
+          "type": "cell",
+          "index": 12,
+          "id": "hide-both",
+          "language": "python",
+          "source": "print(\"input and output hidden: the cell is omitted\")",
+          "execution_count": 10,
+          "outputs": [
+            {
+              "kind": "stream",
+              "name": "stdout",
+              "html": "input and output hidden: the cell is omitted\n"
+            }
+          ],
+          "hide_input": false,
+          "hide_output": true,
+          "fragment": false,
+          "tags": [
+            "hide-input"
+          ],
+          "metadata": {
+            "jupyter": {
+              "outputs_hidden": true
+            },
+            "tags": [
+              "hide-input"
+            ]
+          }
+        },
+        {
+          "type": "html",
+          "html": "<p>A <code>metadata.presenter</code> override on a cell that does not open a slide is ignored (with a warning).</p>\n"
+        }
+      ],
+      "notes": "<p>Speaker notes from the <code>notes</code> tag.</p>\n",
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 1,
+        "cell": 0
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": true,
+    "notes": true,
+    "notebook": true
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "notebook",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

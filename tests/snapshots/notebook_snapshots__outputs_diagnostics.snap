@@ -1,0 +1,8 @@
+---
+source: tests/notebook_snapshots.rs
+expression: diagnostics
+---
+[
+  "cell 11, lines 1-1 [output-unsupported] warning: output 0: no renderable MIME type (found: application/vnd.jupyter.widget-view+json); [notebook] mime_priority decides what is rendered",
+  "cell 12, lines 1-1 [output-widget] warning: output 0: interactive widget rendered as text/plain (widgets need a live kernel)"
+]

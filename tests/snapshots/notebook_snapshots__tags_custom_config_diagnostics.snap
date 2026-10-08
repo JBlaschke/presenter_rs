@@ -1,0 +1,7 @@
+---
+source: tests/notebook_snapshots.rs
+expression: diagnostics
+---
+[
+  "cell 13, lines 1-1 [presenter-override-ignored] warning: metadata.presenter only applies to the slide a cell opens (slide_type `slide` or `subslide`); this cell opens none, ignored"
+]

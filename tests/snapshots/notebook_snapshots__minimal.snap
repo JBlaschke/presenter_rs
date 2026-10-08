@@ -1,0 +1,65 @@
+---
+source: tests/notebook_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": null,
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Minimal notebook",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Minimal notebook</h1>\n<p>One markdown cell and one code cell.</p>\n"
+        },
+        {
+          "type": "cell",
+          "index": 1,
+          "id": "hello",
+          "language": "python",
+          "source": "print(\"hello\")",
+          "execution_count": null,
+          "outputs": [],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {}
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 3,
+        "cell": 0
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": true,
+    "notes": false,
+    "notebook": true
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "notebook",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}

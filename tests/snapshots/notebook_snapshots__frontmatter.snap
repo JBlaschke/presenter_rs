@@ -1,0 +1,87 @@
+---
+source: tests/notebook_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Title from front matter",
+    "subtitle": "Subtitle from front matter",
+    "author": "Author from metadata.presenter",
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {
+      "event": "Fixture Conf"
+    }
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Welcome",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Welcome</h1>\n<p>The front matter block above is removed from this slide.</p>\n"
+        },
+        {
+          "type": "cell",
+          "index": 2,
+          "id": "code",
+          "language": "python",
+          "source": "answer = 42",
+          "execution_count": 2,
+          "outputs": [],
+          "hide_input": false,
+          "hide_output": false,
+          "fragment": false,
+          "tags": [],
+          "metadata": {}
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 7,
+        "cell": 1
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "title: must be ignored",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<hr />\n<h2>title: must be ignored</h2>\n<h2>Second slide</h2>\n<p>Only the first markdown cell may carry front matter.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 1,
+        "end_line": 6,
+        "cell": 3
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": true,
+    "notes": false,
+    "notebook": true
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "notebook",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}
