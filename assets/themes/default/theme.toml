@@ -14,6 +14,6 @@ entries = []
 
 [layouts]
 default = "Heading and content; the fallback for unknown layout names"
-title = "Title slide: the slide content followed by meta.subtitle, meta.author and meta.date"
+title = "Title slide: the first block (the heading), then meta.subtitle, meta.author and meta.date, then the rest"
 section = "Section divider"
 blank = "No chrome, for full-bleed images and iframes"

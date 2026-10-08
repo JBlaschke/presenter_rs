@@ -7,8 +7,13 @@
 //! `target/preview/skeleton.html` (stylesheets and scripts linked relatively to `assets/`, so
 //! the file opens straight from disk for the manual browser check) and asserts the structure
 //! the templates guarantee (§6, §7).
+//!
+//! Markup assertions work on parsed opening tags (element name, class tokens, decoded
+//! attributes) rather than on literal tag strings, so that T17 (design) and T33 (cell.html)
+//! can reorder classes, add classes or attributes and change whitespace without touching
+//! this file. What stays pinned is what §6/§7 guarantee.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -36,6 +41,16 @@ const ALLOWED_FILTERS: &str = "attrs markdown \
     format groupby indent int items join last length lines list lower map max min pprint \
     reject rejectattr replace reverse round safe select selectattr slice sort split string \
     sum title tojson trim unique upper zip";
+
+/// Callables minijinja itself provides, which are not helpers in the §4 sense: the
+/// built-in globals of minijinja 2.24 `src/defaults.rs` (`range`, `dict`, `debug`,
+/// `namespace`) and the special names of blocks, macros and loops.
+const MINIJINJA_CALLABLES: &str =
+    "range dict debug namespace super self caller loop varargs kwargs";
+
+/// Template syntax keywords that may directly precede `(`.
+const KEYWORDS: &str = "and or not in is if elif else for call include import extends from as \
+    with set block filter macro recursive ignore missing";
 
 /// The only expressions allowed to bypass auto-escaping: IR HTML (ir.md invariant 5).
 const SAFE_EXPRESSIONS: [&str; 3] = ["block.html", "slide.notes", "out.html"];
@@ -68,6 +83,16 @@ fn manifest() -> toml::Table {
     toml::from_str(&text).expect("theme.toml parses with toml")
 }
 
+/// `styles.entries` of the manifest, in order.
+fn style_entries() -> Vec<String> {
+    manifest()["styles"]["entries"]
+        .as_array()
+        .expect("styles.entries")
+        .iter()
+        .map(|entry| entry.as_str().expect("entry path").to_string())
+        .collect()
+}
+
 /// Every template file below `templates/`, as loader names (`layouts/title.html`).
 fn template_names() -> Vec<String> {
     let dir = templates_dir();
@@ -82,6 +107,21 @@ fn template_names() -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+fn read_template(name: &str) -> String {
+    std::fs::read_to_string(templates_dir().join(name)).expect("template readable")
+}
+
+/// Every template as `(name, source)`.
+fn templates() -> Vec<(String, String)> {
+    template_names()
+        .into_iter()
+        .map(|name| {
+            let source = read_template(&name);
+            (name, source)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -118,6 +158,14 @@ fn reveal_init_script(reveal: &serde_json::Value) -> String {
     )
 }
 
+/// The theme stylesheet of §5: every `styles.entries` file, in order, concatenated.
+fn theme_css() -> String {
+    style_entries()
+        .iter()
+        .map(|entry| std::fs::read_to_string(theme_dir().join(entry)).expect("style entry"))
+        .collect()
+}
+
 fn environment(context: &serde_json::Value, undefined: UndefinedBehavior) -> Environment<'static> {
     let mut env = Environment::new();
     env.set_loader(path_loader(templates_dir()));
@@ -130,7 +178,7 @@ fn environment(context: &serde_json::Value, undefined: UndefinedBehavior) -> Env
     });
     env.set_undefined_behavior(undefined);
 
-    let css = std::fs::read_to_string(theme_dir().join("styles/theme.css")).expect("theme.css");
+    let css = theme_css();
     let init = reveal_init_script(&context["reveal"]);
     env.add_function("style", |path: String| {
         Value::from_safe_string(format!(
@@ -167,6 +215,17 @@ fn decorate(slide: &Slide) -> serde_json::Value {
     value["layout_template"] = layout_template.into();
     value["children"] = slide.children.iter().map(decorate).collect();
     value
+}
+
+/// Removes `layout_template` from every slide and child of a context's `slides`.
+fn undecorate(slides: &mut serde_json::Value) {
+    for slide in slides.as_array_mut().expect("slides array") {
+        slide
+            .as_object_mut()
+            .expect("slide object")
+            .remove("layout_template");
+        undecorate(&mut slide["children"]);
+    }
 }
 
 /// Plugins the deck needs: enabled ones, with highlight only for code and notes only for
@@ -249,14 +308,125 @@ fn render_sample() -> String {
 }
 
 // ---------------------------------------------------------------------------------------
+// Opening tags with class tokens and decoded attributes
+// ---------------------------------------------------------------------------------------
+
+/// An opening tag of the rendered document.
+#[derive(Debug, Clone)]
+struct Tag {
+    /// Lower-case element name.
+    name: String,
+    /// Attributes, values entity-decoded; boolean attributes map to `""`.
+    attrs: BTreeMap<String, String>,
+    /// Byte range of the tag itself (`<` … `>`) in the string it was parsed from.
+    range: Range<usize>,
+}
+
+impl Tag {
+    fn parse(text: &str, start: usize) -> Tag {
+        let name = Regex::new(r"^<([A-Za-z][\w-]*)").expect("regex");
+        let attr = Regex::new(r#"([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+)))?"#)
+            .expect("regex");
+        let head = name.captures(text).expect("tag name");
+        let rest = &text[head[0].len()..text.len() - 1];
+        let attrs = attr
+            .captures_iter(rest)
+            .map(|c| {
+                let value = c
+                    .get(2)
+                    .or(c.get(3))
+                    .or(c.get(4))
+                    .map_or("", |m| m.as_str());
+                let value = html_escape::decode_html_entities(value).into_owned();
+                (c[1].to_ascii_lowercase(), value)
+            })
+            .collect();
+        Tag {
+            name: head[1].to_ascii_lowercase(),
+            attrs,
+            range: start..start + text.len(),
+        }
+    }
+
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs.get(name).map(String::as_str)
+    }
+
+    fn classes(&self) -> Vec<&str> {
+        self.attr("class")
+            .map(|c| c.split_whitespace().collect())
+            .unwrap_or_default()
+    }
+
+    fn has_class(&self, class: &str) -> bool {
+        self.classes().contains(&class)
+    }
+
+    fn has_classes(&self, classes: &[&str]) -> bool {
+        classes.iter().all(|class| self.has_class(class))
+    }
+}
+
+/// Every opening tag of `html`, in document order.
+fn open_tags(html: &str) -> Vec<Tag> {
+    let tag = Regex::new(r"<[A-Za-z][^>]*>").expect("regex");
+    tag.find_iter(html)
+        .map(|m| Tag::parse(m.as_str(), m.start()))
+        .collect()
+}
+
+/// The first tag satisfying `pred`, or a panic naming `what`.
+fn find_tag<'a>(tags: &'a [Tag], what: &str, pred: impl Fn(&Tag) -> bool) -> &'a Tag {
+    tags.iter()
+        .find(|t| pred(t))
+        .unwrap_or_else(|| panic!("no element {what}"))
+}
+
+/// Inner HTML of `tag` (an element of `html`) up to its matching closing tag.
+fn inner_html<'a>(html: &'a str, tag: &Tag) -> &'a str {
+    let pattern = format!(r"<(/?){}\b[^>]*>", regex::escape(&tag.name));
+    let same = Regex::new(&pattern).expect("regex");
+    let start = tag.range.end;
+    let mut depth = 1;
+    for m in same.captures_iter(&html[start..]) {
+        depth = if &m[1] == "/" { depth - 1 } else { depth + 1 };
+        if depth == 0 {
+            return &html[start..start + m.get(0).expect("match").start()];
+        }
+    }
+    panic!("<{}> is never closed", tag.name)
+}
+
+/// The text right after `tag` up to the next tag, decoded and trimmed.
+fn text_after(html: &str, tag: &Tag) -> String {
+    let rest = &html[tag.range.end..];
+    let text = &rest[..rest.find('<').unwrap_or(rest.len())];
+    html_escape::decode_html_entities(text).trim().to_string()
+}
+
+/// The opening tag of `<div class="slides">`.
+fn slides_div(html: &str) -> Tag {
+    let tags = open_tags(html);
+    find_tag(&tags, ".slides", |t| {
+        t.name == "div" && t.has_class("slides")
+    })
+    .clone()
+}
+
+/// The inner HTML of `<div class="slides">`.
+fn slides_region(html: &str) -> &str {
+    inner_html(html, &slides_div(html))
+}
+
+// ---------------------------------------------------------------------------------------
 // A minimal <div>/<section> tree of the slides region
 // ---------------------------------------------------------------------------------------
 
 /// A `<section>` of the rendered document.
 #[derive(Debug)]
 struct Section {
-    /// The opening tag verbatim, e.g. `<section class="layout-default">`.
-    open_tag: String,
+    /// The opening tag.
+    tag: Tag,
     /// Byte range of the inner HTML.
     inner: Range<usize>,
     /// `false` when a `<div>` sits between this section and its parent (or `.slides`).
@@ -272,8 +442,7 @@ enum Open {
 /// Parses the `<section>`s inside `<div class="slides">` by tracking `<div>`/`<section>`
 /// nesting (the only container elements the templates emit; IR HTML closes its divs).
 fn slides_tree(html: &str) -> Vec<Section> {
-    let marker = r#"<div class="slides">"#;
-    let start = html.find(marker).expect("slides container") + marker.len();
+    let start = slides_div(html).range.end;
     assert!(
         !html[..start].contains("<section"),
         "section outside .slides"
@@ -290,7 +459,7 @@ fn slides_tree(html: &str) -> Vec<Section> {
             (false, _) => {
                 let direct = matches!(stack.last(), None | Some(Open::Section(_)));
                 stack.push(Open::Section(Section {
-                    open_tag: whole.as_str().to_string(),
+                    tag: Tag::parse(whole.as_str(), begin),
                     inner: end..end,
                     direct,
                     children: Vec::new(),
@@ -299,7 +468,7 @@ fn slides_tree(html: &str) -> Vec<Section> {
             (true, "div") => match stack.pop() {
                 None => return roots, // closes .slides
                 Some(Open::Div) => {}
-                Some(Open::Section(s)) => panic!("</div> closes {}", s.open_tag),
+                Some(Open::Section(s)) => panic!("</div> closes {:?}", s.tag),
             },
             (true, _) => {
                 let Some(Open::Section(mut section)) = stack.pop() else {
@@ -320,36 +489,39 @@ fn slides_tree(html: &str) -> Vec<Section> {
     panic!(".slides is never closed");
 }
 
-/// The opening tag `layouts/default.html` must produce for `slide`.
-fn expected_open_tag(slide: &Slide) -> String {
-    let id = slide
-        .id
-        .as_ref()
-        .map(|id| format!(r#" id="{id}""#))
-        .unwrap_or_default();
-    let classes: String = slide.classes.iter().map(|c| format!(" {c}")).collect();
-    let attrs: String = slide
-        .attrs
-        .iter()
-        .map(|(k, v)| {
-            format!(
-                r#" {k}="{}""#,
-                html_escape::encode_double_quoted_attribute(v)
-            )
-        })
-        .collect();
-    format!(
-        r#"<section{id} class="layout-{}{classes}"{attrs}>"#,
-        slide.layout
-    )
+/// The `layout-*` class tokens of a tag.
+fn layout_classes(tag: &Tag) -> Vec<&str> {
+    tag.classes()
+        .into_iter()
+        .filter(|c| c.starts_with("layout-"))
+        .collect()
 }
 
-/// Number of elements whose `class` attribute contains the token `cell` (not `cell-input`).
+/// Checks the layout section's opening tag against its slide (§6, §7): the slide's id,
+/// exactly one `layout-<name>` class, every slide class and every slide attribute. Extra
+/// classes and attributes are allowed (a theme may add them).
+fn check_section_tag(tag: &Tag, slide: &Slide, label: &str) {
+    assert_eq!(tag.name, "section", "{label}");
+    assert_eq!(tag.attr("id"), slide.id.as_deref(), "{label}: id");
+    let layout = format!("layout-{}", slide.layout);
+    assert_eq!(
+        layout_classes(tag),
+        [layout.as_str()],
+        "{label}: layout class"
+    );
+    for class in &slide.classes {
+        assert!(tag.has_class(class), "{label}: class {class}");
+    }
+    for (key, value) in &slide.attrs {
+        assert_eq!(tag.attr(key), Some(value.as_str()), "{label}: {key}");
+    }
+}
+
+/// Number of elements whose class list contains the token `cell` (not `cell-input`).
 fn count_cell_elements(html: &str) -> usize {
-    let class = Regex::new(r#"class="([^"]*)""#).expect("regex");
-    class
-        .captures_iter(html)
-        .filter(|c| c[1].split_whitespace().any(|token| token == "cell"))
+    open_tags(html)
+        .iter()
+        .filter(|t| t.has_class("cell"))
         .count()
 }
 
@@ -365,15 +537,16 @@ fn cell_blocks(slide: &Slide) -> usize {
 fn check_leaf(html: &str, section: &Section, slide: &Slide, label: &str) {
     assert!(section.direct, "{label}: wrapped in a <div>");
     assert!(section.children.is_empty(), "{label}: nested sections");
-    assert_eq!(section.open_tag, expected_open_tag(slide), "{label}");
+    check_section_tag(&section.tag, slide, label);
     let inner = &html[section.inner.clone()];
-    let notes = inner.matches(r#"<aside class="notes">"#).count();
-    assert_eq!(notes, usize::from(slide.notes.is_some()), "{label}: notes");
-    if let Some(text) = &slide.notes {
-        assert!(
-            inner.contains(&format!("<aside class=\"notes\">{text}</aside>")),
-            "{label}"
-        );
+    let tags = open_tags(inner);
+    let notes: Vec<&Tag> = tags
+        .iter()
+        .filter(|t| t.name == "aside" && t.has_class("notes"))
+        .collect();
+    assert_eq!(notes.len(), usize::from(slide.notes.is_some()), "{label}");
+    if let (Some(text), Some(aside)) = (&slide.notes, notes.first()) {
+        assert!(inner_html(inner, aside).contains(text.as_str()), "{label}");
     }
     assert_eq!(
         count_cell_elements(inner),
@@ -383,7 +556,7 @@ fn check_leaf(html: &str, section: &Section, slide: &Slide, label: &str) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Tests
+// Tests: rendering the fixture
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -405,7 +578,11 @@ fn renders_sample_deck_into_reveal_structure() {
             check_leaf(&html, section, slide, &format!("slides[{i}]"));
             continue;
         }
-        assert_eq!(section.open_tag, "<section>", "slides[{i}]: stack wrapper");
+        // The vertical-stack wrapper is not a slide itself: no layout class.
+        assert!(
+            layout_classes(&section.tag).is_empty(),
+            "slides[{i}] wrapper"
+        );
         assert_eq!(section.children.len(), 1 + slide.children.len());
         let members = std::iter::once(slide).chain(&slide.children);
         for (j, (sub, member)) in section.children.iter().zip(members).enumerate() {
@@ -413,80 +590,195 @@ fn renders_sample_deck_into_reveal_structure() {
         }
     }
 
+    let tags = open_tags(&html);
     let with_notes = deck
         .slides
         .iter()
         .flat_map(|s| std::iter::once(s).chain(&s.children))
         .filter(|s| s.notes.is_some())
         .count();
-    assert_eq!(html.matches(r#"<aside class="notes">"#).count(), with_notes);
-    assert!(html.contains(r#"class="layout-title""#));
+    let asides = tags
+        .iter()
+        .filter(|t| t.name == "aside" && t.has_class("notes"));
+    assert_eq!(asides.count(), with_notes);
+    assert!(tags.iter().any(|t| t.has_class("layout-title")));
     let cells: usize = deck.slides.iter().map(cell_blocks).sum();
     assert_eq!(cells, 2);
     assert_eq!(count_cell_elements(&html), cells);
-    assert_eq!(
-        html.matches(r#"class="cell"#).count() - cell_parts(&html),
-        cells
-    );
 }
 
-/// `class="cell-…"` occurrences (cell-input, cell-outputs, cell-prompt), which the literal
-/// substring `class="cell` also matches.
-fn cell_parts(html: &str) -> usize {
-    html.matches(r#"class="cell-"#).count()
+/// Position, class and text of the title-layout meta lines inside `inner`.
+fn title_meta(inner: &str) -> Vec<(usize, &'static str, String)> {
+    let tags = open_tags(inner);
+    ["subtitle", "author", "date"]
+        .into_iter()
+        .filter_map(|class| {
+            let tag = tags.iter().find(|t| t.has_class(class))?;
+            Some((tag.range.start, class, text_after(inner, tag)))
+        })
+        .collect()
 }
 
 #[test]
 fn title_layout_shows_meta_under_the_heading() {
     let html = render_sample();
-    let start = html
-        .find(r#"<section id="intro" class="layout-title">"#)
-        .expect("title");
-    let section = &html[start..start + html[start..].find("</section>").expect("closed")];
+    let tags = open_tags(&html);
+    let intro = find_tag(&tags, "#intro", |t| t.attr("id") == Some("intro"));
+    assert!(intro.has_class("layout-title"));
+    let section = inner_html(&html, intro);
     let heading = section
         .find("<h1>Rust for data people</h1>")
         .expect("heading");
-    for (class, text) in [
-        ("subtitle", "Fast tools without the footguns"),
-        ("author", "J. Blaschke"),
-        ("date", "2026-10-08"),
-    ] {
-        let element = format!(r#"class="{class}">{text}</"#);
-        let at = section
-            .find(&element)
-            .unwrap_or_else(|| panic!("missing {element}"));
-        assert!(at > heading, "{element} must follow the heading");
-    }
-    assert!(section.find("subtitle") < section.find(r#"<aside class="notes">"#));
+    let meta = title_meta(section);
+    let found: Vec<(&str, &str)> = meta.iter().map(|(_, c, t)| (*c, t.as_str())).collect();
+    assert_eq!(
+        found,
+        [
+            ("subtitle", "Fast tools without the footguns"),
+            ("author", "J. Blaschke"),
+            ("date", "2026-10-08"),
+        ]
+    );
+    assert!(meta.windows(2).all(|w| w[0].0 < w[1].0), "meta order");
+    assert!(meta[0].0 > heading, "meta must follow the heading");
+    assert!(meta[2].0 < section.find("<aside").expect("notes"));
 }
 
 #[test]
-fn cells_render_input_outputs_and_flags() {
-    let html = render_sample();
-    // First cell: prompt, escaped source, one element per output kind.
-    for part in [
-        r#"<div class="cell" data-cell-index="4">"#,
-        r#"<div class="cell-prompt">In [3]:</div>"#,
-        r#"<pre><code class="language-python" data-trim>print(&quot;rows:&quot;, len(df))"#,
-        r#"<pre class="output output-stream stdout">rows: 1000"#,
-        r#"<pre class="output output-stream stderr"><span style='color:var(--yellow,#a50)'>warning</span>"#,
-        r#"<div class="output output-display" data-mime="text&#x2f;html">"#,
-        r#"<table class="dataframe">"#,
-        r#"<div class="output output-unsupported">No renderable output (application&#x2f;vnd.jupyter.widget-view+json)</div>"#,
-        r#"<pre class="output output-error"><span style='color:var(--red,#a00)'>"#,
-    ] {
-        assert!(html.contains(part), "missing {part}");
-    }
-    // Second cell: fragment + hide-input; Out [n] prompt only for execute results.
-    assert!(html.contains(r#"<div class="cell fragment hide-input" data-cell-index="5">"#));
-    assert_eq!(
-        html.matches(r#"<div class="cell-prompt">Out [4]:</div>"#)
-            .count(),
-        1
-    );
-    assert_eq!(html.matches("Out [").count(), 1);
+fn title_meta_follows_the_first_block_and_falls_back_to_config() {
+    let mut deck = sample_deck();
+    (deck.meta.title, deck.meta.author, deck.meta.date) = (None, None, None);
+    // notebook-mapping.md §6: a title slide with one block per markdown cell.
+    let mut first = Slide::new();
+    first.layout = "title".into();
+    first.blocks = vec![
+        Block::html("<h1>Analysis</h1>\n".into()),
+        Block::html("<p>Some intro</p>\n".into()),
+    ];
+    let mut empty = Slide::new();
+    empty.layout = "title".into();
+    deck.slides = vec![first, empty];
+    let mut context = context(&deck);
+    context["config"]["deck"]["title"] = json!("Config title");
+    context["config"]["deck"]["author"] = json!("Config Author");
+    context["config"]["deck"]["date"] = json!("2026-01-02");
+    let html = render_with(&context, UndefinedBehavior::Strict);
+
+    let roots = slides_tree(&html);
+    let expected = [
+        ("subtitle", "Fast tools without the footguns"),
+        ("author", "Config Author"),
+        ("date", "2026-01-02"),
+    ];
+    let first = &html[roots[0].inner.clone()];
+    let meta = title_meta(first);
+    let found: Vec<(&str, &str)> = meta.iter().map(|(_, c, t)| (*c, t.as_str())).collect();
+    assert_eq!(found, expected);
+    let heading = first.find("<h1>Analysis</h1>").expect("heading");
+    let intro = first.find("<p>Some intro</p>").expect("second block");
     assert!(
-        html.contains(r#"<img class="output-image" src="../../tests/fixtures/md/images/ok.png""#)
+        heading < meta[0].0 && meta[2].0 < intro,
+        "meta between the blocks"
+    );
+    // A title slide without blocks still shows the meta.
+    let empty = &html[roots[1].inner.clone()];
+    let found: Vec<String> = title_meta(empty).into_iter().map(|m| m.2).collect();
+    assert_eq!(found, expected.map(|e| e.1));
+    // <head> falls back to presenter.toml [deck] as well.
+    let tags = open_tags(&html);
+    let author = find_tag(&tags, "meta[name=author]", |t| {
+        t.name == "meta" && t.attr("name") == Some("author")
+    });
+    assert_eq!(author.attr("content"), Some("Config Author"));
+    let title = find_tag(&tags, "title", |t| t.name == "title");
+    assert_eq!(text_after(&html, title), "Config title");
+}
+
+/// The `.cell` element with `data-cell-index="<index>"`.
+fn cell_tag<'a>(tags: &'a [Tag], index: &str) -> &'a Tag {
+    find_tag(tags, &format!(".cell[{index}]"), |t| {
+        t.has_class("cell") && t.attr("data-cell-index") == Some(index)
+    })
+}
+
+#[test]
+fn cell_renders_prompt_escaped_input_and_every_output_kind() {
+    let html = render_sample();
+    let tags = open_tags(&html);
+    let first = cell_tag(&tags, "4");
+    for absent in ["fragment", "hide-input", "hide-output"] {
+        assert!(!first.has_class(absent), "cell 4 has {absent}");
+    }
+    let body = inner_html(&html, first);
+    let inner = open_tags(body);
+    let input = inner_html(
+        body,
+        find_tag(&inner, ".cell-input", |t| t.has_class("cell-input")),
+    );
+    let prompt = find_tag(&inner, ".cell-prompt", |t| t.has_class("cell-prompt"));
+    assert!(text_after(body, prompt).starts_with("In [3]"));
+    let code = find_tag(&inner, "code.language-python", |t| {
+        t.name == "code" && t.has_class("language-python") && t.attr("data-trim").is_some()
+    });
+    let source = inner_html(body, code);
+    assert!(input.contains(source), "code inside .cell-input");
+    assert!(
+        !source.contains(r#"print("rows"#),
+        "cell source is not escaped"
+    );
+    assert!(html_escape::decode_html_entities(source).contains(r#"print("rows:", len(df))"#));
+
+    let outputs = inner_html(
+        body,
+        find_tag(&inner, ".cell-outputs", |t| t.has_class("cell-outputs")),
+    );
+    // One element per output kind, all inside .cell-outputs.
+    let output = |classes: &[&str]| {
+        let tag = find_tag(&inner, &classes.join("."), |t| {
+            t.has_classes(classes) && t.has_class("output")
+        });
+        assert!(
+            outputs.contains(&body[tag.range.clone()]),
+            "{classes:?} inside .cell-outputs"
+        );
+        tag
+    };
+    let stdout = output(&["output-stream", "stdout"]);
+    assert!(inner_html(body, stdout).contains("rows: 1000"));
+    let stderr = output(&["output-stream", "stderr"]);
+    let warning = "<span style='color:var(--yellow,#a50)'>warning</span>";
+    assert!(
+        inner_html(body, stderr).contains(warning),
+        "stream html unescaped"
+    );
+    let display = output(&["output-display"]);
+    assert_eq!(display.attr("data-mime"), Some("text/html"));
+    assert!(inner_html(body, display).contains(r#"<table class="dataframe">"#));
+    let unsupported = output(&["output-unsupported"]);
+    assert!(text_after(body, unsupported).contains("application/vnd.jupyter.widget-view+json"));
+    let error = output(&["output-error"]);
+    assert!(inner_html(body, error).contains("<span style='color:var(--red,#a00)'>"));
+}
+
+#[test]
+fn fragment_cell_flags_and_out_prompt() {
+    let html = render_sample();
+    let tags = open_tags(&html);
+    // Fragment + hide-input; an Out [n] prompt only for execute results.
+    let second = cell_tag(&tags, "5");
+    assert!(second.has_classes(&["fragment", "hide-input"]) && !second.has_class("hide-output"));
+    let out_prompts: Vec<String> = tags
+        .iter()
+        .filter(|t| t.has_class("cell-prompt"))
+        .map(|t| text_after(&html, t))
+        .filter(|text| text.starts_with("Out"))
+        .collect();
+    assert_eq!(out_prompts.len(), 1, "{out_prompts:?}");
+    assert!(out_prompts[0].starts_with("Out [4]"));
+    let image = find_tag(&tags, "img.output-image", |t| t.has_class("output-image"));
+    assert_eq!(
+        image.attr("src"),
+        Some("../../tests/fixtures/md/images/ok.png")
     );
 }
 
@@ -512,8 +804,12 @@ fn head_and_scripts_follow_the_spec_order() {
     ] {
         assert!(html[..head_end].contains(css), "missing {css}");
     }
-    assert!(html.starts_with("<!DOCTYPE html>\n<html lang=\"en\">"));
-    assert!(html.contains("<title>Rust for data people</title>"));
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    let tags = open_tags(&html);
+    let root = find_tag(&tags, "html", |t| t.name == "html");
+    assert_eq!(root.attr("lang"), Some("en"));
+    let title = find_tag(&tags, "title", |t| t.name == "title");
+    assert_eq!(text_after(&html, title), "Rust for data people");
 
     let order = [
         "vendor/reveal/dist/reveal.js\"",
@@ -546,11 +842,67 @@ fn head_and_scripts_follow_the_spec_order() {
 }
 
 #[test]
+fn theme_stylesheet_is_every_style_entry_in_order() {
+    let html = render_sample();
+    let start = html
+        .find(r#"<style id="presenter-theme">"#)
+        .expect("theme style");
+    let css = theme_css();
+    assert!(html[start..].contains(&css));
+    for entry in style_entries() {
+        let text = std::fs::read_to_string(theme_dir().join(&entry)).expect("entry");
+        assert!(
+            css.contains(&text),
+            "{entry} missing from the theme stylesheet"
+        );
+    }
+}
+
+#[test]
 fn strict_undefined_renders_identically() {
     let context = context(&sample_deck());
     let lenient = render_with(&context, UndefinedBehavior::Lenient);
     let strict = render_with(&context, UndefinedBehavior::Strict);
     assert_eq!(lenient, strict);
+}
+
+#[test]
+fn serve_mode_renders_the_same_slides() {
+    let build = context(&sample_deck());
+    let mut serve = build.clone();
+    serve["build"] = json!({ "mode": "serve", "standalone": false, "live_reload": true,
+                             "version": env!("CARGO_PKG_VERSION"), "id": 3 });
+    let build = render_with(&build, UndefinedBehavior::Strict);
+    let serve = render_with(&serve, UndefinedBehavior::Strict);
+    assert_eq!(slides_region(&serve), slides_region(&build));
+}
+
+#[test]
+fn undecorated_slides_resolve_their_layout_by_name() {
+    let mut deck = sample_deck();
+    deck.slides[1].children[0].layout = "title".into();
+    deck.slides[1].children[1].layout = "no-such-layout".into();
+    let decorated = context(&deck);
+    let mut bare = decorated.clone();
+    undecorate(&mut bare["slides"]);
+    let expected = render_with(&decorated, UndefinedBehavior::Strict);
+    assert_eq!(render_with(&bare, UndefinedBehavior::Strict), expected);
+
+    // The child really went through the title layout, the unknown one through the default.
+    let roots = slides_tree(&expected);
+    let child = &expected[roots[1].children[1].inner.clone()];
+    assert_eq!(title_meta(child).len(), 3, "title meta on the child");
+    let tags = open_tags(&expected);
+    let unknown = find_tag(&tags, "#tooling", |t| t.attr("id") == Some("tooling"));
+    assert_eq!(layout_classes(unknown), ["layout-no-such-layout"]);
+    assert_eq!(tags.iter().filter(|t| t.has_class("subtitle")).count(), 2);
+
+    // A decoration wins over the name: section markup for a slide named "title".
+    let mut forced = decorated;
+    forced["slides"][0]["layout_template"] = json!("layouts/section.html");
+    let html = render_with(&forced, UndefinedBehavior::Strict);
+    let intro = &html[slides_tree(&html)[0].inner.clone()];
+    assert!(title_meta(intro).is_empty());
 }
 
 #[test]
@@ -563,15 +915,15 @@ fn renders_without_optional_meta_and_layout_template() {
     slide.blocks.push(Block::html("<h1>Only</h1>\n".into()));
     deck.slides = vec![slide];
     let mut context = context(&deck);
-    // Hand-built contexts may lack `layout_template`; slide.html falls back to the default.
-    context["slides"][0]
-        .as_object_mut()
-        .expect("slide object")
-        .remove("layout_template");
+    // Hand-built contexts may lack `layout_template`; slide.html resolves the layout by name.
+    undecorate(&mut context["slides"]);
     let html = render_with(&context, UndefinedBehavior::Lenient);
-    assert!(html.contains(r#"<section class="layout-title">"#));
+    let tags = open_tags(&html);
+    let section = find_tag(&tags, "section", |t| t.name == "section");
+    assert_eq!(layout_classes(section), ["layout-title"]);
     assert!(!html.contains("subtitle") && !html.contains(r#"class="author""#));
-    assert!(html.contains("<title>Presentation</title>"));
+    let title = find_tag(&tags, "title", |t| t.name == "title");
+    assert_eq!(text_after(&html, title), "Presentation");
     for absent in [
         "vendor/katex/",
         "presenter/math.js",
@@ -584,19 +936,73 @@ fn renders_without_optional_meta_and_layout_template() {
 }
 
 #[test]
+fn hidden_output_and_disabled_prompts() {
+    let mut deck = sample_deck();
+    let Block::Cell(cell) = &mut deck.slides[5].blocks[1] else {
+        panic!("fixture: slides[5].blocks[1] is a cell");
+    };
+    cell.hide_output = true;
+    let mut context = context(&deck);
+    context["config"]["notebook"]["show_prompts"] = json!(false);
+    let html = render_with(&context, UndefinedBehavior::Strict);
+    let tags = open_tags(&html);
+    let cell = cell_tag(&tags, "4");
+    assert!(cell.has_class("hide-output") && !cell.has_class("hide-input"));
+    // Hidden output is still emitted (CSS hides it, §6).
+    assert!(inner_html(&html, cell).contains("rows: 1000"));
+    assert!(
+        !tags.iter().any(|t| t.has_class("cell-prompt")),
+        "prompts shown"
+    );
+    assert!(!html.contains("In [") && !html.contains("Out ["));
+}
+
+#[test]
+fn math_mode_controls_katex() {
+    let markers = [
+        "vendor/katex/katex.min.css",
+        "vendor/katex/katex.min.js",
+        "presenter/math.js",
+    ];
+    for (feature, mode, included) in [
+        (true, "auto", true),
+        (false, "auto", false),
+        (false, "always", true),
+        (true, "never", false),
+    ] {
+        let mut deck = sample_deck();
+        deck.features.math = feature;
+        let mut context = context(&deck);
+        context["config"]["math"]["enabled"] = json!(mode);
+        let html = render_with(&context, UndefinedBehavior::Strict);
+        for marker in markers {
+            assert_eq!(
+                html.contains(marker),
+                included,
+                "{marker} with features.math = {feature}, math.enabled = {mode}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Tests: the theme files themselves
+// ---------------------------------------------------------------------------------------
+
+#[test]
 fn theme_toml_parses_and_declares_the_skeleton() {
     let manifest = manifest();
     assert_eq!(manifest["name"].as_str(), Some("default"));
     assert!(manifest.get("extends").is_none());
     let styles = &manifest["styles"];
-    let entries = styles["entries"].as_array().expect("entries");
     // theme.css first; later tasks may append entries (T33: styles/notebook.css).
+    let entries = style_entries();
     assert_eq!(
-        entries.first(),
-        Some(&toml::Value::from("styles/theme.css"))
+        entries.first().map(String::as_str),
+        Some("styles/theme.css")
     );
-    for entry in entries {
-        assert!(theme_dir().join(entry.as_str().expect("path")).is_file());
+    for entry in &entries {
+        assert!(theme_dir().join(entry).is_file(), "missing {entry}");
     }
     assert_eq!(styles["reveal_theme"].as_str(), Some("white"));
     assert_eq!(styles["highlight_style"].as_str(), Some("monokai"));
@@ -635,8 +1041,29 @@ fn tag_regions(source: &str) -> Vec<String> {
         .collect()
 }
 
-fn read_template(name: &str) -> String {
-    std::fs::read_to_string(templates_dir().join(name)).expect("template readable")
+/// String literals in either quote style.
+fn string_literal() -> Regex {
+    Regex::new(r#""([^"]*)"|'([^']*)'"#).expect("regex")
+}
+
+/// Every complete template name written as a string literal in a tag (include, extends,
+/// import targets and include fallbacks), in either quote style; `@default/` is dropped.
+/// A literal joined with `~` is a fragment of a computed name and is skipped.
+fn template_references(source: &str) -> Vec<String> {
+    let literal = string_literal();
+    let mut names = Vec::new();
+    for region in tag_regions(source) {
+        for m in literal.captures_iter(&region) {
+            let text = m.get(1).or(m.get(2)).expect("literal body").as_str();
+            let whole = m.get(0).expect("match");
+            let joined = region[..whole.start()].trim_end().ends_with('~')
+                || region[whole.end()..].trim_start().starts_with('~');
+            if text.ends_with(".html") && !joined {
+                names.push(text.strip_prefix("@default/").unwrap_or(text).to_string());
+            }
+        }
+    }
+    names
 }
 
 #[test]
@@ -657,24 +1084,19 @@ fn every_referenced_template_exists() {
     ] {
         assert!(names.contains(required), "missing {required}");
     }
-    // Every template name written in a tag (include/extends targets, include fallbacks).
-    let literal = Regex::new(r#""([^"]+\.html)""#).expect("regex");
     let mut referenced = 0;
-    for name in &names {
-        for region in tag_regions(&read_template(name)) {
-            for target in literal.captures_iter(&region) {
-                referenced += 1;
-                assert!(
-                    names.contains(&target[1]),
-                    "{name} references missing {}",
-                    &target[1]
-                );
-            }
+    for (name, source) in templates() {
+        for target in template_references(&source) {
+            referenced += 1;
+            assert!(
+                names.contains(&target),
+                "{name} references missing {target}"
+            );
         }
     }
     assert!(referenced >= 8, "scan found only {referenced} references");
-    // Dynamic includes go through `layout_template`: each documented layout has its file
-    // and each layout file is documented.
+    // Dynamic includes go through `layout_template` / `layouts/<layout>.html`: each
+    // documented layout has its file and each layout file is documented.
     let documented: BTreeSet<String> = manifest()["layouts"]
         .as_table()
         .expect("[layouts]")
@@ -689,48 +1111,102 @@ fn every_referenced_template_exists() {
     assert_eq!(documented, files);
 }
 
-#[test]
-fn templates_use_only_spec_helpers_and_filters() {
-    let strings = Regex::new(r#""[^"]*"|'[^']*'"#).expect("regex");
-    let filter = Regex::new(r"\|\s*([A-Za-z_]\w*)").expect("regex");
-    let test = Regex::new(r"\bis\s+(?:not\s+)?[A-Za-z_]\w*").expect("regex");
-    let call = Regex::new(r"(?:^|[^\w.])([A-Za-z_]\w*)\s*\(").expect("regex");
-    let safe = Regex::new(r"([\w.]+)\s*\|\s*safe\b").expect("regex");
-    let keywords = ["and", "or", "not", "in", "is", "if", "elif", "else"];
-    let allowed_filters: BTreeSet<&str> = ALLOWED_FILTERS.split_whitespace().collect();
-    let mut helpers_used = BTreeSet::new();
-    for name in template_names() {
-        for region in tag_regions(&read_template(&name)) {
-            for m in safe.captures_iter(&region) {
-                assert!(
-                    SAFE_EXPRESSIONS.contains(&&m[1]),
-                    "{name}: `{}|safe`",
-                    &m[1]
-                );
+/// Result of the static template scan.
+#[derive(Debug, Default)]
+struct Scan {
+    /// One line per violation: `<template>: <what>`.
+    problems: Vec<String>,
+    /// §4 helpers that are called somewhere.
+    helpers: BTreeSet<String>,
+}
+
+/// Names the templates define themselves (macros, imports, `set`/`with`/`for` targets);
+/// calling them is not calling a helper.
+fn defined_names(templates: &[(String, String)]) -> BTreeSet<String> {
+    let simple = Regex::new(r"^\{%-?\s*(?:macro|set|with)\s+([A-Za-z_]\w*)").expect("regex");
+    let for_targets = Regex::new(r"^\{%-?\s*for\s+([A-Za-z_][\w\s,]*?)\s+in\b").expect("regex");
+    let import = Regex::new(r"^\{%-?\s*from\s+.*?\bimport\s+(.*?)-?%\}$").expect("regex");
+    let mut names = BTreeSet::new();
+    for (_, source) in templates {
+        for region in tag_regions(source) {
+            let region = region.trim();
+            if let Some(c) = simple.captures(region) {
+                names.insert(c[1].to_string());
             }
-            let region = strings.replace_all(&region, "\"\"");
-            for m in filter.captures_iter(&region) {
-                assert!(
-                    allowed_filters.contains(&m[1]),
-                    "{name}: filter `{}`",
-                    &m[1]
-                );
+            if let Some(c) = for_targets.captures(region) {
+                names.extend(c[1].split(',').map(|n| n.trim().to_string()));
             }
-            let region = filter.replace_all(&region, "");
-            let region = test.replace_all(&region, "");
-            for m in call.captures_iter(&region) {
-                let ident = m[1].to_string();
-                if keywords.contains(&ident.as_str()) || ident == "super" {
-                    continue;
+            if let Some(c) = import.captures(region) {
+                for item in c[1].split(',') {
+                    let alias = item.split_whitespace().last().unwrap_or_default();
+                    names.insert(alias.to_string());
                 }
-                assert!(
-                    SPEC_HELPERS.contains(&ident.as_str()),
-                    "{name}: helper `{ident}`"
-                );
-                helpers_used.insert(ident);
             }
         }
     }
+    names
+}
+
+/// Checks one tag region: `|safe` only on IR HTML, filters from the allowlist, and every
+/// call either a §4 helper or a name minijinja or the templates define.
+fn scan_region(region: &str, allowed_calls: &BTreeSet<String>, scan: &mut Scan, name: &str) {
+    let delimiters = Regex::new(r"\{\{-?|-?\}\}|\{%-?|-?%\}").expect("regex");
+    let safe = Regex::new(r"(\S+)\s*\|\s*safe\b").expect("regex");
+    let filter = Regex::new(r"\|\s*([A-Za-z_]\w*)(?:\s*\([^()]*\))?").expect("regex");
+    let test = Regex::new(r"\bis\s+(?:not\s+)?[A-Za-z_]\w*(?:\s*\([^()]*\))?").expect("regex");
+    let call = Regex::new(r"(?:^|[^\w.])([A-Za-z_]\w*)\s*\(").expect("regex");
+    let escaping_off = Regex::new(r"^\{%-?\s*(?:autoescape\b|filter\b.*\bsafe\b)").expect("regex");
+    let allowed_filters: BTreeSet<&str> = ALLOWED_FILTERS.split_whitespace().collect();
+
+    if escaping_off.is_match(region.trim()) {
+        scan.problems
+            .push(format!("{name}: `{region}` turns escaping off"));
+    }
+    let region = string_literal().replace_all(region, "\"\"");
+    let region = delimiters.replace_all(&region, " ");
+    for m in safe.captures_iter(&region) {
+        if !SAFE_EXPRESSIONS.contains(&&m[1]) {
+            scan.problems.push(format!("{name}: `{}|safe`", &m[1]));
+        }
+    }
+    for m in filter.captures_iter(&region) {
+        if !allowed_filters.contains(&m[1]) {
+            scan.problems.push(format!("{name}: filter `{}`", &m[1]));
+        }
+    }
+    let region = filter.replace_all(&region, "");
+    let region = test.replace_all(&region, "");
+    for m in call.captures_iter(&region) {
+        let ident = &m[1];
+        if SPEC_HELPERS.contains(&ident) {
+            scan.helpers.insert(ident.to_string());
+        } else if !allowed_calls.contains(ident) {
+            scan.problems.push(format!("{name}: helper `{ident}`"));
+        }
+    }
+}
+
+/// The static scan behind "no helper other than those of §4 is used": every tag of every
+/// template, including branches the fixture never executes.
+fn scan_templates(templates: &[(String, String)]) -> Scan {
+    let mut allowed_calls = defined_names(templates);
+    let builtin = MINIJINJA_CALLABLES
+        .split_whitespace()
+        .chain(KEYWORDS.split_whitespace());
+    allowed_calls.extend(builtin.map(str::to_string));
+    let mut scan = Scan::default();
+    for (name, source) in templates {
+        for region in tag_regions(source) {
+            scan_region(&region, &allowed_calls, &mut scan, name);
+        }
+    }
+    scan
+}
+
+#[test]
+fn templates_use_only_spec_helpers_and_filters() {
+    let scan = scan_templates(&templates());
+    assert!(scan.problems.is_empty(), "{:#?}", scan.problems);
     // The document shell needs these; `asset` is optional (e.g. a logo in a layout).
     for needed in [
         "live_reload",
@@ -739,8 +1215,42 @@ fn templates_use_only_spec_helpers_and_filters() {
         "style",
         "theme_style",
     ] {
-        assert!(helpers_used.contains(needed), "{needed} is never called");
+        assert!(scan.helpers.contains(needed), "{needed} is never called");
     }
+}
+
+/// The static scans on synthetic templates: ordinary minijinja passes, bypasses do not.
+#[test]
+fn static_scans_accept_minijinja_and_catch_bypasses() {
+    let scan = |source: &str| scan_templates(&[("t.html".to_string(), source.to_string())]);
+    for ok in [
+        r#"{% macro prompt(label, n) %}{{ label }} [{{ n }}]{% endmacro %}{{ prompt("In", 1) }}"#,
+        r#"{% from "m.html" import fmt as f, other %}{{ f(1) }}{{ other() }}"#,
+        r#"{%- set mimes = out.mimes %}{{ mimes|join(", ") }}{{ out.mimes|join(', ') }}"#,
+        "{{ range(3)|join }}{% set ns = namespace(n=1) %}{{ dict(a=1)|tojson }}",
+        "{% for a, b in x|items %}{{ loop.cycle(1, 2) }}{% endfor %}",
+        "{{ x is divisibleby(3) }}{{ caller() }}{{ super() }}{{ style(\"a.css\") }}",
+        "{{ block.html|safe }}{{ slide.notes | safe }}{{-out.html|safe-}}",
+    ] {
+        let result = scan(ok);
+        assert!(result.problems.is_empty(), "{ok}: {:?}", result.problems);
+    }
+    for bad in [
+        "{{ helper(1) }}",
+        "{{ x|unknown_filter }}",
+        "{{ (out.name ~ out.html)|safe }}",
+        "{{ cell.source|safe }}",
+        "{{ block.html|e|safe }}",
+        "{% autoescape false %}{{ cell.source }}{% endautoescape %}",
+        "{% filter safe %}{{ cell.source }}{% endfilter %}",
+    ] {
+        assert!(!scan(bad).problems.is_empty(), "{bad} passed the scan");
+    }
+    let refs = template_references(
+        r#"{% include 'partials/a.html' %}{% include ["b.html", "@default/c.html"] %}
+           {% include "layouts/" ~ slide.layout ~ ".html" %}{# {% include "d.html" %} #}"#,
+    );
+    assert_eq!(refs, ["partials/a.html", "b.html", "c.html"]);
 }
 
 #[test]

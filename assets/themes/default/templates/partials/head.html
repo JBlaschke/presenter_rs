@@ -1,11 +1,13 @@
 {#- Document metadata; included by the `head` block of deck.html. Stylesheets are emitted
-    by the `styles` block of deck.html, not here. -#}
+    by the `styles` block of deck.html, not here. title and author fall back to the
+    presenter.toml [deck] defaults (config.md §2). No `set` here: a variable set in an
+    included template stays visible in the including one. -#}
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{ meta.title or "Presentation" }}</title>
+<title>{{ meta.title or config.deck.title or "Presentation" }}</title>
 {%- if meta.description %}
 <meta name="description" content="{{ meta.description }}">
 {%- endif %}
-{%- if meta.author %}
-<meta name="author" content="{{ meta.author }}">
+{%- if meta.author or config.deck.author %}
+<meta name="author" content="{{ meta.author or config.deck.author }}">
 {%- endif %}
