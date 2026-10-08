@@ -6,9 +6,8 @@
 # command-line flags override both.
 
 [deck]
-theme = "theme"            # this presentation's theme, in ./theme (it extends the built-in
-                           # "default" theme); a built-in theme name or a directory relative
-                           # to this file (built-in default: "default")
+theme = "theme"            # this presentation's theme, in ./theme: a built-in theme name or
+                           # a directory relative to this file (built-in default: "default")
 #lang = "en"               # <html lang> when the front matter sets none
 #title = "My talk"         # title, author and date for decks whose front matter sets none
 #author = "Your Name"      # (not set by default)

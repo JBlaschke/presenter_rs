@@ -5,31 +5,42 @@
 //! with `--notebook`), `theme/` (a child of the built-in `default` theme that overrides the
 //! `title` layout and sets a few CSS custom properties), `.gitignore` (`dist/`) and
 //! `README.md`. With `--full-theme`, `theme/` is a copy of the built-in `themes/default/`
-//! instead, renamed like the child theme would be (its `theme.toml` `name` line is
-//! rewritten). `DIR` must be empty or not exist; anything else is a [`UsageError`] (exit 2)
-//! and nothing is written. On success stdout lists the files and the next steps (not with
-//! `-q`).
+//! instead; its `theme.toml` gets a new header comment, `name` and `description`.
+//!
+//! # The target directory
+//!
+//! `DIR` must be empty or not exist; anything else is a [`UsageError`] (exit 2) and nothing
+//! is written. `DIR` is checked where the file system will resolve it: symbolic links are
+//! followed (a broken one is not a directory), a component that is a file is an error, and
+//! so is a `..` after a component that does not exist yet (`new/..` would create `new` and
+//! then write next to it). After creating `DIR`, `init` checks once more that it is empty
+//! before writing anything, and it never overwrites a file. On success stdout lists the
+//! files and the next steps (not with `-q`).
 //!
 //! # Placeholders
 //!
 //! Text files of the scaffold contain placeholders, replaced by plain string replacement in
-//! one pass over each file (no template engine runs on them, so the `{{ … }}` expressions
-//! of the theme's templates stay as they are):
+//! one pass over each file. No template engine runs on them, and the theme's templates
+//! (`theme/templates/`) are copied unchanged, so their `{{ … }}` expressions stay as they are:
 //!
 //! | placeholder | value |
 //! |---|---|
-//! | `{{name}}` | the presentation name as Markdown text: characters Markdown would interpret are backslash-escaped |
+//! | `{{name}}` | the presentation name as Markdown text: characters Markdown would interpret are backslash-escaped, and so is whatever would start an autolink (`:` before `//`, `@`, `.` after `www`) |
 //! | `{{name_yaml}}` | the name as a YAML double-quoted string, quotes included (for front matter) |
 //! | `{{theme_name}}` | the theme's `name`: the presentation name as a lower-case slug |
 //! | `{{deck}}` | the deck's file name, `slides.md` or `slides.ipynb` |
 //!
+//! A line containing the marker `{{child_theme}}` is about the child theme: with
+//! `--full-theme` the whole line is left out, otherwise only the marker is removed.
+//!
 //! In `.ipynb` files the placeholders sit inside JSON strings, so there each value is also
 //! escaped for a JSON string. The presentation name is `--name`, else the name of `DIR`
-//! (made absolute); it must not contain control characters.
+//! (made absolute); it must not contain control characters, line or paragraph separators,
+//! or the non-characters U+FFFE and U+FFFF (YAML does not allow them).
 
 use std::borrow::Cow;
 use std::io::Write as _;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context as _, anyhow};
@@ -47,6 +58,10 @@ const DEFAULT_THEME_PREFIX: &str = "themes/default/";
 /// The theme directory inside the new project (`[deck] theme` in the scaffold's
 /// `presenter.toml` names it).
 const THEME_DIR: &str = "theme";
+/// Scaffold files copied without placeholder replacement: the theme's minijinja templates.
+const VERBATIM_PREFIX: &str = "theme/templates/";
+/// The marker of a scaffold line that only the child theme variant keeps.
+const CHILD_THEME_MARKER: &str = "{{child_theme}}";
 /// The Markdown deck of the scaffold.
 const MARKDOWN_DECK: &str = "slides.md";
 /// The notebook deck of the scaffold (`--notebook`).
@@ -56,8 +71,19 @@ const FALLBACK_NAME: &str = "Presentation";
 /// The theme name when the presentation name has no letters or digits.
 const FALLBACK_THEME_NAME: &str = "theme";
 /// ASCII characters that can change the meaning of Markdown inline text (or of a heading
-/// line: `#` closes an ATX heading, `{` starts heading attributes, `$` math).
-const MARKDOWN_SPECIAL: &str = "\\`*_[]<>!&$~{}#|";
+/// line: `#` closes an ATX heading, `{` starts heading attributes, `$` math, `@` an e-mail
+/// autolink).
+const MARKDOWN_SPECIAL: &str = "\\`*_[]<>!&$~{}#|@";
+/// The header of the `--full-theme` copy's `theme.toml`, instead of the built-in one's.
+const COPIED_MANIFEST_HEADER: &str = "\
+# This presentation's theme, copied from the built-in \"default\" theme by
+# `presenter init --full-theme`. It extends no other theme: every template and stylesheet
+# it uses is in this directory, ready to change.
+
+";
+/// The `description` line of the `--full-theme` copy's `theme.toml`.
+const COPIED_DESCRIPTION: &str =
+    "description = \"The theme of this presentation, copied from the built-in default theme\"";
 /// How many entries of a non-empty target directory the error message names.
 const LISTED_ENTRIES: usize = 3;
 
@@ -134,7 +160,7 @@ impl Scaffold {
             }
             let data = embedded(&key)?;
             let data = match String::from_utf8(data) {
-                Ok(text) => self.fill(&text, rel.ends_with(".ipynb")).into_bytes(),
+                Ok(text) => self.render(rel, &text).into_bytes(),
                 Err(binary) => binary.into_bytes(),
             };
             files.push((rel.to_string(), data));
@@ -166,8 +192,35 @@ impl Scaffold {
         rel != other_deck && !(self.full_theme && child_theme)
     }
 
-    /// The built-in default theme's files below `theme/`, with the manifest's `name`
-    /// replaced by this project's theme name.
+    /// The text of scaffold file `rel` for this variant: the theme's templates unchanged,
+    /// any other file with its [`CHILD_THEME_MARKER`] lines selected and its placeholders
+    /// filled in.
+    fn render(&self, rel: &str, text: &str) -> String {
+        if rel.starts_with(VERBATIM_PREFIX) {
+            return text.to_string();
+        }
+        self.fill(&self.select_lines(text), rel.ends_with(".ipynb"))
+    }
+
+    /// `text` without the lines of the other theme variant: a line containing
+    /// [`CHILD_THEME_MARKER`] is left out with `--full-theme` and kept without the marker
+    /// otherwise.
+    fn select_lines(&self, text: &str) -> String {
+        text.split_inclusive('\n')
+            .filter_map(|line| {
+                if !line.contains(CHILD_THEME_MARKER) {
+                    Some(Cow::Borrowed(line))
+                } else if self.full_theme {
+                    None
+                } else {
+                    Some(Cow::Owned(line.replace(CHILD_THEME_MARKER, "")))
+                }
+            })
+            .collect()
+    }
+
+    /// The built-in default theme's files below `theme/`, with a manifest made for this
+    /// project ([`copied_manifest`]).
     fn default_theme_files(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
         let keys = vendor::list(DEFAULT_THEME_PREFIX);
         if keys.is_empty() {
@@ -180,7 +233,7 @@ impl Scaffold {
                 if rel == MANIFEST_FILE {
                     let text = String::from_utf8(data)
                         .with_context(|| format!("embedded {key} is not UTF-8"))?;
-                    data = rename_theme(&text, &self.theme_name).into_bytes();
+                    data = copied_manifest(&text, &self.theme_name).into_bytes();
                 }
                 Ok((format!("{THEME_DIR}/{rel}"), data))
             })
@@ -250,16 +303,14 @@ impl Scaffold {
         for (file, what) in rows {
             text.push_str(&format!("  {file:<15} {what}\n"));
         }
+        text.push_str("\nNext steps:\n");
+        if !here {
+            text.push_str(&format!("  cd {}\n", cd_argument(dir)));
+        }
         let serve = format!("presenter serve {}", self.deck);
-        let serve = if here {
-            serve
-        } else {
-            format!("cd {} && {serve}", shell_word(dir))
-        };
         let build = format!("presenter build {}", self.deck);
         // `{:<width$}` pads to a number of characters, not bytes.
         let width = serve.chars().count().max(build.chars().count());
-        text.push_str("\nNext steps:\n");
         text.push_str(&format!(
             "  {serve:<width$}    # live preview; every save updates it\n"
         ));
@@ -268,17 +319,115 @@ impl Scaffold {
     }
 }
 
-/// Fails with a [`UsageError`] unless `dir` is an empty directory or does not exist.
+/// Fails with a [`UsageError`] unless `dir` is an empty directory or can be created (see
+/// [`resolve_target`]).
 fn check_target(dir: &Path) -> anyhow::Result<()> {
     let shown = described(dir);
-    let metadata = match std::fs::metadata(dir) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(anyhow::Error::new(err).context(format!("cannot read {shown}"))),
-    };
-    if !metadata.is_dir() {
-        return Err(UsageError(format!("{shown} exists and is not a directory")).into());
+    let (real, found) = resolve_target(dir)?;
+    match found {
+        Found::Missing => Ok(()),
+        Found::NotDir => Err(UsageError(format!("{shown} exists and is not a directory")).into()),
+        Found::Dir => check_empty(&real, &shown),
     }
+}
+
+/// What the path resolved so far is on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Found {
+    /// An existing directory.
+    Dir,
+    /// An existing file, or anything else that is not a directory.
+    NotDir,
+    /// It does not exist (yet): `init` creates it.
+    Missing,
+}
+
+/// Resolves `dir` the way the file system will once `init` has created what is missing:
+/// returns the real path (absolute, symbolic links followed) and what it is now. A
+/// [`UsageError`] when no directory can be created there: a component before the last one
+/// is not a directory, a symbolic link is broken, or a `..` follows a missing component.
+fn resolve_target(dir: &Path) -> anyhow::Result<(PathBuf, Found)> {
+    let mut real = if dir.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::fs::canonicalize(".").context("cannot read the current directory")?
+    };
+    let mut found = Found::Dir;
+    // The components of `dir` resolved so far, for messages.
+    let mut given = PathBuf::new();
+    for component in dir.components() {
+        if found == Found::NotDir {
+            return Err(UsageError(format!("{} is not a directory", given.display())).into());
+        }
+        let previous = given.clone();
+        given.push(component);
+        match component {
+            Component::Prefix(_) | Component::RootDir => real.push(component),
+            Component::CurDir => {}
+            // `real` has no symbolic links, so its parent is what `..` names.
+            Component::ParentDir if found == Found::Dir => {
+                real.pop();
+            }
+            Component::ParentDir => {
+                return Err(UsageError(format!(
+                    "invalid directory {}: `..` follows {}, which does not exist",
+                    dir.display(),
+                    previous.display()
+                ))
+                .into());
+            }
+            Component::Normal(name) => {
+                real.push(name);
+                if found == Found::Dir {
+                    (real, found) = inspect(real, &given)?;
+                }
+            }
+        }
+    }
+    Ok((real, found))
+}
+
+/// What `path` (an existing directory's path plus one component, `given` for messages) is:
+/// a symbolic link is replaced by its target.
+fn inspect(path: PathBuf, given: &Path) -> anyhow::Result<(PathBuf, Found)> {
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((path, Found::Missing));
+        }
+        Err(err) => {
+            let message = format!("cannot read {}", given.display());
+            return Err(anyhow::Error::new(err).context(message));
+        }
+    };
+    let (path, metadata) = if metadata.file_type().is_symlink() {
+        let target = std::fs::canonicalize(&path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(UsageError(format!(
+                    "{} exists and is not a directory (a broken symbolic link)",
+                    given.display()
+                )))
+            } else {
+                anyhow::Error::new(err).context(format!("cannot read {}", given.display()))
+            }
+        })?;
+        let metadata = std::fs::metadata(&target)
+            .with_context(|| format!("cannot read {}", given.display()))?;
+        (target, metadata)
+    } else {
+        (path, metadata)
+    };
+    let found = if metadata.is_dir() {
+        Found::Dir
+    } else {
+        Found::NotDir
+    };
+    Ok((path, found))
+}
+
+/// Fails with a [`UsageError`] naming the first few entries unless directory `dir` (shown
+/// as `shown`) is empty.
+fn check_empty(dir: &Path, shown: &str) -> anyhow::Result<()> {
     let mut names = std::fs::read_dir(dir)
         .and_then(|entries| {
             entries
@@ -301,7 +450,7 @@ fn check_target(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// The presentation name: `--name` (trimmed), else the name of `dir`. A [`UsageError`]
-/// when it is empty or contains a control character.
+/// when it is empty or contains a character the deck's front matter cannot hold.
 fn presentation_name(name: Option<&str>, dir: &Path) -> anyhow::Result<String> {
     let name = match name {
         Some(name) => name.trim().to_string(),
@@ -310,14 +459,21 @@ fn presentation_name(name: Option<&str>, dir: &Path) -> anyhow::Result<String> {
     if name.is_empty() {
         return Err(UsageError("the presentation name (--name) must not be empty".into()).into());
     }
-    if name.chars().any(char::is_control) {
+    if let Some(bad) = name.chars().find(|&c| !allowed_in_name(c)) {
         return Err(UsageError(format!(
-            "invalid presentation name {name:?}: it contains a control character \
-             (line break, tab, …); choose another one with --name"
+            "invalid presentation name {name:?}: it contains {bad:?}, a control character, \
+             line break or non-character; choose another name with --name"
         ))
         .into());
     }
     Ok(name)
+}
+
+/// Whether presentation names may contain `c`. Not: control characters (line breaks and
+/// tabs included), U+2028/U+2029 (YAML line breaks) and U+FFFE/U+FFFF (YAML does not allow
+/// them in a document).
+fn allowed_in_name(c: char) -> bool {
+    !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}')
 }
 
 /// The last component of `dir` made absolute (`.` is the current directory's name), or
@@ -359,12 +515,19 @@ fn theme_name(name: &str) -> String {
     }
 }
 
-/// `text` with every [`MARKDOWN_SPECIAL`] character backslash-escaped, so that Markdown
-/// renders it literally (CommonMark allows escaping any ASCII punctuation).
+/// `text` as Markdown that renders exactly `text`, as plain text: every
+/// [`MARKDOWN_SPECIAL`] character is backslash-escaped (CommonMark allows escaping any
+/// ASCII punctuation), and so are the characters that would start an autolink, inside
+/// which escapes do not work: the `:` of `://` and the `.` of `www.`.
 fn markdown_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if MARKDOWN_SPECIAL.contains(c) {
+    for (at, c) in text.char_indices() {
+        let autolink = match c {
+            ':' => text[at + 1..].starts_with("//"),
+            '.' => text[..at].ends_with("www"),
+            _ => false,
+        };
+        if autolink || MARKDOWN_SPECIAL.contains(c) {
             out.push('\\');
         }
         out.push(c);
@@ -379,23 +542,40 @@ fn json_string_content(text: &str) -> String {
     quoted[1..quoted.len() - 1].to_string()
 }
 
-/// A theme manifest with its top-level `name = …` line replaced by `name = "<name>"`
-/// (`name` is a slug from [`theme_name`], so it needs no TOML escaping). When there is no
-/// such line, one is added at the top.
-fn rename_theme(manifest: &str, name: &str) -> String {
-    let new_line = format!("name = \"{name}\"");
-    let mut out = String::with_capacity(manifest.len());
-    let mut renamed = false;
+/// The manifest of the `--full-theme` copy: the built-in theme's `manifest` with
+/// [`COPIED_MANIFEST_HEADER`] instead of its leading comment lines, `name = "<name>"` and
+/// [`COPIED_DESCRIPTION`] (`name` is a slug from [`theme_name`], so it needs no TOML
+/// escaping).
+fn copied_manifest(manifest: &str, name: &str) -> String {
+    let mut lines = manifest.split_inclusive('\n').peekable();
+    while lines
+        .next_if(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with('#')
+        })
+        .is_some()
+    {}
+    let body: String = lines.collect();
+    let body = set_top_level_key(&body, "description", COPIED_DESCRIPTION);
+    let body = set_top_level_key(&body, "name", &format!("name = \"{name}\""));
+    format!("{COPIED_MANIFEST_HEADER}{body}")
+}
+
+/// A TOML document with its first top-level `key = …` line replaced by `new_line`. When
+/// there is no such line, `new_line` is added at the top.
+fn set_top_level_key(manifest: &str, key: &str, new_line: &str) -> String {
+    let mut out = String::with_capacity(manifest.len() + new_line.len());
+    let mut replaced = false;
     let mut in_table = false;
     for line in manifest.split_inclusive('\n') {
         let trimmed = line.trim_start();
         in_table |= trimmed.starts_with('[');
-        let is_name = trimmed
-            .strip_prefix("name")
+        let is_key = trimmed
+            .strip_prefix(key)
             .is_some_and(|rest| rest.trim_start().starts_with('='));
-        if is_name && !renamed && !in_table {
-            renamed = true;
-            out.push_str(&new_line);
+        if is_key && !replaced && !in_table {
+            replaced = true;
+            out.push_str(new_line);
             if line.ends_with('\n') {
                 out.push('\n');
             }
@@ -403,7 +583,7 @@ fn rename_theme(manifest: &str, name: &str) -> String {
             out.push_str(line);
         }
     }
-    if renamed {
+    if replaced {
         out
     } else {
         format!("{new_line}\n{out}")
@@ -417,9 +597,11 @@ fn embedded(key: &str) -> anyhow::Result<Vec<u8>> {
         .ok_or_else(|| anyhow!("embedded file {key} is missing"))
 }
 
-/// Writes `files` below `dir`, creating directories as needed. Never overwrites a file.
+/// Creates `dir`, checks that it is (still) empty and writes `files` below it, creating
+/// directories as needed. Never overwrites a file.
 fn write_files(dir: &Path, files: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    check_empty(dir, &described(dir))?;
     for (rel, data) in files {
         let path = rel
             .split('/')
@@ -449,6 +631,17 @@ fn described(dir: &Path) -> String {
         "the current directory".to_string()
     } else {
         dir.display().to_string()
+    }
+}
+
+/// `dir` as the argument of a `cd` command: one shell word ([`shell_word`]), with `./` in
+/// front of a relative path that starts with `-` (which `cd` would take for an option).
+fn cd_argument(dir: &Path) -> String {
+    let text = dir.display().to_string();
+    if text.starts_with('-') {
+        shell_word(&Path::new(".").join(dir))
+    } else {
+        shell_word(dir)
     }
 }
 
@@ -502,13 +695,57 @@ mod tests {
     }
 
     #[test]
+    fn templates_are_copied_verbatim() {
+        let s = scaffold("talk");
+        let template = "{{deck}} {{name}} {{child_theme}}{{ meta.title }}\n";
+        assert_eq!(
+            s.render("theme/templates/layouts/title.html", template),
+            template
+        );
+        assert_eq!(
+            s.render("README.md", template),
+            "slides.md talk {{ meta.title }}\n"
+        );
+        assert_eq!(
+            s.render("theme/styles/theme.css", "/* {{deck}} */"),
+            "/* slides.md */"
+        );
+    }
+
+    #[test]
+    fn child_theme_lines_depend_on_the_variant() {
+        let text = "a\n{{child_theme}}b: {{deck}}\n  \"{{child_theme}}c\\n\",\nd";
+        let child = Scaffold::new("t", false, false);
+        assert_eq!(
+            child.render("x.md", text),
+            "a\nb: slides.md\n  \"c\\n\",\nd"
+        );
+        let full = Scaffold::new("t", true, true);
+        assert_eq!(full.render("x.ipynb", text), "a\nd");
+        // The last line has no line break.
+        assert_eq!(full.select_lines("a\n{{child_theme}}b"), "a\n");
+        // A name is filled in after the lines are chosen.
+        let named = Scaffold::new("{{child_theme}}", false, true);
+        assert_eq!(
+            named.render("x.md", "{{name_yaml}}\n"),
+            "\"{{child_theme}}\"\n"
+        );
+    }
+
+    #[test]
     fn markdown_specials_are_escaped() {
         assert_eq!(markdown_text("talk"), "talk");
-        assert_eq!(markdown_text("rust-intro 2.0"), "rust-intro 2.0");
+        assert_eq!(markdown_text("rust-intro 2.0: why"), "rust-intro 2.0: why");
         assert_eq!(
-            markdown_text("*a* _b_ `c` [d] <e> {f} #1 $5 a&b ~x~ !|\\"),
-            "\\*a\\* \\_b\\_ \\`c\\` \\[d\\] \\<e\\> \\{f\\} \\#1 \\$5 a\\&b \\~x\\~ \\!\\|\\\\"
+            markdown_text("*a* _b_ `c` [d] <e> {f} #1 $5 a&b ~x~ !|\\ @"),
+            "\\*a\\* \\_b\\_ \\`c\\` \\[d\\] \\<e\\> \\{f\\} \\#1 \\$5 a\\&b \\~x\\~ \\!\\|\\\\ \\@"
         );
+        // Escapes do not work inside autolinks, so none may start.
+        assert_eq!(
+            markdown_text("https://x.org/a_b www.x.org a@b.com ftp://y C:/x"),
+            "https\\://x.org/a\\_b www\\.x.org a\\@b.com ftp\\://y C:/x"
+        );
+        assert_eq!(markdown_text("www"), "www");
     }
 
     #[test]
@@ -529,20 +766,46 @@ mod tests {
     }
 
     #[test]
-    fn rename_theme_replaces_only_the_top_level_name() {
+    fn set_top_level_key_replaces_only_the_top_level_key() {
         let manifest =
             "# comment\nname = \"default\"\ndescription = \"x\"\n\n[layouts]\nname = \"keep\"\n";
         assert_eq!(
-            rename_theme(manifest, "talk"),
+            set_top_level_key(manifest, "name", "name = \"talk\""),
             "# comment\nname = \"talk\"\ndescription = \"x\"\n\n[layouts]\nname = \"keep\"\n"
         );
-        assert_eq!(rename_theme("[vars]\n", "t"), "name = \"t\"\n[vars]\n");
-        assert_eq!(rename_theme("  name=\"a\"", "b"), "name = \"b\"");
+        assert_eq!(
+            set_top_level_key("[vars]\n", "name", "name = \"t\""),
+            "name = \"t\"\n[vars]\n"
+        );
+        assert_eq!(
+            set_top_level_key("  name=\"a\"", "name", "name = \"b\""),
+            "name = \"b\""
+        );
         // `names = …` is another key.
         assert_eq!(
-            rename_theme("names = 1\nname = \"a\"\n", "b"),
+            set_top_level_key("names = 1\nname = \"a\"\n", "name", "name = \"b\""),
             "names = 1\nname = \"b\"\n"
         );
+    }
+
+    #[test]
+    fn copied_manifests_get_a_new_header_name_and_description() {
+        let manifest = "# The built-in theme.\n# More.\n\nname = \"default\"\n\
+                        description = \"Built-in\"\n# kept\n[styles]\nentries = []\n";
+        assert_eq!(
+            copied_manifest(manifest, "talk"),
+            format!(
+                "{COPIED_MANIFEST_HEADER}name = \"talk\"\n{COPIED_DESCRIPTION}\n\
+                 # kept\n[styles]\nentries = []\n"
+            )
+        );
+        let bare = copied_manifest("[styles]\n", "t");
+        assert_eq!(
+            bare,
+            format!("{COPIED_MANIFEST_HEADER}name = \"t\"\n{COPIED_DESCRIPTION}\n[styles]\n")
+        );
+        let table: toml::Table = bare.parse().unwrap();
+        assert!(table["description"].as_str().unwrap().contains("copied"));
     }
 
     #[test]
@@ -561,8 +824,22 @@ mod tests {
         let dir = Path::new("/work/talk");
         let name = |name: &str| presentation_name(Some(name), dir);
         assert_eq!(name("  My talk ").unwrap(), "My talk");
+        assert_eq!(
+            name("Größe \u{fffd} \u{feff} 🦀").unwrap(),
+            "Größe \u{fffd} \u{feff} 🦀"
+        );
         assert_eq!(presentation_name(None, dir).unwrap(), "talk");
-        for bad in ["", "   ", "a\nb", "tab\there"] {
+        for bad in [
+            "",
+            "   ",
+            "a\nb",
+            "tab\there",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "x\u{fffe}y",
+            "x\u{ffff}y",
+        ] {
             let err = name(bad).unwrap_err();
             assert!(err.is::<UsageError>(), "{bad:?}: {err}");
         }
@@ -590,11 +867,113 @@ mod tests {
     }
 
     #[test]
+    fn cd_arguments_are_never_options() {
+        assert_eq!(cd_argument(Path::new("talk")), "talk");
+        assert_eq!(cd_argument(Path::new("-dash")), "./-dash");
+        assert_eq!(cd_argument(Path::new("-my talk")), "'./-my talk'");
+        assert_eq!(cd_argument(Path::new("a/-b")), "a/-b");
+        assert_eq!(cd_argument(Path::new("/abs/-x")), "/abs/-x");
+        let summary = scaffold("t").summary(Path::new("-dash"));
+        assert!(summary.contains("\n  cd ./-dash\n"), "{summary}");
+    }
+
+    #[test]
+    fn next_steps_change_directory_first() {
+        let summary = scaffold("t").summary(Path::new("my talk"));
+        let steps = summary.split("Next steps:\n").nth(1).unwrap();
+        let lines: Vec<&str> = steps.lines().collect();
+        assert_eq!(lines[0], "  cd 'my talk'");
+        assert!(lines[1].starts_with("  presenter serve slides.md    # "));
+        assert!(lines[2].starts_with("  presenter build slides.md    # "));
+        let here = scaffold("t").summary(Path::new("."));
+        assert!(!here.contains("cd "), "{here}");
+    }
+
+    #[test]
     fn current_dir_detection() {
         assert!(is_current_dir(Path::new(".")));
         assert!(is_current_dir(Path::new("./.")));
         assert!(is_current_dir(Path::new("")));
         assert!(!is_current_dir(Path::new("talk")));
         assert!(!is_current_dir(Path::new("..")));
+    }
+
+    /// `resolve_target` of `rel` below `root`: Ok(what it is) or Err(the usage message).
+    fn resolve(root: &Path, rel: &str) -> Result<(PathBuf, Found), String> {
+        resolve_target(&root.join(rel)).map_err(|err| {
+            assert!(err.is::<UsageError>(), "{rel}: {err:#}");
+            err.to_string()
+        })
+    }
+
+    #[test]
+    fn targets_resolve_like_the_file_system() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::fs::write(root.join("file.txt"), "x").unwrap();
+
+        assert_eq!(
+            resolve(&root, "dir").unwrap(),
+            (root.join("dir"), Found::Dir)
+        );
+        assert_eq!(
+            resolve(&root, "dir/./").unwrap(),
+            (root.join("dir"), Found::Dir)
+        );
+        assert_eq!(
+            resolve(&root, "dir/..").unwrap(),
+            (root.clone(), Found::Dir)
+        );
+        assert_eq!(
+            resolve(&root, "new/a/b").unwrap(),
+            (root.join("new/a/b"), Found::Missing)
+        );
+        assert_eq!(
+            resolve(&root, "dir/../new").unwrap(),
+            (root.join("new"), Found::Missing)
+        );
+        assert_eq!(
+            resolve(&root, "file.txt").unwrap(),
+            (root.join("file.txt"), Found::NotDir)
+        );
+        // `..` after a missing directory would write next to it.
+        let err = resolve(&root, "new/..").unwrap_err();
+        assert!(err.contains("`..` follows") && err.ends_with("new, which does not exist"));
+        assert!(resolve(&root, "new/a/../b").is_err());
+        // A file cannot hold a directory.
+        let err = resolve(&root, "file.txt/sub").unwrap_err();
+        assert!(err.ends_with("file.txt is not a directory"), "{err}");
+        assert!(resolve(&root, "file.txt/..").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_links_are_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("file.txt"), "x").unwrap();
+        symlink(root.join("a/b"), root.join("to-b")).unwrap();
+        symlink(root.join("file.txt"), root.join("to-file")).unwrap();
+        symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+
+        assert_eq!(
+            resolve(&root, "to-b").unwrap(),
+            (root.join("a/b"), Found::Dir)
+        );
+        // `..` leaves the link's target, not the link.
+        assert_eq!(
+            resolve(&root, "to-b/../new").unwrap(),
+            (root.join("a/new"), Found::Missing)
+        );
+        assert_eq!(resolve(&root, "to-file").unwrap().1, Found::NotDir);
+        for rel in ["dangling", "dangling/", "dangling/sub"] {
+            let err = resolve(&root, rel).unwrap_err();
+            assert!(err.ends_with("(a broken symbolic link)"), "{rel}: {err}");
+        }
+        let err = check_target(&root.join("dangling")).unwrap_err();
+        assert!(err.is::<UsageError>(), "{err}");
     }
 }

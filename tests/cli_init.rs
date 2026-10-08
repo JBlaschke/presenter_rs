@@ -20,8 +20,19 @@ use serde_json::Value;
 const TRICKY_NAME: &str =
     r#"Rust: "fast" & <safe> {x} $5 #1 *a* _b_ `c` [d](e) ~~f~~ C:\path it's |p| !g {{deck}}"#;
 
-/// The placeholders of `src/cli/init.rs`; none may survive into a project.
-const PLACEHOLDERS: [&str; 4] = ["{{name}}", "{{name_yaml}}", "{{theme_name}}", "{{deck}}"];
+/// A name with URLs and an e-mail address: Markdown escapes do not work inside autolinks,
+/// so the title heading must not become one.
+const URL_NAME: &str = "Talk at https://example.com/x_y, www.example.org/a_b and a_b@c.com";
+
+/// The placeholders and the line marker of `src/cli/init.rs`; none may survive into a
+/// project.
+const PLACEHOLDERS: [&str; 5] = [
+    "{{name}}",
+    "{{name_yaml}}",
+    "{{theme_name}}",
+    "{{deck}}",
+    "{{child_theme}}",
+];
 
 /// The binary, run in `dir`, without the developer's `RUST_LOG` / `NO_COLOR`.
 fn presenter(dir: &Path) -> Command {
@@ -129,7 +140,11 @@ fn init_then_build_uses_the_child_theme() {
     let tmp = tempfile::tempdir().unwrap();
     let stdout = init(tmp.path(), &["talk"]);
     assert!(
-        stdout.contains("cd talk && presenter serve slides.md"),
+        stdout.contains("Next steps:\n  cd talk\n  presenter serve slides.md "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n  presenter build slides.md "),
         "{stdout}"
     );
     let project = tmp.path().join("talk");
@@ -293,6 +308,79 @@ fn init_refuses_a_non_empty_directory() {
     );
 }
 
+/// Every entry below `dir`, directories included.
+fn entries(dir: &Path) -> BTreeSet<String> {
+    walkdir::WalkDir::new(dir)
+        .min_depth(1)
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let rel = entry.path().strip_prefix(dir).unwrap();
+            rel.to_string_lossy().replace('\\', "/")
+        })
+        .collect()
+}
+
+#[test]
+fn init_never_writes_where_it_cannot_scaffold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    std::fs::write(cwd.join("notes.txt"), "keep me").unwrap();
+    std::fs::create_dir(cwd.join("src")).unwrap();
+    std::fs::write(cwd.join("README.md"), "mine").unwrap();
+    let before = entries(cwd);
+
+    for (dir, message) in [
+        // `new/..` is the (non-empty) current directory once `new` exists.
+        ("newdir/..", "`..` follows newdir, which does not exist"),
+        ("a/b/../../src", "`..` follows a/b, which does not exist"),
+        (
+            "src/..",
+            "src/.. is not empty (it contains README.md, notes.txt, src)",
+        ),
+        ("notes.txt/sub", "notes.txt is not a directory"),
+        ("src/../notes.txt", "exists and is not a directory"),
+    ] {
+        let output = init_fails(cwd, &[dir]);
+        let stderr = text(&output.stderr);
+        assert!(stderr.starts_with("error: "), "{dir}: {stderr}");
+        assert!(stderr.contains(message), "{dir}: {stderr}");
+        assert_eq!(text(&output.stdout), "");
+        assert_eq!(entries(cwd), before, "{dir}");
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("nowhere", cwd.join("dangling")).unwrap();
+        std::os::unix::fs::symlink("notes.txt", cwd.join("to-file")).unwrap();
+        std::os::unix::fs::symlink("src", cwd.join("to-src")).unwrap();
+        std::fs::write(cwd.join("src/main.rs"), "fn main() {}").unwrap();
+        let before = entries(cwd);
+        for (dir, message) in [
+            (
+                "dangling",
+                "dangling exists and is not a directory (a broken symbolic link)",
+            ),
+            ("dangling/sub", "(a broken symbolic link)"),
+            ("to-file", "to-file exists and is not a directory"),
+            ("to-src", "to-src is not empty (it contains main.rs)"),
+        ] {
+            let stderr = text(&init_fails(cwd, &[dir]).stderr);
+            assert!(stderr.contains(message), "{dir}: {stderr}");
+            assert_eq!(entries(cwd), before, "{dir}");
+        }
+        // A link to an empty directory is fine: the files go into its target.
+        std::fs::create_dir(cwd.join("empty")).unwrap();
+        std::os::unix::fs::symlink("empty", cwd.join("to-empty")).unwrap();
+        init(cwd, &["to-empty", "-q"]);
+        assert!(cwd.join("empty/slides.md").is_file());
+    }
+
+    // `..` through existing directories is fine.
+    init(cwd, &["src/../talk", "-q"]);
+    assert!(cwd.join("talk/slides.md").is_file());
+}
+
 #[test]
 fn init_creates_missing_directories_or_fills_an_empty_one() {
     let tmp = tempfile::tempdir().unwrap();
@@ -316,10 +404,40 @@ fn init_creates_missing_directories_or_fills_an_empty_one() {
 
     // A directory with a space is quoted in the `cd` hint.
     let stdout = init(tmp.path(), &["my talk"]);
-    assert!(
-        stdout.contains("cd 'my talk' && presenter serve slides.md"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("\n  cd 'my talk'\n"), "{stdout}");
+}
+
+/// The `cd` line of `init`'s next steps.
+fn cd_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("cd "))
+        .unwrap_or_else(|| panic!("no cd line: {stdout}"))
+}
+
+#[test]
+fn the_cd_hint_works_in_a_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (args, expected) in [
+        (&["--", "-dash"][..], "cd ./-dash"),
+        (&["--", "-my talk"][..], "cd './-my talk'"),
+        (&["it's", "--notebook"][..], r"cd 'it'\''s'"),
+        (&["a/b"][..], "cd a/b"),
+    ] {
+        let stdout = init(tmp.path(), args);
+        let cd = cd_line(&stdout);
+        assert_eq!(cd, expected);
+        if cfg!(unix) {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{cd} && test -f presenter.toml"))
+                .current_dir(tmp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{cd}");
+        }
+    }
 }
 
 #[test]
@@ -334,7 +452,7 @@ fn notebook_scaffold_is_nbformat_4_5_and_builds() {
     let tmp = tempfile::tempdir().unwrap();
     let stdout = init(tmp.path(), &["nb", "--notebook"]);
     assert!(
-        stdout.contains("cd nb && presenter serve slides.ipynb"),
+        stdout.contains("\n  cd nb\n  presenter serve slides.ipynb "),
         "{stdout}"
     );
     let project = tmp.path().join("nb");
@@ -412,20 +530,65 @@ fn full_theme_copies_the_default_theme() {
             "{rel}"
         );
     }
-    // The manifest is the default theme's, renamed after the project.
-    let manifest: toml::Table = read(project.join("theme/theme.toml")).parse().unwrap();
+    // The manifest is the default theme's, renamed after the project, with a header and a
+    // description that say where it came from.
+    let manifest_source = read(project.join("theme/theme.toml"));
+    assert!(
+        manifest_source.starts_with(
+            "# This presentation's theme, copied from the built-in \"default\" theme by\n"
+        ),
+        "{manifest_source}"
+    );
+    assert!(!manifest_source.contains("The built-in theme"));
+    let manifest: toml::Table = manifest_source.parse().unwrap();
     let mut original: toml::Table = presenter::vendor::get_str("themes/default/theme.toml")
         .unwrap()
         .parse()
         .unwrap();
     assert!(!manifest.contains_key("extends"));
     assert_eq!(manifest["name"].as_str(), Some("full"));
+    let description = manifest["description"].as_str().unwrap();
+    assert!(description.contains("copied from the built-in default theme"));
     original.insert("name".into(), "full".into());
+    original.insert("description".into(), description.into());
     assert_eq!(manifest, original);
 
-    build(&project, "slides.md", 6);
+    let html = build(&project, "slides.md", 6);
     let context = dump(&project, "slides.md", true);
     assert_eq!(context["theme"]["chain"], serde_json::json!(["full"]));
+    assert_no_child_theme_text(&project, "slides.md", &html);
+}
+
+/// A `--full-theme` project says nothing about the child theme it does not have: no
+/// `event` front matter (the copied title layout does not show it), no inheritance.
+fn assert_no_child_theme_text(project: &Path, deck: &str, html: &str) {
+    for file in [deck, "presenter.toml", "README.md"] {
+        let text = read(project.join(file));
+        for needle in [
+            "event",
+            "extends the built-in",
+            "layouts/title.html adds",
+            "eject",
+        ] {
+            assert!(!text.contains(needle), "{file}: {needle}");
+        }
+    }
+    assert!(!html.contains(r#"class="event""#));
+    assert!(!html.contains("Event name"));
+}
+
+#[test]
+fn full_theme_notebook_builds() {
+    let tmp = tempfile::tempdir().unwrap();
+    init(tmp.path(), &["nb", "-q", "--notebook", "--full-theme"]);
+    let project = tmp.path().join("nb");
+    let notebook: Value = serde_json::from_str(&read(project.join("slides.ipynb"))).unwrap();
+    assert_eq!(notebook["cells"].as_array().unwrap().len(), 3);
+    let html = build(&project, "slides.ipynb", 2);
+    assert_no_child_theme_text(&project, "slides.ipynb", &html);
+    let deck = dump(&project, "slides.ipynb", false);
+    assert_eq!(deck["meta"]["title"], "nb");
+    assert_eq!(deck["meta"]["author"], "Your Name");
 }
 
 #[test]
@@ -511,9 +674,43 @@ fn names_survive_every_file_format() {
 }
 
 #[test]
+fn names_with_urls_stay_plain_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (dir, deck, flag) in [
+        ("md", "slides.md", None),
+        ("nb", "slides.ipynb", Some("--notebook")),
+    ] {
+        let mut args = vec![dir, "-q", "--name", URL_NAME];
+        args.extend(flag);
+        init(tmp.path(), &args);
+        let project = tmp.path().join(dir);
+        let html = build(&project, deck, if flag.is_some() { 2 } else { 6 });
+        let context = dump(&project, deck, true);
+        assert_eq!(context["meta"]["title"], URL_NAME, "{deck}");
+        assert_eq!(context["slides"][0]["title"], URL_NAME, "{deck}");
+        let heading = context["slides"][0]["blocks"][0]["html"].as_str().unwrap();
+        assert!(heading.starts_with("<h1"), "{heading}");
+        assert!(
+            !heading.contains("<a ") && !heading.contains('\\'),
+            "{heading}"
+        );
+        assert!(heading.contains("https://example.com/x_y"), "{heading}");
+        assert!(!html.contains("href=\"https://example.com"), "{deck}");
+        assert!(html.contains(&format!(">{URL_NAME}</h1>")), "{deck}");
+    }
+}
+
+#[test]
 fn bad_names_are_usage_errors() {
     let tmp = tempfile::tempdir().unwrap();
-    for name in ["", "  ", "two\nlines"] {
+    for name in [
+        "",
+        "  ",
+        "two\nlines",
+        "x\u{fffe}y",
+        "x\u{ffff}y",
+        "a\u{2028}b",
+    ] {
         let output = init_fails(tmp.path(), &["talk", "--name", name]);
         assert!(text(&output.stderr).starts_with("error: "), "{output:?}");
         assert!(!tmp.path().join("talk").exists(), "{name:?}");

@@ -7,6 +7,8 @@
  *   --r-*  reveal.js's own (fonts, colors, sizes), e.g. --r-main-font, --r-main-color,
  *          --r-background-color, --r-heading-font, --r-heading-text-transform
  *   --p-*  the default theme's (spacing, columns, notebook cells), e.g. --p-cell-border
+ * Some come in sets: --r-link-color has --r-link-color-hover (a link under the mouse) and
+ * --r-link-color-dark next to it; change them together.
  * The default theme documents its --p-* properties in its README.md and styles/theme.css;
  * `presenter theme eject default ./default-theme` copies them next to this theme.
  */
@@ -14,9 +16,8 @@
   /* Headings: a deep blue instead of reveal's near-black. */
   --r-heading-color: #1c4e80;
 
-  /* Links, the navigation arrows and the progress bar (--r-link-color-hover sets the
-     color of a link under the mouse). */
-  --r-link-color: #c0392b;
+  /* The slide background: warm paper instead of plain white. */
+  --r-background-color: #f8f5ec;
 
   /* Space between the columns of a ::::columns block. */
   --p-column-gap: 2em;

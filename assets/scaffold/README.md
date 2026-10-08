@@ -28,8 +28,8 @@ presenter check {{deck}}          # look for mistakes without building
 - Markup: the templates in `theme/templates/` (minijinja, Jinja2 syntax), for example
   `layouts/title.html` for the title slide. A theme that `extends` another one only needs
   the files it changes; every other file comes from its parent.
-- `presenter theme eject default ./default-theme` copies the built-in theme next to this
-  one, so you can read (or start from) all of its templates and styles.
+{{child_theme}}- `presenter theme eject default ./default-theme` copies the built-in theme next to this
+{{child_theme}}  one, so you can read (or start from) all of its templates and styles.
 - `presenter dump {{deck}} --context` prints the data the templates receive.
 
 A slide picks a layout with `{layout=NAME}` after its first heading, as the title slide

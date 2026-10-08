@@ -1,12 +1,13 @@
 ---
 # Front matter: settings for this deck. The title slide shows the subtitle, author and
-# date under the heading. `event` is not a built-in key: theme/templates/layouts/title.html
-# adds it as a last line.
+# date under the heading.
+{{child_theme}}# `event` is not a built-in key: theme/templates/layouts/title.html adds it to
+{{child_theme}}# the title slide as a last line.
 title: {{name_yaml}}
 subtitle: What this talk is about
 author: Your Name
 # date: 2026-01-31
-event: Event name, City
+{{child_theme}}event: Event name, City
 ---
 
 # {{name}} {layout=title}
