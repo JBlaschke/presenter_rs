@@ -20,7 +20,7 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | ID | Task | Milestone | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | T00 | Repository scaffold, CI, vendoring, embedded assets | M0 | M | — | done |
-| T01 | Core IR, config, error types, fixture corpus | M0 | M | T00 | todo |
+| T01 | Core IR, config, error types, fixture corpus | M0 | M | T00 | done |
 | T02 | Default theme skeleton against the IR fixture | M0 | M | T01 | todo |
 | T10 | Front matter → DeckMeta and config overrides | M1 | S | T01 | todo |
 | T11 | Slide splitter and attribute parsing | M1 | M | T01 | todo |
