@@ -1,37 +1,628 @@
 /*
- * presenter default theme: structural rules only (docs/spec/theme-format.md §6).
- * Loaded after reveal's reset/core/stock-theme CSS, so plain rules win.
- * Visual design arrives with T17 (default theme v1) and T33 (notebook styling).
+ * presenter default theme (docs/spec/theme-format.md §5–§7).
  *
- * Custom properties: override these in a child theme before overriding rules.
+ * Loaded after reveal's reset/core CSS, the stock reveal theme (theme.toml
+ * `reveal_theme`), the highlight.js style and KaTeX, so plain rules win.
+ *
+ * Customize in this order: (1) override the custom properties below in a child theme's
+ * own stylesheet, (2) override rules. Every --p-* token is documented in ../README.md.
+ *
+ * Colours derive from the text colour (`currentColor`, which is reveal's --r-main-color
+ * unless a slide sets its own), so the theme stays readable on the light and the dark stock
+ * reveal themes and on slides with a dark or light `background=`.
  */
+
+/* ------------------------------------------------------------------------------------
+ * Tokens
+ * ------------------------------------------------------------------------------------ */
+
 :root {
-  --p-column-gap: 1em;                                /* gap between .column elements */
+  /* reveal's own variables (css/theme/template/settings.scss), overridden. System font
+     stacks only: the output never downloads fonts. */
+  --r-main-font: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI",
+    system-ui, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+  --r-heading-font: var(--r-main-font);
+  --r-code-font: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", "Segoe UI Mono",
+    Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
+  --r-main-font-size: 36px;
+  --r-block-margin: 20px;
+  --r-heading-text-transform: none;
+  --r-heading-letter-spacing: -0.015em;
+  --r-heading-font-weight: 700;
+  --r-heading-line-height: 1.15;
+  --r-heading-margin: 0 0 0.5em 0;
+  --r-heading1-size: 2.2em;
+  --r-heading2-size: 1.45em;
+  --r-heading3-size: 1.15em;
+  --r-heading4-size: 1em;
+  --r-link-color: var(--p-accent);
+  --r-link-color-hover: color-mix(in oklab, var(--p-accent) 70%, currentColor);
+  --r-link-color-dark: color-mix(in oklab, var(--p-accent) 80%, black);
+
+  /* presenter tokens */
+  --p-accent: color-mix(in oklab, #2563eb 75%, currentColor);    /* links, bullets, rules, controls */
+  --p-on-accent: var(--r-background-color, #fff);                 /* text on an accent background */
+  --p-muted: color-mix(in srgb, currentColor 66%, transparent);    /* secondary text */
+  --p-surface: color-mix(in srgb, currentColor 6%, transparent);   /* subtle fills: zebra rows, quotes */
+  --p-border: color-mix(in srgb, currentColor 22%, transparent);   /* hairlines */
+  --p-radius: 0.25em;                                              /* corner radius of boxes */
+  --p-slide-padding: 40px 60px;                                    /* space inside every slide */
+  --p-code-bg: #272822;                                            /* code block background (monokai) */
+  --p-code-color: #f8f8f2;                                         /* code block text before highlighting */
+  --p-code-font-size: 0.6em;                                       /* code block size, relative to the text */
+  --p-code-max-height: 520px;                                      /* longer code blocks scroll */
+  --p-inline-code-bg: color-mix(in srgb, currentColor 9%, transparent); /* `code` in text */
+  --p-table-font-size: 0.75em;                                     /* tables, relative to the text */
+  --p-image-max-height: 480px;                                     /* images (r-stretch excepted) */
+  --p-column-gap: 1.25em;                                          /* gap between .column elements */
+  --p-alert-note: color-mix(in oklab, #2563eb 75%, currentColor);  /* > [!NOTE] */
+  --p-alert-tip: color-mix(in oklab, #16a34a 75%, currentColor);   /* > [!TIP] */
+  --p-alert-important: color-mix(in oklab, #7c3aed 75%, currentColor); /* > [!IMPORTANT] */
+  --p-alert-warning: color-mix(in oklab, #d97706 75%, currentColor);   /* > [!WARNING] */
+  --p-alert-caution: color-mix(in oklab, #dc2626 75%, currentColor);   /* > [!CAUTION] */
+
+  /* notebook cells (cell.html; styled further by T33) */
   --p-cell-gap: 0.5em;                                /* vertical space around a .cell */
   --p-cell-border: 1px solid rgba(128, 128, 128, 0.4); /* frame of .cell and its output area */
   --p-output-max-height: 40vh;                        /* longer cell outputs scroll */
 }
 
-/* :::columns → CSS grid. One equal track per .column; a `widths="1fr 2fr"` argument sets
-   grid-template-columns inline, which takes precedence over the implicit tracks. */
+/* ------------------------------------------------------------------------------------
+ * Slide frame. Every slide (a section element that is not a vertical-stack wrapper) is exactly
+ * one slide high, so reveal's vertical centring (`center: true`) leaves it at the top:
+ * content starts under the top padding. Layouts that want centring (title, section, or a
+ * slide with the `.center` class) use their natural height and reveal centres them.
+ * --slide-height is set by reveal on the viewport.
+ * ------------------------------------------------------------------------------------ */
+
+.reveal .slides section:not(.stack) {
+  box-sizing: border-box;
+  height: var(--slide-height, 100%);
+  padding: var(--p-slide-padding);
+  text-align: left;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Text. The first rules repeat what every stock reveal theme does with the --r-*
+ * variables, so the theme also works with `reveal_theme = "none"`.
+ * ------------------------------------------------------------------------------------ */
+
+.reveal-viewport {
+  background-color: var(--r-background-color, #fff);
+}
+
+.reveal {
+  font-family: var(--r-main-font);
+  font-size: var(--r-main-font-size);
+  color: var(--r-main-color, #222);
+}
+
+.reveal :is(h1, h2, h3, h4, h5, h6) {
+  margin: var(--r-heading-margin);
+  color: var(--r-heading-color, inherit);
+  font-family: var(--r-heading-font);
+  font-weight: var(--r-heading-font-weight);
+  line-height: var(--r-heading-line-height);
+  letter-spacing: var(--r-heading-letter-spacing);
+  text-transform: var(--r-heading-text-transform);
+  text-wrap: balance;
+}
+
+.reveal h1 { font-size: var(--r-heading1-size); }
+.reveal h2 { font-size: var(--r-heading2-size); }
+.reveal h3 { font-size: var(--r-heading3-size); }
+.reveal h4 { font-size: var(--r-heading4-size); }
+
+.reveal :is(code, kbd, pre) {
+  font-family: var(--r-code-font);
+}
+
+.reveal :is(strong, b) {
+  font-weight: 700;
+}
+
+.reveal em {
+  font-style: italic;
+}
+
+.reveal a {
+  color: var(--r-link-color);
+}
+
+.reveal p,
+.reveal li {
+  line-height: 1.35;
+  text-wrap: pretty;
+}
+
+.reveal p {
+  margin: var(--r-block-margin) 0;
+}
+
+.reveal ul,
+.reveal ol,
+.reveal dl {
+  display: block;
+  margin: var(--r-block-margin) 0 var(--r-block-margin) 1.1em;
+  padding: 0;
+}
+
+.reveal li + li {
+  margin-top: 0.3em;
+}
+
+.reveal li > ul,
+.reveal li > ol {
+  margin: 0.3em 0 0 1.1em;
+  font-size: 0.85em;
+}
+
+.reveal li::marker {
+  color: var(--p-accent);
+}
+
+.reveal dd {
+  margin-left: 1.1em;
+}
+
+.reveal a {
+  text-decoration: underline;
+  text-decoration-thickness: 0.06em;
+  text-underline-offset: 0.15em;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+
+.reveal sup.footnote-ref {
+  font-size: 0.6em;
+  font-weight: 600;
+}
+
+.reveal sup.footnote-ref a {
+  text-decoration: none;
+}
+
+.reveal mark {
+  padding: 0 0.15em;
+  border-radius: 0.15em;
+  color: inherit;
+  background: color-mix(in srgb, #facc15 55%, transparent);
+}
+
+.reveal kbd {
+  display: inline-block;
+  min-width: 1em;
+  padding: 0.05em 0.4em;
+  border: 1px solid var(--p-border);
+  border-bottom-width: 0.12em;
+  border-radius: var(--p-radius);
+  background: var(--p-surface);
+  font-family: inherit;
+  font-size: 0.75em;
+  font-weight: 500;
+  line-height: 1.3;
+  text-align: center;
+  vertical-align: 0.1em;
+}
+
+/* Directive classes (:::small, :::large, :::center, or {.small} on a slide). */
+.reveal .small {
+  font-size: 0.7em;
+}
+
+.reveal .large {
+  font-size: 1.3em;
+}
+
+.reveal .center {
+  text-align: center;
+}
+
+.reveal .center > :is(ul, ol, dl) {
+  display: inline-block;
+  text-align: left;
+}
+
+.reveal .center > :is(table, pre, blockquote, .markdown-alert) {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* A slide with the `center` class is centred both ways: it uses its natural height, so
+   reveal centres it vertically. */
+.reveal .slides section.center:not(.stack) {
+  height: auto;
+  text-align: center;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Code
+ * ------------------------------------------------------------------------------------ */
+
+.reveal pre {
+  width: 100%;
+  margin: var(--r-block-margin) 0;
+  border-radius: var(--p-radius);
+  box-shadow: none;
+  font-size: var(--p-code-font-size);
+  line-height: 1.4;
+  word-wrap: normal;
+}
+
+/* Long lines scroll sideways instead of wrapping (data-trim only trims blank lines). */
+.reveal pre code {
+  box-sizing: border-box;
+  max-height: var(--p-code-max-height);
+  padding: 0.75em 1em;
+  overflow: auto;
+  border-radius: var(--p-radius);
+  white-space: pre;
+  color: var(--p-code-color);
+  background: var(--p-code-bg);
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--p-code-color) 35%, transparent) transparent;
+}
+
+.reveal pre.r-stretch code,
+.reveal pre.stretch code {
+  max-height: 100%;
+}
+
+/* Line numbers (data-line-numbers): readable on the dark code background. */
+.reveal .hljs-ln-numbers {
+  opacity: 1;
+  color: color-mix(in srgb, var(--p-code-color) 45%, transparent);
+  user-select: none;
+}
+
+/* Line steps (lines="1|3-4"): the other lines are dimmed, never hidden. */
+.reveal .hljs.has-highlights tr:not(.highlight-line) {
+  opacity: 0.35;
+}
+
+.reveal :not(pre) > code {
+  padding: 0.08em 0.3em;
+  border-radius: var(--p-radius);
+  background: var(--p-inline-code-bg);
+  font-size: 0.85em;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Images, video and frames
+ * ------------------------------------------------------------------------------------ */
+
+.reveal img,
+.reveal video,
+.reveal iframe {
+  max-width: 100%;
+}
+
+.reveal img:not(.r-stretch, .stretch),
+.reveal video:not(.r-stretch, .stretch) {
+  max-height: var(--p-image-max-height);
+  object-fit: contain;
+}
+
+.reveal img {
+  margin: 0;
+  vertical-align: middle;
+}
+
+/* A paragraph holding just an image is a figure: centred. */
+.reveal p:has(> img:only-child) {
+  margin: var(--r-block-margin) 0;
+  text-align: center;
+}
+
+.reveal iframe {
+  border: 1px solid var(--p-border);
+  border-radius: var(--p-radius);
+}
+
+/* ------------------------------------------------------------------------------------
+ * Tables: smaller text, zebra rows
+ * ------------------------------------------------------------------------------------ */
+
+/* (not the line-number tables highlight.js builds inside code blocks) */
+.reveal table:not(.hljs-ln) {
+  margin: var(--r-block-margin) 0;
+  font-size: var(--p-table-font-size);
+  border-collapse: collapse;
+}
+
+.reveal table:not(.hljs-ln) :is(th, td) {
+  padding: 0.4em 0.8em;
+  border-bottom: 1px solid var(--p-border);
+  line-height: 1.3;
+}
+
+.reveal table:not(.hljs-ln) thead th {
+  border-bottom: 2px solid var(--p-muted);
+}
+
+.reveal table:not(.hljs-ln) > tbody > tr:nth-child(odd) {
+  background: var(--p-surface);
+}
+
+/* ------------------------------------------------------------------------------------
+ * Block quotes and alerts (> [!NOTE], > [!TIP], > [!IMPORTANT], > [!WARNING], > [!CAUTION])
+ * ------------------------------------------------------------------------------------ */
+
+.reveal blockquote {
+  width: auto;
+  margin: var(--r-block-margin) 0;
+  padding: 0.1em 0 0.1em 0.9em;
+  border-left: 0.15em solid var(--p-border);
+  background: none;
+  box-shadow: none;
+  font-style: italic;
+}
+
+.reveal blockquote p:first-child,
+.reveal blockquote p:last-child {
+  display: block;
+}
+
+.reveal blockquote > :first-child,
+.reveal .markdown-alert > :first-child {
+  margin-top: 0;
+}
+
+.reveal blockquote > :last-child,
+.reveal .markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+
+.reveal .markdown-alert {
+  --p-alert-color: var(--p-alert-note);
+  margin: var(--r-block-margin) 0;
+  padding: 0.45em 0.9em;
+  border-left: 0.15em solid var(--p-alert-color);
+  border-radius: 0 var(--p-radius) var(--p-radius) 0;
+  background: color-mix(in srgb, var(--p-alert-color) 9%, transparent);
+}
+
+.reveal .markdown-alert-tip { --p-alert-color: var(--p-alert-tip); }
+.reveal .markdown-alert-important { --p-alert-color: var(--p-alert-important); }
+.reveal .markdown-alert-warning { --p-alert-color: var(--p-alert-warning); }
+.reveal .markdown-alert-caution { --p-alert-color: var(--p-alert-caution); }
+
+.reveal .markdown-alert .markdown-alert-title {
+  margin: 0 0 0.2em;
+  color: var(--p-alert-color);
+  font-size: 0.7em;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Footnotes
+ * ------------------------------------------------------------------------------------ */
+
+.reveal .footnotes {
+  margin-top: 1.2em;
+  padding-top: 0.4em;
+  border-top: 1px solid var(--p-border);
+  color: var(--p-muted);
+  font-size: 0.55em;
+}
+
+.reveal .footnotes ol {
+  margin: 0 0 0 1.4em;
+}
+
+.reveal .footnotes li + li {
+  margin-top: 0.1em;
+}
+
+.reveal .footnotes p {
+  margin: 0;
+}
+
+.reveal .footnote-backref {
+  text-decoration: none;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Columns. :::columns → CSS grid with one equal track per .column; set --p-columns to a
+ * number to fix the count (more columns wrap into rows); `widths="1fr 2fr"` sets
+ * grid-template-columns inline, which takes precedence over both.
+ * ------------------------------------------------------------------------------------ */
+
 .reveal .columns {
   display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(var(--p-columns, auto-fit), minmax(0, 1fr));
   gap: var(--p-column-gap);
   align-items: start;
+  margin: var(--r-block-margin) 0;
 }
 
 .reveal .columns > .column {
   min-width: 0;
 }
 
-/* KaTeX targets: display math is a block even when the element is a <span>. */
-.reveal [data-math-style="display"] {
-  display: block;
+.reveal .columns > .column > :first-child {
+  margin-top: 0;
 }
 
-/* Notebook cells (cell.html). */
+.reveal .columns > .column > :last-child {
+  margin-bottom: 0;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Math: the [data-math-style] targets that KaTeX renders. Display math is a block even
+ * when the element is a span; a formula wider than the slide scrolls sideways.
+ * ------------------------------------------------------------------------------------ */
+
+.reveal [data-math-style="display"] {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Layouts (templates/layouts/*.html put `layout-<name>` on the slide)
+ * ------------------------------------------------------------------------------------ */
+
+/* default: heading at the top, content left-aligned. A short accent rule under the
+   slide's first heading (centred on a `.center` slide). */
+.reveal .slides section:not(.stack, .layout-title, .layout-section, .layout-blank) > :is(h1, h2):first-child::after {
+  content: "";
+  display: block;
+  width: 1.4em;
+  height: 0.09em;
+  margin-top: 0.25em;
+  border-radius: 0.05em;
+  background: var(--p-accent);
+}
+
+.reveal .slides section.center > :is(h1, h2):first-child::after {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* title: centred; title.html adds the `center` class, so reveal centres it vertically. */
+.reveal .slides section.layout-title {
+  height: auto;
+  text-align: center;
+}
+
+.reveal .slides section.layout-title h1 {
+  font-size: 2.4em;
+  letter-spacing: -0.025em;
+  margin-bottom: 0.3em;
+}
+
+.reveal .slides section.layout-title h1::after {
+  content: "";
+  display: block;
+  width: 0.85em;
+  height: 0.055em;
+  margin: 0.3em auto 0;
+  border-radius: 0.03em;
+  background: var(--p-accent);
+}
+
+.reveal .slides section.layout-title .logo {
+  display: block;
+  max-width: 40%;
+  max-height: 120px;
+  margin: 0 auto 0.8em;
+}
+
+.reveal .slides section.layout-title .subtitle {
+  margin: 0.2em 0 1.2em;
+  color: var(--p-muted);
+  font-size: 1.15em;
+}
+
+.reveal .slides section.layout-title .author,
+.reveal .slides section.layout-title .date {
+  display: inline-block;
+  margin: 0;
+  font-size: 0.8em;
+  color: var(--p-muted);
+}
+
+.reveal .slides section.layout-title .author {
+  font-weight: 600;
+  color: inherit;
+}
+
+.reveal .slides section.layout-title .author + .date::before {
+  content: "·";
+  margin: 0 0.5em 0 0.2em;
+}
+
+/* section: a divider with a big centred heading on the accent colour. reveal copies the
+   slide's classes to its background element, which paints the full-bleed accent (a
+   `background=` on the slide still wins). */
+.reveal .slides section.layout-section {
+  height: auto;
+  text-align: center;
+  color: var(--p-on-accent);
+}
+
+.reveal .slide-background.layout-section {
+  background-color: var(--p-accent);
+}
+
+.reveal .slides section.layout-section :is(h1, h2, h3) {
+  color: inherit;
+}
+
+.reveal .slides section.layout-section h1 {
+  font-size: 2.6em;
+}
+
+.reveal .slides section.layout-section a {
+  color: inherit;
+}
+
+.reveal .slides section.layout-section li::marker {
+  color: inherit;
+}
+
+.reveal:has(.slides section.layout-section.present) :is(.controls, .progress) {
+  color: var(--p-on-accent);
+}
+
+/* blank: no padding; a lone image, video or iframe fills the slide (fitted inside it;
+   use a `background=` for an image that covers the slide edge to edge). */
+.reveal .slides section.layout-blank {
+  padding: 0;
+}
+
+.reveal .slides section.layout-blank > p:only-of-type:has(> img:only-child) {
+  height: 100%;
+  margin: 0;
+}
+
+.reveal .slides section.layout-blank > :is(img, video, iframe),
+.reveal .slides section.layout-blank > p:only-of-type > img:only-child {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  object-fit: contain;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Slides with their own background colour: reveal marks them has-dark-background or
+ * has-light-background; the text colour follows, and every token with it.
+ * ------------------------------------------------------------------------------------ */
+
+.reveal .slides section.has-dark-background {
+  color: #fff;
+}
+
+.reveal .slides section.has-light-background {
+  color: #222;
+}
+
+.reveal .slides section:is(.has-dark-background, .has-light-background) :is(h1, h2, h3, h4, h5, h6) {
+  color: inherit;
+}
+
+/* ------------------------------------------------------------------------------------
+ * reveal chrome
+ * ------------------------------------------------------------------------------------ */
+
+.reveal .slide-number {
+  border-radius: 0.3em;
+  font-family: var(--r-main-font);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Notebook cells (cell.html). Structural rules only; T33 designs them.
+ * ------------------------------------------------------------------------------------ */
+
 .reveal .cell {
   margin: var(--p-cell-gap) 0;
   border: var(--p-cell-border);
@@ -63,4 +654,35 @@
 
 .reveal .cell.hide-input .cell-outputs {
   border-top: 0;
+}
+
+/* ------------------------------------------------------------------------------------
+ * Print and PDF (?print-pdf, `presenter export pdf`)
+ * ------------------------------------------------------------------------------------ */
+
+/* Backgrounds, code blocks and fills print as they look on screen. */
+html.reveal-print,
+html.reveal-print * {
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+@media print {
+  .reveal,
+  .reveal * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}
+
+/* reveal's print view resets slide padding (`padding: 0 !important`); keep the theme's.
+   Slides keep their one-slide height (slide frame above), so reveal puts each on one page
+   and a top-aligned slide stays top-aligned on paper; title and section slides are
+   centred on the page as on screen. */
+html.reveal-print .reveal .slides section:not(.stack) {
+  padding: var(--p-slide-padding) !important;
+}
+
+html.reveal-print .reveal .slides section.layout-blank {
+  padding: 0 !important;
 }

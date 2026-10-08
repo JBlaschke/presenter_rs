@@ -1,3 +1,6 @@
-{#- Layout "section": a section divider. Same markup as the default layout; the
-    `layout-section` class is what themes style. -#}
+{#- Layout "section": a section divider, a big centred heading on the accent colour
+    (`layout-section` in the theme CSS). Same markup as the default layout plus the
+    `center` class, which makes reveal centre the slide vertically whatever the deck's
+    `center` option says. -#}
 {%- extends "layouts/default.html" %}
+{%- block layout_classes %}{% if "center" not in slide.classes %} center{% endif %}{% endblock %}

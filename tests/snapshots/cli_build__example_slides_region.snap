@@ -3,7 +3,7 @@ source: tests/cli_build.rs
 expression: region
 ---
 <div class="slides">
-<section class="layout-title">
+<section class="layout-title center">
 <h1>Presenter basics</h1>
 
 <p class="subtitle">Every Markdown feature of presenter in one deck</p>
@@ -19,7 +19,8 @@ front matter under the heading.</p>
 <li>A <strong>title slide</strong> with the subtitle, author and date from the front matter</li>
 <li>A <strong>vertical stack</strong>, <strong>fragments</strong> and <strong>two columns</strong></li>
 <li><strong>Code</strong> with line stepping, <strong>math</strong>, a <strong>figure</strong> and a <strong>table</strong></li>
-<li><strong>Backgrounds</strong>, an <strong>embedded page</strong>, a <strong>footnote</strong> and <strong>speaker notes</strong></li>
+<li>A <strong>footnote</strong>, <strong>callouts</strong> and <strong>quotes</strong></li>
+<li><strong>Backgrounds</strong>, a <strong>full-slide figure</strong>, an <strong>embedded page</strong> and <strong>speaker notes</strong></li>
 </ul>
 <p>Press <kbd>S</kbd> for the speaker view and <kbd>Esc</kbd> for the overview.</p>
 
@@ -142,6 +143,21 @@ Both are bundled, so this deck works offline.</p>
 </div>
 
 </section>
+<section class="layout-default">
+<h2>Callouts and quotes</h2>
+<div class="markdown-alert markdown-alert-tip">
+<p class="markdown-alert-title">Tip</p>
+<p>GitHub-style alerts start with <code>[!NOTE]</code>, <code>[!TIP]</code>, <code>[!IMPORTANT]</code>, <code>[!WARNING]</code> or
+<code>[!CAUTION]</code> on the first line of a block quote.</p>
+</div>
+<blockquote>
+<p>A plain block quote sets a remark or a citation apart.</p>
+</blockquote>
+<div class="small">
+<p><code>:::small</code> and <code>:::large</code> blocks change the text size; <code>:::center</code> centres one.</p>
+</div>
+
+</section>
 <section class="layout-default" data-background-color="#0f172a" data-transition="zoom">
 <h2>Backgrounds</h2>
 <p>This slide starts with <code>--- {background=&quot;#0f172a&quot; transition=zoom}</code>.</p>
@@ -153,13 +169,20 @@ Both are bundled, so this deck works offline.</p>
 <p>The figure behind this text is <code>figures/plot.png</code>, drawn at 20% opacity.</p>
 
 </section>
+<section class="layout-blank">
+<p><img src="[data-uri]" alt="A damped oscillation that fills the whole slide" /></p>
+
+<aside class="notes"><p><code>--- {layout=blank}</code> drops the slide padding, so a lone image, video or iframe fills the
+whole slide.</p>
+</aside>
+</section>
 <section class="layout-default">
 <h2>Raw HTML: an embedded page</h2>
 <iframe src="[data-uri]" width="900" height="360" title="An embedded local page"></iframe>
 <p>Raw HTML passes through unchanged, except that local <code>src</code> files are bundled like images.</p>
 
 </section>
-<section class="layout-section">
+<section class="layout-section center">
 <h1>Thank you</h1>
 <p>Build this deck with <code>presenter build examples/basic/slides.md</code>.</p>
 

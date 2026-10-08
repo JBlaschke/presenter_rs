@@ -1,10 +1,17 @@
-{#- Layout "title": the slide's first block (normally the deck heading), then
-    meta.subtitle, meta.author and meta.date when they are set, then the remaining blocks.
-    author and date fall back to the presenter.toml [deck] defaults (config.md §2). A
-    Markdown slide is a single HTML block, so there the meta follows all of its content;
-    a notebook title slide (one block per cell) gets it right under the heading cell. -#}
+{#- Layout "title": centred, and vertically centred through the `center` class (reveal
+    centres such a slide whatever the deck's `center` option says). The optional logo
+    (meta.vars.logo from the front matter, else theme.vars.logo from theme.toml [vars]; a
+    path that asset() resolves, e.g. a file in a theme's assets/ directory; `logo: false`
+    in the front matter hides a theme's logo), then the slide's first block (normally the
+    deck heading), then meta.subtitle, meta.author and meta.date when they are set, then
+    the remaining blocks. author and date fall back to the presenter.toml [deck] defaults
+    (config.md §2). A Markdown slide is a single HTML block, so there the meta follows all
+    of its content; a notebook title slide (one block per cell) gets it right under the
+    heading cell. -#}
 {%- extends "layouts/default.html" %}
+{%- block layout_classes %}{% if "center" not in slide.classes %} center{% endif %}{% endblock %}
 {%- block content %}
+{%- set logo = meta.vars.logo if meta.vars.logo is defined else theme.vars.logo|default(none) %}
 {%- set author = meta.author or config.deck.author %}
 {%- set date = meta.date or config.deck.date %}
 {%- set title_meta %}
@@ -18,6 +25,9 @@
 <p class="date">{{ date }}</p>
 {%- endif %}
 {%- endset %}
+{%- if logo %}
+<img class="logo" src="{{ asset(logo) }}" alt="">
+{%- endif %}
 {%- for block in slide.blocks %}
 {% include "block.html" %}
 {%- if loop.first %}{{ title_meta }}{% endif %}

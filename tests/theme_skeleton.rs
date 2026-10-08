@@ -1006,7 +1006,9 @@ fn renders_without_optional_meta_and_layout_template() {
     let tags = open_tags(&html);
     let section = find_tag(&tags, "section", |t| t.name == "section");
     assert_eq!(layout_classes(section), ["layout-title"]);
-    assert!(!html.contains("subtitle") && !html.contains(r#"class="author""#));
+    // In the slides only: the theme stylesheet in <head> styles `.subtitle` (T17).
+    let slides = slides_region(&html);
+    assert!(!slides.contains("subtitle") && !slides.contains(r#"class="author""#));
     let title = find_tag(&tags, "title", |t| t.name == "title");
     assert_eq!(text_after(&html, title), "Presentation");
     for absent in [
