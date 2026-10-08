@@ -4,12 +4,13 @@
 //! `url()` references become placeholders.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use presenter::Error;
 use presenter::assets::emit::{
     EmittedFile, Emitter, OutputMode, data_uri, hashed_file_name, register_css_urls,
 };
-use presenter::assets::registry::{AssetData, AssetRegistry};
+use presenter::assets::registry::{AssetData, AssetRegistry, normalize_lexically};
 use presenter::ir::{Block, CellOutput, Deck};
 
 fn fixture(rel: &str) -> PathBuf {
@@ -398,4 +399,159 @@ fn merged_registries_resolve_together() {
              <img src=\"/__presenter/deck-asset/{png}\">"
         )
     );
+}
+
+/// The file a browser fetches for `url` referenced from the file `referrer` (both relative
+/// to the site root): relative URLs resolve against the referrer's own directory.
+fn fetched_file(referrer: &str, url: &str) -> PathBuf {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let dir = Path::new(referrer).parent().unwrap_or(Path::new(""));
+    normalize_lexically(&dir.join(path))
+}
+
+/// theme-format.md §4 (site column): the theme stylesheet is written into `assets/` and
+/// linked from the document, and a browser resolves the `url()`s inside it against the
+/// stylesheet's own URL. Every URL, followed from where it is written, must reach a file
+/// the emitter emitted.
+#[test]
+fn site_mode_stylesheet_in_assets_dir_references_files_next_to_it() {
+    let (mut registry, [png, gif, _]) = registry();
+    let theme_css = ".reveal{background:url(img/bg.gif)} \
+                     h1{background:url(\"images/ok.png?v=1#x\")} \
+                     @font-face{src:url(fonts/missing.woff)}";
+    let mut resolver = |reference: &str| match reference {
+        "img/bg.gif" => Some(AssetData::Bytes(GIF.to_vec())),
+        other => {
+            let path = fixture("md").join(other);
+            path.is_file().then_some(AssetData::File(path))
+        }
+    };
+    let css = register_css_urls(theme_css, &mut registry, &mut resolver, true).unwrap();
+    assert_eq!(
+        registry.len(),
+        3,
+        "bg.gif and ok.png are already registered"
+    );
+
+    let mode = site_mode();
+    let mut emitter = Emitter::new(&registry, &mode);
+    let html = emitter
+        .resolve_html(&format!(
+            "<link rel=\"stylesheet\" href=\"assets/theme.css\">\
+             <img src=\"asset:{png}\"><div style=\"background:url(asset:{gif})\"></div>"
+        ))
+        .unwrap();
+    let sheet = emitter.resolve_css_in_assets_dir(&css).unwrap();
+    assert_eq!(
+        sheet,
+        format!(
+            ".reveal{{background:url(background-{gif}.gif)}} \
+             h1{{background:url(\"ok-{png}.png?v=1#x\")}} \
+             @font-face{{src:url(fonts/missing.woff)}}"
+        )
+    );
+    let emitted: Vec<PathBuf> = emitter.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(
+        emitted,
+        [
+            PathBuf::from(format!("dist/assets/ok-{png}.png")),
+            PathBuf::from(format!("dist/assets/background-{gif}.gif")),
+        ]
+    );
+
+    // Follow every URL like a browser: the document is dist/index.html, the stylesheet
+    // dist/assets/theme.css.
+    let urls = regex::Regex::new(r#"(?:src|href)="([^"]+)"|url\("?([^")]+)"?\)"#).unwrap();
+    let mut followed = 0;
+    for (referrer, text) in [
+        ("dist/index.html", &html),
+        ("dist/assets/theme.css", &sheet),
+    ] {
+        for caps in urls.captures_iter(text) {
+            let url = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
+            let target = fetched_file(referrer, url);
+            if url.ends_with("theme.css") {
+                assert_eq!(target, Path::new("dist/assets/theme.css"));
+            } else if !url.starts_with("fonts/missing") {
+                assert!(emitted.contains(&target), "{referrer}: {url} -> {target:?}");
+                followed += 1;
+            }
+        }
+    }
+    assert_eq!(followed, 4);
+
+    // The same CSS inlined into the document (`<style>`) is relative to the document; those
+    // URLs would miss from inside assets/ (dist/assets/assets/…).
+    let inline = emitter.resolve_css(&css).unwrap();
+    assert!(inline.starts_with(&format!(
+        ".reveal{{background:url(assets/background-{gif}.gif)}}"
+    )));
+    let from_sheet = fetched_file(
+        "dist/assets/theme.css",
+        &format!("assets/background-{gif}.gif"),
+    );
+    assert!(!emitted.contains(&from_sheet));
+    assert_eq!(emitter.files.len(), 2);
+}
+
+/// T15's template helpers are minijinja functions, which must be `Send + Sync + 'static`, so
+/// they cannot hold an `Emitter<'_>` (it borrows the registry and the mode). They keep owned
+/// state behind a mutex and create a short-lived emitter per call, carrying `files` across
+/// calls; each id is still emitted exactly once.
+#[test]
+fn per_call_emitters_in_static_template_helpers_emit_each_id_once() {
+    struct HelperState {
+        registry: AssetRegistry,
+        mode: OutputMode,
+        files: Vec<EmittedFile>,
+    }
+    let (registry, [png, gif, _]) = registry();
+    let state = Arc::new(Mutex::new(HelperState {
+        registry,
+        mode: site_mode(),
+        files: Vec::new(),
+    }));
+    let mut env = minijinja::Environment::new();
+    let helper = Arc::clone(&state);
+    env.add_function(
+        "asset_url",
+        move |id: String| -> Result<String, minijinja::Error> {
+            let fail = |message: String| {
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message)
+            };
+            let mut guard = helper.lock().map_err(|e| fail(e.to_string()))?;
+            let HelperState {
+                registry,
+                mode,
+                files,
+            } = &mut *guard;
+            let mut emitter = Emitter::with_files(registry, mode, std::mem::take(files));
+            let url = emitter.url_for(&id).map_err(|e| fail(e.to_string()));
+            *files = emitter.files;
+            url
+        },
+    );
+    let out = env
+        .render_str(
+            "{{ asset_url(a) }} {{ asset_url(b) }}|{% for _ in range(3) %}{{ asset_url(a) }} {% endfor %}",
+            minijinja::context! { a => png, b => gif },
+        )
+        .unwrap();
+    let (a_url, b_url) = (
+        format!("assets/ok-{png}.png"),
+        format!("assets/background-{gif}.gif"),
+    );
+    assert_eq!(out, format!("{a_url} {b_url}|{a_url} {a_url} {a_url} "));
+    {
+        let state = state.lock().unwrap();
+        let paths: Vec<&Path> = state.files.iter().map(|f| f.path.as_path()).collect();
+        let expected = [format!("dist/{a_url}"), format!("dist/{b_url}")];
+        assert_eq!(paths, [Path::new(&expected[0]), Path::new(&expected[1])]);
+    }
+    // Errors still name the id.
+    let err = env
+        .render_str("{{ asset_url('0123456789ab') }}", ())
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("0123456789ab"), "{err:#}");
+    assert_eq!(state.lock().unwrap().files.len(), 2);
 }

@@ -12,6 +12,27 @@
 //! | [`OutputMode::Site`] | `url_prefix` + [`hashed_file_name`], e.g. `assets/plot-3f9a1c2b7e0d.png` | read now, one [`EmittedFile`] per id |
 //! | [`OutputMode::Serve`] | `/__presenter/deck-asset/<id>` | not read (the dev server reads them on request) |
 //!
+//! **Site-mode URLs depend on where the text ends up.** [`Emitter::resolve_html`],
+//! [`Emitter::resolve_css`] and [`Emitter::url_for`] return URLs relative to the output
+//! *document* (`url_prefix` + file name, e.g. `assets/plot-<id>.png`): right for the document
+//! itself and for CSS inlined into it (`<style>`). A browser resolves a `url()` inside a
+//! stylesheet *file* against that file's own URL, so a stylesheet written into `assets_dir`
+//! (the site-mode theme CSS `assets/theme-<hash>.css`, the copies made by `style(path)`)
+//! must be resolved with [`Emitter::resolve_css_in_assets_dir`], which writes bare file names
+//! (`plot-<id>.png`). Both methods share [`Emitter::files`]. Standalone and serve URLs do not
+//! depend on the location (`data:` URIs and root-absolute routes).
+//!
+//! **One output, one file list.** Site mode emits each asset once per output: before
+//! emitting a file the emitter looks for its path in [`Emitter::files`], so that list *is*
+//! the deduplication state. An [`Emitter`] borrows the registry and the mode, so it cannot
+//! be stored in a `'static` closure such as a minijinja template function (minijinja 2.24
+//! requires `Send + Sync + 'static`). Two patterns keep the once-per-id guarantee:
+//! 1. template helpers only write `asset:<id>` placeholders (registering into a registry
+//!    they own) and one emitter resolves the finished document and stylesheets at the end;
+//! 2. helpers keep an owned (or `Arc`) [`AssetRegistry`], an owned [`OutputMode`] and the
+//!    `Vec<EmittedFile>` behind a mutex, create a short-lived emitter per call with
+//!    [`Emitter::with_files`], and put [`Emitter::files`] back afterwards.
+//!
 //! **Placeholder scanning.** The placeholder grammar is `asset:` followed by exactly 12
 //! `[0-9a-f]`; a 13th hex digit (`[0-9a-fA-F]`) means the text is not a placeholder (so a
 //! longer hash is never cut to its first 12 chars), any other following character or the end
@@ -28,18 +49,35 @@
 //! after the placeholder (`url(asset:<id>?#iefix)`), so site and serve URLs keep it. A
 //! `data:` URI cannot carry a query (it would become part of the payload), so in standalone
 //! mode a `?query` directly after a placeholder is dropped while a `#fragment` is kept
-//! (fragments are valid on `data:` URIs, e.g. for SVG views).
+//! (fragments are valid on `data:` URIs, e.g. for SVG views). The dropped query ends before
+//! `#`, whitespace, a quote, `(`, `)`, `<`, `>`, `\`, an HTML character reference for a
+//! quote or `#` (`&quot;`, `&#39;`, `&#x27;`, `&apos;`, `&#35;`, …, so an entity-escaped
+//! inline `style` keeps its closing quote; other references such as `&amp;` or `&#38;` are
+//! part of the query) or the end of the text, and never includes trailing commas (`srcset`
+//! separators).
+//!
+//! **Known limitation: `data-background-video` in standalone mode.** reveal.js splits the
+//! value of `data-background-video` on `,` (one `<source>` per URL), which cuts a
+//! `data:video/…;base64,…` URI in two, so a background video does not play in a standalone
+//! build. Site and serve URLs contain no comma and work. The emitter cannot fix this (a
+//! `data:` URI needs its comma); a renderer that wants standalone background videos has to
+//! emit them differently (e.g. as a `<video>` element).
 //!
 //! **CSS `url()` registration.** [`register_css_urls`] is the step *before* emission for
 //! stylesheets: it turns relative `url(...)` references into placeholders, registering what
-//! the caller's resolver finds (theme chain or vendor tree lookup is the caller's job).
+//! the caller's resolver finds (theme chain or vendor tree lookup is the caller's job). It
+//! tokenizes just enough CSS to be safe: comments and string literals are skipped (so
+//! `content: "url(x.png)"` and a `/*` inside a string are text), a `url(` glued to an
+//! identifier (`myurl(`) is not a URL, and CSS escapes are undone and `%XX` sequences
+//! decoded before the resolver sees a path.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use base64::Engine as _;
-use regex::Regex;
+use regex::{Captures, Regex};
 
 use crate::assets::registry::{AssetData, AssetRegistry, unknown_id};
 use crate::error::{Error, Result};
@@ -58,8 +96,10 @@ pub enum OutputMode {
         /// Where emitted files go: each [`EmittedFile::path`] is `assets_dir` joined with the
         /// hashed file name (relative or absolute exactly as given; the caller writes them).
         assets_dir: PathBuf,
-        /// Prepended verbatim to the file name to form the URL; normally `"assets/"`, so it
-        /// should end with `/`.
+        /// Prepended verbatim to the file name to form a URL relative to the output
+        /// *document*; normally `"assets/"`, so it should end with `/`. Not used for
+        /// stylesheets written into `assets_dir`
+        /// ([`Emitter::resolve_css_in_assets_dir`] writes bare file names).
         url_prefix: String,
     },
     /// `presenter serve`: assets are served by id from `/__presenter/deck-asset/<id>`.
@@ -75,51 +115,89 @@ pub struct EmittedFile {
     pub bytes: Vec<u8>,
 }
 
-/// Rewrites placeholders for one output. Keep one emitter per output document so that
-/// site mode emits each asset exactly once, however often it is referenced.
+/// Where resolved text will live; only site-mode URLs depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Referrer {
+    /// The output document, or CSS inlined into it: `url_prefix` + file name.
+    Document,
+    /// A stylesheet file written into `assets_dir`: the bare file name.
+    AssetsDir,
+}
+
+/// Rewrites placeholders for one output. Use one emitter per output (or carry its
+/// [`Emitter::files`] into the next one with [`Emitter::with_files`]) so that site mode
+/// emits each asset exactly once, however often it is referenced.
 #[derive(Debug)]
 pub struct Emitter<'a> {
     registry: &'a AssetRegistry,
     mode: &'a OutputMode,
     /// Files emitted so far (site mode; always empty otherwise), one per distinct id, in
-    /// order of first use.
+    /// order of first use. This list is also the deduplication state: an asset whose path is
+    /// already in it is not emitted again.
     pub files: Vec<EmittedFile>,
-    /// Ids already in `files`.
-    emitted: BTreeSet<String>,
 }
 
 impl<'a> Emitter<'a> {
     /// An emitter resolving ids against `registry` for `mode`.
     pub fn new(registry: &'a AssetRegistry, mode: &'a OutputMode) -> Self {
+        Self::with_files(registry, mode, Vec::new())
+    }
+
+    /// An emitter that continues an earlier emission for the same output: `files` are the
+    /// [`Emitter::files`] of a previous emitter, and assets already in them are not emitted
+    /// again. For callers that cannot keep one emitter alive for the whole output (e.g.
+    /// `'static` template helpers; see the module docs).
+    pub fn with_files(
+        registry: &'a AssetRegistry,
+        mode: &'a OutputMode,
+        files: Vec<EmittedFile>,
+    ) -> Self {
         Emitter {
             registry,
             mode,
-            files: Vec::new(),
-            emitted: BTreeSet::new(),
+            files,
         }
     }
 
     /// Replace every `asset:<id>` in attribute values and CSS url() of an HTML document.
     ///
-    /// The whole document is scanned (see the module docs for why that is sound). Errors:
-    /// an unknown id ([`Error::Other`]), a file asset that disappeared
-    /// ([`Error::MissingAsset`], standalone and site modes only) or another read failure.
+    /// The whole document is scanned (see the module docs for why that is sound). Site-mode
+    /// URLs are relative to the document. Errors: an unknown id ([`Error::Other`]), a file
+    /// asset that disappeared ([`Error::MissingAsset`], standalone and site modes only) or
+    /// another read failure.
     pub fn resolve_html(&mut self, html: &str) -> Result<String> {
-        self.resolve_placeholders(html)
+        self.resolve_placeholders(html, Referrer::Document)
     }
 
     /// Replace `asset:<id>` inside a CSS text (typically the output of
-    /// [`register_css_urls`]). Same scanning and errors as [`Emitter::resolve_html`].
+    /// [`register_css_urls`]) that is inlined into the output document (`<style>`): site-mode
+    /// URLs are relative to the document. For a stylesheet written as a file into
+    /// `assets_dir` use [`Emitter::resolve_css_in_assets_dir`]. Same scanning and errors as
+    /// [`Emitter::resolve_html`].
     pub fn resolve_css(&mut self, css: &str) -> Result<String> {
-        self.resolve_placeholders(css)
+        self.resolve_placeholders(css, Referrer::Document)
+    }
+
+    /// Like [`Emitter::resolve_css`], for a stylesheet that the caller writes as a file into
+    /// the site-mode `assets_dir` (e.g. `assets/theme-<hash>.css`): site-mode URLs are bare
+    /// file names (`bg-<id>.png`), because a browser resolves them against the stylesheet's
+    /// own URL. Emitted files are shared with the other methods. In standalone and serve
+    /// mode this is exactly [`Emitter::resolve_css`].
+    pub fn resolve_css_in_assets_dir(&mut self, css: &str) -> Result<String> {
+        self.resolve_placeholders(css, Referrer::AssetsDir)
     }
 
     /// URL for one id in the current mode (data URI / "assets/plot-3f9a1c2b7e0d.png" /
-    /// "/__presenter/deck-asset/3f9a1c2b7e0d").
+    /// "/__presenter/deck-asset/3f9a1c2b7e0d"); site-mode URLs are relative to the document.
     ///
-    /// Site mode pushes an [`EmittedFile`] the first time an id is seen. Serve mode only
-    /// checks that the id is registered and reads nothing.
+    /// Site mode pushes an [`EmittedFile`] unless [`Emitter::files`] already holds its path.
+    /// Serve mode only checks that the id is registered and reads nothing.
     pub fn url_for(&mut self, id: &str) -> Result<String> {
+        self.url_from(id, Referrer::Document)
+    }
+
+    /// [`Emitter::url_for`] for text that will live at `referrer`.
+    fn url_from(&mut self, id: &str, referrer: Referrer) -> Result<String> {
         let asset = self.registry.get(id).ok_or_else(|| unknown_id(id))?;
         match self.mode {
             OutputMode::Standalone => Ok(data_uri(&asset.mime, &self.registry.read(id)?)),
@@ -128,23 +206,25 @@ impl<'a> Emitter<'a> {
                 url_prefix,
             } => {
                 let name = hashed_file_name(&asset.file_name_hint, id);
-                if !self.emitted.contains(id) {
+                let path = assets_dir.join(&name);
+                // Linear, but outputs hold at most a few hundred files and this runs once
+                // per distinct id and resolve call.
+                if !self.files.iter().any(|file| file.path == path) {
                     let bytes = self.registry.read(id)?.into_owned();
                     tracing::debug!(id, file = %name, len = bytes.len(), "emitting asset file");
-                    self.files.push(EmittedFile {
-                        path: assets_dir.join(&name),
-                        bytes,
-                    });
-                    self.emitted.insert(id.to_string());
+                    self.files.push(EmittedFile { path, bytes });
                 }
-                Ok(format!("{url_prefix}{name}"))
+                Ok(match referrer {
+                    Referrer::Document => format!("{url_prefix}{name}"),
+                    Referrer::AssetsDir => name,
+                })
             }
             OutputMode::Serve => Ok(format!("{SERVE_ASSET_PREFIX}{id}")),
         }
     }
 
-    /// Shared implementation of [`Emitter::resolve_html`] and [`Emitter::resolve_css`].
-    fn resolve_placeholders(&mut self, text: &str) -> Result<String> {
+    /// Shared implementation of the `resolve_*` methods.
+    fn resolve_placeholders(&mut self, text: &str, referrer: Referrer) -> Result<String> {
         let found = find_placeholders(text);
         if found.is_empty() {
             return Ok(text.to_string());
@@ -152,7 +232,7 @@ impl<'a> Emitter<'a> {
         let mut urls: BTreeMap<&str, String> = BTreeMap::new();
         for placeholder in &found {
             if !urls.contains_key(placeholder.id) {
-                let url = self.url_for(placeholder.id)?;
+                let url = self.url_from(placeholder.id, referrer)?;
                 urls.insert(placeholder.id, url);
             }
         }
@@ -229,20 +309,25 @@ pub fn hashed_file_name(hint: &str, id: &str) -> String {
 ///
 /// Details:
 /// - Recognized forms: `url(x)`, `url("x")`, `url('x')`, any case of `url`, with optional
-///   whitespace inside the parentheses. The rewritten reference keeps its quote style:
-///   `url("fonts/a.woff2")` → `url("asset:<id>")`.
+///   whitespace inside the parentheses and CSS escapes (`url(a\(1\).png)`). The rewritten
+///   reference keeps its quote style: `url("fonts/a.woff2")` → `url("asset:<id>")`.
 /// - Left untouched: references with a scheme (`data:`, `http:`, `https:`, `asset:`, …),
 ///   protocol-relative `//…`, root-absolute `/…`, fragment-only `#…`, empty references,
-///   `url()`s inside `/* comments */`, and `@import url(…)` (imports are not followed here;
-///   T42 inlines local imports before calling this function).
-/// - `resolve_rel` receives the reference without its `?query#fragment` (not percent-decoded),
-///   e.g. `fonts/a.woff2` for `url(fonts/a.woff2?v=1#x)`; the suffix is kept after the
-///   placeholder. It is called once per distinct reference.
+///   `@import url(…)` (imports are not followed here; T42 inlines local imports before
+///   calling this function), and everything inside `/* comments */` and string literals
+///   (`content: "url(x.png)"` is text). A function whose name merely ends in `url`
+///   (`myurl(…)`) is not a `url()`.
+/// - `resolve_rel` receives the path without its `?query#fragment`, with CSS escapes undone
+///   and `%XX` sequences percent-decoded (kept as written when they do not decode to UTF-8):
+///   `fonts/My Font.woff2` for `url("fonts/My%20Font.woff2?v=1#x")`. The suffix is kept,
+///   as written, after the placeholder. The resolver is called once per distinct path.
 /// - [`AssetData::File`] is registered with [`AssetRegistry::register_file`];
-///   [`AssetData::Bytes`] with the MIME type guessed from the reference's extension and its
-///   last path segment as file-name hint.
+///   [`AssetData::Bytes`] with the MIME type guessed from the path's extension and its last
+///   segment as file-name hint.
 /// - An unresolvable reference with `lenient = false` is
-///   [`Error::MissingAsset`]` { path: <reference without suffix>, span: None }`.
+///   [`Error::MissingAsset`]` { path: <the path given to resolve_rel>, span: None }`. The
+///   path is relative and the error does not name the stylesheet; callers add that context
+///   (e.g. by mapping it to [`Error::Style`] with the stylesheet's name).
 pub fn register_css_urls(
     css: &str,
     registry: &mut AssetRegistry,
@@ -251,34 +336,26 @@ pub fn register_css_urls(
 ) -> Result<String> {
     let mut out = String::with_capacity(css.len());
     let mut last = 0;
-    // Reference path → id (None: unresolvable), so each is resolved once per call.
-    let mut seen: BTreeMap<&str, Option<String>> = BTreeMap::new();
-    for caps in CSS_URL.captures_iter(css) {
-        let Some(whole) = caps.get(0) else { continue };
-        // Comments and `@import url(...)` are matched only to be skipped.
-        if caps.get(1).is_some() || caps.get(2).is_some() {
-            continue;
-        }
-        let (quote, reference) = match (caps.get(3), caps.get(4), caps.get(5)) {
-            (Some(m), _, _) => ("\"", m.as_str()),
-            (_, Some(m), _) => ("'", m.as_str()),
-            (_, _, Some(m)) => ("", m.as_str()),
-            _ => continue,
-        };
-        let Some((path, suffix)) = split_local_reference(reference) else {
+    // Decoded path → id (None: unresolvable), so each is resolved once per call.
+    let mut seen: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for caps in CSS_TOKEN.captures_iter(css) {
+        let (Some(whole), Some((quote, reference))) = (caps.get(0), url_argument(&caps)) else {
             continue;
         };
-        let id = match seen.get(path) {
+        let Some(LocalRef { path, suffix }) = local_reference(reference) else {
+            continue;
+        };
+        let id = match seen.get(&path) {
             Some(id) => id.clone(),
             None => {
-                let id = resolve_rel(path).map(|data| register_resolved(registry, path, data));
-                seen.insert(path, id.clone());
+                let id = resolve_rel(&path).map(|data| register_resolved(registry, &path, data));
+                seen.insert(path.clone(), id.clone());
                 id
             }
         };
         let Some(id) = id else {
             if lenient {
-                tracing::debug!(reference = path, "leaving unresolvable CSS url() untouched");
+                tracing::debug!(reference, "leaving unresolvable CSS url() untouched");
                 continue;
             }
             return Err(Error::MissingAsset {
@@ -300,15 +377,35 @@ static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"asset:([0-9a-f]{12})([0-9a-fA-F])?").expect("placeholder regex is valid")
 });
 
-/// CSS `url()` pattern. Group 1: a comment (skipped); group 2: an `@import` prefix (the
-/// whole import is skipped); groups 3/4/5: double-quoted, single-quoted, unquoted reference.
-static CSS_URL: LazyLock<Regex> = LazyLock::new(|| {
+/// The CSS tokens [`register_css_urls`] cares about, tried in this order at each position:
+/// a comment (to the end of the text when unterminated), a string literal (ended by its
+/// quote, a newline or the end of the text), or a `url(…)` preceded by an optional
+/// `@import` and by any identifier characters it is glued to. Only a `url(…)` without
+/// `import` and with an empty `prefix` is a reference; the rest is matched to be skipped.
+/// The argument is `dq`, `sq` (inside double or single quotes) or `uq` (unquoted), escapes
+/// included.
+static CSS_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     // A constant pattern covered by the unit tests: compiling it cannot fail.
-    Regex::new(
-        r#"(?s)(/\*.*?(?:\*/|\z))|((?i:@import)\s+)?(?i:url)\(\s*(?:"([^"]*)"|'([^']*)'|([^"'()\s]*))\s*\)"#,
-    )
-    .expect("CSS url() regex is valid")
+    Regex::new(concat!(
+        r"(?s)(?P<comment>/\*.*?(?:\*/|\z))",
+        r#"|(?P<string>"(?:[^"\\\n]|\\.)*(?:"|\n|\z)|'(?:[^'\\\n]|\\.)*(?:'|\n|\z))"#,
+        r"|(?P<import>(?i:@import)\s+)?(?P<prefix>[-\w]*)(?i:url)\(\s*",
+        r#"(?:"(?P<dq>(?:[^"\\\n]|\\.)*)"|'(?P<sq>(?:[^'\\\n]|\\.)*)'"#,
+        r#"|(?P<uq>(?:[^"'()\\\s]|\\(?:[0-9a-fA-F]{1,6}\s?|[^\n0-9a-fA-F]))*))\s*\)"#,
+    ))
+    .expect("CSS token regex is valid")
 });
+
+/// The quote style and the raw argument of a `CSS_TOKEN` match that is a `url()` reference;
+/// `None` for comments, strings, `@import`s and `<identifier>url(` functions.
+fn url_argument<'t>(caps: &Captures<'t>) -> Option<(&'static str, &'t str)> {
+    if caps.name("import").is_some() || caps.name("prefix").is_none_or(|p| !p.is_empty()) {
+        return None;
+    }
+    [("\"", "dq"), ("'", "sq"), ("", "uq")]
+        .into_iter()
+        .find_map(|(quote, group)| Some((quote, caps.name(group)?.as_str())))
+}
 
 /// One placeholder occurrence found in a text.
 struct Placeholder<'t> {
@@ -340,31 +437,182 @@ fn find_placeholders(text: &str) -> Vec<Placeholder<'_>> {
 }
 
 /// End of a `?query` starting at byte `pos` (`pos` itself when there is none). The query
-/// stops before `#`, whitespace, quotes, parentheses, `<`, `>` or `\`, and excludes trailing
-/// commas (a `srcset` candidate separator).
+/// stops before `#`, whitespace, quotes, parentheses, `<`, `>`, `\` or an HTML character
+/// reference for a quote or `#` (other references such as `&#38;` are part of the query),
+/// and excludes trailing commas (a `srcset` candidate separator).
 fn query_end(text: &str, pos: usize) -> usize {
     let rest = &text[pos..];
     if !rest.starts_with('?') {
         return pos;
     }
-    let len = rest
-        .find(|c: char| {
-            c.is_whitespace() || matches!(c, '#' | '"' | '\'' | '(' | ')' | '<' | '>' | '\\')
-        })
-        .unwrap_or(rest.len());
+    let mut len = 0;
+    while let Some(c) = rest[len..].chars().next() {
+        if c.is_whitespace() || matches!(c, '#' | '"' | '\'' | '(' | ')' | '<' | '>' | '\\') {
+            break;
+        }
+        if c == '&'
+            && let Some((decoded, reference_len)) = char_reference(&rest[len..])
+        {
+            if matches!(decoded, '"' | '\'' | '#') {
+                break;
+            }
+            len += reference_len;
+            continue;
+        }
+        len += c.len_utf8();
+    }
     pos + rest[..len].trim_end_matches(',').len()
 }
 
-/// Splits a CSS reference into `(path, "?query#fragment")` when it is a relative local
-/// reference; `None` for references that stay untouched.
-fn split_local_reference(reference: &str) -> Option<(&str, &str)> {
-    let reference = reference.trim();
-    if reference.is_empty() || reference.starts_with(['#', '/']) || has_scheme(reference) {
+/// The character an HTML character reference at the start of `s` stands for, and the
+/// reference's byte length. Decoded: numeric references, decimal or hexadecimal with an
+/// optional `;` (`&#39;`, `&#x27`; out-of-range values are U+FFFD), and the named
+/// references that can end a query: `&quot;`/`&QUOT;` (also without `;` unless followed by
+/// an alphanumeric or `=`, the HTML rule for legacy references in attributes), `&apos;` and
+/// `&num;`. Anything else (including `&amp;`) is `None`: plain text to the query scanner.
+fn char_reference(s: &str) -> Option<(char, usize)> {
+    let rest = s.strip_prefix('&')?;
+    for (name, decoded) in [
+        ("quot;", '"'),
+        ("QUOT;", '"'),
+        ("apos;", '\''),
+        ("num;", '#'),
+    ] {
+        if rest.starts_with(name) {
+            return Some((decoded, 1 + name.len()));
+        }
+    }
+    if let Some(after) = rest
+        .strip_prefix("quot")
+        .or_else(|| rest.strip_prefix("QUOT"))
+        && !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '=')
+    {
+        return Some(('"', 5));
+    }
+    let number = rest.strip_prefix('#')?;
+    let (digits, radix, prefix_len) = match number.strip_prefix(['x', 'X']) {
+        Some(hex) => (hex, 16, 3),
+        None => (number, 10, 2),
+    };
+    let end = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    if end == 0 {
         return None;
     }
-    let cut = reference.find(['?', '#']).unwrap_or(reference.len());
-    let (path, suffix) = reference.split_at(cut);
-    (!path.is_empty()).then_some((path, suffix))
+    let decoded = u32::from_str_radix(&digits[..end], radix)
+        .ok()
+        .and_then(char::from_u32)
+        .unwrap_or(char::REPLACEMENT_CHARACTER);
+    let semicolon = usize::from(digits[end..].starts_with(';'));
+    Some((decoded, prefix_len + end + semicolon))
+}
+
+/// A relative local reference of a CSS `url()`.
+#[derive(Debug, PartialEq, Eq)]
+struct LocalRef<'r> {
+    /// What the resolver gets: the path without `?query#fragment`, CSS escapes undone,
+    /// percent-decoded.
+    path: String,
+    /// The `?query#fragment`, exactly as written.
+    suffix: &'r str,
+}
+
+/// Splits a raw `url()` argument into a [`LocalRef`] when it is a relative local reference;
+/// `None` for references that stay untouched. The suffix starts at the first `?` or `#`
+/// that is not escaped (an escaped one counts as part of the path).
+fn local_reference(reference: &str) -> Option<LocalRef<'_>> {
+    let reference = reference.trim();
+    let (raw_path, suffix) = reference.split_at(suffix_start(reference));
+    let path = css_unescape(raw_path);
+    if path.is_empty() || path.starts_with('/') || has_scheme(&path) {
+        return None;
+    }
+    Some(LocalRef {
+        path: percent_decode(&path).into_owned(),
+        suffix,
+    })
+}
+
+/// Byte offset of the first unescaped `?` or `#` of a raw CSS reference (its length if none).
+fn suffix_start(reference: &str) -> usize {
+    let mut chars = reference.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '?' | '#' => return i,
+            _ => {}
+        }
+    }
+    reference.len()
+}
+
+/// Undoes CSS escapes: `\` + 1–6 hex digits (+ one optional whitespace) is that code point
+/// (U+FFFD for zero, surrogates and values past U+10FFFF), `\` + newline is a line
+/// continuation (removed), `\` at the end is dropped, `\` + any other character is that
+/// character.
+fn css_unescape(s: &str) -> Cow<'_, str> {
+    if !s.contains('\\') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut code: Option<u32> = None;
+        for _ in 0..6 {
+            let Some(digit) = chars.next_if(char::is_ascii_hexdigit) else {
+                break;
+            };
+            // Six hex digits fit a u32; `to_digit` cannot fail on a hex digit.
+            code = Some(code.unwrap_or(0) * 16 + digit.to_digit(16).unwrap_or(0));
+        }
+        match code {
+            Some(code) => {
+                let ws = chars.next_if(|&w| matches!(w, ' ' | '\t' | '\n' | '\r' | '\x0c'));
+                if ws == Some('\r') {
+                    chars.next_if_eq(&'\n');
+                }
+                let decoded = char::from_u32(code).filter(|&ch| ch != '\0');
+                out.push(decoded.unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            None => match chars.next() {
+                Some('\n') | None => {}
+                Some(other) => out.push(other),
+            },
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Decodes `%XX` sequences. Malformed sequences stay as written; when the decoded bytes are
+/// not UTF-8 the input is returned unchanged.
+fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    let hex = |b: Option<&u8>| b.and_then(|&b| char::from(b).to_digit(16));
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%'
+            && let (Some(hi), Some(lo)) = (hex(bytes.get(i + 1)), hex(bytes.get(i + 2)))
+        {
+            // Two hex digits are at most 255.
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_or(Cow::Borrowed(s), Cow::Owned)
 }
 
 /// True if `reference` starts with a URL scheme (`[A-Za-z][A-Za-z0-9+.-]*:`).
@@ -377,7 +625,7 @@ fn has_scheme(reference: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-/// Registers what a resolver returned for the CSS reference `path`; returns the id.
+/// Registers what a resolver returned for the (decoded) CSS reference `path`; returns the id.
 fn register_resolved(registry: &mut AssetRegistry, path: &str, data: AssetData) -> String {
     match data {
         AssetData::File(file) => registry.register_file(&file),
@@ -449,9 +697,68 @@ mod tests {
             ("asset:3f9a1c2b7e0d?a 2x", "?a"),
             ("asset:3f9a1c2b7e0d?a,b, x", "?a,b"),
             ("asset:3f9a1c2b7e0d?a>", "?a"),
+            // An HTML character reference for a quote ends the query (entity-escaped
+            // inline styles); other references are part of it.
+            ("asset:3f9a1c2b7e0d?v=1&quot;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&QUOT;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&quot)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&#39;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&#039;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&#34;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&#x27;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&#X22;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?v=1&apos;)", "?v=1"),
+            ("asset:3f9a1c2b7e0d?a=1&amp;b=2&#38;c", "?a=1&amp;b=2&#38;c"),
+            ("asset:3f9a1c2b7e0d?a=1&#x26c=3", "?a=1&#x26c=3"),
+            ("asset:3f9a1c2b7e0d?a=1&#35;frag", "?a=1"),
+            ("asset:3f9a1c2b7e0d?a=1&num;frag", "?a=1"),
+            ("asset:3f9a1c2b7e0d?a=1&quotation=2", "?a=1&quotation=2"),
+            ("asset:3f9a1c2b7e0d?a=1&quot=2", "?a=1&quot=2"),
+            ("asset:3f9a1c2b7e0d?a=1&#3", "?a=1&#3"),
+            ("asset:3f9a1c2b7e0d?a=1&#", "?a=1&"),
+            ("asset:3f9a1c2b7e0d?a=1&", "?a=1&"),
         ] {
             let p = &find_placeholders(text)[0];
             assert_eq!(&text[p.id_end..p.query_end], query, "{text}");
+        }
+    }
+
+    #[test]
+    fn char_references() {
+        for (s, expected) in [
+            ("&quot;", Some(('"', 6))),
+            ("&QUOT;x", Some(('"', 6))),
+            ("&quot", Some(('"', 5))),
+            ("&quot)", Some(('"', 5))),
+            ("&apos;", Some(('\'', 6))),
+            ("&num;", Some(('#', 5))),
+            ("&#34;", Some(('"', 5))),
+            ("&#39;", Some(('\'', 5))),
+            ("&#0039;", Some(('\'', 7))),
+            ("&#39", Some(('\'', 4))),
+            ("&#x22;", Some(('"', 6))),
+            ("&#X27;", Some(('\'', 6))),
+            ("&#x0027", Some(('\'', 7))),
+            ("&#35;", Some(('#', 5))),
+            ("&#38;b", Some(('&', 5))),
+            ("&#x26;", Some(('&', 6))),
+            (
+                "&#99999999999999999999;",
+                Some((char::REPLACEMENT_CHARACTER, 23)),
+            ),
+            ("&#xD800;", Some((char::REPLACEMENT_CHARACTER, 8))),
+            ("", None),
+            ("&", None),
+            ("&amp;", None),
+            ("&Quot;", None),
+            ("&quotx", None),
+            ("&quot=", None),
+            ("&apos", None),
+            ("&#;", None),
+            ("&#x;", None),
+            ("quot;", None),
+        ] {
+            assert_eq!(char_reference(s), expected, "{s}");
         }
     }
 
@@ -505,11 +812,28 @@ mod tests {
             ("a.woff?v=4.7", Some(("a.woff", "?v=4.7"))),
             ("  spaced.png  ", Some(("spaced.png", ""))),
             ("fonts/a:b.woff", Some(("fonts/a:b.woff", ""))),
+            // CSS escapes are undone for the path; the suffix stays as written.
+            ("a\\(1\\).png", Some(("a(1).png", ""))),
+            ("a\\28 1\\29 .png?v=\\31", Some(("a(1).png", "?v=\\31"))),
+            ("a\\ b.png", Some(("a b.png", ""))),
+            ("a\\?b.png?q", Some(("a?b.png", "?q"))),
+            ("a\\#b.png", Some(("a#b.png", ""))),
+            // Percent-decoded after unescaping; undecodable sequences stay as written.
+            (
+                "fonts/My%20Font.woff2?v=1",
+                Some(("fonts/My Font.woff2", "?v=1")),
+            ),
+            ("%C3%A9t%C3%A9.png", Some(("été.png", ""))),
+            ("100%.png", Some(("100%.png", ""))),
+            ("a%2.png", Some(("a%2.png", ""))),
+            ("%FF.png", Some(("%FF.png", ""))),
             ("data:font/woff2;base64,AAAA", None),
             ("http://example.com/a.png", None),
             ("HTTPS://example.com/a.png", None),
             ("//cdn.example.com/a.png", None),
             ("/abs/a.png", None),
+            ("\\2f abs/a.png", None),
+            ("d\\61ta:x", None),
             ("#filter", None),
             ("asset:3f9a1c2b7e0d", None),
             ("blob:xyz", None),
@@ -517,7 +841,32 @@ mod tests {
             ("   ", None),
             ("?only-query", None),
         ] {
-            assert_eq!(split_local_reference(reference), expected, "{reference:?}");
+            let actual = local_reference(reference);
+            let actual = actual.as_ref().map(|r| (r.path.as_str(), r.suffix));
+            assert_eq!(actual, expected, "{reference:?}");
+        }
+    }
+
+    #[test]
+    fn css_escapes() {
+        for (escaped, expected) in [
+            ("plain", "plain"),
+            ("\\(\\)\\\"\\'\\\\", "()\"'\\"),
+            ("\\41 B", "AB"),
+            ("\\41\tB", "AB"),
+            ("\\41\r\nB", "AB"),
+            ("\\41  B", "A B"),
+            ("\\000041B", "AB"),
+            ("\\0000411", "A1"),
+            ("\\0", "\u{FFFD}"),
+            ("\\d800", "\u{FFFD}"),
+            ("\\110000", "\u{FFFD}"),
+            ("\\1F600x", "\u{1F600}x"),
+            ("a\\\nb", "ab"),
+            ("trailing\\", "trailing"),
+            ("\\é", "é"),
+        ] {
+            assert_eq!(css_unescape(escaped), expected, "{escaped:?}");
         }
     }
 
@@ -568,6 +917,14 @@ mod tests {
                 "x{b:url(a.png?v=2#f)}",
                 format!("x{{b:url(asset:{a}?v=2#f)}}"),
             ),
+            (
+                "x{b:-webkit-image-set(url(a.png) 1x)}",
+                format!("x{{b:-webkit-image-set(url(asset:{a}) 1x)}}"),
+            ),
+            (
+                "x{--bg:url(a.png);b:var(--bg)}",
+                format!("x{{--bg:url(asset:{a});b:var(--bg)}}"),
+            ),
         ] {
             assert_eq!(rewrite(css, refs).0, expected, "{css}");
         }
@@ -601,6 +958,102 @@ mod tests {
             format!("/* c */ x{{background:url(asset:{})}}", id_of("a.png"))
         );
         assert_eq!(registry.len(), 1);
+    }
+
+    /// Strict mode with a resolver that knows only `bg.png`: text that merely looks like a
+    /// `url()` is not a reference, and real references after tricky strings are found.
+    #[test]
+    fn css_strings_and_identifiers_are_not_urls() {
+        let strict = |css: &str| {
+            let mut registry = AssetRegistry::new();
+            register_css_urls(css, &mut registry, &mut known(&["bg.png"]), false)
+                .map(|out| (out, registry.len()))
+        };
+        let bg = id_of("bg.png");
+        // `/*` inside a string does not start a comment.
+        for (css, expected) in [
+            (
+                ".a::before{content:\"/*\"} .b{background:url(bg.png)}",
+                format!(".a::before{{content:\"/*\"}} .b{{background:url(asset:{bg})}}"),
+            ),
+            (
+                "a[href$='/*']{} .b{background:url(bg.png)}",
+                format!("a[href$='/*']{{}} .b{{background:url(asset:{bg})}}"),
+            ),
+            (
+                ".a{content:\"\\\"/*\"} .b{background:url('bg.png')}",
+                format!(".a{{content:\"\\\"/*\"}} .b{{background:url('asset:{bg}')}}"),
+            ),
+            // A bad string ends at the newline; what follows is CSS again.
+            (
+                ".a{content:\"oops\n} .b{background:url(bg.png)}",
+                format!(".a{{content:\"oops\n}} .b{{background:url(asset:{bg})}}"),
+            ),
+        ] {
+            assert_eq!(strict(css).unwrap(), (expected, 1), "{css}");
+        }
+        // `url(` inside strings or glued to an identifier is not a reference.
+        for css in [
+            ".a::after{content:\"url(x.png)\"}",
+            ".a::after{content:'see url(x.png)'}",
+            ".a::after{content:\"\\\"url(x.png)\"}",
+            ".a{--x:myurl(a.png)}",
+            ".a{--x:my-url(\"a.png\")}",
+            ".a{content:\"unterminated url(x.png)",
+        ] {
+            assert_eq!(strict(css).unwrap(), (css.to_string(), 0), "{css}");
+        }
+        // Escaped unquoted references are recognized (and missing ones reported).
+        let err = strict(".a{background:url(a\\(1\\).png)}").unwrap_err();
+        assert!(
+            matches!(&err, Error::MissingAsset { path, .. } if path == Path::new("a(1).png")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn css_escaped_and_percent_encoded_references_are_decoded_for_the_resolver() {
+        let mut calls = Vec::new();
+        let mut resolver = |r: &str| {
+            calls.push(r.to_string());
+            Some(AssetData::Bytes(r.as_bytes().to_vec()))
+        };
+        let mut registry = AssetRegistry::new();
+        let css = "a{b:url(img\\(1\\).png)} c{d:url(\"fonts/My%20Font.woff2?v=1\")} \
+                   e{f:url(img\\28 1\\29 .png)} g{h:url('it\\'s.svg')}";
+        let out = register_css_urls(css, &mut registry, &mut resolver, false).unwrap();
+        assert_eq!(calls, ["img(1).png", "fonts/My Font.woff2", "it's.svg"]);
+        let (img, font, svg) = (
+            id_of("img(1).png"),
+            id_of("fonts/My Font.woff2"),
+            id_of("it's.svg"),
+        );
+        assert_eq!(
+            out,
+            format!(
+                "a{{b:url(asset:{img})}} c{{d:url(\"asset:{font}?v=1\")}} \
+                 e{{f:url(asset:{img})}} g{{h:url('asset:{svg}')}}"
+            )
+        );
+        let font = registry.get(&font).unwrap();
+        assert_eq!(
+            (font.mime.as_str(), font.file_name_hint.as_str()),
+            ("font/woff2", "My Font.woff2")
+        );
+        assert_eq!(registry.get(&svg).unwrap().mime, "image/svg+xml");
+
+        // A missing reference is reported with the decoded path.
+        let err = register_css_urls(
+            "@font-face{src:url(fonts/My%20Font.woff2)}",
+            &mut AssetRegistry::new(),
+            &mut known(&[]),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::MissingAsset { path, .. } if path == Path::new("fonts/My Font.woff2")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -696,6 +1149,33 @@ mod tests {
     }
 
     #[test]
+    fn standalone_query_drop_keeps_entity_escaped_closing_quotes() {
+        let mut registry = AssetRegistry::new();
+        let id = registry.register_bytes(b"x".to_vec(), "image/png", "a.png");
+        let uri = data_uri("image/png", b"x");
+        let standalone = OutputMode::Standalone;
+        for quote in ["&quot;", "&#39;", "&#x27;", "&#34;", "&apos;"] {
+            let html = format!("<div style=\"background:url({quote}asset:{id}?v=1{quote})\">");
+            let out = Emitter::new(&registry, &standalone)
+                .resolve_html(&html)
+                .unwrap();
+            assert_eq!(
+                out,
+                format!("<div style=\"background:url({quote}{uri}{quote})\">"),
+                "{quote}"
+            );
+        }
+        // Site and serve keep the query and the entity.
+        let site = site();
+        let html = format!("<div style=\"background:url(&quot;asset:{id}?v=1&quot;)\">");
+        let out = Emitter::new(&registry, &site).resolve_html(&html).unwrap();
+        assert_eq!(
+            out,
+            format!("<div style=\"background:url(&quot;assets/a-{id}.png?v=1&quot;)\">")
+        );
+    }
+
+    #[test]
     fn a_placeholder_inside_a_dropped_query_goes_with_it() {
         let mut registry = AssetRegistry::new();
         let a = registry.register_bytes(vec![1], "image/png", "a.png");
@@ -722,8 +1202,71 @@ mod tests {
             let html = "<p>asset:3f9a1c2b7e0d1 is a 13-digit hash, not a placeholder</p>";
             assert_eq!(emitter.resolve_html(html).unwrap(), html);
             assert_eq!(emitter.resolve_css("").unwrap(), "");
+            assert_eq!(emitter.resolve_css_in_assets_dir("").unwrap(), "");
             assert!(emitter.files.is_empty());
         }
+    }
+
+    #[test]
+    fn stylesheets_in_assets_dir_get_bare_file_names_and_share_files() {
+        let mut registry = AssetRegistry::new();
+        let a = registry.register_bytes(vec![1], "image/png", "a.png");
+        let b = registry.register_bytes(vec![2], "font/woff2", "b.woff2");
+        let css = format!("x{{b:url(asset:{a}?v=1)}} @font-face{{src:url('asset:{b}')}}");
+        let mode = site();
+        let mut emitter = Emitter::new(&registry, &mode);
+        assert_eq!(emitter.url_for(&a).unwrap(), format!("assets/a-{a}.png"));
+        assert_eq!(
+            emitter.resolve_css_in_assets_dir(&css).unwrap(),
+            format!("x{{b:url(a-{a}.png?v=1)}} @font-face{{src:url('b-{b}.woff2')}}")
+        );
+        assert_eq!(
+            emitter.resolve_css(&css).unwrap(),
+            format!("x{{b:url(assets/a-{a}.png?v=1)}} @font-face{{src:url('assets/b-{b}.woff2')}}")
+        );
+        let paths: Vec<&Path> = emitter.files.iter().map(|f| f.path.as_path()).collect();
+        let (pa, pb) = (
+            format!("out/assets/a-{a}.png"),
+            format!("out/assets/b-{b}.woff2"),
+        );
+        assert_eq!(paths, [Path::new(&pa), Path::new(&pb)]);
+        // Location does not matter in the other modes.
+        for mode in [OutputMode::Standalone, OutputMode::Serve] {
+            let mut emitter = Emitter::new(&registry, &mode);
+            assert_eq!(
+                emitter.resolve_css_in_assets_dir(&css).unwrap(),
+                emitter.resolve_css(&css).unwrap()
+            );
+            assert!(emitter.files.is_empty());
+        }
+    }
+
+    #[test]
+    fn carried_files_are_not_emitted_again() {
+        let mut registry = AssetRegistry::new();
+        let a = registry.register_bytes(vec![1], "image/png", "a.png");
+        let b = registry.register_bytes(vec![2], "image/png", "b.png");
+        let mode = site();
+        let mut carried = Vec::new();
+        for id in [&a, &b, &a, &a, &b] {
+            let mut emitter = Emitter::with_files(&registry, &mode, std::mem::take(&mut carried));
+            emitter.url_for(id).unwrap();
+            emitter.resolve_html(&format!("asset:{id}")).unwrap();
+            carried = emitter.files;
+        }
+        // Assigning the public field works the same as `with_files`.
+        let mut emitter = Emitter::new(&registry, &mode);
+        emitter.files = carried;
+        emitter
+            .resolve_css_in_assets_dir(&format!("url(asset:{a}) url(asset:{b})"))
+            .unwrap();
+        let paths: Vec<&Path> = emitter.files.iter().map(|f| f.path.as_path()).collect();
+        let (pa, pb) = (
+            format!("out/assets/a-{a}.png"),
+            format!("out/assets/b-{b}.png"),
+        );
+        assert_eq!(paths, [Path::new(&pa), Path::new(&pb)]);
+        assert_eq!(emitter.files[1].bytes, [2]);
     }
 
     #[test]
