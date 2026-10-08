@@ -13,10 +13,10 @@ use presenter::ir::Deck;
 use regex::Regex;
 use serde_json::Value;
 
-/// Top-level `<section>`s of the example: 13 horizontal slides (one is a vertical stack).
-const EXAMPLE_TOP_LEVEL_SECTIONS: usize = 13;
+/// Top-level `<section>`s of the example: 15 horizontal slides (one is a vertical stack).
+const EXAMPLE_TOP_LEVEL_SECTIONS: usize = 15;
 /// All slides of the example, vertical children included.
-const EXAMPLE_SLIDES: usize = 15;
+const EXAMPLE_SLIDES: usize = 17;
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -3,7 +3,7 @@ source: tests/render.rs
 expression: region
 ---
 <div class="slides">
-<section id="intro" class="layout-title">
+<section id="intro" class="layout-title center">
 <h1>Rust for data people</h1>
 
 <p class="subtitle">Fast tools without the footguns</p>
@@ -127,7 +127,7 @@ fig</code></pre>
 </div>
 </div>
 </section>
-<section id="questions" class="layout-section inverted" data-transition="zoom">
+<section id="questions" class="layout-section center inverted" data-transition="zoom">
 <h1>Questions?</h1>
 <p>Slides and code: <a href="https://example.org/rust-data">example.org/rust-data</a></p>
 

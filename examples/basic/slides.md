@@ -20,7 +20,8 @@ front matter under the heading.
 - A **title slide** with the subtitle, author and date from the front matter
 - A **vertical stack**, **fragments** and **two columns**
 - **Code** with line stepping, **math**, a **figure** and a **table**
-- **Backgrounds**, an **embedded page**, a **footnote** and **speaker notes**
+- A **footnote**, **callouts** and **quotes**
+- **Backgrounds**, a **full-slide figure**, an **embedded page** and **speaker notes**
 
 Press <kbd>S</kbd> for the speaker view and <kbd>Esc</kbd> for the overview.
 
@@ -135,6 +136,20 @@ Both are bundled, so this deck works offline.
 [^reveal]: reveal.js 6.0.2, <https://revealjs.com>
 [^katex]: KaTeX 0.19.0, <https://katex.org>
 
+---
+
+## Callouts and quotes
+
+> [!TIP]
+> GitHub-style alerts start with `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` or
+> `[!CAUTION]` on the first line of a block quote.
+
+> A plain block quote sets a remark or a citation apart.
+
+:::small
+`:::small` and `:::large` blocks change the text size; `:::center` centres one.
+:::
+
 --- {background="#0f172a" transition=zoom}
 
 ## Backgrounds
@@ -148,6 +163,15 @@ A colour sets the slide's background colour, a file name its background image.
 ## Background images
 
 The figure behind this text is `figures/plot.png`, drawn at 20% opacity.
+
+--- {layout=blank}
+
+![A damped oscillation that fills the whole slide](figures/plot.png)
+
+:::notes
+`--- {layout=blank}` drops the slide padding, so a lone image, video or iframe fills the
+whole slide.
+:::
 
 ---
 
