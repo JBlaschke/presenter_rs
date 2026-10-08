@@ -3,14 +3,14 @@
 //!
 //! Option precedence (config.md §1 and its contract changes): built-in defaults
 //! ([`Config::builtin_reveal_defaults`]) < the theme chain's `[reveal]` < `presenter.toml`
-//! `[reveal]` < front matter `reveal:`. `plugins` is not a reveal option: it selects the
-//! plugin scripts ([`plugins`]) and is stripped from [`reveal_config_json`].
-
-use std::collections::BTreeMap;
+//! `[reveal]` < front matter `reveal:` < the command line. `plugins` is not a reveal option:
+//! it selects the plugin scripts ([`plugins`]) and is stripped from [`reveal_config_json`].
+//! The renderer works on the effective config and uses [`Config::reveal_options_json`];
+//! [`reveal_config_json`] computes the same JSON from a config that is not merged yet.
 
 use serde_json::{Map, Value};
 
-use crate::config::{Config, MathMode, PluginId};
+use crate::config::{Config, MathMode, PluginId, canonical_json};
 use crate::ir::{DeckMeta, Features};
 use crate::theme::Theme;
 
@@ -84,6 +84,10 @@ fn explicitly_listed(config: &Config) -> Vec<PluginId> {
 /// `config.reveal` ← `meta.reveal` (right wins, top-level keys), `plugins` removed, keys
 /// sorted recursively, integral numbers without a trailing `.0`. `width`/`height` come from
 /// the built-in defaults (1280×720) unless a layer sets them.
+///
+/// For a `presenter.toml` config that is not merged yet. Do not pass an effective config
+/// with command-line reveal options: `meta.reveal` would be applied over them again (the
+/// renderer calls [`Config::reveal_options_json`] on the effective config instead).
 pub fn reveal_config_json(config: &Config, meta: &DeckMeta, theme: &Theme) -> String {
     let mut merged = config.clone();
     merged.merge_theme_reveal(&theme.reveal_defaults());
@@ -136,27 +140,6 @@ pub fn reveal_init_script(
 /// becomes the JSON escape `\u003c`, which also neutralizes `<!--`.
 fn script_safe_json(json: &str) -> String {
     json.replace('<', "\\u003c")
-}
-
-/// Object keys sorted recursively and integral floats written as integers, so embedded
-/// option objects are deterministic.
-fn canonical_json(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let sorted: BTreeMap<&String, Value> =
-                map.iter().map(|(k, v)| (k, canonical_json(v))).collect();
-            Value::Object(sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect())
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
-        Value::Number(number) if number.is_f64() => match number.as_f64() {
-            // |f| < 2^53 and integral, so the cast is exact.
-            Some(f) if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 => {
-                Value::from(f as i64)
-            }
-            _ => value.clone(),
-        },
-        other => other.clone(),
-    }
 }
 
 #[cfg(test)]

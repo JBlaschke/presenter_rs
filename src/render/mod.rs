@@ -5,7 +5,7 @@
 //!
 //! [`render`] turns `Deck + AssetRegistry + Theme + Config + OutputMode` into the final HTML
 //! document: it builds the §4 context ([`context::build_context`]), compiles the theme
-//! stylesheet ([`html::compile_theme_css`]), renders `deck.html` in a fresh environment of the
+//! stylesheet ([`compile_theme_css`]), renders `deck.html` in a fresh environment of the
 //! theme chain with the §4 helpers (`style`, `script`, `asset`, `theme_style`, `reveal_init`,
 //! `live_reload`) and filters (`attrs`, `markdown`), and finally resolves every `asset:<id>`
 //! placeholder for the output mode. Nothing is written to disk: site-mode files come back in
@@ -15,10 +15,16 @@
 //! `/__presenter/asset/{*path}` route) are resolved by one function,
 //! [`resolve_helper_path`], which understands the four forms of §4: `vendor/…`,
 //! `presenter/…`, `@<theme>/<path>` and anything else (the chain's `assets/` directories).
+//! Stylesheet `url()`s resolve to helper paths too, so every output mode finds the same
+//! files; in serve mode the theme stylesheet links them as `/__presenter/asset/<path>`.
+//!
+//! The renderer applies no config merge: [`RenderInput::config`] is the effective config.
 
 pub mod context;
 pub mod html;
+mod paths;
 pub mod reveal;
+mod styles;
 
 use serde::Serialize;
 
@@ -30,7 +36,9 @@ use crate::ir::Deck;
 use crate::theme::Theme;
 
 pub use context::build_context;
-pub use html::{compile_theme_css, render, resolve_helper_path};
+pub use html::render;
+pub use paths::{normalize_helper_path, resolve_helper_path};
+pub use styles::compile_theme_css;
 
 /// Which command is rendering: `presenter build` or `presenter serve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -92,9 +100,12 @@ pub struct RenderInput<'a> {
     pub assets: &'a AssetRegistry,
     /// The resolved theme chain.
     pub theme: &'a Theme,
-    /// The project configuration. The renderer applies the theme's `[reveal]` defaults
-    /// (under it) and the deck's front matter (over it) itself; both merges are idempotent,
-    /// so an already merged config works too.
+    /// The **effective** configuration, used as given (config.md §1): `presenter.toml`
+    /// with the theme's `[reveal]` defaults under it, the deck's front matter over it and
+    /// the command line on top. [`context::effective_config`] does the first steps
+    /// (`merge_theme_reveal`, `merge_front_matter`); the caller then applies the CLI
+    /// (`Config::apply_cli`, `Config::apply_cli_reveal`). The renderer merges nothing
+    /// itself, so nothing can override the CLI layer.
     pub config: &'a Config,
     /// How helpers emit files and how placeholders are resolved.
     pub output: OutputMode,
@@ -110,8 +121,9 @@ pub struct RenderedDocument {
     /// The compiled theme stylesheet (all `[styles] entries` of the chain, parent first)
     /// resolved for the output mode: inlined into `html` (standalone, `data:` URIs), written
     /// as `assets/theme-<hash>.css` (site; that file is also in [`RenderedDocument::files`])
-    /// or served at `/__presenter/theme.css` (serve; its assets are served from
-    /// `/__presenter/deck-asset/<id>` out of [`RenderedDocument::assets`]).
+    /// or served at `/__presenter/theme.css` (serve; its `url()`s are
+    /// `/__presenter/asset/<helper path>` URLs, which the dev server resolves with
+    /// [`resolve_helper_path`] like every other helper path).
     pub theme_css: String,
     /// Site mode: files to write next to the document (assets, copied stylesheets and
     /// scripts, the theme stylesheet), in first-use order. Empty in the other modes.
@@ -119,11 +131,9 @@ pub struct RenderedDocument {
     /// Number of slides: top-level slides plus their vertical children (for the CLI summary).
     pub slide_count: usize,
     /// Warnings found while rendering: `unknown-layout` (a slide's layout is not a template
-    /// of the chain; the default layout is used) and `standalone-background-video` (a local
-    /// background video cannot play from a `data:` URI).
+    /// of the chain; the default layout is used), `standalone-background-video` (a local
+    /// background video cannot play from a `data:` URI) and `remote-import` (standalone: an
+    /// inlined stylesheet `@import`s an absolute URL, e.g. a stock reveal theme's Google
+    /// Fonts).
     pub diagnostics: Diagnostics,
-    /// The deck's registry plus everything the renderer registered (theme stylesheet
-    /// `url()` targets, files copied by helpers). The dev server serves
-    /// `/__presenter/deck-asset/<id>` from this registry.
-    pub assets: AssetRegistry,
 }

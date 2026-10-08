@@ -2,10 +2,11 @@
 //! the object `deck.html` receives (and `presenter dump --context` prints).
 //!
 //! Shape: `deck` (the IR), `meta`, `slides` (each slide and each vertical child decorated
-//! with `layout_template`), `features`, `config` (the effective config; its `reveal` table is
-//! the fully merged option map including the built-in defaults and `plugins`), `reveal`
-//! (`config_json`, `plugins`, `plugin_scripts`), `theme` (`name`, `chain`, `reveal_theme`,
-//! `highlight_style`, `vars`, `scripts`) and `build`.
+//! with `layout_template`), `features`, `config` (the effective config as given in
+//! [`RenderInput::config`]; its `reveal` table is the full option map including the
+//! built-in defaults and `plugins`), `reveal` (`config_json`, `plugins`, `plugin_scripts`),
+//! `theme` (`name`, `chain`, `reveal_theme`, `highlight_style`, `vars`, `scripts`) and
+//! `build`.
 //!
 //! Theme-relative files are given as `@<theme>/<path>` helper paths (the theme-format §4
 //! contract change), so templates pass `theme.scripts` entries and a path-valued
@@ -24,12 +25,12 @@ use crate::theme::Theme;
 /// `highlight_style` values that name a built-in style rather than a file.
 const BUILTIN_HIGHLIGHT_STYLES: [&str; 3] = ["monokai", "zenburn", "none"];
 
-/// Builds the §4 context for `input`, appending an `unknown-layout` warning to
-/// `diagnostics` for every slide whose layout the theme chain does not provide (such a
-/// slide gets `layout_template = "layouts/default.html"`).
+/// Builds the §4 context for `input` (whose config is the effective one, see
+/// [`RenderInput::config`]), appending an `unknown-layout` warning to `diagnostics` for
+/// every slide whose layout the theme chain does not provide (such a slide gets
+/// `layout_template = "layouts/default.html"`).
 ///
-/// Fails when the front matter's config tables do not merge
-/// ([`Config::merge_front_matter`]) or a `[scripts] entries` file of the theme is missing
+/// Fails when a `[scripts] entries` file of the theme is missing
 /// ([`Theme::script_entries`]).
 pub fn build_context(
     input: &RenderInput<'_>,
@@ -41,10 +42,11 @@ pub fn build_context(
     )?))
 }
 
-/// [`build_context`] as a JSON object, keys in §4 order.
+/// [`build_context`] as a JSON object, keys in §4 order (what `presenter dump --context`
+/// prints).
 pub fn context_json(input: &RenderInput<'_>, diagnostics: &mut Diagnostics) -> Result<Value> {
     let deck = input.deck;
-    let config = effective_config(input.config, &deck.meta, input.theme)?;
+    let config = input.config;
     let mut context = Map::new();
     context.insert("deck".into(), to_json(deck)?);
     context.insert("meta".into(), to_json(&deck.meta)?);
@@ -53,16 +55,20 @@ pub fn context_json(input: &RenderInput<'_>, diagnostics: &mut Diagnostics) -> R
         decorated_slides(deck, input.theme, diagnostics)?,
     );
     context.insert("features".into(), to_json(&deck.features)?);
-    context.insert("config".into(), config_json(&config)?);
-    context.insert("reveal".into(), reveal_json(&config, deck, input.theme));
+    context.insert("config".into(), config_json(config)?);
+    context.insert("reveal".into(), reveal_json(config, deck));
     context.insert("theme".into(), theme_json(input.theme)?);
     context.insert("build".into(), to_json(&input.build)?);
     Ok(Value::Object(context))
 }
 
-/// The config the deck is rendered with: `config`, the theme's `[reveal]` defaults filled
-/// in where `config.reveal` has no value, then the front matter merged over it
-/// (config.md §1). Both merges are idempotent, so an already merged config is unchanged.
+/// `config` with the theme's `[reveal]` defaults filled in where `config.reveal` has no
+/// value and the deck's front matter merged over it (config.md §1): the effective config
+/// without the command-line layer, which the caller applies afterwards
+/// ([`Config::apply_cli`], [`Config::apply_cli_reveal`]). Both merges are idempotent.
+///
+/// Fails when the front matter's config tables do not merge
+/// ([`Config::merge_front_matter`]).
 pub fn effective_config(config: &Config, meta: &DeckMeta, theme: &Theme) -> Result<Config> {
     let mut config = config.clone();
     config.merge_theme_reveal(&theme.reveal_defaults());
@@ -95,13 +101,10 @@ fn sorted(map: Map<String, Value>) -> Map<String, Value> {
 }
 
 /// The context's `reveal` object.
-fn reveal_json(config: &Config, deck: &Deck, theme: &Theme) -> Value {
+fn reveal_json(config: &Config, deck: &Deck) -> Value {
     let plugins = reveal::plugins(config, &deck.features);
     let mut map = Map::new();
-    map.insert(
-        "config_json".into(),
-        reveal::reveal_config_json(config, &deck.meta, theme).into(),
-    );
+    map.insert("config_json".into(), config.reveal_options_json().into());
     map.insert(
         "plugins".into(),
         plugins

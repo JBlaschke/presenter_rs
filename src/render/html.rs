@@ -1,15 +1,19 @@
-//! Document rendering and the template helpers of `docs/spec/theme-format.md` §4.
+//! Document rendering and the template helpers and filters of `docs/spec/theme-format.md` §4.
 //!
 //! [`render`] builds the context, compiles the theme stylesheet, renders `deck.html` in a
 //! fresh environment of the theme chain (so disk edits are always seen) and resolves every
-//! `asset:<id>` placeholder of the result with one [`Emitter`] pass.
+//! deck `asset:<id>` placeholder of the result with one [`Emitter`] pass over the deck's
+//! registry.
 //!
 //! **Helpers.** minijinja 2.24 stores functions as `Send + Sync + 'static` boxes, so a helper
 //! cannot hold an `Emitter<'a>` borrowing the caller's registry. The helpers share an
-//! `Arc<Mutex<HelperState>>` that owns a copy of the deck's registry (plus everything the
-//! helpers register), the output mode and the site-mode file list; each call that emits
-//! creates a short-lived emitter with [`Emitter::with_files`] and puts the files back
-//! (pattern 2 of the `assets::emit` module docs). What each helper returns:
+//! `Arc<Mutex<HelperState>>` that owns a registry of *their* files (theme stylesheet `url()`
+//! targets, copied stylesheets, scripts and assets), the output mode, the site-mode file
+//! list and their diagnostics. Each call that emits creates a short-lived emitter with
+//! [`Emitter::with_files`], resolves its own placeholders at once and puts the files back
+//! (pattern 2 of the `assets::emit` module docs). Helper output never contains
+//! placeholders, so the final pass needs only the deck's registry (borrowed, not copied).
+//! What each helper returns:
 //!
 //! | helper | standalone | site | serve |
 //! |---|---|---|---|
@@ -20,19 +24,37 @@
 //! | `reveal_init()` | `<script>Reveal.initialize(Object.assign(<config_json>, { plugins: [...] }));</script>` | same | same |
 //! | `live_reload()` | empty | empty | `<script src="/__presenter/live-reload.js"></script>` (when `build.live_reload`) |
 //!
-//! Every helper fails with a template error naming the path when [`resolve_helper_path`]
-//! finds nothing, in every mode. Inlined text never closes its element early: `</style`
-//! and `</script` inside inlined files are written `<\/style` / `<\/script`.
-//! Stylesheets from `vendor/` and `presenter/` resolve `url()`s leniently (KaTeX's
-//! `.woff`/`.ttf` fallbacks stay as written); theme stylesheets must resolve every local
-//! `url()` (relative to the stylesheet, then the chain's `assets/` directories, §5).
+//! Every helper fails with a template error naming the path and why nothing was found
+//! (an unknown `@<theme>`, a path that climbs out, or where it looked) when
+//! [`resolve_helper_path`] finds nothing, in every mode. How
+//! stylesheet `url()`s resolve (the same files in every mode) is described in the
+//! `render::styles` module docs; in serve mode the theme stylesheet refers to its files as
+//! `/__presenter/asset/<helper path>`, so the dev server needs no registry for them.
+//!
+//! **Inlined text** never ends its element early: `</style` and `</script` inside inlined
+//! files are written `<\/style` / `<\/script`. Nor does it keep the element open: a script
+//! that would leave the HTML tokenizer in the "script data double escaped" state (a `<!--`,
+//! then `<script` with no `-->` after them) would make the element's own `</script>` fail
+//! to close it, swallowing the scripts after it (`Reveal.initialize` included). Such a
+//! script is inlined as `<script src="data:text/javascript;charset=utf-8;base64,…">`
+//! instead, which is still self-contained. (The vendored scripts are inlined as text.)
+//!
+//! **Remote imports.** A standalone file promises to be self-contained, which a stylesheet
+//! that `@import`s an absolute URL breaks: 8 of the 14 stock reveal.js themes import Google
+//! Fonts (vendored-assets.md §2 says their fonts are inlined; they are not). The import is
+//! kept (the theme's fonts load when online; offline the browser skips it) and a
+//! `remote-import` warning names the stylesheet and the URL. Site and serve output load
+//! such imports too, without a warning.
 //!
 //! **Filters.** `attrs` renders a map as ` k="v"` pairs (escaped; `none` values skipped);
 //! `markdown` renders a string with comrak and the markdown-dialect §1 options (raw HTML
-//! allowed, no front matter); a result that is one paragraph is unwrapped, so the filter
-//! works inline (`<p class="subtitle">{{ meta.subtitle|markdown }}</p>`). Images in
-//! template-rendered Markdown are not registered as assets (not supported). T16 switches the
-//! filter to the Markdown frontend's `render_fragment`.
+//! allowed, no front matter, `parse.smart` = `config.markdown.smart_punctuation`;
+//! `render.sourcepos` stays off because the positions would be relative to the template
+//! value, not to the deck's source file); a result that is one paragraph is unwrapped, so
+//! the filter works inline (`<p class="subtitle">{{ meta.subtitle|markdown }}</p>`). Images
+//! in template-rendered Markdown are not registered as assets (not supported). T16 switches
+//! the filter to the Markdown frontend's `render_fragment`. `json` is minijinja's `tojson`
+//! under the name §4 lists (its output is safe in HTML and inside `<script>`).
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -41,13 +63,17 @@ use std::sync::{Arc, Mutex};
 use minijinja::value::ValueKind;
 use minijinja::{Environment, ErrorKind, Value};
 
+use super::paths::{
+    helper_path_exists, normalize_helper_path, resolve_helper_path, serve_url, unknown_reason,
+};
 use super::reveal::{self, PluginInfo};
+use super::styles::{self, Targets, UrlRules};
 use super::{BuildMode, RenderInput, RenderedDocument, context};
-use crate::assets::emit::{EmittedFile, Emitter, OutputMode, data_uri, register_css_urls};
-use crate::assets::registry::{AssetData, AssetRegistry};
+use crate::assets::emit::{EmittedFile, Emitter, OutputMode, data_uri};
+use crate::assets::registry::AssetRegistry;
 use crate::error::{Diagnostic, Diagnostics, Error, Result, template_error};
 use crate::ir::{Deck, Slide};
-use crate::theme::{Theme, normalize_rel};
+use crate::theme::Theme;
 
 /// URL prefix of the dev server route that serves helper paths (live-reload.md §1).
 pub const SERVE_HELPER_PREFIX: &str = "/__presenter/asset/";
@@ -58,19 +84,15 @@ pub const SERVE_THEME_CSS: &str = "/__presenter/theme.css";
 /// URL of the live-reload client script (live-reload.md §1).
 pub const SERVE_LIVE_RELOAD_JS: &str = "/__presenter/live-reload.js";
 
-/// Renders `input` into the final document (see the module docs).
+/// Renders `input` into the final document (see the module docs). `input.config` is used
+/// as given: it must already be the effective config ([`super::RenderInput::config`]).
 ///
 /// Errors: template errors ([`Error::Template`], with the source excerpt in serve mode), a
-/// helper path that resolves to nothing (an [`Error::Template`] naming the path and the
-/// template), theme stylesheets ([`Error::Style`]: SCSS before T42, an unresolvable
-/// `url()`), theme manifest entries ([`Error::Theme`]), invalid front matter config tables
-/// ([`Error::FrontMatter`]) and placeholders naming unregistered assets.
+/// helper path that resolves to nothing or a stylesheet `url()` that does (an
+/// [`Error::Template`] naming the path and the template), theme stylesheets
+/// ([`Error::Style`]: SCSS before T42, an unresolvable `url()`), theme manifest entries
+/// ([`Error::Theme`]) and placeholders naming unregistered assets.
 pub fn render(input: RenderInput<'_>) -> Result<RenderedDocument> {
-    let config = context::effective_config(input.config, &input.deck.meta, input.theme)?;
-    let input = RenderInput {
-        config: &config,
-        ..input
-    };
     let mut diagnostics = Diagnostics::new();
     let ctx = context::build_context(&input, &mut diagnostics)?;
     check_background_videos(&input, &mut diagnostics);
@@ -78,33 +100,37 @@ pub fn render(input: RenderInput<'_>) -> Result<RenderedDocument> {
     let mut state = HelperState {
         theme: input.theme.clone(),
         mode: input.output.clone(),
-        registry: input.assets.clone(),
+        registry: AssetRegistry::new(),
         files: Vec::new(),
+        diagnostics: Diagnostics::new(),
     };
-    let raw_css = compile_theme_css(input.theme, &mut state.registry)?;
-    let theme_css = state.with_emitter(|e| e.resolve_css_in_assets_dir(&raw_css))?;
+    let theme_css = state.theme_css()?;
     let extras = Extras {
         theme_css: Arc::from(theme_css.as_str()),
         reveal_init: Arc::from(init_script(&input).as_str()),
         live_reload: input.build.live_reload,
         build_id: input.build.id,
+        smart_punctuation: input.config.markdown.smart_punctuation,
     };
     let state = Arc::new(Mutex::new(state));
     let html = render_deck(&input, &state, extras, &ctx)?;
 
-    let mut guard = state.lock().map_err(|_| poisoned())?;
-    let registry = std::mem::take(&mut guard.registry);
-    let mut emitter =
-        Emitter::with_files(&registry, &input.output, std::mem::take(&mut guard.files));
+    let (files, helper_diagnostics) = {
+        let mut guard = state.lock().map_err(|_| poisoned())?;
+        (
+            std::mem::take(&mut guard.files),
+            std::mem::take(&mut guard.diagnostics),
+        )
+    };
+    diagnostics.extend(helper_diagnostics);
+    let mut emitter = Emitter::with_files(input.assets, &input.output, files);
     let html = emitter.resolve_html(&html)?;
-    let files = emitter.files;
     Ok(RenderedDocument {
         html,
         theme_css,
-        files,
+        files: emitter.files,
         slide_count: slide_count(input.deck),
         diagnostics,
-        assets: registry,
     })
 }
 
@@ -116,14 +142,13 @@ fn slide_count(deck: &Deck) -> usize {
         .sum()
 }
 
-/// The `reveal_init()` script for `input` (whose config is already effective).
+/// The `reveal_init()` script for `input` (whose config is the effective one).
 fn init_script(input: &RenderInput<'_>) -> String {
     let config = input.config;
     let features = &input.deck.features;
     let plugins: Vec<PluginInfo> = reveal::plugins(config, features);
-    let config_json = reveal::reveal_config_json(config, &input.deck.meta, input.theme);
     let katex = reveal::math_enabled(config, features).then_some(&config.math.katex_options);
-    reveal::reveal_init_script(&config_json, &plugins, katex)
+    reveal::reveal_init_script(&config.reveal_options_json(), &plugins, katex)
 }
 
 /// Renders `deck.html` in a fresh environment with the helpers and filters registered.
@@ -179,187 +204,6 @@ fn check_background_videos(input: &RenderInput<'_>, diagnostics: &mut Diagnostic
 }
 
 // ---------------------------------------------------------------------------------------
-// Helper paths
-// ---------------------------------------------------------------------------------------
-
-/// Resolves a helper path (`style()`, `script()`, `asset()`, and the dev server's
-/// `/__presenter/asset/{*path}` route) to its bytes and MIME type, or `Ok(None)` if nothing
-/// is there. The path is normalized first (`/` and `\` separate segments, `.` and empty
-/// segments are dropped, `..` removes the previous segment; a path that climbs out is
-/// `None`), then by its first segment (theme-format.md §4):
-///
-/// - `vendor/…` → the embedded vendor tree ([`crate::vendor::get`]);
-/// - `presenter/…` → our own scripts in `assets/presenter/`;
-/// - `@<theme>/<path>` → `<path>` relative to the **root directory** of that theme of the
-///   chain (no `..` escapes; an unknown theme name finds nothing);
-/// - anything else → the chain's `assets/` directories, child first ([`Theme::read_asset`]).
-///
-/// The MIME type is guessed from the extension (`application/octet-stream` otherwise).
-/// Errors only when an existing file cannot be read.
-pub fn resolve_helper_path(theme: &Theme, path: &str) -> Result<Option<(Vec<u8>, String)>> {
-    let Some(key) = normalize_helper_path(path) else {
-        return Ok(None);
-    };
-    let bytes = match path_form(&key) {
-        PathForm::Builtin => crate::vendor::get(&key).map(Cow::into_owned),
-        PathForm::Theme { name, rel } => match theme.dir(name) {
-            Some(dir) => dir.read(rel)?,
-            None => None,
-        },
-        PathForm::Asset => theme.read_asset(&key)?,
-    };
-    Ok(bytes.map(|bytes| (bytes, mime_of(&key))))
-}
-
-/// `path` normalized as in [`resolve_helper_path`]; `None` if it is empty or climbs out.
-pub fn normalize_helper_path(path: &str) -> Option<String> {
-    normalize_rel(path).filter(|key| !key.is_empty())
-}
-
-/// The form of a normalized helper path.
-enum PathForm<'k> {
-    /// `vendor/…` or `presenter/…`: the embedded tree.
-    Builtin,
-    /// `@<name>/<rel>`.
-    Theme { name: &'k str, rel: &'k str },
-    /// Below the chain's `assets/` directories.
-    Asset,
-}
-
-fn path_form(key: &str) -> PathForm<'_> {
-    let (first, rest) = key.split_once('/').unwrap_or((key, ""));
-    match first.strip_prefix('@') {
-        Some(name) => PathForm::Theme { name, rel: rest },
-        None if !rest.is_empty() && matches!(first, "vendor" | "presenter") => PathForm::Builtin,
-        None => PathForm::Asset,
-    }
-}
-
-fn mime_of(key: &str) -> String {
-    mime_guess::from_path(key)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string()
-}
-
-/// The helper path of `rel` written in a file whose helper path is `base`: `rel` joined to
-/// `base`'s directory, staying inside `base`'s root (`vendor/`, `presenter/`, `@<theme>/`,
-/// or the `assets/` directories). `None` when it would leave that root.
-fn join_helper_path(base: &str, rel: &str) -> Option<String> {
-    let (root, inner) = match path_form(base) {
-        PathForm::Asset => ("", base),
-        _ => base.split_once('/').unwrap_or((base, "")),
-    };
-    let dir = inner.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let joined = normalize_rel(&format!("{dir}/{rel}")).filter(|j| !j.is_empty())?;
-    if root.is_empty() {
-        // Stay below assets/: a path that now looks like another form does not count.
-        matches!(path_form(&joined), PathForm::Asset).then_some(joined)
-    } else {
-        Some(format!("{root}/{joined}"))
-    }
-}
-
-/// Where [`resolve_helper_path`] looked for `key`, for "unknown path" messages.
-fn looked_in(key: &str) -> String {
-    match path_form(key) {
-        PathForm::Builtin if key.starts_with("vendor/") => "the embedded vendor tree".into(),
-        PathForm::Builtin => "assets/presenter/".into(),
-        PathForm::Theme { name, .. } => format!("the directory of theme '{name}'"),
-        PathForm::Asset => "the assets/ directories of the theme chain".into(),
-    }
-}
-
-// ---------------------------------------------------------------------------------------
-// Theme stylesheet
-// ---------------------------------------------------------------------------------------
-
-/// Compiles the theme stylesheet (theme-format.md §5): every `[styles] entries` file of the
-/// chain, parent first, concatenated (each preceded by a `/* @<theme>/<path> */` comment).
-/// Relative `url()`s are resolved against the stylesheet's own directory, then the chain's
-/// `assets/` directories, registered in `registry` as bytes and rewritten to `asset:<id>`
-/// placeholders (the caller resolves them for its output mode).
-///
-/// Errors: [`Error::Style`] (`file` = the entry as a helper path, `@<theme>/<path>`) for a
-/// `.scss`/`.sass` entry ("SCSS support arrives in T42"), another extension, a file that is
-/// not UTF-8 or a `url()` that resolves to nothing; [`Error::Theme`] for an entry that does
-/// not exist.
-pub fn compile_theme_css(theme: &Theme, registry: &mut AssetRegistry) -> Result<String> {
-    let mut css = String::new();
-    for entry in theme.style_entries()? {
-        let key = format!("@{}/{}", entry.theme, entry.rel_path);
-        let style_error = |message: String| Error::Style {
-            file: key.clone(),
-            message,
-        };
-        let lower = entry.rel_path.to_ascii_lowercase();
-        if lower.ends_with(".scss") || lower.ends_with(".sass") {
-            return Err(style_error("SCSS support arrives in T42".into()));
-        }
-        if !lower.ends_with(".css") {
-            return Err(style_error("a style entry must be a .css file".into()));
-        }
-        let text = String::from_utf8(entry.bytes)
-            .map_err(|e| style_error(format!("not valid UTF-8: {e}")))?;
-        let text = register_stylesheet_urls(theme, &key, &text, registry)?;
-        let _ = writeln!(css, "/* {key} */");
-        css.push_str(&text);
-        if !css.ends_with('\n') {
-            css.push('\n');
-        }
-    }
-    Ok(css)
-}
-
-/// Rewrites the relative `url()`s of the stylesheet at helper path `key` to placeholders
-/// (see [`compile_theme_css`]). Stylesheets from `vendor/`/`presenter/` are lenient and do
-/// not fall back to the theme's `assets/`; others must resolve every reference.
-fn register_stylesheet_urls(
-    theme: &Theme,
-    key: &str,
-    css: &str,
-    registry: &mut AssetRegistry,
-) -> Result<String> {
-    let lenient = matches!(path_form(key), PathForm::Builtin);
-    let mut failure: Option<Error> = None;
-    let result = {
-        let mut resolve = |rel: &str| -> Option<AssetData> {
-            let found = match join_helper_path(key, rel) {
-                Some(joined) => resolve_helper_path(theme, &joined),
-                None => Ok(None),
-            };
-            let found = match found {
-                Ok(None) if !lenient => {
-                    theme.read_asset(rel).map(|b| b.map(|b| (b, String::new())))
-                }
-                other => other,
-            };
-            match found {
-                Ok(found) => found.map(|(bytes, _)| AssetData::Bytes(bytes)),
-                Err(err) => {
-                    failure.get_or_insert(err);
-                    None
-                }
-            }
-        };
-        register_css_urls(css, registry, &mut resolve, lenient)
-    };
-    if let Some(err) = failure {
-        return Err(err);
-    }
-    result.map_err(|err| match err {
-        Error::MissingAsset { path, .. } => Error::Style {
-            file: key.to_string(),
-            message: format!(
-                "url({}) not found next to the stylesheet or in the theme chain's assets/ directories",
-                path.display()
-            ),
-        },
-        other => other,
-    })
-}
-
-// ---------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------
 
@@ -367,30 +211,26 @@ fn register_stylesheet_urls(
 struct HelperState {
     theme: Theme,
     mode: OutputMode,
-    /// The deck's registry plus everything helpers registered.
+    /// What the helpers registered (never the deck's assets).
     registry: AssetRegistry,
     /// Site-mode files emitted so far (the emitters' dedupe state).
     files: Vec<EmittedFile>,
+    /// `remote-import` warnings.
+    diagnostics: Diagnostics,
 }
 
-/// Per-render values the helpers need besides the shared state.
+/// Per-render values the helpers and filters need besides the shared state.
 struct Extras {
     theme_css: Arc<str>,
     reveal_init: Arc<str>,
     live_reload: bool,
     build_id: u64,
-}
-
-/// A file a helper path resolved to.
-struct Found {
-    /// The normalized helper path.
-    key: String,
-    bytes: Vec<u8>,
-    mime: String,
+    smart_punctuation: bool,
 }
 
 impl HelperState {
-    /// Runs `f` with an emitter that continues this render's file list.
+    /// Runs `f` with an emitter over the helpers' registry that continues this render's
+    /// file list.
     fn with_emitter<T>(&mut self, f: impl FnOnce(&mut Emitter<'_>) -> Result<T>) -> Result<T> {
         let files = std::mem::take(&mut self.files);
         let mut emitter = Emitter::with_files(&self.registry, &self.mode, files);
@@ -407,32 +247,89 @@ impl HelperState {
         self.with_emitter(|emitter| emitter.url_for(&id))
     }
 
-    /// The file behind helper path `path`, or an error naming `helper` and `path`.
-    fn lookup(&self, helper: &str, path: &str) -> Result<Found> {
-        let unknown = |key: &str| {
-            Error::Other(format!(
-                "{helper}(\"{path}\"): unknown path (looked in {})",
-                looked_in(key)
-            ))
+    /// The compiled theme stylesheet, resolved for this mode (standalone: `data:` URIs;
+    /// site: a file in `assets/`, so bare file names; serve: `/__presenter/asset/` URLs).
+    fn theme_css(&mut self) -> Result<String> {
+        let mut remote = Vec::new();
+        let targets = match &self.mode {
+            OutputMode::Serve => Targets::ServeUrls,
+            _ => Targets::Placeholders(&mut self.registry),
         };
-        let key = normalize_helper_path(path).ok_or_else(|| unknown(path))?;
-        let (bytes, mime) = resolve_helper_path(&self.theme, &key)?.ok_or_else(|| unknown(&key))?;
-        Ok(Found { key, bytes, mime })
+        let css = styles::compile(&self.theme, targets, &mut remote)?;
+        for (key, url) in remote {
+            self.warn_remote_import(&format!("theme stylesheet entry '{key}'"), &url);
+        }
+        // Serve: no placeholder is left, except `asset:<id>` text the theme wrote itself,
+        // which is an unknown id here exactly as in the other modes.
+        self.with_emitter(|e| e.resolve_css_in_assets_dir(&css))
+    }
+
+    /// A `remote-import` warning in standalone mode (see the module docs).
+    fn warn_remote_import(&mut self, stylesheet: &str, url: &str) {
+        if self.mode != OutputMode::Standalone {
+            return;
+        }
+        self.diagnostics.push(Diagnostic::warning(
+            "remote-import",
+            format!(
+                "{stylesheet} imports {url}: the standalone file is not self-contained, it \
+                 loads that stylesheet from the network when opened (offline the browser \
+                 skips it, e.g. falling back to other fonts)"
+            ),
+        ));
+    }
+
+    /// The normalized helper path `path` names if a file is there, else the "unknown path"
+    /// error naming `helper`, `path` and the reason.
+    fn lookup(&self, helper: &str, path: &str) -> Result<String> {
+        match normalize_helper_path(path) {
+            Some(key) if helper_path_exists(&self.theme, &key) => Ok(key),
+            _ => Err(self.unknown(helper, path)),
+        }
+    }
+
+    fn unknown(&self, helper: &str, path: &str) -> Error {
+        Error::Other(format!(
+            "{helper}(\"{path}\"): unknown path ({})",
+            unknown_reason(&self.theme, path)
+        ))
+    }
+
+    /// The bytes and MIME type at `key` (found by [`HelperState::lookup`]).
+    fn read(&self, helper: &str, path: &str, key: &str) -> Result<(Vec<u8>, String)> {
+        resolve_helper_path(&self.theme, key)?.ok_or_else(|| self.unknown(helper, path))
+    }
+
+    /// The text at `key` (UTF-8, a leading byte order mark removed).
+    fn text(&self, helper: &str, path: &str, key: &str) -> Result<String> {
+        let (bytes, _) = self.read(helper, path, key)?;
+        styles::decode_text(bytes)
+            .map_err(|e| Error::Other(format!("{helper}(\"{path}\"): not valid UTF-8: {e}")))
     }
 
     fn style(&mut self, path: &str) -> Result<String> {
-        let found = self.lookup("style", path)?;
-        if matches!(self.mode, OutputMode::Serve) {
+        let key = self.lookup("style", path)?;
+        let rules = UrlRules::for_style(&key);
+        if self.mode == OutputMode::Serve {
+            if !rules.is_lenient() {
+                // The browser loads the url()s; check them as the other modes do.
+                let css = self.text("style", path, &key)?;
+                styles::rewrite_urls(&self.theme, &key, &css, rules, Targets::ServeUrls)?;
+            }
             return Ok(format!(
                 r#"<link rel="stylesheet" href="{}">"#,
-                serve_url(&found.key)
+                serve_url(&key)
             ));
         }
-        let css = utf8(found.bytes, "style", path)?;
-        let css = register_stylesheet_urls(&self.theme, &found.key, &css, &mut self.registry)?;
+        let css = self.text("style", path, &key)?;
+        for url in styles::remote_imports(&css) {
+            self.warn_remote_import(&format!("style(\"{path}\")"), &url);
+        }
+        let targets = Targets::Placeholders(&mut self.registry);
+        let css = styles::rewrite_urls(&self.theme, &key, &css, rules, targets)?;
         if matches!(self.mode, OutputMode::Site { .. }) {
             let css = self.with_emitter(|e| e.resolve_css_in_assets_dir(&css))?;
-            let url = self.emit_bytes(css.into_bytes(), "text/css", &found.key)?;
+            let url = self.emit_bytes(css.into_bytes(), "text/css", &key)?;
             return Ok(format!(r#"<link rel="stylesheet" href="{}">"#, attr(&url)));
         }
         let css = self.with_emitter(|e| e.resolve_css(&css))?;
@@ -440,32 +337,31 @@ impl HelperState {
     }
 
     fn script(&mut self, path: &str) -> Result<String> {
-        let found = self.lookup("script", path)?;
+        let key = self.lookup("script", path)?;
         match &self.mode {
-            OutputMode::Serve => Ok(format!(
-                r#"<script src="{}"></script>"#,
-                serve_url(&found.key)
-            )),
+            OutputMode::Serve => Ok(format!(r#"<script src="{}"></script>"#, serve_url(&key))),
             OutputMode::Site { .. } => {
-                let url = self.emit_bytes(found.bytes, &found.mime, &found.key)?;
+                let (bytes, mime) = self.read("script", path, &key)?;
+                let url = self.emit_bytes(bytes, &mime, &key)?;
                 Ok(format!(r#"<script src="{}"></script>"#, attr(&url)))
             }
-            OutputMode::Standalone => {
-                let js = utf8(found.bytes, "script", path)?;
-                Ok(format!("<script>\n{}</script>", raw_text(&js, "script")))
-            }
+            OutputMode::Standalone => Ok(inline_script(&self.text("script", path, &key)?)),
         }
     }
 
     fn asset(&mut self, path: &str) -> Result<String> {
-        let found = self.lookup("asset", path)?;
+        let key = self.lookup("asset", path)?;
         match &self.mode {
-            OutputMode::Serve => Ok(serve_url(&found.key)),
+            OutputMode::Serve => Ok(serve_url(&key)),
             OutputMode::Site { .. } => {
-                let url = self.emit_bytes(found.bytes, &found.mime, &found.key)?;
+                let (bytes, mime) = self.read("asset", path, &key)?;
+                let url = self.emit_bytes(bytes, &mime, &key)?;
                 Ok(attr(&url).into_owned())
             }
-            OutputMode::Standalone => Ok(data_uri(&found.mime, &found.bytes)),
+            OutputMode::Standalone => {
+                let (bytes, mime) = self.read("asset", path, &key)?;
+                Ok(data_uri(&mime, &bytes))
+            }
         }
     }
 
@@ -495,6 +391,13 @@ fn register_helpers(
     state: &Arc<Mutex<HelperState>>,
     extras: Extras,
 ) {
+    let Extras {
+        theme_css,
+        reveal_init,
+        live_reload,
+        build_id,
+        smart_punctuation,
+    } = extras;
     let st = Arc::clone(state);
     env.add_function("style", move |path: String| call(&st, |s| s.style(&path)));
     let st = Arc::clone(state);
@@ -502,12 +405,6 @@ fn register_helpers(
     let st = Arc::clone(state);
     env.add_function("asset", move |path: String| call(&st, |s| s.asset(&path)));
     let st = Arc::clone(state);
-    let Extras {
-        theme_css,
-        reveal_init,
-        live_reload,
-        build_id,
-    } = extras;
     env.add_function("theme_style", move || {
         call(&st, |s| s.theme_style(&theme_css, build_id))
     });
@@ -523,7 +420,11 @@ fn register_helpers(
         Value::from_safe_string(tag)
     });
     env.add_filter("attrs", attrs_filter);
-    env.add_filter("markdown", markdown_filter);
+    env.add_filter("markdown", move |text: Value| {
+        markdown_filter(text, smart_punctuation)
+    });
+    // §4 lists `json` among the built-in filters; minijinja names its JSON filter `tojson`.
+    env.add_filter("json", minijinja::filters::tojson);
 }
 
 /// Runs a helper on the locked state; its HTML result is marked safe.
@@ -547,10 +448,14 @@ fn poisoned() -> Error {
     Error::Other("template helper state is unusable after a panic in a helper".into())
 }
 
-/// `bytes` as text, or an error naming the helper call.
-fn utf8(bytes: Vec<u8>, helper: &str, path: &str) -> Result<String> {
-    String::from_utf8(bytes)
-        .map_err(|e| Error::Other(format!("{helper}(\"{path}\"): not valid UTF-8: {e}")))
+/// A `<script>` element that runs `js` inline (see the module docs).
+fn inline_script(js: &str) -> String {
+    let text = raw_text(js, "script");
+    if leaves_script_open(&text) {
+        let uri = data_uri("text/javascript;charset=utf-8", js.as_bytes());
+        return format!(r#"<script src="{uri}"></script>"#);
+    }
+    format!("<script>\n{text}</script>")
 }
 
 /// `text` for inlining in a `<tag>` raw-text element: every `</tag` (ASCII case-insensitive)
@@ -574,18 +479,55 @@ fn raw_text(text: &str, tag: &str) -> String {
     out
 }
 
-/// The dev server URL of helper path `key`: [`SERVE_HELPER_PREFIX`] + `key`, with every byte
-/// other than ASCII letters, digits and `-._~/@` percent-encoded.
-fn serve_url(key: &str) -> String {
-    let mut url = String::from(SERVE_HELPER_PREFIX);
-    for byte in key.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~/@".contains(&byte) {
-            url.push(char::from(byte));
-        } else {
-            let _ = write!(url, "%{byte:02X}");
+/// True when the content `text` of a `<script>` element (passed through [`raw_text`], so
+/// without `</script`) ends with the HTML tokenizer in the "script data double escaped"
+/// state, where the element's own `</script>` does not close it (HTML Living Standard
+/// §13.2.5.4 and §13.2.5.20–31): `<!--` enters the escaped state, which `-->` leaves (the
+/// dashes of `<!--` count, so `<!-->` leaves at once); in it, `<script` followed by
+/// whitespace, `/`, `>` (or the end, as the element's `</script>` follows a line break)
+/// enters the double escaped state, which only `-->` leaves. May err on the side of `true`.
+fn leaves_script_open(text: &str) -> bool {
+    enum State {
+        Data,
+        Escaped,
+        DoubleEscaped,
+    }
+    // ASCII lowercasing keeps byte offsets.
+    let lower = text.to_ascii_lowercase();
+    let mut state = State::Data;
+    let mut at = 0;
+    loop {
+        let rest = &lower[at..];
+        match state {
+            State::Data => match rest.find("<!--") {
+                Some(i) => (state, at) = (State::Escaped, at + i + 2),
+                None => return false,
+            },
+            State::Escaped => match (rest.find("-->"), script_start(rest)) {
+                (Some(exit), Some(enter)) if exit < enter => {
+                    (state, at) = (State::Data, at + exit + 3);
+                }
+                (_, Some(enter)) => (state, at) = (State::DoubleEscaped, at + enter + 7),
+                (Some(exit), None) => (state, at) = (State::Data, at + exit + 3),
+                (None, None) => return false,
+            },
+            State::DoubleEscaped => match rest.find("-->") {
+                Some(exit) => (state, at) = (State::Data, at + exit + 3),
+                None => return true,
+            },
         }
     }
-    url
+}
+
+/// Byte offset of the first `<script` in the lowercase `text` that is followed by
+/// whitespace, `/`, `>` or the end of `text`.
+fn script_start(text: &str) -> Option<usize> {
+    text.match_indices("<script").map(|(i, _)| i).find(|&i| {
+        matches!(
+            text.as_bytes().get(i + "<script".len()),
+            None | Some(b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'/' | b'>')
+        )
+    })
 }
 
 /// `text` escaped for a double-quoted attribute value.
@@ -631,17 +573,17 @@ fn text_of(value: &Value) -> String {
 }
 
 /// `markdown`: renders a string with comrak (see the module docs); none/undefined → empty.
-fn markdown_filter(text: Value) -> Value {
+fn markdown_filter(text: Value, smart_punctuation: bool) -> Value {
     if text.is_undefined() || text.is_none() {
         return Value::from_safe_string(String::new());
     }
-    let html = comrak::markdown_to_html(&text_of(&text), &markdown_options());
+    let html = comrak::markdown_to_html(&text_of(&text), &markdown_options(smart_punctuation));
     Value::from_safe_string(unwrap_paragraph(&html).to_string())
 }
 
 /// The markdown-dialect §1 comrak options, without front matter (the filter renders
-/// fragments).
-fn markdown_options() -> comrak::Options<'static> {
+/// fragments) and without source positions (see the module docs).
+fn markdown_options(smart_punctuation: bool) -> comrak::Options<'static> {
     let mut o = comrak::Options::default();
     o.extension.table = true;
     o.extension.strikethrough = true;
@@ -657,7 +599,7 @@ fn markdown_options() -> comrak::Options<'static> {
     o.extension.fenced_code_attributes = true;
     o.extension.link_attributes = true;
     o.extension.inline_code_attributes = true;
-    o.parse.smart = false;
+    o.parse.smart = smart_punctuation;
     o.parse.relaxed_autolinks = false;
     o.render.r#unsafe = true;
     o.render.escape = false;
@@ -685,51 +627,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_forms() {
-        assert!(matches!(path_form("vendor/a.js"), PathForm::Builtin));
-        assert!(matches!(path_form("presenter/math.js"), PathForm::Builtin));
-        assert!(matches!(path_form("vendor"), PathForm::Asset));
-        assert!(matches!(
-            path_form("@default/styles/theme.css"),
-            PathForm::Theme {
-                name: "default",
-                rel: "styles/theme.css"
-            }
-        ));
-        assert!(matches!(path_form("img/logo.png"), PathForm::Asset));
-    }
-
-    #[test]
-    fn joined_paths_stay_in_their_root() {
-        let cases = [
-            (
-                "vendor/katex/katex.min.css",
-                "fonts/a.woff2",
-                Some("vendor/katex/fonts/a.woff2"),
-            ),
-            ("vendor/katex/katex.min.css", "../../themes/x", None),
-            (
-                "@t/styles/theme.css",
-                "../assets/bg.png",
-                Some("@t/assets/bg.png"),
-            ),
-            ("@t/styles/theme.css", "../../x.png", None),
-            ("@t/theme.css", "x.png", Some("@t/x.png")),
-            ("css/a.css", "../img/b.png", Some("img/b.png")),
-            ("css/a.css", "../vendor/reveal/dist/reveal.js", None),
-            ("a.css", "./b.png", Some("b.png")),
-            ("a.css", "..", None),
-        ];
-        for (base, rel, expected) in cases {
-            assert_eq!(
-                join_helper_path(base, rel).as_deref(),
-                expected,
-                "{base} + {rel}"
-            );
-        }
-    }
-
-    #[test]
     fn raw_text_never_closes_its_element() {
         assert_eq!(
             raw_text("a</script>b</SCRIPT x", "script"),
@@ -741,25 +638,77 @@ mod tests {
     }
 
     #[test]
-    fn serve_urls_are_percent_encoded() {
-        assert_eq!(
-            serve_url("@my theme/scripts/x+y.js"),
-            "/__presenter/asset/@my%20theme/scripts/x%2By.js"
-        );
-        assert_eq!(
-            serve_url("vendor/a-b_c.~d"),
-            "/__presenter/asset/vendor/a-b_c.~d"
-        );
+    fn scripts_that_would_stay_open_are_detected() {
+        let open = [
+            "window.x = '<!-- <script>';",
+            "var s = '<!--<SCRIPT/';",
+            "'<!-- <script>' + 1",
+            "<!-- <script\n",
+            "<!--<script>",
+            "<!-- <script> --> <!-- <script>",
+            "<!-- --> <!-- x <script\t-",
+        ];
+        for text in open {
+            assert!(leaves_script_open(&raw_text(text, "script")), "{text}");
+        }
+        let closed = [
+            "",
+            "let a = 1 < 2;",
+            "a <!-- b",
+            "'<script>'",
+            "<!-- <script> -->",
+            "<!-- --> <script>",
+            "<!-- <scripts> <scriptx",
+            // Only whitespace, `/` and `>` end the tag name the tokenizer compares.
+            "'<!-- <script' + 1",
+            "<!--><script>",
+            "<!---><script>",
+            "<!-- <script> --->",
+            // `-- >` does not leave the escaped state; `-->` leaves the double escaped one.
+            "<!-- -- > <script>--> a",
+        ];
+        for text in closed {
+            assert!(!leaves_script_open(&raw_text(text, "script")), "{text}");
+        }
+    }
+
+    #[test]
+    fn open_scripts_are_inlined_as_data_uris() {
+        let js = "window.x = '<!-- <script>';";
+        let tag = inline_script(js);
+        let uri = data_uri("text/javascript;charset=utf-8", js.as_bytes());
+        assert_eq!(tag, format!(r#"<script src="{uri}"></script>"#));
+        assert!(uri.starts_with("data:text/javascript;charset=utf-8;base64,"));
+        assert_eq!(inline_script("a()"), "<script>\na()\n</script>");
+    }
+
+    #[test]
+    fn vendored_scripts_are_inlined_as_text() {
+        for path in [
+            "vendor/reveal/dist/reveal.js",
+            "vendor/reveal/dist/plugin/highlight.js",
+            "vendor/reveal/dist/plugin/notes.js",
+            "vendor/reveal/dist/plugin/zoom.js",
+            "vendor/reveal/dist/plugin/search.js",
+            "vendor/katex/katex.min.js",
+            "presenter/math.js",
+        ] {
+            let js = crate::vendor::get_str(path).unwrap();
+            assert!(!leaves_script_open(&raw_text(&js, "script")), "{path}");
+        }
     }
 
     #[test]
     fn markdown_filter_unwraps_single_paragraphs() {
-        let render = |s: &str| markdown_filter(Value::from(s)).to_string();
+        let render = |s: &str| markdown_filter(Value::from(s), false).to_string();
         assert_eq!(render("*Fast* tools"), "<em>Fast</em> tools");
         assert_eq!(render("a\n\nb"), "<p>a</p>\n<p>b</p>\n");
         assert_eq!(render("$x$"), "<span data-math-style=\"inline\">x</span>");
         assert_eq!(render("<b>raw</b>"), "<b>raw</b>");
-        assert_eq!(markdown_filter(Value::UNDEFINED).to_string(), "");
+        assert_eq!(render("\"a\" -- b"), "&quot;a&quot; -- b");
+        assert_eq!(markdown_filter(Value::UNDEFINED, false).to_string(), "");
+        let smart = markdown_filter(Value::from("\"a\" -- b"), true).to_string();
+        assert_eq!(smart, "“a” – b");
     }
 
     #[test]
