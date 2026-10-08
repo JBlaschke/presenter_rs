@@ -65,3 +65,4 @@ HTTP server, SSE, browser client (T21/T22/T23).
 
 ## Amendments (coordinator, 2026-10-08)
 - `ChangeKind` already exists in `src/serve/watch.rs` (T00 contract stub); keep it as is.
+- Delete T16's `watch_is_a_usage_error_until_t20` test in `src/cli/build.rs` when you wire `--watch`.

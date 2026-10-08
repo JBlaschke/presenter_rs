@@ -158,6 +158,13 @@ Merged in this order (later wins):
    exactly like Markdown front matter and removed from the cell content. This is the
    recommended way to set deck metadata from inside Jupyter.
 
+> **Clarifications (T31, 2026-10-08):** a first markdown cell that holds only front matter opens
+> no slide. A first-cell block that holds only YAML comments is empty front matter
+> (`front-matter-empty` warning); a non-mapping block is an error, exactly as in Markdown. A `---`
+> block at the start of a *later* markdown cell is rendered as Markdown, except that a block that
+> would set deck metadata is removed with a `front-matter-ignored` warning. Hidden code cells
+> (hide_input && hide_output) emit no block but still apply their slide_type structure.
+
 ## 6. Example mapping
 
 Notebook cells (type · slide_type · tags):

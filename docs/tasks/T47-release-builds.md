@@ -26,3 +26,9 @@ arm64), and `presenter --version` identifies the exact build.
 - A tag on a fork/test branch produces four artifacts (verify once; link the run in the PR).
 - `cargo build --release` works offline after `cargo fetch` (no build-time downloads).
 - `presenter --version` output format tested in `tests/cli_build.rs` (regex).
+
+## Amendments (coordinator, 2026-10-08)
+- T16 already routes `--version` through `cli::version()`, which reads `PRESENTER_GIT_SHA` at
+  compile time; extend T00's `build.rs` (keep its rerun-if-changed logic). There is no git remote,
+  so the release workflow cannot run here: validate it statically (actionlint if available, or
+  careful review) and mark the "four artifacts" criterion as not verifiable, with the reason.

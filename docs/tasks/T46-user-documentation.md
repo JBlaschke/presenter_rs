@@ -26,3 +26,6 @@ and export a PDF from the docs alone — and the docs match the implementation, 
 - Every command in the guide runs as written against the examples (do it; note results).
 - No reference to task ids or "planned" features; stretch items listed under "Not yet".
 - Links checked (`lychee` locally or a quick script); images present.
+
+## Amendments (coordinator, 2026-10-08)
+- `presenter dump --default-config` is approved (additive `DumpArgs` field in `cli/mod.rs`; INPUT optional only with that flag).

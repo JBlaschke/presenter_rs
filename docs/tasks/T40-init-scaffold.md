@@ -35,3 +35,8 @@ theme they can start editing immediately.
 
 ## Out of scope
 Interactive prompts.
+
+## Amendments (coordinator, 2026-10-08)
+- T34 (`check`) and T41 (`theme eject`) run in parallel with you: copy `themes/default/**` directly
+  for `--full-theme`, and verify "the scaffold passes `check` with no warnings" by building it with
+  zero diagnostics (and with `check` if it exists in your worktree). Replace the `stub_exits_2` test.

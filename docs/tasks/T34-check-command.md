@@ -47,3 +47,8 @@ Fixing issues automatically; theme file validation (T41 `theme check`).
   `separator-not-recognized` (for `---{` lines) and `invalid-slide-attr` — pass them through.
 - `check` may warn "interactive widget rendered as text" (notebook-mapping §4) for bundles with
   `application/vnd.jupyter.widget-view+json` that fell back to text: T32 does not emit it.
+- `examples/notebook/analysis.ipynb` is created by T33 (next wave): assert its "no warnings"
+  criterion only when the file exists (T33 will make it pass). `examples/basic/slides.md` must
+  report no warnings now.
+- Use `pipeline::{BuildOptions::new, parse_only, …}` (see T16's notes) and T16's
+  `cli/report.rs` printing helpers; replace the `stub_exits_2` test in `src/cli/check.rs`.

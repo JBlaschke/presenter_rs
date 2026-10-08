@@ -101,6 +101,15 @@ deeper levels → ordinary content. Separator lines are still honored if present
 mode), so a deck can be migrated gradually. Content before the first heading becomes an
 initial slide only if it is non-blank.
 
+> **Contract change (coordinator, 2026-10-08, from T43):** headings mode follows pandoc. A
+> slide-level heading (level == slide_level) is vertical only when a section heading
+> (level < slide_level) opened the current stack; otherwise (a deck of only `##`, `slide_level = 1`,
+> or `##` after a `---` rule) it starts a horizontal slide. A boundary heading joins a slide that
+> has no visible content yet (e.g. right after `---` or a `<!-- .slide: -->` comment). `---` ends
+> the section; `--` keeps it. `<!-- .slide: -->` is also read directly after a slide's first
+> heading. A `data-background` value that reveal treats as an image moves to `data-background-image`
+> (and is registered as an asset).
+
 ## 3. Attributes
 
 ### 3.1 Syntax

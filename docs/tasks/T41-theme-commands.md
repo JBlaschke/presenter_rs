@@ -34,3 +34,6 @@ it ("eject"), create a minimal child theme, and validate a theme directory.
 
 ## Out of scope
 Theme galleries, remote themes.
+
+## Amendments (coordinator, 2026-10-08)
+- Replace the `stub_exits_2` test in `src/cli/theme.rs` along with the stub.

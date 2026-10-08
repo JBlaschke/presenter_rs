@@ -25,6 +25,7 @@ lang = "en"
 
 [build]
 out_dir = "dist"           # `presenter build x.md` writes dist/x.html (or dist/x/ in site mode)
+                           # relative to the presenter.toml that sets it (else to the input's dir) — T16
 standalone = true          # false → site mode: index.html + assets/
 minify = false             # reserved; no-op in this plan
 

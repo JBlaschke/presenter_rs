@@ -59,3 +59,11 @@ Notebook cell design (T33), SCSS conversion (T42). Additional themes beyond `def
 ## Hints (verified)
 - reveal 6 stock themes expose `--r-background-color`, `--r-main-font`, `--r-main-font-size`, `--r-main-color`, `--r-heading-*`, `--r-link-color*`, `--r-selection-*`, `--r-block-margin`, `--r-code-font` as CSS custom properties on `:root`; overriding them in a later stylesheet works without SCSS.
 - Our theme stylesheet is always loaded last (theme-format.md §5), so plain overrides win.
+
+## Amendments (coordinator, 2026-10-08)
+- Leave `templates/cell.html` and notebook styling to T33 (next wave). Template changes will
+  change `tests/snapshots/render_*` and `tests/snapshots/cli_*`: update them deliberately and read
+  every diff. T02's `tests/theme_skeleton.rs` and T15's `tests/render.rs` must keep passing.
+- Screenshots: Chrome's `--screenshot` flag hangs here; use the coordinator's CDP helper
+  (`tools/cdp.mjs`, see the project rules in your prompt) to capture `docs/screenshots/*.png` and to
+  measure `scrollWidth` per slide.
