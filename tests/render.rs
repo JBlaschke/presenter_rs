@@ -677,10 +677,13 @@ entries = ["scripts/extra.js"]
         "{}",
         doc.theme_css
     );
-    // Found through the §5 assets/ fallback: named by its assets-form helper path.
+    // Found through the §5 assets/ fallback: named by its theme-root helper path.
     assert!(
+        doc.theme_css.contains(
+            ".logo { background: url('/__presenter/asset/@mine/assets/logo.png?v=2#x'); }"
+        ),
+        "{}",
         doc.theme_css
-            .contains(".logo { background: url('/__presenter/asset/logo.png?v=2#x'); }")
     );
     let served = |url: &str| {
         let path = url.strip_prefix(render::html::SERVE_HELPER_PREFIX).unwrap();
@@ -693,7 +696,10 @@ entries = ["scripts/extra.js"]
         served("/__presenter/asset/@mine/assets/bg.png"),
         b"bg-bytes"
     );
-    assert_eq!(served("/__presenter/asset/logo.png"), b"logo-bytes");
+    assert_eq!(
+        served("/__presenter/asset/@mine/assets/logo.png"),
+        b"logo-bytes"
+    );
     assert!(
         doc.theme_css
             .find("/* @default/styles/theme.css */")
@@ -766,6 +772,172 @@ fn theme_stylesheet_errors() {
         matches!(&err, Error::Style { file, message } if file == "@missing/styles/x.css" && message.contains("url(nope.png)")),
         "{err:?}"
     );
+}
+
+/// The themes of the [styles] fallback tests: `v` (one entry, `styles/x.css` = `css`) extends
+/// `p`, which extends `default`; `p` and `v` hold the files of [`FALLBACK_HITS`].
+fn fallback_theme(dir: &Path, css: &str) -> Theme {
+    disk_theme(
+        &dir.join("p"),
+        "name = \"p\"\nextends = \"default\"\n",
+        &[
+            ("assets/vendor/a.png", b"parent-a"),
+            ("assets/presenter/b.png", b"parent-b"),
+        ],
+    );
+    let theme = disk_theme(
+        &dir.join("v"),
+        "name = \"v\"\nextends = \"../p\"\n[styles]\nentries = [\"styles/x.css\"]\n",
+        &[
+            ("styles/x.css", css.as_bytes()),
+            ("assets/vendor/a.png", b"child-a"),
+            ("assets/@x/c.png", b"child-c"),
+        ],
+    );
+    assert_eq!(theme.chain.len(), 3);
+    theme
+}
+
+/// The entry of [`fallback_theme`] for [`FALLBACK_HITS`].
+const FALLBACK_CSS: &str = ".a { background: url(vendor/a.png); }\n\
+                            .b { background: url(presenter/b.png); }\n\
+                            .c { background: url('@x/c.png'); }\n";
+
+/// (selector, expected bytes, helper path of the hit): §5's assets/ fallback, child first,
+/// also when `rel` starts with vendor/, presenter/ or @ (helper paths that would name the
+/// embedded tree or a theme root); the hit is named @<theme>/assets/<rel>.
+const FALLBACK_HITS: [(&str, &[u8], &str); 3] = [
+    (".a", b"child-a", "@v/assets/vendor/a.png"),
+    (".b", b"parent-b", "@p/assets/presenter/b.png"),
+    (".c", b"child-c", "@v/assets/@x/c.png"),
+];
+
+/// The URL of `selector`'s `background: url(…)` in `css`.
+fn background_url(css: &str, selector: &str) -> String {
+    let pattern = format!(
+        r#"{} \{{ background: url\('?([^')]*)'?\); \}}"#,
+        regex::escape(selector)
+    );
+    Regex::new(&pattern)
+        .unwrap()
+        .captures(css)
+        .unwrap_or_else(|| panic!("{selector} in {css}"))[1]
+        .to_string()
+}
+
+/// The bytes of the emitted file a site build's theme stylesheet names for `selector`.
+fn site_file_bytes<'d>(doc: &'d RenderedDocument, selector: &str) -> &'d [u8] {
+    let name = background_url(&doc.theme_css, selector);
+    let file = doc
+        .files
+        .iter()
+        .find(|f| f.path.file_name().unwrap().to_string_lossy() == name)
+        .unwrap_or_else(|| panic!("{name} is emitted"));
+    &file.bytes
+}
+
+#[test]
+fn style_entry_assets_fallback_takes_any_reference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = fallback_theme(tmp.path(), FALLBACK_CSS);
+    let deck = sample_deck();
+    let doc = render_with(&deck, &theme, &Config::default(), OutputMode::Standalone);
+    for (selector, bytes, _) in FALLBACK_HITS {
+        assert_eq!(
+            background_url(&doc.theme_css, selector),
+            data_uri("image/png", bytes)
+        );
+    }
+    assert!(doc.html.contains(&data_uri("image/png", b"child-c")));
+
+    let doc = render_with(&deck, &theme, &Config::default(), site());
+    for (selector, bytes, _) in FALLBACK_HITS {
+        assert_eq!(site_file_bytes(&doc, selector), bytes, "{selector}");
+    }
+}
+
+#[test]
+fn style_entry_assets_fallback_serves_the_theme_file() {
+    // serve: the URL names the theme file, which the asset route serves; the same paths
+    // in the vendor/presenter form would name the embedded tree.
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = fallback_theme(tmp.path(), FALLBACK_CSS);
+    let doc = render_with(
+        &sample_deck(),
+        &theme,
+        &Config::default(),
+        OutputMode::Serve,
+    );
+    for (selector, bytes, path) in FALLBACK_HITS {
+        let url = background_url(&doc.theme_css, selector);
+        assert_eq!(url, format!("/__presenter/asset/{path}"));
+        let served = render::resolve_helper_path(&theme, path).unwrap().unwrap();
+        assert_eq!(served, (bytes.to_vec(), "image/png".to_string()));
+    }
+}
+
+#[test]
+fn style_entry_vendor_reference_falls_back_to_the_embedded_tree() {
+    // theme-format.md §3: `vendor/...` names come from the embedded vendor tree, after the
+    // chain's assets/ (FALLBACK_HITS' `.a`: the theme's own assets/vendor/a.png wins).
+    let font = "vendor/katex/fonts/KaTeX_AMS-Regular.woff2";
+    let css = format!("{FALLBACK_CSS}.f {{ background: url({font}); }}\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = fallback_theme(tmp.path(), &css);
+    let (bytes, mime) = render::resolve_helper_path(&theme, font).unwrap().unwrap();
+    assert_eq!(mime, "font/woff2");
+    let deck = sample_deck();
+    let config = Config::default();
+
+    let doc = render_with(&deck, &theme, &config, OutputMode::Standalone);
+    assert_eq!(
+        background_url(&doc.theme_css, ".f"),
+        data_uri(&mime, &bytes)
+    );
+    assert_eq!(
+        background_url(&doc.theme_css, ".a"),
+        data_uri("image/png", b"child-a")
+    );
+    let doc = render_with(&deck, &theme, &config, site());
+    assert_eq!(site_file_bytes(&doc, ".f"), bytes);
+    let doc = render_with(&deck, &theme, &config, OutputMode::Serve);
+    assert_eq!(
+        background_url(&doc.theme_css, ".f"),
+        format!("/__presenter/asset/{font}")
+    );
+}
+
+#[test]
+fn style_entry_unresolvable_reference_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deck = sample_deck();
+    for (name, rel, looked_in) in [
+        (
+            "w",
+            "vendor/nope.png",
+            ", in the theme chain's assets/ directories or among the built-in files",
+        ),
+        (
+            "x",
+            "nope.png",
+            " or in the theme chain's assets/ directories",
+        ),
+    ] {
+        let theme = fallback_theme(
+            &tmp.path().join(name),
+            &format!(".x {{ background: url({rel}); }}"),
+        );
+        for output in [OutputMode::Standalone, site(), OutputMode::Serve] {
+            let err = try_render_with(&deck, &theme, &Config::default(), output.clone())
+                .expect_err("unresolvable url()");
+            let want = format!("url({rel}) not found next to the stylesheet{looked_in}");
+            assert!(
+                matches!(&err, Error::Style { file, message } if file == "@v/styles/x.css"
+                    && *message == want),
+                "{output:?}: {err:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 
 use crate::assets::registry::AssetRegistry;
 use crate::error::Diagnostics;
+use crate::markdown::render::has_math_markup;
 
 /// A whole presentation. One source file produces one `Deck`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,8 +45,17 @@ impl Deck {
     /// in `Block::Html` / `CellOutput::Display` HTML, in `attrs` values (e.g. a registered
     /// `data-background-image`) and in `notes` is listed in `assets` (4); features
     /// implied by content are set — `notes` for notes, `notebook` and `code` for cells,
-    /// `math` for `data-math-style` or `text/latex` outputs (6); spans are 1-based and
-    /// ordered (8).
+    /// `math` for `text/latex` outputs and for math markup in `Block::Html`, in
+    /// `CellOutput::Display` HTML or in `notes` (6); spans are 1-based and ordered (8).
+    ///
+    /// Math markup is what [`has_math_markup`] finds, the test the Markdown frontend derives
+    /// `features.math` from (in the slide HTML and the notes): a start tag with a
+    /// `data-math-style` attribute, its name matched case-insensitively as browsers do,
+    /// outside comments and raw-text elements such as `<script>`/`<style>`. So the literal
+    /// text `data-math-style`, e.g. in inline code, is not math. Every frontend must set
+    /// `features.math` at least for the HTML and notes for which [`has_math_markup`] is
+    /// true: a broader test only loads KaTeX needlessly, a narrower one (a case-sensitive
+    /// substring test misses `<span DATA-MATH-STYLE=…>`) is a violation here.
     pub fn invariant_violations(&self) -> Vec<String> {
         let mut problems = Vec::new();
         for (i, slide) in self.slides.iter().enumerate() {
@@ -80,6 +90,11 @@ impl Deck {
             if !self.features.notes {
                 problems.push(format!("{path}: has notes but features.notes is false"));
             }
+            if !self.features.math && has_math_markup(notes) {
+                problems.push(format!(
+                    "{path}.notes: math in notes but features.math is false"
+                ));
+            }
             self.check_placeholders(notes, &format!("{path}.notes"), problems);
         }
         for block in &slide.blocks {
@@ -105,7 +120,7 @@ impl Deck {
     }
 
     fn check_html(&self, html: &str, path: &str, problems: &mut Vec<String>) {
-        if html.contains("data-math-style") && !self.features.math {
+        if !self.features.math && has_math_markup(html) {
             problems.push(format!("{path}: math in HTML but features.math is false"));
         }
         self.check_placeholders(html, path, problems);
@@ -361,4 +376,194 @@ pub struct Parsed {
     pub assets: AssetRegistry,
     /// Warnings (and non-fatal errors) found while parsing, e.g. `missing-asset`.
     pub diagnostics: Diagnostics,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deck with one slide holding `html`, with `features.math` set to `math`.
+    fn deck_with(html: &str, math: bool) -> Deck {
+        let mut slide = Slide::new();
+        slide.blocks.push(Block::html(html.to_string()));
+        Deck {
+            meta: DeckMeta::default(),
+            slides: vec![slide],
+            features: Features {
+                math,
+                ..Features::default()
+            },
+            source: SourceInfo {
+                path: PathBuf::from("/x/deck.md"),
+                kind: SourceKind::Markdown,
+                base_dir: PathBuf::from("/x"),
+            },
+            assets: vec![],
+        }
+    }
+
+    fn math_problems(deck: &Deck) -> Vec<String> {
+        deck.invariant_violations()
+            .into_iter()
+            .filter(|p| p.contains("features.math"))
+            .collect()
+    }
+
+    #[test]
+    fn math_markup_without_features_math_is_a_violation() {
+        for html in [
+            r#"<p><span data-math-style="inline">x^2</span></p>"#,
+            r#"<div data-math-style="display">\\int</div>"#,
+            r#"<P><SPAN class="m" DATA-MATH-STYLE='inline'>x</SPAN></P>"#,
+            "<!-- c --><span data-math-style=inline>x</span>",
+            "<script>a</script><span data-math-style>x</span>",
+        ] {
+            assert_eq!(
+                math_problems(&deck_with(html, false)),
+                ["slides[0]: math in HTML but features.math is false"],
+                "{html}"
+            );
+            assert_eq!(
+                deck_with(html, true).invariant_violations(),
+                Vec::<String>::new()
+            );
+        }
+        // A notebook output's HTML is checked the same way.
+        let mut deck = deck_with("<p>x</p>", false);
+        deck.features.code = true;
+        deck.features.notebook = true;
+        deck.slides[0].blocks.push(Block::Cell(NotebookCell {
+            outputs: vec![CellOutput::Display {
+                mime: "text/html".into(),
+                html: r#"<span data-math-style="inline">y</span>"#.into(),
+                execution_count: None,
+            }],
+            ..NotebookCell::default()
+        }));
+        assert_eq!(math_problems(&deck).len(), 1);
+    }
+
+    #[test]
+    fn literal_math_attribute_text_is_not_math() {
+        for html in [
+            "<p><code>data-math-style</code></p>",
+            r#"<pre><code>&lt;span data-math-style="inline"&gt;</code></pre>"#,
+            r#"<p title="data-math-style=inline">x</p>"#,
+            r#"<!-- <span data-math-style="inline">x</span> -->"#,
+            r#"<script>document.write('<span data-math-style>x</span>')</script>"#,
+            r#"<style>[data-math-style] { color: red }</style>"#,
+        ] {
+            assert_eq!(
+                deck_with(html, false).invariant_violations(),
+                Vec::<String>::new(),
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_frontend_and_invariant_agree_on_math() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/md");
+        let source = SourceInfo {
+            path: dir.join("unit.md"),
+            kind: SourceKind::Markdown,
+            base_dir: dir,
+        };
+        let config = crate::config::Config::default();
+        let parse = |text: &str| crate::markdown::parse(&source, text, &config).unwrap();
+        // Only literal text: the frontend derives no math and the invariant agrees.
+        let parsed = parse("# A\n\nThe attribute `data-math-style` marks math.\n");
+        assert!(!parsed.deck.features.math);
+        assert_eq!(parsed.deck.invariant_violations(), Vec::<String>::new());
+        // Real math: features.math is set; clearing it is a violation.
+        let mut parsed = parse("# A\n\nInline $x^2$ math.\n");
+        assert!(parsed.deck.features.math);
+        assert_eq!(parsed.deck.invariant_violations(), Vec::<String>::new());
+        parsed.deck.features.math = false;
+        assert_eq!(math_problems(&parsed.deck).len(), 1);
+        // Math only in the notes: the frontend sets features.math (T12 scans the notes too).
+        let mut parsed = parse("# A\n\nText\n\n::: notes\nSay $x^2$.\n:::\n");
+        assert!(parsed.deck.features.math);
+        assert_eq!(parsed.deck.invariant_violations(), Vec::<String>::new());
+        parsed.deck.features.math = false;
+        assert_eq!(
+            math_problems(&parsed.deck),
+            ["slides[0].notes: math in notes but features.math is false"]
+        );
+        // Literal text in the notes is not math.
+        let parsed = parse("# A\n\n::: notes\nThe `data-math-style` attribute.\n:::\n");
+        assert!(!parsed.deck.features.math);
+        assert_eq!(parsed.deck.invariant_violations(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn math_in_notes_is_checked_like_html() {
+        let with_notes = |notes: &str, math: bool| {
+            let mut deck = deck_with("<p>x</p>", math);
+            deck.features.notes = true;
+            deck.slides[0].notes = Some(notes.to_string());
+            let mut child = Slide::new();
+            child.notes = Some(notes.to_string());
+            deck.slides[0].children.push(child);
+            deck
+        };
+        let math = r#"<p>Say <SPAN Data-Math-Style="inline">x^2</SPAN>.</p>"#;
+        assert_eq!(
+            with_notes(math, false).invariant_violations(),
+            [
+                "slides[0].notes: math in notes but features.math is false",
+                "slides[0].children[0].notes: math in notes but features.math is false",
+            ]
+        );
+        assert_eq!(
+            with_notes(math, true).invariant_violations(),
+            Vec::<String>::new()
+        );
+        for literal in [
+            "<p><code>data-math-style</code></p>",
+            "<!-- <span data-math-style>x</span> -->",
+        ] {
+            assert_eq!(
+                with_notes(literal, false).invariant_violations(),
+                Vec::<String>::new(),
+                "{literal}"
+            );
+        }
+    }
+
+    /// T32's output renderer and the invariant agree on the outputs notebooks produce. (Its
+    /// case-sensitive substring test misses an upper-case `DATA-MATH-STYLE` attribute, which
+    /// the invariant counts; see the W3FIX contract notes.)
+    #[test]
+    fn notebook_outputs_and_invariant_agree_on_math() {
+        use crate::assets::registry::AssetRegistry;
+        use crate::notebook::{nbformat::Output, outputs::render_outputs};
+        let render = |data: serde_json::Value| {
+            let outputs: Vec<Output> = serde_json::from_value(serde_json::json!([
+                { "output_type": "display_data", "data": data, "metadata": {} }
+            ]))
+            .unwrap();
+            let (mut assets, mut diags) = (AssetRegistry::new(), Diagnostics::new());
+            let mut md = |text: &str| Ok(text.to_string());
+            let cfg = crate::config::NotebookConfig::default();
+            let (outputs, features) =
+                render_outputs(&outputs, &cfg, &mut assets, &mut diags, &mut md).unwrap();
+            let mut deck = deck_with("<p>x</p>", features.math);
+            deck.features.code = true;
+            deck.features.notebook = true;
+            deck.slides[0].blocks.push(Block::Cell(NotebookCell {
+                outputs,
+                ..NotebookCell::default()
+            }));
+            deck
+        };
+        let math = render(serde_json::json!({
+            "text/html": r#"<p><span data-math-style="inline">x</span></p>"#
+        }));
+        assert!(math.features.math);
+        assert_eq!(math.invariant_violations(), Vec::<String>::new());
+        let text = render(serde_json::json!({ "text/plain": r#"<span data-math-style="x">"# }));
+        assert!(!text.features.math);
+        assert_eq!(text.invariant_violations(), Vec::<String>::new());
+    }
 }

@@ -7,10 +7,15 @@
 //! `/__presenter/asset/<key>`. So a stylesheet finds the same files in every output mode.
 //! Per stylesheet:
 //! - theme `[styles] entries` (compiled into the theme stylesheet): next to the
-//!   stylesheet, then (§5) `rel` in the chain's `assets/` directories (`rel` read as an
-//!   assets-form helper path, so `url(vendor/x.png)` never falls back); every reference
-//!   must resolve. The theme stylesheet is processed by the renderer in every mode, so
-//!   the fallback works in serve mode too;
+//!   stylesheet, then (§5) `assets/<rel>` in the chain's themes, child first (the lookup of
+//!   [`Theme::read_asset`], for any `rel`: `url(vendor/x.png)` finds `assets/vendor/x.png`
+//!   too), and last, for a `vendor/…` or `presenter/…` `rel`, the embedded file of that
+//!   builtin helper path (§3: "`vendor/...` names come from the embedded vendor tree"; a
+//!   theme's own `assets/vendor/…` file wins); every reference must resolve. A chain hit is
+//!   named by its theme-root helper path `@<theme>/assets/<rel>`, which names that one file
+//!   whatever `rel` starts with (as a helper path, `vendor/x.png` alone names the embedded
+//!   tree). The theme stylesheet is processed by the renderer in every mode, so the fallback
+//!   works in serve mode too;
 //! - `style(path)` of a theme file (`@<theme>/…` or the `assets/` form): next to the
 //!   stylesheet only, as a browser resolves it; every reference must resolve (checked in
 //!   serve mode too, although the browser loads the files there);
@@ -35,8 +40,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::paths::{
-    PathForm, helper_path_exists, is_builtin, join_relative, normalize_helper_path, path_form,
-    resolve_helper_path, serve_url,
+    helper_path_exists, is_builtin, join_relative, normalize_helper_path, resolve_helper_path,
+    serve_url,
 };
 use crate::assets::emit::register_css_urls;
 use crate::assets::registry::{AssetData, AssetRegistry};
@@ -176,11 +181,17 @@ pub(super) fn rewrite_urls(
     rules: UrlRules,
     targets: Targets<'_>,
 ) -> Result<String> {
+    let chain: Vec<&str> = theme.chain.iter().map(|dir| dir.name.as_str()).collect();
+    let lookup = Lookup {
+        key,
+        rules,
+        chain: &chain,
+    };
     match targets {
         Targets::Placeholders(registry) => {
             let mut fetch =
                 |path: &str| Ok(resolve_helper_path(theme, path)?.map(|(bytes, _)| bytes));
-            register_urls(key, css, rules, registry, &mut fetch)
+            register_urls(lookup, css, registry, &mut fetch)
         }
         Targets::ServeUrls => {
             // A scratch registry is the id → helper path table: each target is registered
@@ -189,7 +200,7 @@ pub(super) fn rewrite_urls(
             let mut table = AssetRegistry::new();
             let mut fetch =
                 |path: &str| Ok(helper_path_exists(theme, path).then(|| path.as_bytes().to_vec()));
-            let mut css = register_urls(key, css, rules, &mut table, &mut fetch)?;
+            let mut css = register_urls(lookup, css, &mut table, &mut fetch)?;
             for asset in table.iter() {
                 if let AssetData::Bytes(path) = &asset.data {
                     let url = serve_url(&String::from_utf8_lossy(path));
@@ -201,19 +212,69 @@ pub(super) fn rewrite_urls(
     }
 }
 
+/// Where the references of one stylesheet are looked up.
+#[derive(Clone, Copy)]
+struct Lookup<'l> {
+    /// The stylesheet's normalized helper path.
+    key: &'l str,
+    /// Its rules.
+    rules: UrlRules,
+    /// The names of the chain's themes, child first.
+    chain: &'l [&'l str],
+}
+
+impl Lookup<'_> {
+    /// The helper paths the reference `rel` may name, in lookup order: `rel` joined to the
+    /// stylesheet's directory, then (with the `assets/` fallback) `@<theme>/assets/<rel>`
+    /// for each theme of the chain, child first, and last, for a `vendor/…` or
+    /// `presenter/…` `rel`, that builtin helper path (theme-format.md §3: such names come
+    /// from the embedded tree; a theme's own `assets/vendor/…` file comes first).
+    fn candidates(self, rel: &str) -> Vec<String> {
+        let mut paths: Vec<String> = join_relative(self.key, rel).into_iter().collect();
+        let fallback = self
+            .rules
+            .assets_fallback
+            .then(|| normalize_helper_path(rel))
+            .flatten();
+        if let Some(rel) = fallback {
+            let builtin = is_builtin(&rel).then(|| rel.clone());
+            let chain = self
+                .chain
+                .iter()
+                .map(|name| format!("@{name}/assets/{rel}"));
+            for path in chain.chain(builtin) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
+
+    /// Where a reference `rel` that resolved to nothing was looked for, for the error.
+    fn looked_in(self, rel: &str) -> &'static str {
+        if !self.rules.assets_fallback {
+            ""
+        } else if normalize_helper_path(rel).is_some_and(|rel| is_builtin(&rel)) {
+            ", in the theme chain's assets/ directories or among the built-in files"
+        } else {
+            " or in the theme chain's assets/ directories"
+        }
+    }
+}
+
 /// [`register_css_urls`] with a resolver that tries the candidate helper paths of each
 /// reference in order and registers what `fetch` returns for the first one it finds.
 fn register_urls(
-    key: &str,
+    lookup: Lookup<'_>,
     css: &str,
-    rules: UrlRules,
     registry: &mut AssetRegistry,
     fetch: &mut dyn FnMut(&str) -> Result<Option<Vec<u8>>>,
 ) -> Result<String> {
     let mut failure: Option<Error> = None;
     let result = {
         let mut resolve = |rel: &str| -> Option<AssetData> {
-            for candidate in candidates(key, rel, rules) {
+            for candidate in lookup.candidates(rel) {
                 match fetch(&candidate) {
                     Ok(Some(bytes)) => return Some(AssetData::Bytes(bytes)),
                     Ok(None) => {}
@@ -225,39 +286,22 @@ fn register_urls(
             }
             None
         };
-        register_css_urls(css, registry, &mut resolve, rules.lenient)
+        register_css_urls(css, registry, &mut resolve, lookup.rules.lenient)
     };
     if let Some(err) = failure {
         return Err(err);
     }
     result.map_err(|err| match err {
         Error::MissingAsset { path, .. } => Error::Style {
-            file: key.to_string(),
+            file: lookup.key.to_string(),
             message: format!(
                 "url({}) not found next to the stylesheet{}",
                 path.display(),
-                if rules.assets_fallback {
-                    " or in the theme chain's assets/ directories"
-                } else {
-                    ""
-                }
+                lookup.looked_in(&path.to_string_lossy())
             ),
         },
         other => other,
     })
-}
-
-/// The helper paths a reference `rel` in the stylesheet `key` may name, in lookup order.
-fn candidates(key: &str, rel: &str, rules: UrlRules) -> Vec<String> {
-    let mut paths: Vec<String> = join_relative(key, rel).into_iter().collect();
-    if rules.assets_fallback
-        && let Some(path) = normalize_helper_path(rel)
-        && matches!(path_form(&path), PathForm::Asset)
-        && !paths.contains(&path)
-    {
-        paths.push(path);
-    }
-    paths
 }
 
 /// Absolute targets of `@import` rules (`https://…`, `http://…` or `//…`, quoted or in
@@ -309,25 +353,76 @@ a { background: url(https://x.example/not-an-import.png) }"#;
 
     #[test]
     fn candidates_follow_the_rules() {
-        let entry = UrlRules::THEME_ENTRY;
+        let chain = ["t", "default"];
+        let lookup = |key, rules| Lookup {
+            key,
+            rules,
+            chain: &chain,
+        };
+        let entry = lookup("@t/styles/a.css", UrlRules::THEME_ENTRY);
         assert_eq!(
-            candidates("@t/styles/a.css", "logo.png", entry),
-            ["@t/styles/logo.png", "logo.png"]
+            entry.candidates("logo.png"),
+            [
+                "@t/styles/logo.png",
+                "@t/assets/logo.png",
+                "@default/assets/logo.png"
+            ]
         );
-        // Only an assets-form `rel` falls back.
+        // Every `rel` falls back, named in the theme-root form whatever its first segment;
+        // a builtin-form `rel` then names the embedded file (§3).
         assert_eq!(
-            candidates("@t/styles/a.css", "vendor/x.png", entry),
-            ["@t/styles/vendor/x.png"]
+            entry.candidates("vendor/x.png"),
+            [
+                "@t/styles/vendor/x.png",
+                "@t/assets/vendor/x.png",
+                "@default/assets/vendor/x.png",
+                "vendor/x.png"
+            ]
         );
         assert_eq!(
-            candidates("@t/a.css", "x.png", entry),
-            ["@t/x.png", "x.png"]
+            entry.candidates("./presenter/../presenter/y.js"),
+            [
+                "@t/styles/presenter/y.js",
+                "@t/assets/presenter/y.js",
+                "@default/assets/presenter/y.js",
+                "presenter/y.js"
+            ]
+        );
+        assert_eq!(
+            entry.looked_in("logo.png"),
+            " or in the theme chain's assets/ directories"
+        );
+        assert_eq!(
+            entry.looked_in("./vendor/x.png"),
+            ", in the theme chain's assets/ directories or among the built-in files"
+        );
+        assert_eq!(
+            entry.candidates("./presenter/../@u\\x.png"),
+            [
+                "@t/styles/@u/x.png",
+                "@t/assets/@u/x.png",
+                "@default/assets/@u/x.png"
+            ]
+        );
+        // A `rel` that climbs out of its root has no fallback; duplicates are dropped.
+        assert_eq!(entry.candidates("../x.png"), ["@t/x.png"]);
+        assert_eq!(
+            lookup("@t/assets/a.css", UrlRules::THEME_ENTRY).candidates("x.png"),
+            ["@t/assets/x.png", "@default/assets/x.png"]
         );
         let style = UrlRules::for_style("@t/styles/a.css");
         assert!(!style.is_lenient());
         assert_eq!(
-            candidates("@t/styles/a.css", "logo.png", style),
+            lookup("@t/styles/a.css", style).candidates("logo.png"),
             ["@t/styles/logo.png"]
+        );
+        assert_eq!(
+            lookup("@t/styles/a.css", style).candidates("vendor/x.png"),
+            ["@t/styles/vendor/x.png"]
+        );
+        assert_eq!(
+            lookup("@t/styles/a.css", style).looked_in("vendor/x.png"),
+            ""
         );
         assert!(UrlRules::for_style("vendor/katex/katex.min.css").is_lenient());
     }

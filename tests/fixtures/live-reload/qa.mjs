@@ -3,13 +3,13 @@
 // mock-server.py: drives headless Chrome over the DevTools protocol, runs each scenario in the
 // page and prints one PASS/FAIL line per scenario; exit code 1 if any fails.
 //
-// usage: node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHJRSF] [--chrome PATH] [--out DIR]
+// usage: node tests/fixtures/live-reload/qa.mjs [--only ABCDEGHJKLMNPRSF] [--chrome PATH] [--out DIR]
 //   --only   sessions to run (default: all); F stops and restarts the mock process (~40 s)
 //   --chrome Chrome or Chromium binary (default: $CHROME_PATH, else the usual install path)
 //   --out    directory for a log and a final screenshot per session
 // Needs Node >= 22 (global fetch and WebSocket), python3 and Chrome; no network beyond
 // 127.0.0.1. Temporary Chrome profiles go to os.tmpdir() ($TMPDIR). The whole run takes
-// about 2.5 minutes. It is not part of `cargo test`.
+// about 3 minutes. It is not part of `cargo test`.
 import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -22,7 +22,7 @@ const opt = (name, fallback) => {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : fallback;
 };
-const ONLY = opt('--only', 'ABCDEGHJRSF');
+const ONLY = opt('--only', 'ABCDEGHJKLMNPRSF');
 const CHROME = opt('--chrome', process.env.CHROME_PATH ||
   (process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 'google-chrome'));
 const OUT = opt('--out', null);
@@ -482,6 +482,143 @@ async function j5Early() {
   return { item: 'J5 [27] client script before reveal.js (child theme `scripts` block): slide edit and reconnect in place', pass: a.ok && b.ok, a, b };
 }
 
+// --- K, L, M: theme scripts that add a <body> child at load (item 28) ---------------------
+
+// A DOMContentLoaded listener registered before the client's (a head or theme.scripts script).
+const DCL_HEAD = `<script>(window.__order = window.__order || []).push('head');
+document.addEventListener('DOMContentLoaded', () => { const d = document.createElement('div');
+  d.className = 'dcl-added'; d.textContent = 'dcl'; document.body.append(d); __order.push('dcl-handler'); });</script>`;
+// reveal dispatches 'ready' on .reveal with bubbles: true, so this runs when a
+// Reveal.on('ready', ...) registered before Reveal.initialize (theme.scripts) does.
+const READY_HEAD = `<script>(window.__order = window.__order || []).push('head');
+document.addEventListener('ready', () => { const d = document.createElement('div');
+  d.className = 'ready-added'; d.textContent = 'ready'; document.body.append(d); __order.push('ready-handler'); });
+document.addEventListener('DOMContentLoaded', () => __order.push('dcl'));</script>`;
+
+async function k1Edit() {
+  const added = !!document.querySelector('body > .dcl-added');
+  const r = await qa.editInPlace('K1');
+  return { item: 'K1 [28] a DOMContentLoaded handler (registered before the client) adds a body child: slide edit in place', pass: r.ok && added && qa.nav() === 'navigate', added, order: window.__order, ...r };
+}
+async function k2Reconnect() {
+  const r = await qa.reconnectInPlace('K2');
+  return { item: 'K2 [28] same page: a reconnect (same build id) refreshes in place', pass: r.ok && qa.nav() === 'navigate', ...r };
+}
+async function l1Edit() {
+  const added = !!document.querySelector('body > .ready-added');
+  const order = (window.__order || []).slice();
+  const r = await qa.editInPlace('L1');
+  return { item: "L1 [28] a reveal 'ready' handler adds a body child (body_end markup present): slide edit in place", pass: r.ok && added && qa.nav() === 'navigate', added, order, ...r };
+}
+async function l2Reconnect() {
+  const r = await qa.reconnectInPlace('L2');
+  return { item: 'L2 [28] same page: a reconnect (same build id) refreshes in place', pass: r.ok && qa.nav() === 'navigate', ...r };
+}
+async function l3Edit2() {
+  const r = await qa.editInPlace('L3');
+  return { item: 'L3 [28] same page: a second slide edit in place', pass: r.ok && qa.nav() === 'navigate' && !!document.querySelector('body > .ready-added'), ...r };
+}
+async function m1Body() {
+  window.__qaMarker = 'M1';
+  await qa.post('/__mock/body', '<div class="footer">footer v2</div>');
+  return JSON.parse(await qa.get('/__mock/emit?kind=content'));
+}
+function m1Check() {
+  const footer = (document.querySelector('body > .footer') || {}).textContent;
+  const pass = !window.__qaMarker && qa.nav() === 'reload' && footer === 'footer v2' && !!document.querySelector('body > .ready-added');
+  return { item: "M1 [19,28] with the 'ready' handler: a body_start edit still reloads once and is shown", pass, footer, hash: location.hash };
+}
+async function m2Edit() {
+  const r = await qa.editInPlace('M2');
+  return { item: 'M2 [19,28] after that reload: a slide edit in place', pass: r.ok, ...r };
+}
+async function m3BodyEnd() {
+  window.__qaMarker = 'M3';
+  await qa.post('/__mock/bodyend', '\n<div class="body-end-footer">end v2</div>');
+  return JSON.parse(await qa.get('/__mock/emit?kind=content'));
+}
+function m3Check() {
+  const footer = (document.querySelector('.body-end-footer') || {}).textContent;
+  const pass = !window.__qaMarker && qa.nav() === 'reload' && footer === 'end v2';
+  return { item: "M3 [19,28] with the 'ready' handler: a body_end edit reloads once and is shown", pass, footer };
+}
+async function m4Head() {
+  window.__qaMarker = 'M4';
+  await qa.post('/__mock/head', document.head.querySelector('script').outerHTML + '<style>.reveal h1 { letter-spacing: 3px }</style>');
+  return JSON.parse(await qa.get('/__mock/emit?kind=content'));
+}
+function m4Check() {
+  const pass = !window.__qaMarker && qa.nav() === 'reload' && getComputedStyle(document.querySelector('#intro h1')).letterSpacing === '3px'
+    && !!document.querySelector('body > .ready-added');
+  return { item: "M4 [19,28] with the 'ready' handler: a head edit reloads once and is shown", pass };
+}
+
+// --- N: a build lands between the page load and the client's baseline GET / (item 28) -----
+
+// Once per tab, while the page is parsed: changes body_start and emits a build synchronously.
+const RACE_HEAD = `<script>if (!sessionStorage.getItem('qa_race')) { sessionStorage.setItem('qa_race', '1');
+const x = new XMLHttpRequest(); x.open('POST', '/__mock/body', false); x.send('<div class="footer">raced</div>');
+const y = new XMLHttpRequest(); y.open('GET', '/__mock/emit?kind=content', false); y.send(); }</script>`;
+
+async function n1Edit() {
+  const before = { footer: !!document.querySelector('body > .footer'), id: qa.lr().buildId,
+    theme: document.getElementById('presenter-theme').getAttribute('href') };
+  window.__qaMarker = 'N1';
+  await qa.post('/__mock/slides', (await qa.slidesHtml()).replace('<p>bottom</p>', '<p>bottom N1</p>'));
+  const ev = JSON.parse(await qa.get('/__mock/emit?kind=content'));
+  sessionStorage.setItem('qa_n1', JSON.stringify({ before, ev }));
+  return 'n1 emitted';
+}
+function n1Check() {
+  const { before, ev } = JSON.parse(sessionStorage.getItem('qa_n1'));
+  const footer = (document.querySelector('body > .footer') || {}).textContent;
+  const pass = !before.footer && before.theme.endsWith('?v=2') && !window.__qaMarker && qa.nav() === 'reload'
+    && footer === 'raced' && document.querySelector('#stack-bottom p').textContent === 'bottom N1' && qa.snap().stored === String(ev.build_id);
+  return { item: 'N1 [28] a build lands between the page load and the baseline GET / (outside the slides changed): the next content build reloads and shows it', pass, before, footer };
+}
+async function n2Edit() {
+  const r = await qa.editInPlace('N2');
+  return { item: 'N2 [28] after that reload: a slide edit in place', pass: r.ok, ...r };
+}
+
+// --- P: template markup inside .reveal next to .slides, <body> attributes (item 19) -------
+
+// The mock has no slot inside .reveal: slides HTML that closes .slides puts this markup next
+// to it, inside .reveal (the template's own </div> after it is then ignored by the parser).
+const REVEAL_FOOTER = (v) => `</div><div class="deck-footer">deck footer ${v}</div>`;
+
+async function p1Edit() {
+  const footer = document.querySelector('.reveal > .deck-footer')?.textContent;
+  const attr = document.body.dataset.deck;
+  const r = await qa.editInPlace('P1');
+  return { item: 'P1 [19] markup inside .reveal next to .slides and <body> attributes: a slide edit is still in place', pass: r.ok
+    && footer === 'deck footer v1' && attr === 'v1' && qa.nav() === 'navigate', footer, attr, ...r };
+}
+async function p2RevealMarkup() {
+  window.__qaMarker = 'P2';
+  await qa.post('/__mock/slides', (await qa.slidesHtml()).replace('deck footer v1', 'deck footer v2'));
+  return JSON.parse(await qa.get('/__mock/emit?kind=content'));
+}
+function p2Check() {
+  const footer = document.querySelector('.reveal > .deck-footer')?.textContent;
+  const pass = !window.__qaMarker && qa.nav() === 'reload' && footer === 'deck footer v2' && location.hash === '#/stack-bottom';
+  return { item: 'P2 [19] template edit inside .reveal next to .slides: one full reload, new markup shown', pass, footer, hash: location.hash };
+}
+async function p3BodyAttr() {
+  window.__qaMarker = 'P3';
+  await qa.post('/__mock/body', '<body data-deck="v2">'); // the parser adds it to <body>
+  return JSON.parse(await qa.get('/__mock/emit?kind=content'));
+}
+function p3Check() {
+  const attr = document.body.dataset.deck;
+  const pass = !window.__qaMarker && qa.nav() === 'reload' && attr === 'v2';
+  return { item: 'P3 [19] template edit of a <body> attribute: one full reload, new attribute', pass, attr };
+}
+async function p4Edit() {
+  const r = await qa.editInPlace('P4');
+  return { item: 'P4 [19] after those reloads: a slide edit in place', pass: r.ok, ...r };
+}
+
 // --- E: page opened while the build fails (item 22) -------------------------------------
 
 function e1Check() {
@@ -647,6 +784,29 @@ const SESSIONS = [
     await ctl(m, '/__mock/emit?kind=content'); // build 2
   }, // H again before each scenario, so that one that fails by reloading does not take the next ones with it
   steps: [H, j1Edit, 1500, H, j2Reconnect, 1500, H, j3BodyEnd, 3000, H, j3Check, j4Early, 3000, H, j4Check, j5Early] },
+  { id: 'K', path: '/#/1/1', async setup(m) {
+    await ctl(m, '/__mock/head', DCL_HEAD);
+    await ctl(m, '/__mock/emit?kind=content'); // build 2
+  }, steps: [H, k1Edit, 1500, H, k2Reconnect] },
+  { id: 'L', path: '/#/1/1', async setup(m) {
+    await ctl(m, '/__mock/head', READY_HEAD);
+    await ctl(m, '/__mock/bodyend', '\n<div class="body-end-footer">end v1</div>');
+    await ctl(m, '/__mock/emit?kind=content'); // build 2
+  }, steps: [H, l1Edit, 1500, H, l2Reconnect, 1500, H, l3Edit2] },
+  { id: 'M', path: '/#/1/1', async setup(m) {
+    await ctl(m, '/__mock/head', READY_HEAD);
+    await ctl(m, '/__mock/body', '<div class="footer">footer v1</div>');
+    await ctl(m, '/__mock/emit?kind=content'); // build 2
+  }, steps: [H, m1Body, 3000, H, m1Check, m2Edit, 1500, H, m3BodyEnd, 3000, H, m3Check, m4Head, 3000, H, m4Check] },
+  { id: 'N', path: '/#/1/1', async setup(m) {
+    await ctl(m, '/__mock/head', RACE_HEAD);
+    await ctl(m, '/__mock/emit?kind=content'); // build 2; the page's head script makes build 3
+  }, steps: [H, n1Edit, 3000, H, n1Check, n2Edit] },
+  { id: 'P', path: '/#/1/1', async setup(m) {
+    await ctl(m, '/__mock/slides', (await ctl(m, '/__mock/slides')) + REVEAL_FOOTER('v1'));
+    await ctl(m, '/__mock/body', '<body data-deck="v1">');
+    await ctl(m, '/__mock/emit?kind=content'); // build 2
+  }, steps: [H, p1Edit, 1500, H, p2RevealMarkup, 3000, H, p2Check, p3BodyAttr, 3000, H, p3Check, p4Edit] },
   { id: 'H', path: '/__mock/frames', steps: [H, h1Frames, 5000, h1Check] },
   { id: 'R', path: '/#/3', steps: [H, r1RestartSame] },
   { id: 'S', path: '/?view=scroll#/3', steps: [H, s1Scroll, 3000, H, s1Check] },
