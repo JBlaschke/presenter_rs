@@ -9,8 +9,9 @@
 //! Ids are content-derived and therefore stable across runs: the first 12 hex chars of the
 //! BLAKE3 hash of the absolute path (files) or of the bytes (in-memory assets). Registering
 //! the same path or bytes again returns the same id and keeps the first registration.
-//! File paths are normalized lexically first ([`normalize_lexically`]), so
-//! `/talk/./img.png`, `/talk/sub/../img.png` and `/talk/img.png` are one asset.
+//! File paths are resolved first ([`resolve_path`]: canonicalized when the absolute path
+//! exists, so symlinks are followed exactly as the OS does; otherwise normalized lexically),
+//! so `/talk/./img.png`, `/talk/sub/../img.png` and `/talk/img.png` are one asset.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -58,14 +59,16 @@ impl AssetRegistry {
     /// (lossy for non-UTF-8 paths). MIME from the extension via `mime_guess`, default
     /// "application/octet-stream". Does NOT read the file. Returns the id.
     ///
-    /// The path is first normalized with [`normalize_lexically`] (`.` dropped, `..`
-    /// resolved, no filesystem access), and the normalized path is what is hashed and stored
-    /// in [`AssetData::File`]: `base_dir.join("./x.png")`, `base_dir.join("a/../x.png")` and
-    /// `base_dir.join("x.png")` all get the same id. Callers pass the resolved absolute path;
-    /// a relative path is accepted and hashed as given (after normalization), which makes
-    /// the id depend on the path spelling rather than on the working directory.
+    /// The path is first resolved with [`resolve_path`] (canonicalized when it is absolute
+    /// and exists — only metadata is touched — else normalized lexically), and the resolved
+    /// path is what is hashed and stored in [`AssetData::File`]: `base_dir.join("./x.png")`,
+    /// `base_dir.join("a/../x.png")` and `base_dir.join("x.png")` all get the same id, and a
+    /// `..` that crosses a symlinked directory resolves to the file the OS would open.
+    /// Callers pass the resolved absolute path; a relative path is accepted and hashed as
+    /// given (after lexical normalization), which makes the id depend on the path spelling
+    /// rather than on the working directory.
     pub fn register_file(&mut self, abs_path: &Path) -> String {
-        let path = normalize_lexically(abs_path);
+        let path = resolve_path(abs_path);
         let id = hash_id(path.to_string_lossy().as_bytes());
         self.assets.entry(id.clone()).or_insert_with(|| Asset {
             id: id.clone(),
@@ -107,9 +110,9 @@ impl AssetRegistry {
     /// Summaries for `Deck.assets`, ordered by id. `origin` is `file:<path relative to
     /// base_dir>` (`/`-separated; the full stored path when the file is not under
     /// `base_dir`, e.g. for `base_dir.join("../shared/logo.png")`) or `inline:<byte length>`.
-    /// `base_dir` is normalized lexically before the comparison.
+    /// `base_dir` is resolved with [`resolve_path`] before the comparison, like the files.
     pub fn infos(&self, base_dir: &Path) -> Vec<AssetInfo> {
-        let base_dir = normalize_lexically(base_dir);
+        let base_dir = resolve_path(base_dir);
         self.iter()
             .map(|asset| AssetInfo {
                 id: asset.id.clone(),
@@ -145,6 +148,18 @@ fn display_relative(path: &Path, base: &Path) -> String {
             .join("/"),
         Err(_) => path.to_string_lossy().into_owned(),
     }
+}
+
+/// The path the registry stores for `path`: `std::fs::canonicalize(path)` when `path` is
+/// absolute and exists (symlinks resolved exactly as the OS resolves them when opening the
+/// file), otherwise [`normalize_lexically`]. Relative paths are never made absolute.
+pub fn resolve_path(path: &Path) -> PathBuf {
+    if path.is_absolute()
+        && let Ok(canonical) = std::fs::canonicalize(path)
+    {
+        return canonical;
+    }
+    normalize_lexically(path)
 }
 
 /// Removes `.` components and resolves `..` against the preceding component, without
@@ -386,5 +401,40 @@ mod tests {
     fn default_equals_new() {
         assert_eq!(AssetRegistry::default(), AssetRegistry::new());
         assert_eq!(AssetRegistry::new().iter().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_dir_through_a_symlink_resolves_like_the_os() {
+        // root/current -> root/2026/talk; the image lives at root/2026/shared/logo.png, so
+        // `current/../shared/logo.png` exists for the OS but `root/shared/logo.png` does not.
+        let tmp = std::env::temp_dir().join(format!("presenter-registry-{}", std::process::id()));
+        let root = tmp.join("root");
+        std::fs::create_dir_all(root.join("2026/talk")).unwrap();
+        std::fs::create_dir_all(root.join("2026/shared")).unwrap();
+        std::fs::write(root.join("2026/shared/logo.png"), b"png").unwrap();
+        let link = root.join("current");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(root.join("2026/talk"), &link).unwrap();
+
+        let joined = link.join("../shared/logo.png");
+        assert!(joined.is_file());
+        let mut registry = AssetRegistry::new();
+        let id = registry.register_file(&joined);
+        match &registry.get(&id).unwrap().data {
+            AssetData::File(stored) => {
+                assert!(stored.is_file(), "stored path must be readable: {stored:?}");
+                assert_eq!(std::fs::read(stored).unwrap(), b"png");
+            }
+            other => panic!("expected a file asset, got {other:?}"),
+        }
+        // The same file reached through the real directory is the same asset.
+        assert_eq!(
+            registry.register_file(&root.join("2026/shared/logo.png")),
+            id
+        );
+        let infos = registry.infos(&link);
+        assert_eq!(infos.len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
