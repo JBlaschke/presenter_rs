@@ -5,6 +5,13 @@
 //! and every asset id (blake3 of an absolute path, so machine-dependent) replaced by a stable
 //! 12-hex label (`000000000001`, … in order of first appearance). The labelled deck still
 //! satisfies `Deck::invariant_violations() == []`, which every test checks.
+//!
+//! Every fixture is snapshotted: the ones in [`DEDICATED`] by their own test below (which also
+//! checks the slide shape and the fixture's behaviours), any other `*.md` (e.g. T43's
+//! `headings-mode.md`) by [`other_fixtures_are_snapshotted`] with the default config. A
+//! fixture that needs other settings sets them in its front matter (`slides: {split:
+//! headings}`), which `parse` merges into the config; [`check_fixture_with`] takes a config
+//! for a dedicated test that cannot.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +20,9 @@ use presenter::assets::registry::AssetRegistry;
 use presenter::config::Config;
 use presenter::error::{Diagnostics, Error, Level};
 use presenter::ir::{Block, Deck, Parsed, Slide, SourceInfo, SourceKind, SourceSpan};
-use presenter::markdown::render::{RenderCtx, RenderMode, render_fragment};
+use presenter::markdown::render::{
+    RenderCtx, RenderMode, missing_asset_path, render_fragment, render_fragment_with_lift,
+};
 use presenter::markdown::{comrak_options, parse};
 use regex::Regex;
 use serde_json::Value;
@@ -31,10 +40,24 @@ fn source(name: &str) -> SourceInfo {
     }
 }
 
-fn parse_fixture(name: &str) -> Parsed {
+fn parse_fixture(name: &str, config: &Config) -> Parsed {
     let source = source(name);
     let text = std::fs::read_to_string(&source.path).unwrap();
-    parse(&source, &text, &Config::default()).unwrap()
+    parse(&source, &text, config).unwrap()
+}
+
+/// The stems of `tests/fixtures/md/*.md`, sorted.
+fn fixture_names() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(fixture_dir())
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            let stem = path.file_stem()?.to_string_lossy().into_owned();
+            (path.extension()? == "md").then_some(stem)
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn parse_text(text: &str) -> presenter::Result<Parsed> {
@@ -91,10 +114,17 @@ fn html(slide: &Slide) -> &str {
 
 /// Snapshot + invariants + shape, shared by every fixture test.
 fn check_fixture(name: &str, expected_shape: &[usize]) -> Parsed {
-    let parsed = parse_fixture(name);
+    check_fixture_with(name, &Config::default(), Some(expected_shape))
+}
+
+/// [`check_fixture`] with a config; `expected_shape: None` skips the shape check.
+fn check_fixture_with(name: &str, config: &Config, expected_shape: Option<&[usize]>) -> Parsed {
+    let parsed = parse_fixture(name, config);
     let deck = &parsed.deck;
     assert_eq!(deck.invariant_violations(), Vec::<String>::new(), "{name}");
-    assert_eq!(shape(deck), expected_shape, "{name}: shape");
+    if let Some(expected) = expected_shape {
+        assert_eq!(shape(deck), expected, "{name}: shape");
+    }
     let json = stable_json(deck);
     let relabelled: Deck = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(
@@ -110,6 +140,15 @@ fn check_fixture(name: &str, expected_shape: &[usize]) -> Parsed {
         assert_eq!(diagnostic.path.as_deref(), Some(deck.source.path.as_path()));
         assert!(diagnostic.span.is_some(), "{diagnostic:#}");
     }
+    // reveal.js would turn a slide containing a <section> into a vertical stack
+    for slide in deck
+        .slides
+        .iter()
+        .flat_map(|s| std::iter::once(s).chain(&s.children))
+    {
+        let notes = slide.notes.as_deref().unwrap_or_default();
+        assert!(!html(slide).contains("<section") && !notes.contains("<section"));
+    }
     parsed
 }
 
@@ -120,31 +159,35 @@ fn codes(diagnostics: &Diagnostics) -> Vec<(&'static str, usize)> {
         .collect()
 }
 
+/// Fixtures with a dedicated test below.
+const DEDICATED: [&str; 8] = [
+    "attributes",
+    "code",
+    "directives",
+    "images",
+    "math",
+    "minimal",
+    "notes",
+    "separators",
+];
+
 #[test]
-fn every_fixture_has_a_snapshot_test() {
-    let mut names: Vec<String> = std::fs::read_dir(fixture_dir())
-        .unwrap()
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
-            let stem = path.file_stem()?.to_string_lossy().into_owned();
-            (path.extension()? == "md").then_some(stem)
-        })
-        .collect();
-    names.sort();
-    let tested = [
-        "attributes",
-        "code",
-        "directives",
-        "images",
-        "math",
-        "minimal",
-        "notes",
-        "separators",
-    ];
-    assert_eq!(
-        names, tested,
-        "add a test (and snapshot) for each new fixture"
-    );
+fn dedicated_fixtures_exist() {
+    let names = fixture_names();
+    for name in DEDICATED {
+        assert!(names.iter().any(|n| n == name), "{name}.md is missing");
+    }
+}
+
+/// Snapshot, invariants and diagnostics of every fixture without a dedicated test (module
+/// docs), so new fixtures need no edit here.
+#[test]
+fn other_fixtures_are_snapshotted() {
+    for name in fixture_names() {
+        if !DEDICATED.contains(&name.as_str()) {
+            check_fixture_with(&name, &Config::default(), None);
+        }
+    }
 }
 
 #[test]
@@ -458,6 +501,44 @@ fn missing_image_is_an_error_only_when_asked() {
     // parse() never fails on a missing image
     let parsed = parse_text(text).unwrap();
     assert_eq!(codes(&parsed.diagnostics), [("missing-asset", 3)]);
+    // the diagnostic's path is the deck; the missing file is recovered for Error::MissingAsset
+    let warning = parsed.diagnostics.iter().next().unwrap();
+    assert_eq!(warning.path, Some(source("inline").path));
+    assert_eq!(
+        missing_asset_path(warning),
+        Some(dir.join("images/missing.png"))
+    );
+}
+
+#[test]
+fn notebook_cells_lift_a_leading_heading_on_request() {
+    let (mut assets, mut diagnostics) = ctx_parts();
+    let dir = fixture_dir();
+    let mut ctx = RenderCtx {
+        assets: &mut assets,
+        base_dir: &dir,
+        mode: RenderMode::Notebook,
+        diagnostics: &mut diagnostics,
+        missing_asset_is_error: false,
+    };
+    let opts = comrak_options(&Default::default());
+    let cell = "# Analysis {layout=title}\n\n$x$\n\n:::notes\nSay hi.\n:::\n";
+    let (rendered, lifted) = render_fragment_with_lift(cell, &opts, &mut ctx, true).unwrap();
+    assert_eq!(
+        rendered.html,
+        "<h1>Analysis</h1>\n<p><span data-math-style=\"inline\">x</span></p>\n"
+    );
+    assert_eq!(rendered.notes.as_deref(), Some("<p>Say hi.</p>\n"));
+    assert_eq!(rendered.title.as_deref(), Some("Analysis"));
+    let lifted = lifted.unwrap();
+    assert_eq!(lifted.pairs, [("layout".to_string(), "title".to_string())]);
+    let mut slide = Slide::new();
+    presenter::markdown::attrs::SlideAttrs::from_parsed(lifted).apply_to(&mut slide);
+    assert_eq!(slide.layout, "title");
+    // render_fragment never lifts
+    let plain = render_fragment(cell, &opts, &mut ctx).unwrap();
+    assert!(plain.html.starts_with("<h1 layout=\"title\">Analysis</h1>"));
+    assert!(diagnostics.is_empty());
 }
 
 #[test]

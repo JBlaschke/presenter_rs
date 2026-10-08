@@ -2,24 +2,42 @@
 //!
 //! Contract: `docs/spec/markdown-dialect.md` §3.3–§9. [`render_nodes`] renders one slide (a
 //! group of top-level comrak nodes) and [`render_fragment`] parses and renders a standalone
-//! Markdown string (notebook cells, `text/markdown` outputs, the `markdown` template filter).
+//! Markdown string (notebook cells, `text/markdown` outputs, the `markdown` template filter);
+//! [`render_fragment_with_lift`] also lifts a leading heading's attributes (notebook cells).
 //!
 //! The nodes are moved under a synthetic `Document` node, so lists and footnotes render as a
-//! unit (the footnote `<section>` of a slide is closed at the end of that slide). Then:
+//! unit (the footnote list of a slide is closed at the end of that slide). Then:
 //!
 //! 1. **title**: [`first_heading_text`] of the nodes, before anything is changed;
 //! 2. **notes** (§4, §7): every outermost `:::notes` directive, wherever it is nested, is
-//!    detached; its children are rendered through a second synthetic document with the same
-//!    passes and appended to [`Rendered::notes`] in document order;
-//! 3. **assets** (§6): relative image URLs and relative `src="…"` / `poster="…"` values in raw
-//!    HTML tags ([`rewrite_html_assets`]) are resolved against [`RenderCtx::base_dir`]: an existing file is registered
-//!    ([`AssetRegistry::register_file`]) and the URL becomes `asset:<id>` (a `?query` or
-//!    `#fragment` is kept after it); a missing file is a `missing-asset` warning (the URL stays
-//!    as written) or [`Error::MissingAsset`] when [`RenderCtx::missing_asset_is_error`];
-//! 4. **footnotes**: references are renumbered per slide in order of first use (comrak
-//!    numbers them across the whole document, but every slide has its own footnote list),
-//!    and the slide's definitions are ordered to match;
-//! 5. **HTML**: comrak's formatter with a small override (`format_node`) for the nodes the
+//!    detached; its children (and the footnote definitions written inside it, which comrak
+//!    moved to the end of the document) are rendered through a second synthetic document with
+//!    the same passes and appended to [`Rendered::notes`] in document order;
+//! 3. **checks**: a paragraph that starts like a directive (`:::name …`) but is not one is an
+//!    `invalid-directive` warning: comrak does not open a directive whose line has a `:`
+//!    after the fence (`title="a:b"`, a URL); `&#58;` is the way to write that colon;
+//! 4. **assets** (§6): relative image URLs and relative `src` / `poster` attributes of raw
+//!    HTML start tags ([`rewrite_html_assets`]) are resolved against [`RenderCtx::base_dir`]:
+//!    an existing file is registered ([`AssetRegistry::register_file`]) and the URL becomes
+//!    `asset:<id>` (a `?query` or `#fragment` is kept after it); a missing file is a
+//!    `missing-asset` warning (the URL stays as written; [`missing_asset_path`] reads the
+//!    file back from it) or [`Error::MissingAsset`] when [`RenderCtx::missing_asset_is_error`].
+//!    Raw HTML is tokenized like a browser does: comments, the content of raw-text elements
+//!    (`<script>`, `<style>`, …) and text inside other attributes' quoted values never count,
+//!    also when a `<script>` opens in one raw HTML node and closes in a later one;
+//! 5. **footnotes**: every slide (and every notes block) has its own footnote list.
+//!    References are numbered per slide in order of first use (comrak numbers them across the
+//!    whole document) and link to the definition *on the same slide*, so a label such as
+//!    `[^1]` can be reused on every slide; the definitions move to the end, ordered to match,
+//!    with back-links to this slide's references only. Ids stay unique in the deck: the
+//!    definition comrak resolved a label to keeps `fn-<label>`, any other definition of the
+//!    label (on another slide) gets `fn<line>-<label>`; reference ids are comrak's
+//!    (`fnref-<label>[-<n>]`). A label defined twice on one slide is a `duplicate-footnote`
+//!    warning, a reference with no definition on its slide a `footnote-elsewhere` warning
+//!    (it links to comrak's definition). The list is a `<div class="footnotes"
+//!    data-footnotes><ol>…</ol></div>`, never comrak's `<section>`: reveal.js would turn a
+//!    slide containing a `<section>` into a vertical stack;
+//! 6. **HTML**: comrak's formatter with a small override (`format_node`) for the nodes the
 //!    dialect renders differently from comrak:
 //!    - `BlockDirective` (§4): `<div class="name classes…" …>` from a quote-aware split of the
 //!      info string: `:::fragment … index=N` adds `data-fragment-index="N"`,
@@ -32,26 +50,32 @@
 //!    - headings, links, images and inline code with `{…}` attributes (§3.3): comrak's own
 //!      tag with `id`, `class` and `key="value"` appended (comrak's formatter never writes
 //!      node attributes). Doing this in the formatter rather than by rewriting nodes to raw
-//!      HTML keeps the inline children (emphasis, alt text, …) rendered by comrak.
+//!      HTML keeps the inline children (emphasis, alt text, …) rendered by comrak;
+//!    - footnote references and definitions (pass 5).
 //!
 //! Every attribute value written here is escaped with `encode_double_quoted_attribute`.
 //! [`Rendered::features`] reports `code` (any code block other than a math fence), `math`
-//! (any `data-math-style` in the HTML or notes) and `notes`.
+//! (an element with a `data-math-style` attribute in the HTML or notes, see
+//! [`has_math_markup`]; the text `data-math-style` in inline code does not count) and `notes`.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::convert::Infallible;
 use std::fmt::{self, Write as _};
-use std::path::Path;
-use std::sync::LazyLock;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use comrak::html::{
     ChildRendering, Context, dangerous_url, format_document_with_formatter, format_node_default,
     render_sourcepos,
 };
-use comrak::nodes::{AstNode, Attributes, NodeCodeBlock, NodeLink, NodeMath, NodeValue};
+use comrak::nodes::{
+    AstNode, Attributes, NodeCodeBlock, NodeFootnoteDefinition, NodeFootnoteReference, NodeLink,
+    NodeMath, NodeValue,
+};
 use comrak::options::Plugins;
 use comrak::{Arena, Options, parse_document};
 use html_escape::{decode_html_entities, encode_quoted_attribute};
-use regex::Regex;
 
 use crate::assets::registry::{AssetRegistry, normalize_lexically};
 use crate::error::{Diagnostic, Diagnostics, Error, Result};
@@ -60,10 +84,16 @@ use crate::markdown::attrs::{ParsedAttrs, is_valid_attr_name};
 use crate::markdown::code::{
     code_attrs, push_attr, render_code_block_with, strip_trailing_newline,
 };
-use crate::markdown::split::first_heading_text;
+use crate::markdown::split::{first_heading_text, lift_heading_attrs};
 
 /// The attribute every math element carries (`Features.math` is derived from it).
 const MATH_ATTR: &str = "data-math-style";
+
+/// Diagnostic code of a missing local file.
+const MISSING_ASSET: &str = "missing-asset";
+
+/// Separates the URL as written from the resolved path in a `missing-asset` message.
+const LOOKED_FOR: &str = " (looked for ";
 
 /// What is being rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +116,10 @@ pub struct RenderCtx<'r> {
     pub base_dir: &'r Path,
     /// Deck or notebook rendering.
     pub mode: RenderMode,
-    /// Receives `missing-asset` and `invalid-directive-arg` warnings. Spans are lines of the
-    /// rendered text (`cell: None`) and the path is not set: the caller adds both.
+    /// Receives `missing-asset`, `invalid-directive`, `invalid-directive-arg`,
+    /// `duplicate-footnote` and `footnote-elsewhere` warnings. Spans are lines of the rendered
+    /// text (`cell: None`) and the path is not set: the caller adds both. The missing file of
+    /// a `missing-asset` warning is in its message only: see [`missing_asset_path`].
     pub diagnostics: &'r mut Diagnostics,
     /// Return [`Error::MissingAsset`] for a missing local file instead of a warning.
     pub missing_asset_is_error: bool,
@@ -140,8 +172,28 @@ pub fn render_nodes<'a>(
 /// [`RenderMode::Notebook`] the text is parsed without the front matter extension; in
 /// [`RenderMode::Deck`] `opts` are used as given and a front matter block, if `opts` enable
 /// it, is dropped. `:::notes` blocks are extracted into [`Rendered::notes`] in both modes.
+/// Heading attributes are written on the heading; [`render_fragment_with_lift`] can lift them.
 /// Errors as [`render_nodes`].
 pub fn render_fragment(text: &str, opts: &Options, ctx: &mut RenderCtx) -> Result<Rendered> {
+    render_fragment_with_lift(text, opts, ctx, false).map(|(rendered, _)| rendered)
+}
+
+/// [`render_fragment`], and with `lift_heading` the attributes of a leading heading are
+/// lifted first (notebook-mapping §2: a markdown cell that starts with
+/// `# Title {layout=title}` while the current slide is still empty gives them to the slide).
+///
+/// With `lift_heading`, [`lift_heading_attrs`] runs on the fragment's top-level nodes (front
+/// matter excluded) before rendering: when the first node is a heading with `{…}` attributes,
+/// they are removed from it (the heading renders clean) and returned for the caller to apply
+/// (`SlideAttrs::from_parsed(attrs).apply_to(slide)`). Otherwise, and always without
+/// `lift_heading`, the second value is `None` and the attributes stay on the `<hN>` element.
+/// Errors as [`render_nodes`].
+pub fn render_fragment_with_lift(
+    text: &str,
+    opts: &Options,
+    ctx: &mut RenderCtx,
+    lift_heading: bool,
+) -> Result<(Rendered, Option<ParsedAttrs>)> {
     let arena = Arena::new();
     let root = match ctx.mode {
         RenderMode::Deck => parse_document(&arena, text, opts),
@@ -155,7 +207,45 @@ pub fn render_fragment(text: &str, opts: &Options, ctx: &mut RenderCtx) -> Resul
         .children()
         .filter(|node| !matches!(node.data().value, NodeValue::FrontMatter(_)))
         .collect();
-    render_nodes(&arena, &nodes, opts, ctx)
+    let lifted = if lift_heading {
+        lift_heading_attrs(&nodes)
+    } else {
+        None
+    };
+    let rendered = render_nodes(&arena, &nodes, opts, ctx)?;
+    Ok((rendered, lifted))
+}
+
+/// The missing file a `missing-asset` diagnostic of this module is about (resolved, normally
+/// absolute), or `None` for any other diagnostic.
+///
+/// Such a diagnostic's `path` is the *source* file (the deck or notebook, set by the
+/// frontend) and its span the referencing lines; the missing file is only in the message,
+/// whose format is frozen for this function: ``<what> `<url as written>` not found (looked
+/// for <resolved path>)``. The pipeline escalates with
+/// `Error::MissingAsset { path: missing_asset_path(d)?, span: d.span.clone() }`.
+pub fn missing_asset_path(diagnostic: &Diagnostic) -> Option<PathBuf> {
+    if diagnostic.code != MISSING_ASSET {
+        return None;
+    }
+    let (_, path) = diagnostic
+        .message
+        .strip_suffix(')')?
+        .rsplit_once(LOOKED_FOR)?;
+    Some(PathBuf::from(path))
+}
+
+/// Whether `html` contains an element with a `data-math-style` attribute (dialect §8), i.e.
+/// whether KaTeX is needed. Only start tags count, outside comments and raw-text elements, so
+/// the text `data-math-style` in inline code, in an escaped code sample or in another
+/// attribute's value does not. [`Rendered::features`]`.math` is derived from this.
+pub fn has_math_markup(html: &str) -> bool {
+    let mut found = false;
+    let Ok(()) = HtmlScan::default().start_tags(html, |tag| {
+        found |= tag.attrs.iter().any(|attr| attr.name == MATH_ATTR);
+        Ok::<(), Infallible>(())
+    });
+    found
 }
 
 /// Registers the local files named by a slide's `data-background-image`,
@@ -200,48 +290,243 @@ pub fn rewrite_slide_assets(
     Ok(())
 }
 
-/// Rewrites relative `src="…"` and `poster="…"` values (double-, single- or unquoted) in a
+/// Rewrites relative `src` and `poster` attribute values (double-, single- or unquoted) in a
 /// raw HTML snippet like images (dialect §6): existing files become `asset:<id>`, missing
-/// ones are reported. Only attributes inside start tags count: text and `<!-- … -->`
-/// comments are left alone. Values are HTML-entity-decoded before they are resolved.
-/// Errors as [`rewrite_slide_assets`].
+/// ones are reported. Only attributes of start tags count, found by an HTML-style tokenizer:
+/// text, `<!-- … -->` comments, the content of raw-text elements (`<script>`, `<style>`,
+/// `<textarea>`, `<title>`, `<iframe>`, …) and text inside another attribute's quoted value
+/// (`alt="x src=y.png"`) are left alone. Values are HTML-entity-decoded before they are
+/// resolved. Errors as [`rewrite_slide_assets`].
 pub fn rewrite_html_assets(
     html: &mut String,
     span: Option<&SourceSpan>,
     ctx: &mut RenderCtx,
 ) -> Result<()> {
-    // Constant patterns: compiling them cannot fail.
-    static TAG_OR_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)<!--.*?-->|<[A-Za-z][^\s/>]*(?:[^>"']|"[^"]*"|'[^']*')*>"#)
-            .expect("constant regex")
-    });
-    static URL_ATTR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)\s(?:src|poster)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"#)
-            .expect("constant regex")
-    });
-    let mut out = String::with_capacity(html.len());
-    let mut last = 0;
-    for tag in TAG_OR_COMMENT.find_iter(html) {
-        if tag.as_str().starts_with("<!--") {
-            continue;
-        }
-        for caps in URL_ATTR.captures_iter(tag.as_str()) {
-            let Some(value) = caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(3)) else {
+    rewrite_html_snippet(html, span, ctx, &mut HtmlScan::default())
+}
+
+/// [`rewrite_html_assets`] for one of several raw HTML nodes scanned in document order:
+/// `scan` carries an open comment or raw-text element from one node to the next.
+fn rewrite_html_snippet(
+    html: &mut String,
+    span: Option<&SourceSpan>,
+    ctx: &mut RenderCtx,
+    scan: &mut HtmlScan,
+) -> Result<()> {
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    let source: &str = html;
+    scan.start_tags(source, |tag| {
+        for attr in &tag.attrs {
+            let Some(range) = attr.value.clone() else {
                 continue;
             };
-            let url = decode_html_entities(value.as_str());
+            if !matches!(attr.name.as_str(), "src" | "poster") {
+                continue;
+            }
+            let url = decode_html_entities(&source[range.clone()]);
             if let Some(asset) = local_asset(&url, "file", span, ctx)? {
-                out.push_str(&html[last..tag.start() + value.start()]);
-                out.push_str(&encode_quoted_attribute(&asset));
-                last = tag.start() + value.end();
+                edits.push((range, encode_quoted_attribute(&asset).into_owned()));
             }
         }
-    }
-    if last > 0 {
-        out.push_str(&html[last..]);
-        *html = out;
+        Ok::<(), Error>(())
+    })?;
+    for (range, text) in edits.into_iter().rev() {
+        html.replace_range(range, &text);
     }
     Ok(())
+}
+
+/// Elements whose content is raw text (or escapable raw text) for the HTML tokenizer: tags
+/// inside them are not tags.
+const RAW_TEXT_ELEMENTS: [&str; 8] = [
+    "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes",
+];
+
+/// Where an HTML scan stands between snippets. The raw HTML nodes of a document are scanned
+/// one after the other, and a comment or `<script>` opened in one can close in a later one
+/// (`x <script>…'<img src=a.png>'…</script>` is three inline HTML nodes).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum HtmlScan {
+    /// Ordinary content: tags are recognized.
+    #[default]
+    Data,
+    /// Inside `<!-- … -->`.
+    Comment,
+    /// Inside a raw-text element (one of [`RAW_TEXT_ELEMENTS`]) until its end tag.
+    RawText(&'static str),
+}
+
+/// A start tag found by [`HtmlScan::start_tags`].
+#[derive(Debug)]
+struct StartTag {
+    /// The tag name, ASCII-lowercased.
+    name: String,
+    /// Its attributes in order.
+    attrs: Vec<TagAttr>,
+    /// Byte offset just after the tag's `>` (or the end of the snippet).
+    end: usize,
+}
+
+/// One attribute of a [`StartTag`].
+#[derive(Debug)]
+struct TagAttr {
+    /// The name, ASCII-lowercased.
+    name: String,
+    /// Byte range of the value in the snippet, quotes excluded; `None` for a bare attribute.
+    value: Option<Range<usize>>,
+}
+
+impl HtmlScan {
+    /// Calls `on_tag` for every start tag of `html` that is outside comments and raw-text
+    /// elements, then leaves `self` in the state the snippet ends in. End tags, `<!…>`
+    /// declarations and `<?…>` are skipped; a `<` that starts none of these is text.
+    fn start_tags<E>(
+        &mut self,
+        html: &str,
+        mut on_tag: impl FnMut(&StartTag) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let bytes = html.as_bytes();
+        let mut at = 0;
+        while at < html.len() {
+            match *self {
+                HtmlScan::Comment => match html[at..].find("-->") {
+                    Some(end) => {
+                        at += end + "-->".len();
+                        *self = HtmlScan::Data;
+                    }
+                    None => break,
+                },
+                HtmlScan::RawText(name) => match raw_text_end(html, at, name) {
+                    Some(end) => {
+                        at = end;
+                        *self = HtmlScan::Data;
+                    }
+                    None => break,
+                },
+                HtmlScan::Data => {
+                    let Some(lt) = html[at..].find('<') else {
+                        break;
+                    };
+                    at += lt;
+                    let rest = &html[at..];
+                    if let Some(empty) = ["<!-->", "<!--->"].iter().find(|c| rest.starts_with(**c))
+                    {
+                        at += empty.len();
+                    } else if rest.starts_with("<!--") {
+                        at += "<!--".len();
+                        *self = HtmlScan::Comment;
+                    } else if bytes.get(at + 1).is_some_and(u8::is_ascii_alphabetic) {
+                        let tag = start_tag(html, at);
+                        on_tag(&tag)?;
+                        if let Some(raw) = RAW_TEXT_ELEMENTS.iter().find(|raw| **raw == tag.name) {
+                            *self = HtmlScan::RawText(raw);
+                        }
+                        at = tag.end;
+                    } else if matches!(bytes.get(at + 1), Some(b'/' | b'!' | b'?')) {
+                        at = html[at..].find('>').map_or(html.len(), |gt| at + gt + 1);
+                    } else {
+                        at += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Byte offset of the `</name` that ends a raw-text element (searching from `from`).
+fn raw_text_end(html: &str, from: usize, name: &str) -> Option<usize> {
+    let bytes = html.as_bytes();
+    html[from..]
+        .match_indices("</")
+        .map(|(offset, _)| from + offset)
+        .find(|&lt| {
+            let after = &bytes[lt + 2..];
+            after.len() >= name.len()
+                && after[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+                && after
+                    .get(name.len())
+                    .is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b'/' | b'>'))
+        })
+}
+
+/// Tokenizes the start tag whose `<` is at byte `lt` (HTML tokenizer rules: attribute names
+/// end at whitespace, `/`, `>` or `=`; a value is quoted or runs to whitespace or `>`).
+fn start_tag(html: &str, lt: usize) -> StartTag {
+    let bytes = html.as_bytes();
+    let ends_name = |b: u8| b.is_ascii_whitespace() || matches!(b, b'/' | b'>');
+    let mut at = lt + 1;
+    while at < bytes.len() && !ends_name(bytes[at]) {
+        at += 1;
+    }
+    let name = html[lt + 1..at].to_ascii_lowercase();
+    let mut attrs = Vec::new();
+    loop {
+        while at < bytes.len() && (bytes[at].is_ascii_whitespace() || bytes[at] == b'/') {
+            at += 1;
+        }
+        match bytes.get(at) {
+            None => {
+                return StartTag {
+                    name,
+                    attrs,
+                    end: at,
+                };
+            }
+            Some(b'>') => {
+                return StartTag {
+                    name,
+                    attrs,
+                    end: at + 1,
+                };
+            }
+            Some(_) => {}
+        }
+        let name_start = at;
+        at += 1; // the first character of a name may be `=`
+        while at < bytes.len() && !ends_name(bytes[at]) && bytes[at] != b'=' {
+            at += 1;
+        }
+        let attr_name = html[name_start..at].to_ascii_lowercase();
+        let (value, next) = attr_value(bytes, at);
+        at = next;
+        attrs.push(TagAttr {
+            name: attr_name,
+            value,
+        });
+    }
+}
+
+/// The value after an attribute name that ends at byte `at`: its byte range (quotes
+/// excluded) when `=` follows, and where tokenizing continues.
+fn attr_value(bytes: &[u8], at: usize) -> (Option<Range<usize>>, usize) {
+    let skip_space = |mut i: usize| {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let eq = skip_space(at);
+    if bytes.get(eq) != Some(&b'=') {
+        return (None, at);
+    }
+    let start = skip_space(eq + 1);
+    match bytes.get(start) {
+        Some(&quote @ (b'"' | b'\'')) => {
+            let end = bytes[start + 1..]
+                .iter()
+                .position(|&b| b == quote)
+                .map_or(bytes.len(), |p| start + 1 + p);
+            (Some(start + 1..end), (end + 1).min(bytes.len()))
+        }
+        _ => {
+            let end = bytes[start..]
+                .iter()
+                .position(|&b| b.is_ascii_whitespace() || b == b'>')
+                .map_or(bytes.len(), |p| start + p);
+            (Some(start..end), end)
+        }
+    }
 }
 
 /// Notes, assets, footnotes and formatting for one synthetic document (see the module docs).
@@ -252,13 +537,14 @@ fn render_document<'a>(
     ctx: &mut RenderCtx,
 ) -> Result<Rendered> {
     let (notes, mut features) = extract_notes(arena, doc, opts, ctx)?;
+    check_unopened_directives(doc, ctx);
     rewrite_assets(doc, ctx)?;
-    renumber_footnotes(doc);
+    let footnotes = prepare_footnotes(doc, ctx);
     features.code |= doc.descendants().any(|node| {
         matches!(&node.data().value, NodeValue::CodeBlock(block) if !is_math_fence(&block.info))
     });
-    let html = format_html(doc, opts, ctx)?;
-    features.math |= html.contains(MATH_ATTR);
+    let html = format_html(doc, opts, ctx, footnotes)?;
+    features.math |= has_math_markup(&html);
     features.notes |= notes.is_some();
     Ok(Rendered {
         html,
@@ -270,6 +556,8 @@ fn render_document<'a>(
 
 /// Detaches the outermost `:::notes` directives under `doc` and renders their contents
 /// (nested notes are rendered through the same passes and appended after their parent).
+/// Footnote definitions written inside a notes block go with it: comrak moved them to the
+/// end of the document, so they are found among `doc`'s children by their source line.
 fn extract_notes<'a>(
     arena: &'a Arena<'a>,
     doc: &'a AstNode<'a>,
@@ -290,6 +578,19 @@ fn extract_notes<'a>(
         while let Some(child) = block.first_child() {
             notes_doc.append(child);
         }
+        let pos = block.data().sourcepos;
+        let lines = pos.start.line..=pos.end.line;
+        let definitions: Vec<_> = doc
+            .children()
+            .filter(|node| {
+                let data = node.data();
+                matches!(data.value, NodeValue::FootnoteDefinition(_))
+                    && lines.contains(&data.sourcepos.start.line)
+            })
+            .collect();
+        for definition in definitions {
+            notes_doc.append(definition);
+        }
         let rendered = render_document(arena, notes_doc, opts, ctx)?;
         html.push_str(&rendered.html);
         html.push_str(rendered.notes.as_deref().unwrap_or_default());
@@ -304,8 +605,50 @@ fn is_notes(node: &AstNode<'_>) -> bool {
         NodeValue::BlockDirective(directive) if directive.info.split_whitespace().next() == Some("notes"))
 }
 
-/// Pass 3: images and raw HTML `src`/`poster` (module docs).
+/// Pass 3: a paragraph whose text starts with `:::name` is a directive comrak did not open
+/// (module docs): an `invalid-directive` warning on its first line.
+fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
+    for node in doc.descendants() {
+        if !matches!(node.data().value, NodeValue::Paragraph) {
+            continue;
+        }
+        let Some(first) = node.first_child() else {
+            continue;
+        };
+        let name = match &first.data().value {
+            NodeValue::Text(text) => {
+                let line = text.lines().next().unwrap_or_default();
+                let rest = line.trim_start_matches(':');
+                if line.len() - rest.len() < 3 {
+                    continue;
+                }
+                let name: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+                    .collect();
+                name
+            }
+            _ => continue,
+        };
+        if !name.starts_with(char::is_alphabetic) {
+            continue;
+        }
+        let message = format!(
+            "`:::{name} …` is not a directive: comrak does not open one when the line has a \
+             `:` after the fence (a URL, `title=\"a:b\"`); write the colon as `&#58;`"
+        );
+        let span = node_span(node).map(|span| SourceSpan {
+            end_line: span.start_line,
+            ..span
+        });
+        ctx.diagnostics.warn("invalid-directive", message).span = span;
+    }
+}
+
+/// Pass 4: images and raw HTML `src`/`poster` (module docs).
 fn rewrite_assets<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) -> Result<()> {
+    let mut scan = HtmlScan::default();
     for node in doc.descendants() {
         let span = node_span(node);
         let mut data = node.data_mut();
@@ -316,9 +659,11 @@ fn rewrite_assets<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) -> Result<()> {
                 }
             }
             NodeValue::HtmlBlock(block) => {
-                rewrite_html_assets(&mut block.literal, span.as_ref(), ctx)?;
+                rewrite_html_snippet(&mut block.literal, span.as_ref(), ctx, &mut scan)?;
             }
-            NodeValue::HtmlInline(literal) => rewrite_html_assets(literal, span.as_ref(), ctx)?,
+            NodeValue::HtmlInline(literal) => {
+                rewrite_html_snippet(literal, span.as_ref(), ctx, &mut scan)?;
+            }
             _ => {}
         }
     }
@@ -349,11 +694,12 @@ fn local_asset(
             span: span.cloned(),
         });
     }
+    // The format is frozen: `missing_asset_path` parses it.
     let message = format!(
-        "{what} `{url}` not found (looked for {})",
+        "{what} `{url}` not found{LOOKED_FOR}{})",
         resolved.display()
     );
-    ctx.diagnostics.warn("missing-asset", message).span = span.cloned();
+    ctx.diagnostics.warn(MISSING_ASSET, message).span = span.cloned();
     Ok(None)
 }
 
@@ -391,37 +737,124 @@ fn percent_decode(path: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| path.to_string())
 }
 
-/// Pass 4: per-slide footnote numbers (module docs).
-fn renumber_footnotes<'a>(doc: &'a AstNode<'a>) {
-    let mut order: Vec<String> = Vec::new();
+/// How one document's footnotes link up (pass 5 of the module docs).
+#[derive(Debug, Default)]
+struct FootnotePlan {
+    /// Label key ([`label_key`]) → id of the definition this document's references link to:
+    /// the first definition of the label in this document.
+    targets: BTreeMap<String, String>,
+    /// Label key → ids of this document's references to the label, in document order.
+    references: BTreeMap<String, Vec<String>>,
+}
+
+/// Pass 5 (module docs): numbers the references per document in order of first use, moves
+/// every footnote definition to the end in that order and plans the links. Warns about
+/// labels defined twice here (`duplicate-footnote`) and references with no definition here
+/// (`footnote-elsewhere`, once per label).
+fn prepare_footnotes<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) -> FootnotePlan {
+    let mut plan = FootnotePlan::default();
+    // label keys in order of first use, with the label and the line of that use
+    let mut order: Vec<(String, String, Option<SourceSpan>)> = Vec::new();
     for node in doc.descendants() {
+        let span = node_span(node);
         if let NodeValue::FootnoteReference(reference) = &mut node.data_mut().value {
-            let position = order.iter().position(|name| *name == reference.name);
-            let ix = position.unwrap_or_else(|| {
-                order.push(reference.name.clone());
-                order.len() - 1
-            });
+            let key = label_key(&reference.name);
+            let ix = match order.iter().position(|(k, ..)| *k == key) {
+                Some(ix) => ix,
+                None => {
+                    order.push((key.clone(), reference.name.clone(), span));
+                    order.len() - 1
+                }
+            };
             reference.ix = u32::try_from(ix + 1).unwrap_or(u32::MAX);
+            let id = reference_id(reference);
+            plan.references.entry(key).or_default().push(id);
         }
     }
     let mut definitions: Vec<_> = doc
-        .children()
-        .filter_map(|node| match &node.data().value {
-            NodeValue::FootnoteDefinition(def) => {
-                let rank = order.iter().position(|name| *name == def.name);
-                Some((rank.unwrap_or(usize::MAX), node))
-            }
-            _ => None,
-        })
+        .descendants()
+        .filter(|node| matches!(node.data().value, NodeValue::FootnoteDefinition(_)))
         .collect();
-    definitions.sort_by_key(|(rank, _)| *rank);
-    for (_, node) in definitions {
+    let first_use = |node: &AstNode<'_>| match &node.data().value {
+        NodeValue::FootnoteDefinition(def) => {
+            let key = label_key(&def.name);
+            order.iter().position(|(k, ..)| *k == key)
+        }
+        _ => None,
+    };
+    // stable: definitions without references here keep their order, after the others
+    definitions.sort_by_key(|node| first_use(node).unwrap_or(usize::MAX));
+    for node in definitions {
         doc.append(node);
+        let data = node.data();
+        let NodeValue::FootnoteDefinition(def) = &data.value else {
+            continue;
+        };
+        match plan.targets.entry(label_key(&def.name)) {
+            Entry::Vacant(entry) => {
+                entry.insert(definition_id(node, def));
+            }
+            Entry::Occupied(_) => {
+                let message = format!(
+                    "footnote `[^{}]` is defined more than once on this slide; its references \
+                     link to the first definition",
+                    def.name
+                );
+                ctx.diagnostics.warn("duplicate-footnote", message).span = node_span(node);
+            }
+        }
+    }
+    for (key, name, span) in order {
+        if !plan.targets.contains_key(&key) {
+            let message = format!(
+                "footnote `[^{name}]` is not defined on this slide: every slide (and every \
+                 notes block) lists its own footnotes, so define it where it is used"
+            );
+            ctx.diagnostics.warn("footnote-elsewhere", message).span = span;
+        }
+    }
+    plan
+}
+
+/// A footnote label as comrak matches them: trimmed, whitespace runs collapsed, case folded
+/// (lowercased; comrak's full Unicode case folding differs only for a few characters).
+fn label_key(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// comrak's id of a reference: `fnref-<label>`, `fnref-<label>-<n>` for the n-th (n > 1) use
+/// of the label in the parsed document, so ids are unique in a deck.
+fn reference_id(reference: &NodeFootnoteReference) -> String {
+    if reference.ref_num > 1 {
+        format!("fnref-{}-{}", reference.name, reference.ref_num)
+    } else {
+        format!("fnref-{}", reference.name)
     }
 }
 
-/// comrak's `format_html` with [`format_node`]; formatter diagnostics go to `ctx`.
-fn format_html<'a>(doc: &'a AstNode<'a>, opts: &Options, ctx: &mut RenderCtx) -> Result<String> {
+/// `fn-<label>` for the definition comrak resolved the label to (it counted the references);
+/// `fn<line>-<label>` for another definition of the same label, which comrak left in place
+/// with no references (a label reused on another slide). Unique in a deck either way.
+fn definition_id(node: &AstNode<'_>, def: &NodeFootnoteDefinition) -> String {
+    if def.total_references > 0 {
+        format!("fn-{}", def.name)
+    } else {
+        format!("fn{}-{}", node.data().sourcepos.start.line, def.name)
+    }
+}
+
+/// comrak's `format_html` with [`format_node`]; formatter diagnostics go to `ctx`. Closes the
+/// footnote list that the first footnote definition opened.
+fn format_html<'a>(
+    doc: &'a AstNode<'a>,
+    opts: &Options,
+    ctx: &mut RenderCtx,
+    footnotes: FootnotePlan,
+) -> Result<String> {
     let mut html = String::new();
     let plugins = Plugins::default();
     let state = format_document_with_formatter(
@@ -430,9 +863,16 @@ fn format_html<'a>(doc: &'a AstNode<'a>, opts: &Options, ctx: &mut RenderCtx) ->
         &mut html,
         &plugins,
         format_node,
-        FormatState::default(),
+        FormatState {
+            footnotes,
+            ..FormatState::default()
+        },
     )
     .map_err(|err| Error::Other(format!("formatting HTML failed: {err}")))?;
+    if state.definitions_written > 0 {
+        // the definitions are the last nodes of the document (`prepare_footnotes`)
+        html.push_str("</ol>\n</div>\n");
+    }
     ctx.diagnostics.extend(state.diagnostics);
     Ok(html)
 }
@@ -441,6 +881,12 @@ fn format_html<'a>(doc: &'a AstNode<'a>, opts: &Options, ctx: &mut RenderCtx) ->
 #[derive(Default)]
 struct FormatState {
     diagnostics: Vec<Diagnostic>,
+    footnotes: FootnotePlan,
+    /// Footnote definitions written so far; the first one opens the list.
+    definitions_written: u32,
+    /// Back-links of the definition being written (its number and the ids of the references
+    /// on this slide), until they are placed: in its last paragraph or before `</li>`.
+    pending_backrefs: Option<(u32, Vec<String>)>,
 }
 
 type FormatResult = std::result::Result<ChildRendering, fmt::Error>;
@@ -475,8 +921,131 @@ fn format_node<'a>(
             }
             Ok(ChildRendering::HTML)
         }
+        (NodeValue::FootnoteReference(reference), _) => {
+            write_footnote_reference(context, node, reference, entering)
+        }
+        (NodeValue::FootnoteDefinition(def), _) => {
+            write_footnote_definition(context, node, def, entering)
+        }
+        // the last paragraph of a footnote definition carries its back-links (as in comrak)
+        (NodeValue::Paragraph, _)
+            if !entering
+                && node.next_sibling().is_none()
+                && node.parent().is_some_and(|parent| {
+                    matches!(parent.data().value, NodeValue::FootnoteDefinition(_))
+                }) =>
+        {
+            write_backrefs(context, true)?;
+            context.write_str("</p>")?;
+            context.lf()?;
+            Ok(ChildRendering::HTML)
+        }
         _ => format_node_default(context, node, entering),
     }
+}
+
+/// `<sup class="footnote-ref"><a href="#<definition on this slide>" id="fnref-…">N</a></sup>`
+/// (module docs, pass 5); comrak's markup with a per-slide target and number.
+fn write_footnote_reference<'a>(
+    context: &mut Context<'_, '_, FormatState>,
+    node: &'a AstNode<'a>,
+    reference: &NodeFootnoteReference,
+    entering: bool,
+) -> FormatResult {
+    if entering {
+        let target = context
+            .user
+            .footnotes
+            .targets
+            .get(&label_key(&reference.name))
+            .cloned()
+            .unwrap_or_else(|| format!("fn-{}", reference.name));
+        context.write_str("<sup")?;
+        render_sourcepos(context, node)?;
+        context.write_str(" class=\"footnote-ref\"><a href=\"#")?;
+        context.escape_href(&target)?;
+        context.write_str("\" id=\"")?;
+        context.escape_href(&reference_id(reference))?;
+        write!(context, "\" data-footnote-ref>{}</a></sup>", reference.ix)?;
+    }
+    Ok(ChildRendering::HTML)
+}
+
+/// `<li id="…">` of a footnote definition; the first one opens
+/// `<div class="footnotes" data-footnotes><ol>` (closed by [`format_html`]). Only the
+/// definition a label's references link to gets back-links.
+fn write_footnote_definition<'a>(
+    context: &mut Context<'_, '_, FormatState>,
+    node: &'a AstNode<'a>,
+    def: &NodeFootnoteDefinition,
+    entering: bool,
+) -> FormatResult {
+    if !entering {
+        if write_backrefs(context, false)? {
+            context.lf()?;
+        }
+        context.write_str("</li>")?;
+        context.lf()?;
+        return Ok(ChildRendering::HTML);
+    }
+    if context.user.definitions_written == 0 {
+        context.cr()?;
+        context.write_str("<div")?;
+        render_sourcepos(context, node)?;
+        context.write_str(" class=\"footnotes\" data-footnotes>")?;
+        context.lf()?;
+        context.write_str("<ol>")?;
+        context.lf()?;
+    }
+    context.user.definitions_written += 1;
+    let id = definition_id(node, def);
+    context.write_str("<li")?;
+    render_sourcepos(context, node)?;
+    context.write_str(" id=\"")?;
+    context.escape_href(&id)?;
+    context.write_str("\">")?;
+    let state = &mut context.user;
+    let key = label_key(&def.name);
+    state.pending_backrefs = match state.footnotes.references.get(&key) {
+        Some(refs) if state.footnotes.targets.get(&key) == Some(&id) => {
+            Some((state.definitions_written, refs.clone()))
+        }
+        _ => None,
+    };
+    Ok(ChildRendering::HTML)
+}
+
+/// Writes the pending back-links of the current footnote definition (comrak's markup: `↩`,
+/// then `↩²`, … for further references on this slide); `false` when there were none.
+fn write_backrefs(
+    context: &mut Context<'_, '_, FormatState>,
+    leading_space: bool,
+) -> std::result::Result<bool, fmt::Error> {
+    let Some((ix, refs)) = context.user.pending_backrefs.take() else {
+        return Ok(false);
+    };
+    for (n, id) in (1..).zip(&refs) {
+        let (suffix, superscript) = if n == 1 {
+            (String::new(), String::new())
+        } else {
+            (
+                format!("-{n}"),
+                format!("<sup class=\"footnote-ref\">{n}</sup>"),
+            )
+        };
+        if n > 1 || leading_space {
+            context.write_str(" ")?;
+        }
+        context.write_str("<a href=\"#")?;
+        context.escape_href(id)?;
+        write!(
+            context,
+            "\" class=\"footnote-backref\" data-footnote-backref \
+             data-footnote-backref-idx=\"{ix}{suffix}\" \
+             aria-label=\"Back to reference {ix}{suffix}\">↩{superscript}</a>"
+        )?;
+    }
+    Ok(true)
 }
 
 /// `<div class="name classes…" data-…>` … `</div>` (dialect §4).
@@ -1064,6 +1633,221 @@ x <img src=\"images/missing.png\"> <img src=\"https://e.org/a.png\"> <img src=\"
         );
         assert_eq!(assets.len(), 1);
         assert_eq!(codes, [("missing-asset", 9)]);
+    }
+
+    #[test]
+    fn raw_html_text_in_values_scripts_and_styles_is_not_an_attribute() {
+        let id = ok_png_id();
+        let text = "\
+<img alt=\"x src=images/missing.png\" title=' poster=images/ok.png' src=\"https://e.org/a.png\">
+
+<script>var s = '<img src=\"images/missing.png\">';</script>
+
+<STYLE>x::after { content: '<video poster=images/missing.png>' }</Style>
+
+x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/ok.png>
+
+<textarea><img src=\"images/missing.png\"></textarea><img data-x=a src=images/ok.png>
+";
+        let (rendered, assets, codes) = render_with(text, RenderMode::Deck, false);
+        assert_eq!(codes, [], "{}", rendered.html);
+        assert_eq!(assets.len(), 1);
+        let html = &rendered.html;
+        assert!(html.starts_with(
+            "<img alt=\"x src=images/missing.png\" title=' poster=images/ok.png' \
+             src=\"https://e.org/a.png\">\n"
+        ));
+        assert!(html.contains("<script>var s = '<img src=\"images/missing.png\">';</script>\n"));
+        assert!(html.contains(&format!(
+            "</script> <img src=asset:{id}></p>\n<textarea><img src=\"images/missing.png\">\
+             </textarea><img data-x=a src=asset:{id}>"
+        )));
+    }
+
+    #[test]
+    fn start_tags_follow_the_html_tokenizer() {
+        let tags = |snippets: &[&str]| {
+            let mut scan = HtmlScan::default();
+            let mut found: Vec<String> = Vec::new();
+            for html in snippets {
+                let Ok(()) = scan.start_tags(html, |tag| {
+                    let attrs: Vec<String> = tag
+                        .attrs
+                        .iter()
+                        .map(|a| match &a.value {
+                            Some(range) => format!("{}={}", a.name, &html[range.clone()]),
+                            None => a.name.clone(),
+                        })
+                        .collect();
+                    found.push(format!("{}[{}]", tag.name, attrs.join(" ")));
+                    Ok::<(), Infallible>(())
+                });
+            }
+            (found, scan)
+        };
+        let (found, scan) = tags(&[
+            "<A HREF = 'x y' Data-K=v/ bare =odd>",
+            "<!--> <b x=1> <!---> <i y=2> <!-- <c> -->",
+            "</p x=1> <!DOCTYPE html> <?pi <d>?> a < b <e f=\"1>2\" g=é>",
+            "<script type=module>if (a<b) { '<f src=1>' }</SCRIPT ><g>",
+            "<p>unclosed <!-- <h>",
+            "--> <i src=\"unterminated",
+        ]);
+        assert_eq!(
+            found,
+            [
+                "a[href=x y data-k=v/ bare=odd]",
+                "b[x=1]",
+                "i[y=2]",
+                "e[f=1>2 g=é]",
+                "script[type=module]",
+                "g[]",
+                "p[]",
+                "i[src=unterminated]",
+            ]
+        );
+        assert_eq!(scan, HtmlScan::Data);
+        assert_eq!(tags(&["<style>a<b>"]).1, HtmlScan::RawText("style"));
+        assert_eq!(tags(&["x <!-- y"]).1, HtmlScan::Comment);
+    }
+
+    #[test]
+    fn math_markup_is_a_start_tag_attribute() {
+        for html in [
+            "<span data-math-style=\"inline\">x</span>",
+            "<div class=\"m\" DATA-MATH-STYLE='display'>x</div>",
+            "<p data-math-style>x</p>",
+        ] {
+            assert!(has_math_markup(html), "{html}");
+        }
+        for html in [
+            "<p>Use <code>data-math-style</code> attribute.</p>",
+            "<pre><code>&lt;span data-math-style=\"inline\"&gt;</code></pre>",
+            "<p title=\" data-math-style=x\">t</p>",
+            "<!-- <span data-math-style=\"inline\"> -->",
+            "<script>'<span data-math-style=\"inline\">'</script>",
+        ] {
+            assert!(!has_math_markup(html), "{html}");
+        }
+        let rendered = render(
+            "Use `data-math-style` attribute.\n\n```html\n<span data-math-style=\"inline\">x</span>\n```\n",
+        );
+        assert!(!rendered.features.math && rendered.features.code);
+        assert!(
+            render("<span data-math-style=\"inline\">x</span>\n")
+                .features
+                .math
+        );
+    }
+
+    #[test]
+    fn missing_asset_path_reads_the_frozen_message() {
+        let (_, _, codes) = render_with("![a](images/missing.png)\n", RenderMode::Deck, false);
+        assert_eq!(codes, [("missing-asset", 1)]);
+        let mut assets = AssetRegistry::new();
+        let mut diagnostics = Diagnostics::new();
+        let dir = fixture_dir();
+        let mut ctx = RenderCtx {
+            assets: &mut assets,
+            base_dir: &dir,
+            mode: RenderMode::Deck,
+            diagnostics: &mut diagnostics,
+            missing_asset_is_error: false,
+        };
+        let opts = comrak_options(&MarkdownConfig::default());
+        let text = "<img src=\"a b (1).png\"> ![x](sub/../gone%29.png)\n";
+        render_fragment(text, &opts, &mut ctx).unwrap();
+        let paths: Vec<_> = diagnostics.iter().map(missing_asset_path).collect();
+        assert_eq!(
+            paths,
+            [Some(dir.join("a b (1).png")), Some(dir.join("gone).png"))]
+        );
+        let other = Diagnostic::warning("invalid-directive", "x (looked for y)");
+        assert_eq!(missing_asset_path(&other), None);
+    }
+
+    #[test]
+    fn colons_in_a_directive_line_are_reported() {
+        let codes_of = |text: &str| render_with(text, RenderMode::Deck, false).2;
+        let (rendered, _, codes) = render_with(
+            "Intro\n\n:::box title=\"a:b\"\nx\n:::\n",
+            RenderMode::Deck,
+            false,
+        );
+        assert_eq!(codes, [("invalid-directive", 3)]);
+        assert_eq!(
+            rendered.html,
+            "<p>Intro</p>\n<p>:::box title=&quot;a:b&quot;\nx</p>\n<div>\n</div>\n"
+        );
+        assert_eq!(
+            codes_of("- item\n\n  ::::callout https://x.org\n  y\n  ::::\n"),
+            [("invalid-directive", 3)]
+        );
+        // `&#58;` is the colon comrak accepts
+        let rendered = render("::: tip title=\"a&#58;b\"\nok\n:::\n");
+        assert_eq!(
+            rendered.html,
+            "<div class=\"tip\" data-title=\"a:b\">\n<p>ok</p>\n</div>\n"
+        );
+        // not reported: text that does not start with a fence, two colons, no name
+        assert_eq!(codes_of("A :::b line\n\n::x\n\n::: 1:2\n"), []);
+    }
+
+    #[test]
+    fn duplicate_footnotes_on_one_fragment() {
+        let (rendered, _, codes) = render_with(
+            "A[^x]\n\n[^x]: first\n\n[^x]: second\n",
+            RenderMode::Deck,
+            false,
+        );
+        assert_eq!(codes, [("duplicate-footnote", 5)]);
+        assert!(
+            rendered
+                .html
+                .contains(r##"<a href="#fn3-x" id="fnref-x" data-footnote-ref>1</a>"##)
+        );
+        assert!(
+            rendered
+                .html
+                .contains("<li id=\"fn-x\">\n<p>second</p>\n</li>")
+        );
+    }
+
+    #[test]
+    fn heading_attributes_are_lifted_on_request() {
+        let mut assets = AssetRegistry::new();
+        let mut diagnostics = Diagnostics::new();
+        let dir = fixture_dir();
+        let mut ctx = RenderCtx {
+            assets: &mut assets,
+            base_dir: &dir,
+            mode: RenderMode::Notebook,
+            diagnostics: &mut diagnostics,
+            missing_asset_is_error: false,
+        };
+        let opts = comrak_options(&MarkdownConfig::default());
+        let text = "# Analysis {#a .wide layout=title}\n\n## Sub {.x}\n";
+        let (rendered, lifted) = render_fragment_with_lift(text, &opts, &mut ctx, true).unwrap();
+        assert_eq!(
+            rendered.html,
+            "<h1>Analysis</h1>\n<h2 class=\"x\">Sub</h2>\n"
+        );
+        assert_eq!(rendered.title.as_deref(), Some("Analysis"));
+        let lifted = lifted.unwrap();
+        assert_eq!(lifted.id.as_deref(), Some("a"));
+        assert_eq!(lifted.classes, ["wide"]);
+        let (rendered, lifted) = render_fragment_with_lift(text, &opts, &mut ctx, false).unwrap();
+        assert!(lifted.is_none());
+        assert!(
+            rendered
+                .html
+                .starts_with("<h1 id=\"a\" class=\"wide\" layout=\"title\">")
+        );
+        // only a leading heading is lifted
+        let (_, lifted) =
+            render_fragment_with_lift("x\n\n# H {.c}\n", &opts, &mut ctx, true).unwrap();
+        assert!(lifted.is_none());
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

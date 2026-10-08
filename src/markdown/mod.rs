@@ -17,7 +17,9 @@
 //!    ordered by line.
 //!
 //! Missing local files never fail [`parse`]: they are `missing-asset` warnings (dialect §6;
-//! ir.md §4 contract change). The pipeline decides whether they are fatal.
+//! ir.md §4 contract change). The pipeline decides whether they are fatal; the warning's
+//! `path` is the deck, and [`render::missing_asset_path`] gives the missing file for
+//! `Error::MissingAsset`.
 
 pub mod attrs;
 pub mod code;
@@ -276,7 +278,7 @@ More[^c].
         );
         assert!(first.contains(r##"<a href="#fn-b" id="fnref-b" data-footnote-ref>2</a>"##));
         assert!(first.contains(r##"<a href="#fn-a" id="fnref-a-2" data-footnote-ref>1</a>"##));
-        assert!(first.ends_with("</ol>\n</section>\n"), "{first}");
+        assert!(first.ends_with("</ol>\n</div>\n"), "{first}");
         let second = html(&slides[1]);
         assert!(second.starts_with("<h1>Two</h1>\n"));
         assert!(
@@ -284,10 +286,127 @@ More[^c].
             "{second}"
         );
         assert!(
-            second.contains("<section class=\"footnotes\" data-footnotes>\n<ol>\n<li id=\"fn-c\">")
+            second.contains("<div class=\"footnotes\" data-footnotes>\n<ol>\n<li id=\"fn-c\">")
         );
         assert!(second.contains("data-footnote-backref-idx=\"1\""));
-        assert!(second.ends_with("</ol>\n</section>\n"));
+        assert!(second.ends_with("</ol>\n</div>\n"));
+        assert!(parsed.diagnostics.is_empty());
+    }
+
+    /// reveal.js turns a slide that contains a `<section>` into a vertical stack, so nothing
+    /// the renderer writes may contain one (comrak's footnote list is a `<section>`).
+    #[test]
+    fn slides_and_notes_never_contain_a_section() {
+        let text = "\
+# One
+
+A claim[^src].
+
+::::fragment
+Step.
+::::
+
+:::notes
+Speaker text[^n].
+
+[^n]: A note's footnote.
+:::
+
+[^src]: Smith 2020.
+";
+        let parsed = parse_text(text);
+        let slide = &parsed.deck.slides[0];
+        let body = html(slide);
+        let notes = slide.notes.as_deref().unwrap();
+        for html in [body, notes] {
+            assert!(!html.contains("<section"), "{html}");
+        }
+        assert!(body.ends_with(
+            "<div class=\"footnotes\" data-footnotes>\n<ol>\n<li id=\"fn-src\">\n<p>Smith 2020. \
+             <a href=\"#fnref-src\" class=\"footnote-backref\" data-footnote-backref \
+             data-footnote-backref-idx=\"1\" aria-label=\"Back to reference 1\">↩</a></p>\n\
+             </li>\n</ol>\n</div>\n"
+        ));
+        // the definition written inside the notes block stays in the notes
+        assert!(!body.contains("A note's footnote"), "{body}");
+        assert!(notes.starts_with(
+            "<p>Speaker text<sup class=\"footnote-ref\"><a href=\"#fn-n\" id=\"fnref-n\" \
+             data-footnote-ref>1</a></sup>.</p>\n<div class=\"footnotes\" data-footnotes>\n"
+        ));
+        assert!(notes.contains("<li id=\"fn-n\">\n<p>A note's footnote. <a href=\"#fnref-n\""));
+        assert!(parsed.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn footnote_labels_can_be_reused_on_every_slide() {
+        let text = "# One\n\nA[^1]\n\n[^1]: one\n\n---\n\n# Two\n\nB[^1]\n\n[^1]: two\n";
+        let parsed = parse_text(text);
+        let (first, second) = (html(&parsed.deck.slides[0]), html(&parsed.deck.slides[1]));
+        // comrak resolves `1` to the last definition (`fn-1`); the other one is `fn<line>-1`
+        assert!(first.contains(r##"<a href="#fn5-1" id="fnref-1" data-footnote-ref>1</a>"##));
+        assert!(
+            first.contains(
+                "<li id=\"fn5-1\">\n<p>one <a href=\"#fnref-1\" class=\"footnote-backref\""
+            )
+        );
+        assert!(second.contains(r##"<a href="#fn-1" id="fnref-1-2" data-footnote-ref>1</a>"##));
+        assert!(second.contains(
+            "<li id=\"fn-1\">\n<p>two <a href=\"#fnref-1-2\" class=\"footnote-backref\" \
+             data-footnote-backref data-footnote-backref-idx=\"1\" \
+             aria-label=\"Back to reference 1\">↩</a></p>"
+        ));
+        // ids are unique across the deck and every back-link stays on its slide
+        let ids = regex::Regex::new(r#" id="([^"]+)""#).unwrap();
+        let mut all: Vec<&str> = [first, second]
+            .iter()
+            .flat_map(|html| ids.captures_iter(html).map(|c| c.get(1).unwrap().as_str()))
+            .collect();
+        let count = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), count, "duplicate ids: {first}{second}");
+        assert_eq!(first.matches("footnote-backref\"").count(), 1);
+        assert_eq!(second.matches("footnote-backref\"").count(), 1);
+        assert!(parsed.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn footnotes_defined_elsewhere_or_twice_are_reported() {
+        let text = "\
+# One
+
+A[^1] and[^1].
+
+[^1]: one
+
+---
+
+B[^1], C[^2].
+
+[^2]: first
+[^2]: second
+";
+        let parsed = parse_text(text);
+        let second = html(&parsed.deck.slides[1]);
+        // the reference with no definition here links to comrak's definition on slide 1
+        assert!(second.contains(r##"<a href="#fn-1" id="fnref-1-3" data-footnote-ref>1</a>"##));
+        assert!(second.contains(r##"<a href="#fn11-2" id="fnref-2" data-footnote-ref>2</a>"##));
+        // slide 1 lists only its own two references
+        let first = html(&parsed.deck.slides[0]);
+        assert!(first.contains("href=\"#fnref-1-2\""));
+        assert!(!first.contains("href=\"#fnref-1-3\""));
+        let found: Vec<_> = parsed
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.span.as_ref().map(|s| s.start_line)))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("footnote-elsewhere", Some(9)),
+                ("duplicate-footnote", Some(12))
+            ]
+        );
     }
 
     #[test]
