@@ -1,0 +1,30 @@
+# This presentation's theme. It extends the built-in "default" theme: any file this
+# directory does not have (templates, styles, assets) comes from there, so it only holds
+# what it changes. To see every file of the default theme:
+#   presenter theme eject default ./default-theme
+#
+# Lines like `#transition = "fade"` are switched off; delete the `#` to use them.
+
+name = "{{theme_name}}"    # shown in error messages and by `presenter theme list`
+extends = "default"        # the parent theme: a built-in name or a directory relative to this file
+description = "The theme of this presentation"
+
+[styles]
+entries = ["styles/theme.css"]   # added after the parent's stylesheets, so these rules win
+#reveal_theme = "white"          # reveal.js base theme: black, white, league, beige, night,
+                                 # serif, simple, solarized, moon, dracula, sky, blood,
+                                 # black-contrast, white-contrast or "none"
+#highlight_style = "monokai"     # code colors: "monokai", "zenburn", "none" or a CSS file
+
+[scripts]
+#entries = ["scripts/extra.js"]  # JavaScript files run before Reveal.initialize
+
+[reveal]                         # Reveal.initialize defaults for decks with this theme;
+#transition = "fade"             # presenter.toml [reveal] and front matter override them
+#slideNumber = "c/t"
+
+[layouts]                        # what this theme's layouts (templates/layouts/) are for
+title = "Title slide; adds the front matter's `event` as a last line"
+
+[vars]                           # free-form values for the templates: {{ theme.vars.accent }}
+#accent = "#2a76dd"

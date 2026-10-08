@@ -1,4 +1,5 @@
-//! Embedded assets: vendored reveal.js/KaTeX, our own scripts and the built-in themes.
+//! Embedded assets: vendored reveal.js/KaTeX, our own scripts, the built-in themes and the
+//! `presenter init` scaffold (`scaffold/`, dotfiles included).
 //!
 //! Contract: `docs/spec/vendored-assets.md` §4. Paths are relative to `assets/`, e.g.
 //! `vendor/reveal/dist/reveal.js`. Debug builds read the files from disk at runtime (so
@@ -18,12 +19,14 @@ use std::borrow::Cow;
 
 use crate::error::{Error, Result};
 
-/// The embedded `assets/` directory (vendor files, presenter scripts, built-in themes).
+/// The embedded `assets/` directory (vendor files, presenter scripts, built-in themes, the
+/// `presenter init` scaffold).
 #[derive(rust_embed::Embed)]
 #[folder = "assets/"]
 #[include = "vendor/**/*"]
 #[include = "presenter/**/*"]
 #[include = "themes/**/*"]
+#[include = "scaffold/**/*"]
 #[exclude = "**/*.map"]
 #[exclude = "**/.DS_Store"]
 #[exclude = "**/._*"]

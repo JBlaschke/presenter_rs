@@ -1,0 +1,15 @@
+{#- The "title" layout of this theme: the default theme's title slide plus one last line
+    with the deck's `event` (front matter keys presenter does not know, like `event`, are
+    available to templates as meta.vars.<key>).
+
+    `extends "@default/…"` reads the default theme's own file (a plain "layouts/title.html"
+    would find this file again), `block content` replaces the block of that name, and
+    `super()` renders the default theme's version of it. Templates use minijinja (Jinja2
+    syntax). `presenter dump <deck> --context` prints everything templates can use. -#}
+{%- extends "@default/layouts/title.html" %}
+{%- block content %}
+{{- super() }}
+{%- if meta.vars.event %}
+<p class="event">{{ meta.vars.event }}</p>
+{%- endif %}
+{%- endblock %}
