@@ -147,6 +147,128 @@ fn list_is_sorted_and_prefix_filtered() {
     assert!(vendor::list("no-such-prefix/").is_empty());
 }
 
+/// Debug builds resolve paths on disk, release builds by exact key; `get` must agree in both
+/// (CI runs this file under `cargo test` and `cargo test --release`).
+#[test]
+fn non_normalized_paths_resolve_like_clean_ones() {
+    for (messy, clean) in [
+        (
+            "vendor/reveal/css/theme/./fonts/league-gothic/league-gothic.css",
+            "vendor/reveal/css/theme/fonts/league-gothic/league-gothic.css",
+        ),
+        (
+            "vendor/reveal/css/theme/fonts/league-gothic/./league-gothic.woff",
+            "vendor/reveal/css/theme/fonts/league-gothic/league-gothic.woff",
+        ),
+        (
+            "vendor/katex/./fonts/KaTeX_Main-Regular.woff2",
+            "vendor/katex/fonts/KaTeX_Main-Regular.woff2",
+        ),
+        (
+            "vendor/katex/fonts/../katex.min.css",
+            "vendor/katex/katex.min.css",
+        ),
+        ("vendor//VERSIONS.toml", "vendor/VERSIONS.toml"),
+        (
+            "vendor//reveal/dist/reveal.js",
+            "vendor/reveal/dist/reveal.js",
+        ),
+        (
+            "vendor/../vendor/reveal/dist/reveal.js",
+            "vendor/reveal/dist/reveal.js",
+        ),
+        ("presenter/../vendor/VERSIONS.toml", "vendor/VERSIONS.toml"),
+        ("./presenter/math.js", "presenter/math.js"),
+        ("/presenter/math.js", "presenter/math.js"),
+        (
+            "vendor/reveal/dist/reveal.js/",
+            "vendor/reveal/dist/reveal.js",
+        ),
+        (
+            "vendor\\reveal\\dist\\reveal.js",
+            "vendor/reveal/dist/reveal.js",
+        ),
+    ] {
+        let expected = vendor::get(clean).unwrap_or_else(|| panic!("{clean} is vendored"));
+        let actual = vendor::get(messy);
+        // Compare without printing the (possibly binary) contents on failure.
+        assert!(
+            actual.as_deref() == Some(&*expected),
+            "{messy:?}: got {:?} bytes, want the {} bytes of {clean}",
+            actual.map(|data| data.len()),
+            expected.len()
+        );
+    }
+    assert_eq!(
+        vendor::get_str("vendor/./VERSIONS.toml").unwrap(),
+        vendor::get_str("vendor/VERSIONS.toml").unwrap()
+    );
+}
+
+#[test]
+fn wrong_case_directories_and_escaping_paths_are_none() {
+    for path in [
+        // On macOS the debug-mode disk lookup is case-insensitive; release lookup is not.
+        "vendor/reveal/dist/Reveal.js",
+        "vendor/reveal/dist/REVEAL.JS",
+        "Vendor/reveal/dist/reveal.js",
+        // Directories are not files.
+        "vendor/reveal",
+        "vendor/reveal/dist/",
+        // Nothing outside assets/.
+        "../assets/vendor/VERSIONS.toml",
+        "vendor/../../Cargo.toml",
+        "../Cargo.toml",
+        "",
+        "/",
+    ] {
+        assert!(vendor::get(path).is_none(), "{path:?} must be None");
+    }
+}
+
+#[test]
+fn every_listed_path_is_gettable() {
+    let all = vendor::list("");
+    // vendor/ plus the two presenter scripts, at least.
+    assert!(all.len() >= expected_vendor_files().len() + 2, "{all:?}");
+    for path in &all {
+        assert!(
+            vendor::get(path).is_some(),
+            "{path} is listed but not gettable"
+        );
+    }
+}
+
+/// CI plants junk files (`.DS_Store`, `._*`, `Thumbs.db`, `*.swp`, `*~`) under `assets/`
+/// before testing, so there this checks the rust-embed excludes in both build modes.
+#[test]
+fn os_junk_is_never_listed_or_served() {
+    let is_junk = |path: &str| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        name == ".DS_Store"
+            || name.starts_with("._")
+            || name == "Thumbs.db"
+            || name.ends_with(".swp")
+            || name.ends_with('~')
+    };
+    let junk: Vec<String> = vendor::list("")
+        .into_iter()
+        .filter(|p| is_junk(p))
+        .collect();
+    assert!(junk.is_empty(), "OS/editor junk embedded: {junk:?}");
+    for path in [
+        "vendor/.DS_Store",
+        "vendor/reveal/dist/theme/.DS_Store",
+        "vendor/katex/._katex.min.js",
+        "themes/default/.DS_Store",
+        "themes/default/Thumbs.db",
+        "presenter/.math.js.swp",
+        "presenter/math.js~",
+    ] {
+        assert!(vendor::get(path).is_none(), "{path} must be None");
+    }
+}
+
 #[test]
 fn presenter_scripts_are_embedded() {
     assert!(vendor::get("presenter/math.js").is_some());

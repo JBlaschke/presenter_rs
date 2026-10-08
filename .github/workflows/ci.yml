@@ -25,8 +25,19 @@ jobs:
         run: cargo fmt --check
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      # OS/editor junk must never be listed, served or embedded (src/vendor.rs excludes it);
+      # plant some so the vendor_smoke tests exercise the excludes in both build modes.
+      - name: plant junk files under assets/
+        run: |
+          touch assets/vendor/.DS_Store assets/vendor/reveal/dist/theme/.DS_Store \
+            assets/themes/default/.DS_Store assets/vendor/katex/._katex.min.js \
+            assets/themes/default/Thumbs.db assets/presenter/.math.js.swp assets/presenter/math.js~
       - name: cargo test
         run: cargo test
+      # Debug builds read assets/ from disk, release builds embed them: test the embedded
+      # mode too (docs/spec/vendored-assets.md §4).
+      - name: cargo test --release (embedded assets)
+        run: cargo test --release
 
   vendor-drift:
     name: vendored assets match scripts/vendor.sh
