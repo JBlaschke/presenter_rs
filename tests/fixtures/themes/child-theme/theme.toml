@@ -1,0 +1,20 @@
+# Test fixture (T13, docs/spec/theme-format.md): a child of the built-in default theme.
+# It overrides templates/layouts/title.html, adds styles/child.css after the default
+# theme's styles, and sets a few [styles]/[reveal]/[vars] values to test inheritance.
+name = "child-theme"
+extends = "default"
+description = "Fixture: overrides the title layout and adds a stylesheet"
+
+[styles]
+entries = ["styles/child.css"]
+highlight_style = "zenburn"
+
+[reveal]
+transition = "fade"
+slideNumber = "c/t"
+
+[layouts]
+title = "Title slide with an accent bar (overrides the default title layout)"
+
+[vars]
+accent = "#2a76dd"

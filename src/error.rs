@@ -88,6 +88,75 @@ impl From<toml::de::Error> for Error {
     }
 }
 
+/// minijinja errors become [`Error::Template`] without debug info; use [`template_error`]
+/// with `env.debug()` where the environment's debug flag should decide.
+impl From<minijinja::Error> for Error {
+    fn from(err: minijinja::Error) -> Self {
+        template_error(err, false)
+    }
+}
+
+/// Converts a minijinja error to [`Error::Template`].
+///
+/// minijinja reports an error raised inside an included template (or a `super()` block)
+/// as an error located at the include site whose source is the original error. The
+/// conversion walks that chain and reports the innermost located error: `template` and
+/// `line` are where the problem is (e.g. `layouts/title.html`, line 4; `<unknown>` when
+/// minijinja does not know, as for a top-level `get_template` of a missing name), and
+/// `message` is its kind and detail, any further causes (`: cause`), then the include
+/// sites from the inside out (`(via slide.html line 3, deck.html line 12)`). minijinja's
+/// own `(in name:line)` suffix is left out since the location is in the other fields.
+///
+/// With `debug` (serve mode: pass `env.debug()`), the message also contains that error's
+/// `display_debug_info()`: the template source around the line and the referenced
+/// variables, when minijinja captured them.
+pub fn template_error(err: minijinja::Error, debug: bool) -> Error {
+    use std::fmt::Write as _;
+
+    // The chain of minijinja errors, outermost first, and the first other cause after it.
+    let mut frames: Vec<&minijinja::Error> = vec![&err];
+    let mut cause = std::error::Error::source(&err);
+    while let Some(inner) = cause.and_then(|c| c.downcast_ref::<minijinja::Error>()) {
+        frames.push(inner);
+        cause = std::error::Error::source(inner);
+    }
+    let at = frames
+        .iter()
+        .rposition(|frame| frame.line().is_some())
+        .unwrap_or(0);
+    let origin = frames[at];
+    let describe = |frame: &minijinja::Error| match frame.detail() {
+        Some(detail) => format!("{}: {detail}", frame.kind()),
+        None => frame.kind().to_string(),
+    };
+    let mut message = frames[at..]
+        .iter()
+        .map(|frame| describe(frame))
+        .collect::<Vec<_>>()
+        .join(": ");
+    while let Some(inner) = cause {
+        // Writing to a String cannot fail.
+        let _ = write!(message, ": {inner}");
+        cause = inner.source();
+    }
+    let sites: Vec<String> = frames[..at]
+        .iter()
+        .rev()
+        .filter_map(|frame| Some(format!("{} line {}", frame.name()?, frame.line()?)))
+        .collect();
+    if !sites.is_empty() {
+        let _ = write!(message, " (via {})", sites.join(", "));
+    }
+    if debug {
+        let _ = write!(message, "{}", origin.display_debug_info());
+    }
+    Error::Template {
+        template: origin.name().unwrap_or("<unknown>").to_string(),
+        line: origin.line(),
+        message: message.trim_end().to_string(),
+    }
+}
+
 /// Severity of a [`Diagnostic`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

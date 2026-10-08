@@ -1,0 +1,9 @@
+{#- child-theme fixture: overrides the default title layout. Same contract as every
+    layout (theme-format.md §7): exactly one <section>, blocks through block.html,
+    speaker notes in <aside class="notes">. -#}
+<section{% if slide.id %} id="{{ slide.id }}"{% endif %} class="layout-{{ slide.layout }} child-title {{ slide.classes|join(' ') }}"{{ slide.attrs|attrs }}>
+<div class="child-accent" style="background: {{ theme.vars.accent }}"></div>
+{% for block in slide.blocks %}{% include "block.html" %}{% endfor %}
+{% if meta.subtitle %}<p class="subtitle">{{ meta.subtitle }}</p>{% endif %}
+{% if slide.notes %}<aside class="notes">{{ slide.notes|safe }}</aside>{% endif %}
+</section>
