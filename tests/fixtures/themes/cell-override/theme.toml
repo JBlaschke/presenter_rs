@@ -1,0 +1,6 @@
+# Test fixture (T33, docs/spec/theme-format.md §6–§7): a child of the built-in default theme
+# that replaces only templates/cell.html. It has no stylesheet of its own: its cells keep the
+# default theme's classes, so the default styles/notebook.css styles them.
+name = "cell-override"
+extends = "default"
+description = "Fixture: overrides cell.html only (no prompts, tags as a data attribute)"

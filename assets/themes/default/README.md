@@ -9,7 +9,8 @@ footnotes and columns, four layouts, and print rules for PDF export.
 ```
 default/
 ├── theme.toml                 name, reveal_theme = "white", highlight_style = "monokai", [layouts]
-├── styles/theme.css           every rule and token below
+├── styles/theme.css           the tokens and rules below
+├── styles/notebook.css        the notebook cells' design (see Notebook cells)
 └── templates/
     ├── deck.html              document shell (blocks head, styles, body_start, slides, scripts, body_end)
     ├── slide.html             one slide or vertical stack; picks the layout
@@ -98,8 +99,7 @@ is relative to the surrounding text.
 | `--p-alert-caution` | `color-mix(in oklab, #dc2626 75%, currentColor)` | `> [!CAUTION]` alerts. |
 | `--p-alert-color` | `var(--p-alert-note)` | Set on each `.markdown-alert` from the five tokens above; the alert box reads it. Override the five instead. |
 | `--p-cell-gap` | `0.5em` | Vertical space around a notebook `.cell`. |
-| `--p-cell-border` | `1px solid rgba(128, 128, 128, 0.4)` | Frame of a notebook `.cell` and its output area. |
-| `--p-output-max-height` | `40vh` | Taller notebook cell outputs scroll. |
+| `--p-cell-border` | `1px solid rgba(128, 128, 128, 0.4)` | Frame of a notebook cell's output area, under its input. More notebook tokens: [Notebook cells](#notebook-cells). |
 
 ### reveal variables the theme overrides
 
@@ -138,7 +138,7 @@ overrides these:
 | `[data-math-style]` | `$…$`, `$$…$$` | KaTeX; wide display math scrolls instead of overflowing |
 | `section.has-dark-background`, `section.has-light-background` | `background=` colours | white or dark text, and every derived token with it |
 | `aside.notes` | `:::notes` | hidden on the slide (reveal); shown in the speaker view (<kbd>S</kbd>) |
-| `.cell`, `.cell-*`, `.output*` | notebooks | structural rules only (framing, hidden parts) |
+| `.cell`, `.cell-*`, `.output*` | notebook code cells | see [Notebook cells](#notebook-cells) |
 
 reveal's own layout helpers work with the slide padding:
 
@@ -153,6 +153,81 @@ reveal's own layout helpers work with the slide padding:
   holds fit text directly drops its side padding and the text spans the slide, as in
   reveal.
 - `r-stack`, `r-hstack` and `r-vstack` are left alone.
+
+## Notebook cells
+
+A Jupyter notebook's code cells are rendered by `templates/cell.html` and styled by
+`styles/notebook.css` (Markdown cells are ordinary slide content). A cell reads as a card:
+the input is a highlighted code block, and the outputs sit in a frame under it.
+[`examples/notebook/`](../../../examples/notebook/) shows every part.
+
+```html
+<div class="cell" data-cell-index="7">                <!-- + fragment, hide-input, hide-output -->
+  <div class="cell-input">
+    <div class="cell-prompt">In [3]:</div>           <!-- when [notebook] show_prompts -->
+    <pre><code class="language-python" data-trim>…</code></pre>
+  </div>
+  <div class="cell-outputs">                          <!-- only when the cell has outputs -->
+    <pre class="output output-stream stdout">…</pre>  <!-- or stderr -->
+    <div class="output output-display" data-mime="text/html">
+      <div class="cell-prompt">Out [3]:</div>        <!-- execute results only -->
+      <table class="dataframe">…</table>              <!-- or img.output-image, pre.output-text, … -->
+    </div>
+    <pre class="output output-error">…</pre>          <!-- the traceback -->
+    <div class="output output-unsupported">No renderable output (…)</div>
+  </div>
+</div>
+```
+
+- **Prompts** (`In [n]:`, and `Out [n]:` on execute results) are small labels in
+  `--p-prompt-color`. `show_prompts = false` under `[notebook]` in `presenter.toml`, or
+  `notebook: {show_prompts: false}` in the front matter, leaves them out.
+- **Outputs** taller than `--p-output-max-height` scroll inside their frame, and lines longer
+  than the slide scroll it sideways (they never wrap). Images keep their size, or the width and
+  height the notebook recorded, and shrink to fit the frame instead of scrolling it.
+- **Streams:** stdout is plain text; stderr is tinted with `--p-stderr-color`.
+- **Errors:** the traceback sits in a box with a bar in `--p-error-color` and a tint of it.
+- **DataFrames** (pandas' `table.dataframe`, and any HTML table in a result): compact text
+  (`--p-cell-font-size`), numbers right-aligned in tabular figures, the index column bold and
+  left-aligned. The header rows (two for a named index) stay in view at the top of the frame
+  while it scrolls, on the deck's background colour (`--r-background-color`). On a slide with
+  its own background (a `background=` colour, image, video or gradient) they scroll with the
+  table instead, since the slide's colour is not known to the stylesheet.
+- **Rendered Markdown and LaTeX** results keep the slide's text size.
+- **`hide-input`** (tag, or `metadata.jupyter.source_hidden`): the outputs become slide
+  content, without frame or prompts. Hidden inputs and outputs stay in the markup with
+  `display: none`, so a theme can show them faintly instead.
+- **`fragment`** (slide type or tag): the whole cell is one reveal fragment.
+- **ANSI colours** in streams and tracebacks (text and background, SGR 30–37, 40–47, 90–97
+  and 100–107) are spans that read one of 16 variables, the converter's names rather than
+  `--p-` tokens: `--black`, `--red`, `--green`, `--yellow`, `--blue`, `--magenta`, `--cyan`,
+  `--white`, and `--bright-black` … `--bright-white`. `.cell-outputs` sets all 16: the six
+  colours mixed with the text colour, so they stay readable as text on light and dark slides;
+  each bright colour equal to the normal one; black, white and their bright variants as shades
+  of the text colour. Set them on `.reveal .cell-outputs` to change them.
+
+| token | default | purpose |
+|---|---|---|
+| `--p-cell-font-size` | `0.5em` | Text size of a cell's code, its text outputs and its tables, relative to the slide text. |
+| `--p-prompt-color` | `color-mix(in srgb, currentColor 50%, transparent)` | Colour of the `In [n]:` and `Out [n]:` prompts. |
+| `--p-stderr-color` | `var(--p-alert-warning)` | Text and background tint of stderr output. |
+| `--p-error-color` | `var(--p-alert-caution)` | Bar and background tint of an error's traceback. |
+| `--p-output-max-height` | `288px` | Taller outputs scroll inside their frame; images shrink to fit it. 40 % of the default 720px slide height. Use slide pixels, not `vh`: reveal scales the slide to the window, so a `vh` length grows with the window and can overflow the slide. |
+
+`--p-cell-gap` and `--p-cell-border` are in the [token table](#tokens).
+
+**Your own cell markup.** Put a `templates/cell.html` in a child theme. It receives `cell`
+(`index`, `language`, `source`, `execution_count`, `outputs`, `hide_input`, `hide_output`,
+`fragment`, `tags`, `metadata`; see `presenter dump --context`) and the whole template context
+(`config.notebook.show_prompts`). Each output has a `kind`: `stream` (`name`, `html`), `error`
+(`ename`, `evalue`, `html`), `display` (`mime`, `html`, `execution_count`) or `unsupported`
+(`mimes`). Output `html` is already rendered: insert it with `|safe`, and leave `cell.source`
+escaped. Keep the classes above and the default stylesheet styles your markup without any CSS
+of your own. To wrap the default markup instead of replacing it:
+
+```jinja
+<div class="my-cell">{% include "@default/cell.html" %}</div>
+```
 
 ## Print and PDF
 

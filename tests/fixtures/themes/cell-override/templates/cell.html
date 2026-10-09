@@ -1,0 +1,23 @@
+{#- Test fixture (T33): a notebook cell without prompts. It keeps the class contract of
+    docs/spec/theme-format.md §6 (cell, cell-input, cell-outputs, output, output-stream
+    stdout/stderr, output-error, output-display, output-unsupported, hide-input, hide-output,
+    fragment), so the default theme's stylesheet applies unchanged. Additions: the class
+    `compact-cell` and the cell's tags in `data-tags`. -#}
+<div class="cell compact-cell{% if cell.fragment %} fragment{% endif %}{% if cell.hide_input %} hide-input{% endif %}{% if cell.hide_output %} hide-output{% endif %}" data-cell-index="{{ cell.index }}" data-tags="{{ cell.tags|join(" ") }}">
+<div class="cell-input"><pre><code class="language-{{ cell.language }}" data-trim>{{ cell.source }}</code></pre></div>
+{%- if cell.outputs %}
+<div class="cell-outputs">
+{%- for out in cell.outputs %}
+{%- if out.kind == "stream" %}
+<pre class="output output-stream {{ out.name }}">{{ out.html|safe }}</pre>
+{%- elif out.kind == "error" %}
+<pre class="output output-error">{{ out.html|safe }}</pre>
+{%- elif out.kind == "display" %}
+<div class="output output-display" data-mime="{{ out.mime }}">{{ out.html|safe }}</div>
+{%- else %}
+<div class="output output-unsupported">No renderable output ({{ out.mimes|join(", ") }})</div>
+{%- endif %}
+{%- endfor %}
+</div>
+{%- endif %}
+</div>

@@ -1,8 +1,11 @@
-{#- A notebook code cell (docs/spec/theme-format.md §6–§7, notebook-mapping.md §4).
-    Receives `cell` (an ir::NotebookCell). Hidden input/output is still emitted and hidden
-    by CSS (`.cell.hide-input .cell-input`, `.cell.hide-output .cell-outputs`), so a theme
-    can choose to show it faintly instead. Output `html` is already rendered by the
-    notebook frontend and inserted unescaped. -#}
+{#- A notebook code cell (docs/spec/theme-format.md §6–§7, notebook-mapping.md §4), styled by
+    styles/notebook.css. Receives `cell` (an ir::NotebookCell) and the whole context
+    (`config.notebook.show_prompts` switches the In/Out prompts). Hidden input/output is
+    still emitted and hidden by CSS (`.cell.hide-input .cell-input`, `.cell.hide-output
+    .cell-outputs`), so a theme can choose to show it faintly instead. Output `html` is
+    already rendered by the notebook frontend and inserted unescaped; `cell.source` stays
+    auto-escaped. A child theme may replace this file and keep these classes to reuse the
+    default stylesheet (README.md, "Notebook cells"). -#}
 {%- set show_prompts = config.notebook.show_prompts|default(true) %}
 <div class="cell{% if cell.fragment %} fragment{% endif %}{% if cell.hide_input %} hide-input{% endif %}{% if cell.hide_output %} hide-output{% endif %}" data-cell-index="{{ cell.index }}">
 <div class="cell-input">

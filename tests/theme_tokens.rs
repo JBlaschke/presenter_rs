@@ -9,7 +9,11 @@
 //! - no `@import`, `@font-face` or remote URL in the theme CSS (offline output);
 //! - rules that keep reveal's layout helpers, highlight styles, inline images, tables and
 //!   the overview working (the browser checks themselves are manual, see the T17 PR);
-//! - the title layout's logo: front matter `logo:`, theme `[vars] logo`, `logo: false`.
+//! - the title layout's logo: front matter `logo:`, theme `[vars] logo`, `logo: false`;
+//! - (T33) `styles/notebook.css`: its tokens are in the README's "Notebook cells" section,
+//!   and the rules behind the notebook browser checks (outputs that scroll past a cap in
+//!   slide pixels, hidden parts, DataFrame headers that stick flush with the frame and give
+//!   way on slides with their own background, tinted stderr and errors, all 16 ANSI colours).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -62,8 +66,10 @@ fn normalize(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Custom properties with `prefix` (`--p-`, `--r-`) the CSS declares, each with the value
-/// of its first declaration.
+/// Custom properties with `prefix` (`--p-`, `--r-`) the CSS declares, each with its default:
+/// the value of its last declaration in a top-level `:root` rule (a later stylesheet, such as
+/// notebook.css, overrides an earlier one, as in the browser), or else of its first
+/// declaration (a token only set on elements, like `--p-alert-color`).
 fn declared(css: &str, prefix: &str) -> BTreeMap<String, String> {
     let declaration = Regex::new(&format!(
         r"({}[a-z0-9-]+)\s*:\s*([^;]+);",
@@ -74,6 +80,17 @@ fn declared(css: &str, prefix: &str) -> BTreeMap<String, String> {
     for caps in declaration.captures_iter(css) {
         out.entry(caps[1].to_string())
             .or_insert_with(|| normalize(&caps[2]));
+    }
+    let roots = rules(css);
+    for root in roots
+        .iter()
+        .filter(|r| r.context.is_empty() && r.selector == ":root")
+    {
+        for (name, value) in &root.declarations {
+            if name.starts_with(prefix) {
+                out.insert(name.clone(), value.clone());
+            }
+        }
     }
     out
 }
@@ -601,6 +618,275 @@ fn overview_thumbnails_are_one_slide_high() {
         .collect();
     assert!(auto.len() >= 3, "{auto:?}");
     assert!(auto.iter().all(|&i| i < overview), "{auto:?} vs {overview}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Notebook cells (T33): styles/notebook.css and the README's "Notebook cells" section
+// ---------------------------------------------------------------------------------------
+
+/// styles/notebook.css without comments.
+fn notebook_css() -> String {
+    let comments = Regex::new(r"(?s)/\*.*?\*/").unwrap();
+    comments
+        .replace_all(&read("styles/notebook.css"), "")
+        .into_owned()
+}
+
+/// The README from `## Notebook cells` up to the next `## ` heading.
+fn notebook_section() -> String {
+    let readme = readme();
+    let start = readme
+        .find("\n## Notebook cells\n")
+        .expect("README section Notebook cells");
+    let rest = &readme[start + 1..];
+    let end = rest[3..].find("\n## ").map_or(rest.len(), |i| i + 3);
+    rest[..end].to_string()
+}
+
+/// notebook.css comes after theme.css, so its rules win over theme.css's structural cell
+/// rules, and the README's notebook section documents every token it declares (the rows of
+/// the other tables are checked by `every_declared_token_is_documented_with_its_default`).
+#[test]
+fn notebook_tokens_are_documented_in_the_notebook_section() {
+    let entries = stylesheets();
+    let position = |entry: &str| {
+        entries
+            .iter()
+            .position(|e| e == entry)
+            .unwrap_or_else(|| panic!("{entry} not in theme.toml [styles] entries"))
+    };
+    assert!(
+        position("styles/theme.css") < position("styles/notebook.css"),
+        "{entries:?}"
+    );
+    let css = notebook_css();
+    let declared = declared(&css, "--p-");
+    let section = documented_tokens(&notebook_section());
+    for token in ["--p-prompt-color", "--p-cell-font-size"] {
+        assert!(declared.contains_key(token), "{token} not declared");
+    }
+    for (name, value) in &declared {
+        assert_eq!(section.get(name), Some(value), "{name} in Notebook cells");
+    }
+    // The cell tokens theme.css declares are read here and documented in the token table.
+    let used = used(&css);
+    let documented = documented_tokens(&readme());
+    for token in ["--p-cell-gap", "--p-cell-border", "--p-output-max-height"] {
+        assert!(used.contains(token), "notebook.css does not read {token}");
+        assert!(documented.contains_key(token), "{token}");
+    }
+}
+
+/// reveal scales the whole slide to the window with a transform, so a `vh` cap grows with the
+/// window: 40vh is 576 slide pixels in a 2560×1440 window, and the 200-line output of the
+/// example overflowed the slide. The cap that applies (notebook.css replaces theme.css's
+/// 40vh) is in slide pixels and well inside the 720px slide; images under an `Out [n]:` prompt
+/// leave room for it.
+#[test]
+fn the_output_cap_is_in_slide_pixels() {
+    let effective = declared(&css(), "--p-");
+    let cap = &effective["--p-output-max-height"];
+    assert_eq!(
+        cap,
+        &declared(&notebook_css(), "--p-")["--p-output-max-height"]
+    );
+    let px: f64 = cap
+        .strip_suffix("px")
+        .unwrap_or_else(|| panic!("--p-output-max-height: {cap} is not in slide pixels"))
+        .parse()
+        .unwrap();
+    assert!((150.0..=400.0).contains(&px), "{px}px");
+
+    let rules = rules(&notebook_css());
+    let image = ".reveal .output-display img.output-image, .reveal .output-display figure.output-image > svg";
+    assert_eq!(
+        rule(&rules, image).get("max-height"),
+        Some("calc(var(--p-output-max-height) - 1em)")
+    );
+    let under_prompt = rule(
+        &rules,
+        ".reveal .output-display > .cell-prompt + img.output-image, .reveal .output-display > .cell-prompt + figure.output-image > svg",
+    );
+    assert_eq!(
+        under_prompt.get("max-height"),
+        Some("calc(var(--p-output-max-height) - 1.7em)")
+    );
+}
+
+/// ansi-to-html writes `var(--<name>,<fallback>)` for all 16 four-bit colours, text and
+/// background; `.cell-outputs` sets every one, so none falls back to the converter's colours
+/// for a black terminal (`#ff5` bright yellow is invisible on a white slide).
+#[test]
+fn every_ansi_colour_is_themed() {
+    let mut sgr = String::new();
+    for code in (30..=37).chain(40..=47).chain(90..=97).chain(100..=107) {
+        sgr.push_str(&format!("\u{1b}[{code}mx\u{1b}[0m "));
+    }
+    let html = presenter::notebook::outputs::ansi_to_html(&sgr);
+    let reference = Regex::new(r"var\(--([a-z-]+),").unwrap();
+    let names: BTreeSet<String> = reference
+        .captures_iter(&html)
+        .map(|caps| format!("--{}", &caps[1]))
+        .collect();
+    assert_eq!(names.len(), 16, "{names:?} from {html}");
+    assert!(
+        names.contains("--bright-yellow") && names.contains("--black"),
+        "{names:?}"
+    );
+
+    let rules = rules(&notebook_css());
+    let outputs = rule(&rules, ".reveal .cell-outputs");
+    let section = notebook_section();
+    for name in &names {
+        let value = outputs
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is not set on .cell-outputs"));
+        assert!(
+            value.contains("currentColor") || value.starts_with("var(--"),
+            "{name}: {value} does not follow the text colour"
+        );
+        assert!(
+            section.contains(&format!("`{name}`")) || name.starts_with("--bright-"),
+            "{name}"
+        );
+    }
+    for name in ["--bright-black", "--bright-white"] {
+        assert!(
+            section.contains(&format!("`{name}`")),
+            "{name} in the README"
+        );
+    }
+}
+
+/// The DataFrame header: the whole `thead` sticks (pandas writes two header rows for a named
+/// index, and two `th` rows stuck at the same `top` overlap), flush with the frame's top edge
+/// (`top` is minus the frame's padding-top, both in the frame's em, so the text size sits on
+/// the rows), with separate borders so its underline moves with it. On a slide with its own
+/// background it scrolls with the table and paints no background: the deck's background
+/// colour would be a white band on a dark slide.
+#[test]
+fn dataframe_headers_stick_flush_and_follow_the_slide_background() {
+    let rules = rules(&notebook_css());
+    let outputs = rule(&rules, ".reveal .cell-outputs");
+    let padding_top = outputs.get("padding").unwrap().split(' ').next().unwrap();
+    assert_eq!(padding_top, "0.3em");
+
+    let table = rule(&rules, ".reveal .output-display table");
+    assert_eq!(table.get("border-collapse"), Some("separate"));
+    assert_eq!(
+        table.get("font-size"),
+        Some("inherit"),
+        "thead's em is the frame's"
+    );
+    assert_eq!(
+        rule(&rules, ".reveal .output-display table :is(tr, caption)").get("font-size"),
+        Some("var(--p-cell-font-size)")
+    );
+    let thead = rule(&rules, ".reveal .output-display table thead");
+    assert_eq!(thead.get("position"), Some("sticky"));
+    assert_eq!(thead.get("top"), Some(format!("-{padding_top}").as_str()));
+    assert_eq!(
+        rule(
+            &rules,
+            ".reveal .cell.hide-input .output-display table thead"
+        )
+        .get("top"),
+        Some("0"),
+        "a hidden-input cell's frame has no padding"
+    );
+    assert_eq!(
+        rule(&rules, ".reveal .cell.hide-input .cell-outputs").get("padding"),
+        Some("0")
+    );
+    let th = rule(&rules, ".reveal .output-display table thead th");
+    assert_eq!(th.get("position"), None, "rows of a sticky th overlap");
+    assert_eq!(
+        th.get("background"),
+        Some("var(--r-background-color, #fff)")
+    );
+
+    let own = ".reveal .slides section:is(.has-dark-background, .has-light-background, [data-background], [data-background-color], [data-background-image], [data-background-video], [data-background-iframe], [data-background-gradient])";
+    assert_eq!(
+        rule(&rules, &format!("{own} .output-display table thead")).get("position"),
+        Some("static")
+    );
+    assert_eq!(
+        rule(&rules, &format!("{own} .output-display table thead th")).get("background"),
+        Some("none")
+    );
+}
+
+/// The rules behind the browser checks of T33: outputs scroll past --p-output-max-height,
+/// hidden parts are `display: none`, DataFrame headers stick, images fit, stderr and errors
+/// are tinted with their tokens, prompts use theirs.
+#[test]
+fn notebook_outputs_scroll_and_hidden_parts_stay_hidden() {
+    let rules = rules(&notebook_css());
+    let outputs = rule(&rules, ".reveal .cell-outputs");
+    assert_eq!(
+        outputs.get("max-height"),
+        Some("var(--p-output-max-height)")
+    );
+    assert_eq!(outputs.get("overflow"), Some("auto"));
+    assert_eq!(outputs.get("border"), Some("var(--p-cell-border)"));
+    assert_eq!(
+        rule(&rules, ".reveal .cell").get("margin"),
+        Some("var(--p-cell-gap) 0")
+    );
+    assert_eq!(
+        rule(&rules, ".reveal .cell-prompt").get("color"),
+        Some("var(--p-prompt-color)")
+    );
+    let hidden = rule(
+        &rules,
+        ".reveal .cell.hide-input .cell-input, .reveal .cell.hide-output .cell-outputs, .reveal .cell.hide-input .cell-prompt",
+    );
+    assert_eq!(hidden.get("display"), Some("none"));
+    let header = rule(&rules, ".reveal .output-display table thead");
+    assert_eq!(header.get("position"), Some("sticky"));
+    let images = rule(
+        &rules,
+        ".reveal .output-display img.output-image, .reveal .output-display figure.output-image > svg",
+    );
+    assert_eq!(images.get("max-width"), Some("100%"));
+    assert!(
+        images.get("width").is_none() && images.get("height").is_none(),
+        "keeps width/height attributes"
+    );
+    let stderr = rule(&rules, ".reveal .cell-outputs .output-stream.stderr");
+    assert!(
+        stderr
+            .get("background")
+            .unwrap()
+            .contains("var(--p-stderr-color)")
+    );
+    let error = rule(&rules, ".reveal .cell-outputs .output-error");
+    assert!(
+        error
+            .get("border-left")
+            .unwrap()
+            .contains("var(--p-error-color)")
+    );
+    assert!(
+        error
+            .get("background")
+            .unwrap()
+            .contains("var(--p-error-color)")
+    );
+}
+
+/// The theme stylesheet is inlined into every document, and tests elsewhere scan whole
+/// documents: no prompt text (tests/theme_skeleton.rs asserts its absence when prompts are
+/// off), no lowercase `katex` (tests/render.rs, math off) and no `<section`, comments
+/// included.
+#[test]
+fn theme_css_contains_no_text_that_document_tests_look_for() {
+    for entry in stylesheets() {
+        let source = read(&entry);
+        for needle in ["In [", "Out [", "katex", "<section"] {
+            assert!(!source.contains(needle), "{entry} contains {needle:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
