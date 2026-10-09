@@ -39,9 +39,10 @@ Verified facts used in this plan are dated 2026-10-08 (versions, APIs). See §9.
 
 ### Decisions already taken
 - License: MIT (`LICENSE` in the repo root, copyright Johannes Blaschke). Vendored reveal.js and
-  KaTeX are MIT as well. reveal's plugins bundle highlight.js (BSD-3-Clause) and marked (MIT),
-  and its themes use the Source Sans Pro and League Gothic fonts (SIL OFL 1.1). Every one of
-  these licenses ships next to the assets (`docs/spec/vendored-assets.md` §1).
+  KaTeX are MIT as well. reveal bundles highlight.js (BSD-3-Clause), highlightjs-line-numbers.js,
+  marked and fitty (MIT) into its files, and its themes use the Source Sans Pro and League
+  Gothic fonts (SIL OFL 1.1). Every one of these licenses ships next to the assets
+  (`docs/spec/vendored-assets.md` §1).
 - Crate structure: a single crate with a library and a binary (confirmed by the repo owner,
   2026-10-08). Do not split into a workspace; module ownership per task is the unit of parallelism.
 
@@ -176,7 +177,7 @@ presenter_rs/
 ├── Cargo.toml                 package "presenter": lib + bin; build.rs embeds the build id
 ├── PLAN.md                    this file
 ├── CHANGELOG.md               release notes (the release workflow publishes a version's section)
-├── docs/spec/*.md             frozen contracts (IR, dialect, theme, config, CLI, live reload, vendoring)
+├── docs/spec/*.md             frozen contracts (IR, dialect, notebook mapping, theme, config, CLI, live reload, vendoring)
 ├── docs/tasks/*.md            one file per task, pick-up-able independently
 ├── docs/guide/*.md            user documentation (T46, the last task)
 ├── docs/dev/*.md              live-reload QA checklist, release process
@@ -185,7 +186,7 @@ presenter_rs/
 ├── assets/                    embedded into the binary with rust-embed
 │   ├── vendor/reveal/…        reveal.js 6.0.2 subset (dist/, css/theme/**)  (see docs/spec/vendored-assets.md)
 │   ├── vendor/katex/…         KaTeX 0.19.0 (js, css, woff2 fonts)
-│   ├── vendor/{highlight.js,marked}/  license files of the libraries reveal's plugins bundle
+│   ├── vendor/{highlight.js,highlightjs-line-numbers.js,marked,fitty}/  license files of the libraries reveal bundles
 │   ├── presenter/             our own small JS: math.js (KaTeX init), live-reload.js
 │   ├── themes/default/        the built-in theme (theme.toml, templates/, styles/, README.md)
 │   └── scaffold/              the files `presenter init` writes (T40)

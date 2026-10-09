@@ -467,7 +467,7 @@ fn relative_path(from: &Path, to: &Path) -> Option<String> {
 /// The `theme.toml` of a new theme.
 fn new_manifest(name: &str, extends: &str) -> String {
     format!(
-        r##"# Theme manifest (docs/spec/theme-format.md §2), created by `presenter theme new`.
+        r##"# Theme manifest, created by `presenter theme new`.
 name = {name}
 extends = {extends}  # a built-in theme name, or a theme directory relative to this file
 # description = "One line for `presenter theme list`"

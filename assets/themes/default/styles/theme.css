@@ -204,6 +204,17 @@
   transform: rotate(45deg);
 }
 
+/* In a loose task list (items apart, or an item with a second paragraph) the item's text is
+   a paragraph after the box: that first paragraph stays on the box's line, and the item
+   keeps the space a paragraph has around it, as the items of a loose plain list do. */
+.reveal li > input[type="checkbox"]:first-child + p {
+  display: inline;
+}
+
+.reveal li:has(> input[type="checkbox"]:first-child + p) {
+  margin-block: var(--r-block-margin);
+}
+
 .reveal a {
   text-decoration: underline;
   text-decoration-thickness: 0.06em;
@@ -796,7 +807,10 @@ html.reveal-print .reveal .slides section:not(.stack):has(> .r-fit-text) {
    page. In print the box's lines are therefore set 5 % closer than the `pre` sets them on
    screen (0.95lh: 1.33 instead of 1.4 here, and relative to a child theme's own value): the
    space this saves on a page is more than the one line a page break moves. A break may fall
-   between any two lines (orphans and widows 1), so it moves at most one. */
+   between any two lines (orphans and widows 1), so it moves at most one. The cost: reveal
+   reserves the pages from the screen height, so a slide that ends within a line or two past
+   a page boundary there ends a page earlier in print, and its last page prints empty but for
+   the background (nothing is lost; about one in ten to twenty slides that span pages). */
 html.reveal-print .reveal pre code {
   max-height: none;
   orphans: 1;

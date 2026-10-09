@@ -1249,6 +1249,7 @@ fn the_readme_documents_the_print_rules() {
         .expect("README section Print and PDF");
     let section = &readme[start..];
     let section = &section[..section[3..].find("\n## ").map_or(section.len(), |i| i + 3)];
+    let section = section.split_whitespace().collect::<Vec<_>>().join(" ");
     for part in [
         "--p-code-max-height",
         "--p-output-max-height",
@@ -1257,6 +1258,9 @@ fn the_readme_documents_the_print_rules() {
         "text outputs at 1.3",
         "cut off",
         "header rows print once",
+        // The trade-off of the closer lines (the review's sweeps of long code slides).
+        "prints empty but for the slide's background",
+        "one in ten to twenty",
     ] {
         assert!(section.contains(part), "README Print and PDF: {part}");
     }
@@ -1373,22 +1377,93 @@ fn task_list_items_show_a_text_sized_box_instead_of_a_bullet() {
     );
 }
 
+/// In a loose task list (items separated by blank lines, or an item with a second
+/// paragraph) comrak puts the item's text in a `<p>` after the box. A block paragraph put
+/// the box alone on a line with the text a line below it (the review's CDP check: box at
+/// y=217, text at y=270). The first paragraph stays on the box's line, and the item takes
+/// the paragraph's margins instead, so it is spaced like an item of a loose plain list
+/// (checked with the CDP helper: same line as the box, 66px apart like plain loose items).
+#[test]
+fn loose_task_list_items_keep_their_text_on_the_box_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deck = tmp.path().join("tasks.md");
+    std::fs::write(
+        &deck,
+        "# Tasks\n\n- [ ] open\n\n- [x] done\n\n  more about it\n",
+    )
+    .unwrap();
+    let html = build_deck(&BuildOptions::new(&deck)).unwrap().document.html;
+    assert!(
+        html.contains("<li><input type=\"checkbox\" disabled=\"\" /> \n<p>open</p>\n</li>"),
+        "the markup the rules select: {html}"
+    );
+    assert!(html.contains(
+        "<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> \n<p>done</p>\n<p>more about it</p>"
+    ));
+
+    let rules = rules(&css());
+    let first = rule(
+        &rules,
+        r#".reveal li > input[type="checkbox"]:first-child + p"#,
+    );
+    assert_eq!(first.get("display"), Some("inline"), "on the box's line");
+    let item = rule(
+        &rules,
+        r#".reveal li:has(> input[type="checkbox"]:first-child + p)"#,
+    );
+    // The margin an inline paragraph no longer has: the one `.reveal p` sets above and below.
+    let paragraph = rule(&rules, ".reveal p").get("margin").unwrap();
+    assert_eq!(
+        item.get("margin-block"),
+        paragraph.split(' ').next(),
+        "{paragraph}"
+    );
+    // Only a paragraph right after the box: a second paragraph stays a block.
+    assert!(
+        rules
+            .iter()
+            .filter(|r| r.selector.contains("checkbox"))
+            .all(|r| r.get("display").is_none() || r.selector.ends_with(":first-child + p")),
+    );
+    assert!(
+        readme().contains("In a loose list (blank lines between items"),
+        "README: the loose list case"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Shipped files (audit F47)
 // ---------------------------------------------------------------------------------------
 
+/// Fails if a file that reaches users names a task id or points into the repository: at its
+/// `docs/` (a binary user has neither), or with a Markdown link that leaves the theme
+/// directory (dead in an ejected or scaffolded copy).
+fn assert_names_no_tasks_or_repository_documents(name: &str, text: &str) {
+    let task = Regex::new(r"\bT[0-9]{2}\b").unwrap();
+    assert!(!task.is_match(text), "{name} names a task id");
+    for reference in [
+        "docs/spec",
+        "docs/tasks",
+        "docs/dev",
+        ".md §",
+        "config.md",
+        "ir.md",
+        "](../",
+    ] {
+        assert!(!text.contains(reference), "{name} points at {reference}");
+    }
+}
+
 /// The theme's files ship in the binary: the CSS is inlined into every standalone deck, and
-/// `theme eject` and `init --full-theme` copy all of them. They must not name the tasks that
-/// built them or point at the repository's `docs/` (a binary user has neither); the theme's
-/// own README is the documentation that travels with it. (README.md links the repository's
-/// theme-format spec for readers of the repository; it is not checked here.)
+/// `theme eject` and `init --full-theme` copy all of them, README.md included. They must
+/// not name the tasks that built them or point at the repository's `docs/`; the theme's
+/// own README is the documentation that travels with it.
 #[test]
 fn shipped_theme_files_name_no_tasks_or_repository_documents() {
-    let task = Regex::new(r"\bT[0-9]{2}\b").unwrap();
     let mut checked = 0;
     for entry in walkdir::WalkDir::new(theme_dir()) {
         let entry = entry.unwrap();
-        if !entry.file_type().is_file() || entry.file_name() == "README.md" {
+        if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.path();
@@ -1398,15 +1473,50 @@ fn shipped_theme_files_name_no_tasks_or_repository_documents() {
             .unwrap()
             .display()
             .to_string();
-        assert!(!task.is_match(&text), "{name} names a task id");
-        for reference in ["docs/spec", "docs/tasks", ".md §", "config.md", "ir.md"] {
-            assert!(!text.contains(reference), "{name} points at {reference}");
-        }
+        assert_names_no_tasks_or_repository_documents(&name, &text);
         checked += 1;
     }
-    assert!(checked >= 14, "{checked} files");
-    let readme = readme();
-    assert!(!task.is_match(&readme), "README names a task id");
+    assert!(checked >= 15, "{checked} files");
+}
+
+/// The other files that reach users' decks and directories: what `presenter init` writes
+/// (`assets/scaffold`), the KaTeX script inlined into every deck with math, and the
+/// `theme.toml` and stylesheet that `presenter theme new` writes.
+#[test]
+fn scaffold_math_script_and_new_themes_name_no_repository_documents() {
+    let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let mut checked = 0;
+    for entry in walkdir::WalkDir::new(assets.join("scaffold")) {
+        let entry = entry.unwrap();
+        if entry.file_type().is_file() {
+            let name = entry
+                .path()
+                .strip_prefix(&assets)
+                .unwrap()
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            assert_names_no_tasks_or_repository_documents(&name, &text);
+            checked += 1;
+        }
+    }
+    assert!(checked >= 5, "{checked} scaffold files");
+    let math = std::fs::read_to_string(assets.join("presenter/math.js")).unwrap();
+    assert_names_no_tasks_or_repository_documents("presenter/math.js", &math);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = tmp.path().join("mytheme");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+        .args(["--quiet", "theme", "new"])
+        .arg(&theme)
+        .current_dir(tmp.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "presenter theme new: {status}");
+    for file in ["theme.toml", "styles/theme.css"] {
+        let text = std::fs::read_to_string(theme.join(file)).unwrap();
+        assert_names_no_tasks_or_repository_documents(&format!("theme new: {file}"), &text);
+    }
 }
 
 // ---------------------------------------------------------------------------------------

@@ -34,7 +34,10 @@ publishes that section as the GitHub Release notes (see
 - `presenter export pdf` prints a deck to PDF with headless Chrome or Chromium (found on
   the system, or `--chrome`), one page per slide or fragment step. Slides taller than a page
   continue on further pages, and code blocks and notebook outputs that scroll on screen
-  print in full.
+  print in full. To leave room for the line Chrome moves at each page break, their lines
+  print slightly closer than on screen; so a slide whose content ends just past a page
+  boundary can end with a page that is empty but for the slide's background (about one in
+  ten to twenty of the slides that run onto more pages).
 - `presenter dump` prints a deck's intermediate representation as JSON, or with
   `--context` the template context.
 - Every command takes `-v`/`-vv` (more logging), `-q` (errors only) and `--config PATH`.
@@ -72,5 +75,5 @@ publishes that section as the GitHub Release notes (see
   `presenter 0.1.0 (<git describe>)`. Pushing a `v*` tag publishes binaries for macOS
   (arm64, x86_64) and Linux (x86_64, arm64), with SHA-256 checksums and the license
   notices of the third-party code they contain: the Rust crates, reveal.js, KaTeX, the
-  highlight.js and marked code bundled in reveal's plugins, and the fonts of reveal's
-  themes.
+  libraries bundled into reveal's files (highlight.js, highlightjs-line-numbers.js, marked
+  and fitty), and the fonts of reveal's themes.

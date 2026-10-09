@@ -1,4 +1,4 @@
-// KaTeX initialisation for presenter (docs/spec/vendored-assets.md §2, theme-format.md §6).
+// KaTeX initialisation for presenter, included in every deck that uses math.
 // Renders every [data-math-style] element ("inline" or "display") with katex.render, using
 // window.__presenterKatexOptions (from [math] katex_options, set by reveal_init()) on top of
 // { displayMode, throwOnError: false }. Rendered elements are marked data-rendered="1", so

@@ -136,9 +136,9 @@ jobs:
           fi
           notices="dist/$ARCHIVE/THIRD-PARTY-LICENSES"
           mkdir -p "$notices/assets" "$notices/crates"
-          # The web assets embedded from assets/vendor (reveal.js, KaTeX, the highlight.js and
-          # marked code bundled in reveal's plugins, the fonts of reveal's themes): the license
-          # files, at their paths there, and the versions.
+          # The web assets embedded from assets/vendor (reveal.js, KaTeX, the libraries reveal
+          # bundles into its files, the fonts of reveal's themes): the license files, at their
+          # paths there, and the versions.
           cp assets/vendor/VERSIONS.toml "$notices/assets/"
           (cd assets/vendor && find . -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' \)) \
             | while IFS= read -r file; do
@@ -234,6 +234,33 @@ jobs:
           COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
           # The contents, without the ~140 crate license directories.
           tar -tzvf "dist/$ARCHIVE.tar.gz" | grep -v "/THIRD-PARTY-LICENSES/crates/."
+          # Check what the flags above promise (docs/dev/release.md): every entry is owned by
+          # root:root (0:0), no ._* entry, and no pax header keyword that POSIX does not
+          # define (LIBARCHIVE.xattr.*, SCHILY.xattr.*, ...), which GNU tar warns about.
+          if ! command -v python3 >/dev/null; then
+            echo "::error::python3 is not installed on $RUNNER_LABEL"
+            exit 1
+          fi
+          python3 - "dist/$ARCHIVE.tar.gz" <<'PY'
+          import sys, tarfile
+          posix = {"atime", "charset", "comment", "ctime", "gid", "gname", "hdrcharset",
+                   "linkpath", "mtime", "path", "size", "uid", "uname"}
+          problems = []
+          with tarfile.open(sys.argv[1]) as archive:
+              entries = archive.getmembers()
+          for entry in entries:
+              if (entry.uid, entry.gid, entry.uname, entry.gname) != (0, 0, "root", "root"):
+                  problems.append(f"{entry.name} is owned by {entry.uname}:{entry.gname} ({entry.uid}:{entry.gid})")
+              extra = sorted(set(entry.pax_headers) - posix)
+              if extra:
+                  problems.append(f"{entry.name} has the pax headers {', '.join(extra)}")
+              if entry.name.rsplit("/", 1)[-1].startswith("._"):
+                  problems.append(f"{entry.name} is an AppleDouble file")
+          for problem in problems:
+              print(f"::error::{problem}")
+          print(f"{len(entries)} entries, {len(problems)} problems")
+          sys.exit(1 if problems else 0)
+          PY
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE }}

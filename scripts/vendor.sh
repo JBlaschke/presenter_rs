@@ -5,9 +5,9 @@
 #   scripts/vendor.sh            # run from anywhere; writes into <repo>/assets/vendor/
 #
 # What it does:
-#   1. downloads the pinned npm tarballs of reveal.js and KaTeX, and of highlight.js and
-#      marked (reveal bundles them into its plugins; only their license files are kept),
-#      into a temporary directory,
+#   1. downloads the pinned npm tarballs of reveal.js and KaTeX, and of the libraries reveal
+#      bundles into its files (highlight.js, highlightjs-line-numbers.js, marked and fitty;
+#      only their license files are kept), into a temporary directory,
 #   2. verifies each tarball's SHA-256 against the value hard-coded below (aborts on mismatch),
 #   3. copies exactly the files listed in docs/spec/vendored-assets.md §2 (nothing else)
 #      into a staging directory, completes League Gothic's license notice, and writes
@@ -19,8 +19,9 @@
 # (CI checks this). Requirements: bash, curl, tar, awk, and sha256sum or shasum.
 #
 # Upgrading (vendored-assets.md §5): edit the versions, URLs, hashes and PINNED_DATE below
-# (highlight.js and marked: the versions the new reveal.js bundles), run the script, review
-# `git diff`, then run `cargo test` and the browser smoke test.
+# (the bundled libraries: the versions the new reveal.js release was built with, see the
+# comment above their pins), run the script, review `git diff`, then run `cargo test` and the
+# browser smoke test.
 
 set -euo pipefail
 
@@ -32,22 +33,35 @@ KATEX_VERSION="0.19.0"
 KATEX_URL="https://registry.npmjs.org/katex/-/katex-${KATEX_VERSION}.tgz"
 KATEX_SHA256="d8e49f2fea6eeed7cdae2cf4fd48e2f1d348758aa9e5740715e4533c2c96d1ee"
 
-# Libraries reveal.js bundles into its plugin builds: dist/plugin/highlight.js contains
-# highlight.js (its version string is in the bundle) and dist/plugin/highlight/*.css are
-# highlight.js styles; dist/plugin/notes.js contains marked. reveal's tarball carries neither
-# license, so they come from the libraries' own packages. reveal 6.0.2 declares marked
-# ^17.0.5; 17.0.6 was the newest 17.x when reveal 6.0.2 was published (2026-09-10), and its
-# LICENSE.md is the same as 17.0.5's. Upgrade these together with reveal.
+# Libraries reveal.js bundles into its own files. reveal's tarball carries none of their
+# licenses, so they come from the libraries' own npm packages (only the license files are
+# kept). The versions are the ones reveal 6.0.2 was built with: reveal's package-lock.json at
+# the 6.0.2 tag (https://raw.githubusercontent.com/hakimel/reveal.js/6.0.2/package-lock.json,
+# `packages["node_modules/<name>"].version`) for the npm dependencies, and for
+# highlightjs-line-numbers.js, which reveal copies into its source, the version in the header
+# comment of plugin/highlight/plugin.js at that tag. Upgrade these together with reveal.
+#   dist/plugin/highlight.js        highlight.js (dist/plugin/highlight/*.css are its styles)
+#                                   and highlightjs-line-numbers.js
+#   dist/plugin/notes.js            marked
+#   dist/reveal.js                  fitty
 HLJS_VERSION="11.11.1"
 HLJS_URL="https://registry.npmjs.org/highlight.js/-/highlight.js-${HLJS_VERSION}.tgz"
 HLJS_SHA256="fbc9443263e976583bd5640e550b77f84d8d7e19fc8408dfe53776a5bae7ed39"
 
-MARKED_VERSION="17.0.6"
+HLJS_LN_VERSION="2.8.0"
+HLJS_LN_URL="https://registry.npmjs.org/highlightjs-line-numbers.js/-/highlightjs-line-numbers.js-${HLJS_LN_VERSION}.tgz"
+HLJS_LN_SHA256="828745455b960fde2e8bf835e6a6b424706c46fb99b1f6a9af220935d49633b3"
+
+MARKED_VERSION="17.0.5"
 MARKED_URL="https://registry.npmjs.org/marked/-/marked-${MARKED_VERSION}.tgz"
-MARKED_SHA256="d0ca499e365edfbdb6df8f769417bd7e9308d142f5e86e6ffe76918db6a399db"
+MARKED_SHA256="1aebca0400d160cb1bedca2e271daad0e324503b7e0d0b4b23781ca3293bacce"
+
+FITTY_VERSION="2.4.2"
+FITTY_URL="https://registry.npmjs.org/fitty/-/fitty-${FITTY_VERSION}.tgz"
+FITTY_SHA256="d5b57f6687fc924cd6fb385d52b3604190d542dd21e2f2e1aca32cd01c4fd486"
 
 # Date the pins above were verified. Fixed (not "today") so that reruns are idempotent.
-PINNED_DATE="2026-10-08"
+PINNED_DATE="2026-10-09"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${ROOT}/assets/vendor"
@@ -177,7 +191,9 @@ vendor_katex() {
 # The license files of the libraries reveal.js bundles (see the pins at the top).
 vendor_bundled() {
     copy "${WORK}/highlight.js/package" "${OUT}/highlight.js" LICENSE
+    copy "${WORK}/highlightjs-line-numbers.js/package" "${OUT}/highlightjs-line-numbers.js" LICENSE
     copy "${WORK}/marked/package" "${OUT}/marked" LICENSE.md
+    copy "${WORK}/fitty/package" "${OUT}/fitty" LICENSE
 }
 
 write_versions() {
@@ -215,6 +231,18 @@ date = "${PINNED_DATE}"
 path = "highlight.js"
 bundled_in = "reveal/dist/plugin/highlight.js"
 
+# Bundled inside reveal.js's dist/plugin/highlight.js (reveal copies it into the plugin's
+# source); only its license file is vendored.
+[[package]]
+name = "highlightjs-line-numbers.js"
+version = "${HLJS_LN_VERSION}"
+license = "MIT"
+url = "${HLJS_LN_URL}"
+sha256 = "${HLJS_LN_SHA256}"
+date = "${PINNED_DATE}"
+path = "highlightjs-line-numbers.js"
+bundled_in = "reveal/dist/plugin/highlight.js"
+
 # Bundled inside reveal.js's dist/plugin/notes.js; only its license file is vendored.
 [[package]]
 name = "marked"
@@ -225,6 +253,18 @@ sha256 = "${MARKED_SHA256}"
 date = "${PINNED_DATE}"
 path = "marked"
 bundled_in = "reveal/dist/plugin/notes.js"
+
+# Bundled inside reveal.js's dist/reveal.js (it fits text to its box, for r-fit-text);
+# only its license file is vendored.
+[[package]]
+name = "fitty"
+version = "${FITTY_VERSION}"
+license = "MIT"
+url = "${FITTY_URL}"
+sha256 = "${FITTY_SHA256}"
+date = "${PINNED_DATE}"
+path = "fitty"
+bundled_in = "reveal/dist/reveal.js"
 EOF
     chmod 0644 "${OUT}/VERSIONS.toml"
 }
@@ -233,7 +273,9 @@ main() {
     fetch reveal "${REVEAL_URL}" "${REVEAL_SHA256}"
     fetch katex "${KATEX_URL}" "${KATEX_SHA256}"
     fetch highlight.js "${HLJS_URL}" "${HLJS_SHA256}"
+    fetch highlightjs-line-numbers.js "${HLJS_LN_URL}" "${HLJS_LN_SHA256}"
     fetch marked "${MARKED_URL}" "${MARKED_SHA256}"
+    fetch fitty "${FITTY_URL}" "${FITTY_SHA256}"
     mkdir -p "${OUT}"
     vendor_reveal
     write_league_gothic_license
@@ -245,7 +287,8 @@ main() {
     mkdir -p "$(dirname "${DEST}")"
     mv "${OUT}" "${DEST}"
     echo "vendored reveal.js ${REVEAL_VERSION} and KaTeX ${KATEX_VERSION}, and the licenses of" \
-        "highlight.js ${HLJS_VERSION} and marked ${MARKED_VERSION}, into ${DEST}" >&2
+        "highlight.js ${HLJS_VERSION}, highlightjs-line-numbers.js ${HLJS_LN_VERSION}," \
+        "marked ${MARKED_VERSION} and fitty ${FITTY_VERSION}, into ${DEST}" >&2
 }
 
 main "$@"

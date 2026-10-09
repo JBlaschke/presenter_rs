@@ -15,7 +15,8 @@ holds one archive per platform and a `SHA256SUMS` file.
 Each archive holds one directory with the archive's name. That directory contains the
 `presenter` binary, `LICENSE`, `README.md` and `THIRD-PARTY-LICENSES/` (see
 [Third-party licenses](#third-party-licenses)). Every entry is owned by `root`, and macOS
-archives carry no extended attributes (see [What the workflow checks](#what-the-workflow-checks)).
+archives carry no extended attributes; the workflow fails otherwise (see
+[What the workflow checks](#what-the-workflow-checks)).
 The binary is self-contained: the themes, reveal.js and KaTeX are embedded. It needs only
 the system's own libraries. On macOS those are `libSystem`, `libiconv` and the
 CoreFoundation and CoreServices frameworks, which the file watcher uses for FSEvents
@@ -67,7 +68,7 @@ CoreFoundation and CoreServices frameworks, which the file watcher uses for FSEv
 | job | checks |
 |---|---|
 | `label` | On a tag push, the tag is exactly `v` + the `Cargo.toml` version, and it is annotated. |
-| `build` (×4) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. The archive's entries belong to `root:root` (uid and gid 0), with neither the builder's user name nor, on macOS, extended attributes: macOS `tar` would store attributes such as `com.apple.provenance` as `LIBARCHIVE.xattr.*` headers, and GNU `tar` warns about each of them when it extracts the archive. |
+| `build` (×4) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. The "package" step reads the archive back (Python's `tarfile`) and fails unless every entry belongs to `root:root` (uid and gid 0, so not to the builder's user), no entry is an AppleDouble `._*` file, and no entry has a pax header keyword that POSIX does not define. macOS `tar` would store extended attributes such as `com.apple.provenance` as `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*` headers, and GNU `tar` warns about each of them when it extracts the archive. |
 | `release` | All four archives exist. `gh release create --verify-tag` publishes them with `SHA256SUMS`. |
 
 The release job runs only after all four builds succeed, so a release is never partial.
@@ -84,11 +85,12 @@ step fills `THIRD-PARTY-LICENSES/` in each archive:
 
 - `assets/`: the license files of the web assets embedded from `assets/vendor`, at their
   paths there, and `VERSIONS.toml` with their versions and sources. These are reveal.js and
-  KaTeX (MIT), highlight.js (BSD-3-Clause) and marked (MIT), which reveal.js bundles into
-  its highlight and notes plugins, and the Source Sans Pro and League Gothic fonts of
-  reveal's themes (SIL OFL 1.1). `scripts/vendor.sh` fetches the highlight.js and marked
-  licenses from those libraries' own packages, because reveal's package does not contain
-  them, and completes League Gothic's notice (`docs/spec/vendored-assets.md` §1).
+  KaTeX (MIT); the libraries reveal.js bundles into its files: highlight.js (BSD-3-Clause)
+  and highlightjs-line-numbers.js (MIT) in the highlight plugin, marked (MIT) in the notes
+  plugin and fitty (MIT) in `reveal.js` itself; and the Source Sans Pro and League Gothic
+  fonts of reveal's themes (SIL OFL 1.1). `scripts/vendor.sh` fetches the bundled
+  libraries' licenses from their own npm packages, because reveal's package does not
+  contain them, and completes League Gothic's notice (`docs/spec/vendored-assets.md` §1).
 - `crates.txt`: every crate linked into the binary for that target, with its version,
   license expression and crates.io page (where the source of, for example, the MPL-2.0
   `selectors` crate is available).
@@ -294,12 +296,16 @@ on top of commit b69ace7:
 
 - `actionlint` 1.7.12 with `shellcheck`: no findings.
 - The "third-party licenses" step, run locally for `aarch64-apple-darwin` and
-  `x86_64-unknown-linux-gnu`, accounted for all 153 and 158 linked crates, copied the seven
-  license files of `assets/vendor` (reveal.js, KaTeX, highlight.js, marked, Source Sans
-  Pro, League Gothic and its `LICENSE-OFL.txt`), and wrote `LICENSE-MIT` for
-  `ansi-to-html`, `grass` and `grass_compiler`; `selectors` got its note.
+  `x86_64-unknown-linux-gnu`, accounted for all 153 and 158 linked crates, copied the nine
+  license files of `assets/vendor` (reveal.js, KaTeX, highlight.js,
+  highlightjs-line-numbers.js, marked, fitty, Source Sans Pro, League Gothic and its
+  `LICENSE-OFL.txt`), and wrote `LICENSE-MIT` for `ansi-to-html`, `grass` and
+  `grass_compiler`; `selectors` got its note.
 - The "package" step, run with macOS `tar` (bsdtar 3.5.3) on files that carry
   `com.apple.provenance`: GNU tar 1.35 extracts the archive without a warning, where the
   previous command gave 442 "Ignoring unknown extended header keyword" warnings, and
   lists every entry as `root/root`. Run with GNU tar in place of `tar`, the entries are
-  `root/root` too.
+  `root/root` too. The step's archive check passed both archives, and failed (exit 1) on
+  an archive made without the ownership and `--no-xattrs` flags, with two errors for each of
+  its 103 entries: owned by the builder, and `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*`
+  headers.

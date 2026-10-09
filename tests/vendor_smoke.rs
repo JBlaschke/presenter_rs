@@ -50,8 +50,10 @@ const KATEX_FONTS: [&str; 20] = [
 fn expected_vendor_files() -> Vec<String> {
     let mut files: Vec<String> = [
         "vendor/VERSIONS.toml",
-        // The licenses of the libraries reveal bundles into its plugins (audit F19).
+        // The licenses of the libraries reveal bundles into its files (audit F19).
+        "vendor/fitty/LICENSE",
         "vendor/highlight.js/LICENSE",
+        "vendor/highlightjs-line-numbers.js/LICENSE",
         "vendor/marked/LICENSE.md",
         "vendor/katex/LICENSE",
         "vendor/katex/katex.min.css",
@@ -321,7 +323,9 @@ fn versions_toml_records_pins() {
             ("reveal.js", "MIT"),
             ("katex", "MIT"),
             ("highlight.js", "BSD-3-Clause"),
+            ("highlightjs-line-numbers.js", "MIT"),
             ("marked", "MIT"),
+            ("fitty", "MIT"),
         ]
     );
     for package in &packages {
@@ -345,8 +349,8 @@ fn versions_toml_records_pins() {
 
 /// Every vendored package's license file ships next to its files, where the release
 /// workflow's `licen[cs]e*` search finds it, and the license matches VERSIONS.toml (audit F19:
-/// reveal's plugins bundle highlight.js, BSD-3-Clause, and marked, MIT, whose notices are not
-/// in reveal's package).
+/// reveal's files bundle highlight.js, BSD-3-Clause, and highlightjs-line-numbers.js, marked
+/// and fitty, MIT, whose notices are not in reveal's package).
 #[test]
 fn every_vendored_package_ships_its_license() {
     for package in versioned_packages() {
@@ -372,11 +376,24 @@ fn every_vendored_package_ships_its_license() {
     assert!(highlight.contains("Copyright (c) 2006, Ivan Sagalaev."));
     let marked = vendor::get_str("vendor/marked/LICENSE.md").unwrap();
     assert!(marked.contains("Copyright (c) 2018+, MarkedJS"), "{marked}");
+    let line_numbers = vendor::get_str("vendor/highlightjs-line-numbers.js/LICENSE").unwrap();
+    assert!(
+        line_numbers.contains("Copyright (c) 2017 Yauheni Pakala"),
+        "{line_numbers}"
+    );
+    let fitty = vendor::get_str("vendor/fitty/LICENSE").unwrap();
+    assert!(
+        fitty.contains("Copyright (c) 2017-2021 Rik Schennink"),
+        "{fitty}"
+    );
 }
 
-/// The licensed libraries are the ones reveal's plugins bundle: the highlight plugin carries
-/// highlight.js's version string, the notes plugin marked's own messages. A reveal upgrade
-/// that bundles another highlight.js version fails here until vendor.sh pins it too.
+/// The licensed libraries are the ones reveal's files bundle: the highlight plugin carries
+/// highlight.js's version string and highlightjs-line-numbers.js's API, the notes plugin
+/// marked's own messages, and reveal.js fitty's options. A reveal upgrade that bundles
+/// another highlight.js version fails here until vendor.sh pins it too. (Only highlight.js's
+/// bundle names its version; the others' versions come from reveal's package-lock.json, see
+/// vendor.sh.)
 #[test]
 fn bundled_libraries_match_their_pins() {
     for package in versioned_packages() {
@@ -384,22 +401,45 @@ fn bundled_libraries_match_their_pins() {
             continue;
         };
         let code = vendor::get_str(&format!("vendor/{bundle}")).unwrap();
-        let marker = match package["name"].as_str().unwrap() {
-            "highlight.js" => package["version"].as_str().unwrap().to_string(),
-            "marked" => "markedjs/marked".to_string(),
+        let markers = match package["name"].as_str().unwrap() {
+            "highlight.js" => vec![package["version"].as_str().unwrap().to_string()],
+            "highlightjs-line-numbers.js" => {
+                vec![
+                    "lineNumbersBlock".to_string(),
+                    "hljs-ln-numbers".to_string(),
+                ]
+            }
+            "marked" => vec!["markedjs/marked".to_string()],
+            "fitty" => vec!["observeMutations".to_string(), "fitAll".to_string()],
             other => panic!("unexpected bundled package {other}"),
         };
-        assert!(
-            code.contains(&marker),
-            "{bundle} does not contain {marker:?}"
-        );
+        for marker in markers {
+            assert!(
+                code.contains(&marker),
+                "{bundle} does not contain {marker:?}"
+            );
+        }
     }
-    let names: Vec<String> = versioned_packages()
+    let bundled: Vec<(String, String)> = versioned_packages()
         .iter()
-        .filter(|p| p.contains_key("bundled_in"))
-        .map(|p| p["name"].as_str().unwrap().to_string())
+        .filter_map(|p| {
+            let bundle = p.get("bundled_in")?.as_str()?;
+            Some((p["name"].as_str()?.to_string(), bundle.to_string()))
+        })
         .collect();
-    assert_eq!(names, ["highlight.js", "marked"]);
+    assert_eq!(
+        bundled,
+        [
+            ("highlight.js", "reveal/dist/plugin/highlight.js"),
+            (
+                "highlightjs-line-numbers.js",
+                "reveal/dist/plugin/highlight.js"
+            ),
+            ("marked", "reveal/dist/plugin/notes.js"),
+            ("fitty", "reveal/dist/reveal.js"),
+        ]
+        .map(|(name, bundle)| (name.to_string(), bundle.to_string()))
+    );
 }
 
 /// The SIL Open Font License asks every copy of a font to carry its copyright notice and the

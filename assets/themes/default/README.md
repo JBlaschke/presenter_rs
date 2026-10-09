@@ -1,7 +1,7 @@
 # The `default` theme
 
-The built-in theme of presenter, and the root of every theme chain
-([`docs/spec/theme-format.md`](../../../docs/spec/theme-format.md)). It is reveal.js's stock
+The built-in theme of presenter, and the root of the usual theme chain: a theme with
+`extends = "default"` builds on it (see [Extending it](#extending-it)). It is reveal.js's stock
 `white` theme for colours, plus `styles/theme.css`: system fonts, a heading at the top of
 each slide with left-aligned content, styled code blocks, tables, quotes, alerts,
 footnotes and columns, four layouts, and print rules for PDF export.
@@ -134,7 +134,7 @@ overrides these:
 | `.footnotes`, `sup.footnote-ref` | `[^1]` | small, muted, under a rule |
 | `.small`, `.large`, `.center` | `:::small`, `{.center}` on a slide, … | 0.7×, 1.3× text; centred text (and the whole slide when on a slide) |
 | `kbd`, `mark` | `<kbd>S</kbd>`, `<mark>` | key caps, highlighter |
-| `li > input[type=checkbox]` | task lists: `- [ ] open`, `- [x] done` | no bullet: a box sized with the text takes its place, in `--p-accent`, with a tick when done; the item's text lines up with the other items' |
+| `li > input[type=checkbox]` | task lists: `- [ ] open`, `- [x] done` | no bullet: a box sized with the text takes its place, in `--p-accent`, with a tick when done; the item's text lines up with the other items'. In a loose list (blank lines between items, or an item with a second paragraph) the item's first paragraph stays on the box's line, and the items are spaced like those of a loose plain list |
 | `img`, `video`, `iframe` | images, raw HTML | fit the slide and keep the alignment of the text around them (`:::center` centres a figure); `.r-stretch` see below |
 | `[data-math-style]` | `$…$`, `$$…$$` | KaTeX; wide display math scrolls instead of overflowing |
 | `section.has-dark-background`, `section.has-light-background` | `background=` colours | white or dark text, and every derived token with it |
@@ -159,8 +159,8 @@ reveal's own layout helpers work with the slide padding:
 
 A Jupyter notebook's code cells are rendered by `templates/cell.html` and styled by
 `styles/notebook.css` (Markdown cells are ordinary slide content). A cell reads as a card:
-the input is a highlighted code block, and the outputs sit in a frame under it.
-[`examples/notebook/`](../../../examples/notebook/) shows every part.
+the input is a highlighted code block, and the outputs sit in a frame under it. The
+example notebook in presenter's repository (`examples/notebook/`) shows every part.
 
 ```html
 <div class="cell" data-cell-index="7">                <!-- + fragment, hide-input, hide-output -->
@@ -261,10 +261,17 @@ grow to their whole height, and the slide continues on extra pages (as many as i
 to reveal's `pdfMaxPagesPerSlide`). In print, and only there, their lines are set 4–5 %
 closer: code at `0.95lh`, 95 % of the line height its `pre` has on screen (1.33 instead of
 1.4), text outputs at 1.3 instead of 1.35 (a theme that changes the outputs' line height
-should lower its print value as well), and DataFrame rows get a little less padding. Chrome moves a line or row that straddles a page break to the
-next page; the space saved leaves room for that, so the last lines still fit on the pages
-reveal reserved. (It can also leave the last of those pages empty but for the slide's
-background.) A DataFrame's header rows print once, at the top of the table.
+should lower its print value as well), and DataFrame rows get a little less padding. Chrome
+moves a line or row that straddles a page break to the next page; the space saved leaves
+room for that, so the last lines still fit on the pages reveal reserved. A DataFrame's
+header rows print once, at the top of the table.
+
+The price of that room: reveal reserves a slide's pages from its height on screen, before
+Chrome sets it closer for print. A slide whose content ends within a line or two past a page
+boundary on screen ends a page earlier in print, and its last page prints empty but for the
+slide's background. Nothing is lost, but expect such an empty page after about one in ten to
+twenty of the slides that run onto more pages (measured with code blocks of 18 to 71 lines).
+The theme cannot drop the page: reveal fixes each slide's page count before printing.
 
 What does not print in full: lines longer than the box and tables wider than it are cut off
 at its right edge (on screen they scroll sideways); a `.r-stretch` code block keeps the size
