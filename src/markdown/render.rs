@@ -10,6 +10,9 @@
 //! The nodes are moved under a synthetic `Document` node, so lists and footnotes render as a
 //! unit (the footnote list of a slide is closed at the end of that slide). Then:
 //!
+//! 0. **includes** (§4.1, T48), in [`RenderMode::Notebook`] only: an `:::include` directive
+//!    is removed with an `include-in-notebook` warning (only a Markdown deck includes files;
+//!    the Markdown frontend handles every `:::include` of a deck before rendering);
 //! 1. **title**: [`first_heading_text`] of the nodes, before anything is changed;
 //! 2. **notes** (§4, §7): every outermost `:::notes` directive, wherever it is nested, is
 //!    detached; its children (and the footnote definitions written inside it, which comrak
@@ -117,6 +120,9 @@ const MISSING_ASSET: &str = "missing-asset";
 /// Diagnostic code of a local file found only by letter case (A3).
 const ASSET_CASE_MISMATCH: &str = "asset-case-mismatch";
 
+/// Diagnostic code of an `:::include` in a notebook (T48).
+const INCLUDE_IN_NOTEBOOK: &str = crate::markdown::include::codes::INCLUDE_IN_NOTEBOOK;
+
 /// Separates the URL as written from the resolved path in a `missing-asset` message.
 const LOOKED_FOR: &str = " (looked for ";
 
@@ -143,7 +149,8 @@ pub struct RenderCtx<'r> {
     pub mode: RenderMode,
     /// Receives `missing-asset`, `asset-case-mismatch`, `invalid-directive`,
     /// `invalid-directive-arg`, `duplicate-footnote`, `footnote-elsewhere`,
-    /// `unparsed-attr-block` and `unlifted-slide-attr` warnings. Spans are lines of the
+    /// `unparsed-attr-block`, `unlifted-slide-attr` and (notebook mode)
+    /// `include-in-notebook` warnings. Spans are lines of the
     /// rendered text (`cell: None`) and the path is not set: the caller adds both. The missing
     /// file of a `missing-asset` warning is in its message only: see [`missing_asset_path`].
     pub diagnostics: &'r mut Diagnostics,
@@ -592,6 +599,7 @@ fn render_document<'a>(
     opts: &Options,
     ctx: &mut RenderCtx,
 ) -> Result<Rendered> {
+    drop_notebook_includes(doc, ctx);
     let (notes, mut features) = extract_notes(arena, doc, opts, ctx)?;
     check_unopened_directives(doc, ctx);
     let _listings = DirListings::enter();
@@ -1538,6 +1546,42 @@ pub(crate) fn is_notes_info(info: &str) -> bool {
     directive_info(info).name == "notes"
 }
 
+/// Whether a directive's info string names `:::include` (dialect §4.1, T48; also
+/// `::: {.include}`, which the Markdown frontend rejects with a hint).
+pub(crate) fn is_include_info(info: &str) -> bool {
+    directive_info(info).name == "include"
+}
+
+/// Pass 0, in [`RenderMode::Notebook`] only (notebook markdown cells and outputs, the
+/// `markdown` template filter): every outermost `:::include` directive under `doc` is
+/// detached with an `include-in-notebook` warning on its line, so it renders nothing. Only a
+/// Markdown deck includes files (dialect §4.1); the Markdown frontend consumes or rejects
+/// every `:::include` before rendering, so in [`RenderMode::Deck`] there is none.
+fn drop_notebook_includes<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
+    if ctx.mode != RenderMode::Notebook {
+        return;
+    }
+    let is_include = |node: &'a AstNode<'a>| {
+        matches!(&node.data().value,
+            NodeValue::BlockDirective(directive) if is_include_info(&directive.info))
+    };
+    let found: Vec<_> = doc
+        .descendants()
+        .filter(|node| is_include(node) && !node.ancestors().skip(1).any(is_include))
+        .collect();
+    for node in found {
+        let message = "`:::include` works only in a Markdown deck, not in a notebook: nothing is \
+                       included and the directive is not shown (include the notebook from a \
+                       Markdown deck instead)";
+        let span = node_span(node).map(|span| SourceSpan {
+            end_line: span.start_line,
+            ..span
+        });
+        ctx.diagnostics.warn(INCLUDE_IN_NOTEBOOK, message).span = span;
+        node.detach();
+    }
+}
+
 /// The attributes of a directive's `<div>` (leading space included) and the problems found
 /// in its info string (dialect §4): `id` (pandoc form), `class` (the name, then the other
 /// classes, deduplicated), then the other attributes by name. `:::fragment index=N` needs a
@@ -1919,6 +1963,7 @@ fn node_span(node: &AstNode<'_>) -> Option<SourceSpan> {
         start_line: pos.start.line,
         end_line: pos.end.line.max(pos.start.line),
         cell: None,
+        file: None,
     })
 }
 
@@ -2776,6 +2821,7 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
             start_line: 4,
             end_line: 9,
             cell: None,
+            file: None,
         };
         rewrite_slide_assets(&mut attrs, Some(&span), &mut ctx).unwrap();
         assert_eq!(attrs["data-background-image"], "https://e.org/a.png");

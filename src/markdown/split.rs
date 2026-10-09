@@ -165,6 +165,7 @@ impl RawSlide<'_> {
             start_line: self.start_line,
             end_line: self.end_line,
             cell: None,
+            file: None,
         }
     }
 }
@@ -963,6 +964,7 @@ impl<'a, 's> Builder<'a, 's> {
                 start_line: line,
                 end_line: line,
                 cell: None,
+                file: None,
             });
         }
     }
@@ -1119,6 +1121,7 @@ fn report_misplaced_slide_comments<'a>(
             start_line: data.sourcepos.start.line,
             end_line: data.sourcepos.end.line,
             cell: None,
+            file: None,
         });
     }
 }
@@ -1266,11 +1269,7 @@ mod tests {
             "27-29 | 31-35 | 37-41 [43-47] | 49-53 | 55-59 | 61-65 | 67-71 | 73-82",
             &[("unknown-slide-attr", 49)],
         ),
-        (
-            "directives.md",
-            "23-29 | 31-45 | 47-58 | 60-78 | 80-86",
-            &[],
-        ),
+        ("directives.md", "23-29 | 31-45 | 47-58 | 60-78", &[]),
         (
             "code.md",
             "22-27 | 29-35 | 37-46 | 48-62 | 64-71 | 73-79 | 81-87 | 89-95 | 97-103 | 105-111 \
@@ -1368,7 +1367,8 @@ mod tests {
                     SourceSpan {
                         start_line: slide.start_line,
                         end_line: slide.end_line,
-                        cell: None
+                        cell: None,
+                        file: None
                     }
                 );
             }
@@ -1541,6 +1541,7 @@ mod tests {
                 base_dir: "/abs".into(),
             },
             assets: vec![],
+            includes: Vec::new(),
         };
         assert_eq!(ir.invariant_violations(), Vec::<String>::new());
     }

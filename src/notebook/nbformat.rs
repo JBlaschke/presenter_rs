@@ -328,6 +328,7 @@ impl Cell {
             start_line: 1,
             end_line: self.source.as_str().lines().count().max(1),
             cell: Some(index),
+            file: None,
         }
     }
 }

@@ -263,6 +263,7 @@ fn unparsed_at(kind: Kind, block: &str, reason: &str, line: usize) -> Diagnostic
         start_line: line,
         end_line: line,
         cell: None,
+        file: None,
     })
 }
 

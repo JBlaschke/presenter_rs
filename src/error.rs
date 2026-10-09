@@ -118,6 +118,7 @@ impl Error {
             start_line: line,
             end_line: line,
             cell,
+            file: None,
         };
         match self {
             Error::Parse {
@@ -813,6 +814,7 @@ mod tests {
             start_line: line,
             end_line: line,
             cell: None,
+            file: None,
         }
     }
 
@@ -951,6 +953,7 @@ mod tests {
             start_line: 2,
             end_line: 4,
             cell: Some(7),
+            file: None,
         };
         let md = Diagnostic::warning("empty-slide", "slide 3 is empty");
         let cases = [

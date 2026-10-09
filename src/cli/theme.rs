@@ -146,6 +146,7 @@ fn project_theme(cwd: &Path, config: &Config, config_path: &Path) -> crate::erro
             base_dir: cwd.to_path_buf(),
         },
         assets: Vec::new(),
+        includes: Vec::new(),
     };
     pipeline::resolve_theme(&BuildOptions::new(cwd), &deck, config, Some(config_path))
 }
@@ -908,6 +909,7 @@ fn line_span(line: usize) -> SourceSpan {
         start_line: line,
         end_line: line,
         cell: None,
+        file: None,
     }
 }
 

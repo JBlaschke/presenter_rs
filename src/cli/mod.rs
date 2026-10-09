@@ -1310,6 +1310,7 @@ mod tests {
                 start_line: 12,
                 end_line: 12,
                 cell: None,
+                file: None,
             }),
         };
         assert_eq!(
@@ -1322,6 +1323,7 @@ mod tests {
                 start_line: 2,
                 end_line: 2,
                 cell: Some(5),
+                file: None,
             }),
         };
         assert_eq!(

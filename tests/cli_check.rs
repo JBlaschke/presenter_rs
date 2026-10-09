@@ -409,7 +409,8 @@ fn split_markdown_cells_are_linted_for_separators() {
             })
             .collect()
     };
-    let include = ("unknown-directive".to_string(), Some(0), Some(12));
+    // The frontend reports the `:::include` (T48: a notebook cannot include).
+    let include = ("include-in-notebook".to_string(), Some(0), Some(12));
     assert_eq!(found("plain/n.ipynb"), std::slice::from_ref(&include));
     assert_eq!(
         found("split/n.ipynb"),

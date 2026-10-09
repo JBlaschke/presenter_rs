@@ -423,6 +423,7 @@ mod tests {
             start_line: 7,
             end_line: 7,
             cell,
+            file: None,
         };
         let missing = |cell| Error::MissingAsset {
             path: PathBuf::from("/deck/x.png"),
@@ -559,6 +560,7 @@ mod tests {
                 start_line: 5,
                 end_line: 5,
                 cell: None,
+                file: None,
             }),
         };
         let payload = ErrorPayload::new(&missing, base, Some(&deck));

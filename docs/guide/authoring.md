@@ -244,6 +244,7 @@ block becomes `<div class="name">`.
 | `:::fragment` | appears on the next click; add reveal effects and an order: `:::fragment fade-up index=2` |
 | `:::columns` … `:::column` | side-by-side columns (CSS grid); `:::columns widths="2fr 3fr"` sets their widths |
 | `:::center`, `:::small`, `:::large` | centred text, smaller or larger text (built-in theme) |
+| `:::include part2.md` | the slides of another Markdown file or a notebook ([Including files](#including-files)) |
 | `:::anything a b key=v` | `<div class="anything a b" data-key="v">`, for your theme's CSS |
 
 To nest directives, make the **outer** fence longer than the inner ones:
@@ -435,6 +436,61 @@ HTML passes through unchanged, so every reveal.js feature is reachable:
 <span class="fragment highlight-red">click me</span>
 ```
 
+## Including files
+
+A deck can pull in other Markdown files and whole notebooks, so a talk mixes slides you
+write with an executed notebook without copying cells around:
+
+```markdown
+---
+title: Smoothing a noisy signal
+---
+
+# Why smooth? {layout=title}
+
+---
+
+:::include analysis.ipynb
+:::
+
+---
+
+:::include "part 2/summary.md"
+:::
+```
+
+- Write `:::include PATH` and a closing `:::` on the next line, with nothing between. The
+  path is relative to the file that has the directive (an absolute path works, a URL does
+  not); quote it when it has spaces. A `.ipynb` file is read as a notebook, a `.md` or
+  `.markdown` file as a Markdown deck.
+- **An include replaces whole slides.** The directive must be the only thing on its slide:
+  put `---` before and after it (in headings mode, the `---` after it can be left out when
+  the next slide starts with a heading). The slide is replaced by every slide of the
+  included file, each with its vertical slides, in place. Included slides are never merged
+  with yours: an include next to other content, in a vertical slide (after `--`), with a
+  `--` after it, or inside a list, a quote or another directive is an error that names the
+  line. HTML comments next to it are fine.
+- The included file is read as if you built it on its own, with this deck's settings
+  (`presenter.toml` and the deck's front matter, such as `notebook:` tag lists for an
+  included notebook). Its own `slides:`, `markdown:` and `notebook:` settings still apply
+  to it, and its images are found next to it. Its deck metadata (`title`, `subtitle`,
+  `author`, `date`, `description`, `lang`, `theme`, `reveal` options and other keys) is
+  ignored; presenter warns about each value that differs from the deck's, so repeat a
+  notebook's title in the deck or remove it from the notebook.
+- Slide attributes (`--- {…}`, `<!-- .slide: -->`) and `:::notes` on the include slide are
+  ignored, with a warning: put them on the included file's slides.
+- An included Markdown file can include further files, up to 8 levels deep. A file that ends
+  up including itself is an error that names the chain. A notebook cannot include: a
+  `:::include` in a markdown cell shows nothing, with a warning.
+- A missing or unreadable file is an error, also in `presenter serve`.
+- Warnings and errors name the file they are in, so a mistake in `part2.md` shows as
+  `part2.md:12`, also in the browser overlay of `presenter serve`.
+- `presenter serve` and `presenter build --watch` watch the included files and rebuild when
+  one is saved; `presenter check` checks them too.
+
+[`examples/mixed`](../../examples/mixed/README.md) includes the notebook of
+[`examples/notebook`](../../examples/notebook/README.md) and a Markdown part.
+
 ## Headings mode
 
 Pandoc and Quarto users write decks without separator lines: headings start the slides.
@@ -480,7 +536,7 @@ presenter check slides.md
 ```text
 slides.md:4: warning: `--` under a line of text turns that text into a heading (setext), so no slide starts here; put a blank line before it to start a vertical slide
 slides.md:21: warning: image `nothere.png` not found (looked for /home/me/talk/nothere.png)
-slides.md:23: warning: unknown directive 'include': including files is not implemented, so nothing is included (the directive renders as a plain <div>)
+slides.md:30: warning: `part2.md` sets `title`; an included file's deck metadata is ignored (the top-level deck's front matter applies)
 ```
 
 It finds, among others:
@@ -488,11 +544,13 @@ It finds, among others:
 - separator lines that did not start a slide, with the reason;
 - empty slides and duplicate slide ids;
 - unknown layouts, unknown slide attributes and attribute blocks it could not read;
-- directive mistakes (a bare `:::` opener, a `:` in the opening line, `:::include`);
+- directive mistakes (a bare `:::` opener, a `:` in the opening line);
 - missing images and file names that match only in letter case;
 - front matter that probably swallowed a slide;
 - problems with the theme that would fail the build;
-- for notebooks: missing outputs, widgets and scripts in outputs ([Notebooks](notebooks.md#check-a-notebook)).
+- for notebooks: missing outputs, widgets and scripts in outputs ([Notebooks](notebooks.md#check-a-notebook));
+- all of this for every file the deck includes, each named with its own path
+  ([Including files](#including-files)).
 
 The exit code is 0 when there are only warnings, and 1 when there is an error, or any
 finding at all with `--deny-warnings` (for CI). `--format json` prints the findings as JSON

@@ -60,6 +60,10 @@ fn text_report_flags(global: &GlobalArgs, args: &CheckArgs) -> GlobalArgs {
 
 /// The diagnostics of one input, or the failure that stopped its check as an error
 /// diagnostic.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is one diagnostic per input; `SourceSpan.file` (T48) made it 128 bytes"
+)]
 fn check_input(
     input: &Path,
     args: &CheckArgs,
@@ -202,6 +206,7 @@ mod tests {
                     start_line: 2,
                     end_line: 3,
                     cell: Some(5),
+                    file: None,
                 }),
             Diagnostic::error("theme-error", "theme 'x': not found").with_path("/elsewhere/a.md"),
         ]);

@@ -311,6 +311,7 @@ fn convert_with(
         features,
         source: source.clone(),
         assets: assets.infos(&source.base_dir),
+        includes: Vec::new(),
     };
     Ok((deck, deferred))
 }
@@ -428,6 +429,7 @@ fn empty_front_matter(front: &FrontMatter<'_>) -> Option<Diagnostic> {
         start_line: 1,
         end_line: front.consumed,
         cell: Some(front.cell),
+        file: None,
     };
     Some(Diagnostic::warning(codes::FRONT_MATTER_EMPTY, message).with_span(span))
 }
@@ -881,6 +883,7 @@ impl<'a> Converter<'a> {
             start_line: 1,
             end_line: consumed,
             cell: Some(index),
+            file: None,
         };
         self.warn(codes::FRONT_MATTER_IGNORED, message, &span);
         (rest, consumed)
@@ -987,6 +990,7 @@ impl<'a> Converter<'a> {
             start_line: raw.start_line + part.offset,
             end_line: raw.end_line + part.offset,
             cell: Some(part.index),
+            file: None,
         };
         if !(leading && self.opened_here && self.cur_is_empty()) {
             self.open(vertical, span.clone());
@@ -2449,7 +2453,8 @@ mod tests {
             Some(SourceSpan {
                 start_line: 1,
                 end_line: 3,
-                cell: Some(2)
+                cell: Some(2),
+                file: None
             })
         );
         assert!(empty_front_matter(&front("")).is_none());
@@ -2478,12 +2483,14 @@ mod tests {
             start_line: 1,
             end_line: 9,
             cell: Some(4),
+            file: None,
         };
         let path = Path::new("/nb.ipynb");
         let inner = Diagnostic::warning("missing-asset", "m").with_span(SourceSpan {
             start_line: 2,
             end_line: 3,
             cell: None,
+            file: None,
         });
         let moved = relocate(inner, Some(&at), 3, path);
         assert_eq!(
@@ -2491,7 +2498,8 @@ mod tests {
             Some(SourceSpan {
                 start_line: 5,
                 end_line: 6,
-                cell: Some(4)
+                cell: Some(4),
+                file: None
             })
         );
         assert_eq!(moved.path.as_deref(), Some(path));

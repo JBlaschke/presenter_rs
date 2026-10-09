@@ -34,6 +34,10 @@ pub struct Deck {
     pub source: SourceInfo,
     /// Summary of registered assets without their bytes (for `dump` and `check`).
     pub assets: Vec<AssetInfo>,
+    /// Files pulled in with `:::include` (markdown-dialect §4.1), transitively, absolute, in
+    /// first-use order. Serialized only when non-empty. (T48, contract change 2026-10-09)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<PathBuf>,
 }
 
 impl Deck {
@@ -46,7 +50,8 @@ impl Deck {
     /// `data-background-image`) and in `notes` is listed in `assets` (4); features
     /// implied by content are set — `notes` for notes, `notebook` and `code` for cells,
     /// `math` for `text/latex` outputs and for math markup in `Block::Html`, in
-    /// `CellOutput::Display` HTML or in `notes` (6); spans are 1-based and ordered (8).
+    /// `CellOutput::Display` HTML or in `notes` (6); spans are 1-based and ordered (8), and a
+    /// span's `file` (a slide from an included file, T48) is listed in `includes`.
     ///
     /// Math markup is what [`has_math_markup`] finds, the test the Markdown frontend derives
     /// `features.math` from (in the slide HTML and the notes): a start tag with a
@@ -85,6 +90,14 @@ impl Deck {
             && (span.start_line == 0 || span.end_line < span.start_line)
         {
             problems.push(format!("{path}: bad span {span:?}"));
+        }
+        if let Some(file) = slide.span.as_ref().and_then(|span| span.file.as_ref())
+            && !self.includes.contains(file)
+        {
+            problems.push(format!(
+                "{path}: span.file {} is not in includes",
+                file.display()
+            ));
         }
         if let Some(notes) = &slide.notes {
             if !self.features.notes {
@@ -354,6 +367,10 @@ pub struct SourceSpan {
     pub end_line: usize,
     /// Notebook cell index; `None` for Markdown.
     pub cell: Option<usize>,
+    /// The file the lines belong to when it is not the deck's own source (an included file,
+    /// markdown-dialect §4.1); absolute. Serialized only when set. (T48, 2026-10-09)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
 }
 
 /// Summary of one registered asset (no bytes).
@@ -399,6 +416,7 @@ mod tests {
                 base_dir: PathBuf::from("/x"),
             },
             assets: vec![],
+            includes: Vec::new(),
         }
     }
 

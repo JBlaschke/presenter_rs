@@ -576,6 +576,7 @@ mod tests {
                 start_line: 7,
                 end_line: 7,
                 cell: None,
+                file: None,
             });
         let cwd = Path::new("/work");
         assert_eq!(
@@ -606,6 +607,7 @@ mod tests {
                 start_line: 2,
                 end_line: 2,
                 cell: Some(5),
+                file: None,
             });
         assert_eq!(
             diagnostic_line(&diagnostic, Some(Path::new("/work")), false),
@@ -623,6 +625,7 @@ mod tests {
             start_line: line,
             end_line: line,
             cell,
+            file: None,
         }
     }
 

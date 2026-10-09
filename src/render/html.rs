@@ -232,6 +232,8 @@ fn check_background_videos(input: &RenderInput<'_>, diagnostics: &mut Diagnostic
         if !video.contains("asset:") {
             return;
         }
+        // located in the file the slide comes from (an included file's, T48)
+        let file = slide.span.as_ref().and_then(|span| span.file.as_ref());
         let mut diagnostic = Diagnostic::warning(
             "standalone-background-video",
             format!(
@@ -239,7 +241,7 @@ fn check_background_videos(input: &RenderInput<'_>, diagnostics: &mut Diagnostic
                  (reveal.js cannot read it from a data: URI); build with --site or use presenter serve"
             ),
         )
-        .with_path(&deck.source.path);
+        .with_path(file.unwrap_or(&deck.source.path));
         diagnostic.span = slide.span.clone();
         diagnostics.push(diagnostic);
     };

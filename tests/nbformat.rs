@@ -223,7 +223,8 @@ fn unknown_output_type_is_skipped_with_a_warning_and_the_cell_survives() {
         Some(SourceSpan {
             start_line: 1,
             end_line: 2,
-            cell: Some(1)
+            cell: Some(1),
+            file: None
         })
     );
     assert!(

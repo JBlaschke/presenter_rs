@@ -11,7 +11,8 @@
 //!    [`BuildOptions::format`] or the extension ([`detect_kind`]) and parses it into a
 //!    [`Parsed`] deck. The returned config also has the deck's front matter merged.
 //! 3. [`prepare`]: escalates the first `missing-asset` warning to [`Error::MissingAsset`]
-//!    when [`BuildOptions::missing_asset_is_error`] (ir.md §4 contract change), resolves the
+//!    when [`BuildOptions::missing_asset_is_error`] (ir.md §4 contract change; one of an
+//!    included file is an [`Error::Parse`] in that file, [`missing_asset_as_error`]), resolves the
 //!    theme (`cli.theme` → front matter `theme` → `[deck] theme`, searched in the config
 //!    file's directory, the input's directory and the current directory), checks the
 //!    theme's `[reveal] plugins` (an [`Error::Theme`] naming the theme) and builds the
@@ -521,16 +522,20 @@ pub enum InputRole {
     Asset,
     /// A file of a theme directory the build uses ([`input_files`] says which).
     Theme,
+    /// A file the deck pulls in with `:::include` (markdown-dialect §4.1, T48).
+    Include,
 }
 
 impl fmt::Display for InputRole {
-    /// `the input file`, `the config file`, `the deck's asset` or `the theme file`.
+    /// `the input file`, `the config file`, `the deck's asset`, `the theme file` or `the
+    /// included file`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             InputRole::Source => "the input file",
             InputRole::Config => "the config file",
             InputRole::Asset => "the deck's asset",
             InputRole::Theme => "the theme file",
+            InputRole::Include => "the included file",
         })
     }
 }
@@ -575,7 +580,8 @@ const THEME_INPUT_DIRS: [&str; 4] = ["templates", "styles", "assets", "scripts"]
 const OUTPUT_EXTENSIONS: [&str; 3] = ["html", "htm", "pdf"];
 
 /// The files `build` read, or may read, that its output must never overwrite, each with
-/// its role: the source, the `presenter.toml` that was used, every local file asset of the
+/// its role: the source, the files it includes (`Deck.includes`, T48), the `presenter.toml`
+/// that was used, every local file asset of the
 /// deck and the files of each theme directory of the chain ([`InputRole::Theme`]): its
 /// top-level files (`theme.toml` among them) except `.html`, `.htm` and `.pdf` files,
 /// which may be earlier outputs; every file in its `templates/`, `styles/`, `assets/` and
@@ -587,6 +593,13 @@ const OUTPUT_EXTENSIONS: [&str; 3] = ["html", "htm", "pdf"];
 /// have no files on disk.
 pub fn input_files(build: &Build) -> Vec<(PathBuf, InputRole)> {
     let mut inputs = vec![(build.deck.source.path.clone(), InputRole::Source)];
+    inputs.extend(
+        build
+            .deck
+            .includes
+            .iter()
+            .map(|path| (path.clone(), InputRole::Include)),
+    );
     inputs.extend(
         build
             .config_path
@@ -940,9 +953,33 @@ fn missing_asset_error(diagnostics: &Diagnostics) -> Option<Error> {
 /// with: the missing file from its message (else the diagnostic's path), the span from the
 /// diagnostic. `None` for any other diagnostic. The CLI uses it to report every missing
 /// asset of a failed build the same way (audit F37).
+///
+/// A missing asset of an included file (its span names the file, `SourceSpan.file`, T48) is
+/// an [`Error::Parse`] in that file instead, at the span's line (`cell N, line M: ` for a
+/// notebook cell), with the diagnostic's message: [`Error::MissingAsset`] cannot say which
+/// file its span is in, and its readers locate it in the deck's source.
 pub fn missing_asset_as_error(diagnostic: &Diagnostic) -> Option<Error> {
     if diagnostic.code != MISSING_ASSET {
         return None;
+    }
+    if let Some(span) = &diagnostic.span
+        && let Some(file) = &span.file
+    {
+        let (line, message) = match span.cell {
+            Some(cell) => (
+                None,
+                format!(
+                    "cell {cell}, line {}: {}",
+                    span.start_line, diagnostic.message
+                ),
+            ),
+            None => (Some(span.start_line), diagnostic.message.clone()),
+        };
+        return Some(Error::Parse {
+            path: file.clone(),
+            line,
+            message,
+        });
     }
     let path = missing_asset_path(diagnostic)
         .or_else(|| diagnostic.path.clone())
@@ -1574,6 +1611,7 @@ mod tests {
                     start_line: 4,
                     end_line: 4,
                     cell: None,
+                    file: None,
                 }),
         );
         match missing_asset_error(&diagnostics) {

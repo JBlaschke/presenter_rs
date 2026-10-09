@@ -248,7 +248,7 @@ fn attributes_md() {
 
 #[test]
 fn directives_md() {
-    let parsed = check_fixture("directives", &[0, 0, 0, 0, 0]);
+    let parsed = check_fixture("directives", &[0, 0, 0, 0]);
     let slides = &parsed.deck.slides;
     // notes removed from the body and present in Slide.notes
     let first = html(&slides[0]);
@@ -282,7 +282,6 @@ fn directives_md() {
     assert!(other.contains(r#"<div class="warning large">"#));
     assert!(other.contains(r#"<div class="callout tip" data-title="Hint">"#));
     assert!(other.contains(r#"<div class="r-stack">"#));
-    assert!(html(&slides[4]).contains(r#"<div class="include other.md">"#));
     assert!(parsed.diagnostics.is_empty());
 }
 
@@ -620,6 +619,7 @@ fn missing_image_is_an_error_only_when_asked() {
                 start_line: 3,
                 end_line: 3,
                 cell: None,
+                file: None,
             };
             assert_eq!(span, Some(line3));
         }
