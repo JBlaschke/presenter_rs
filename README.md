@@ -91,7 +91,9 @@ Chrome or Chromium.
 
 ## Documentation
 
-The [user guide](docs/guide/README.md):
+The [user guide](docs/guide/README.md) is in the repository's `docs/guide/` directory. The
+release archives do not include it or the pictures, so this README's links work on the
+project's GitHub page or in a checkout:
 
 - [Getting started](docs/guide/getting-started.md): install, create, preview, build, export.
 - [Writing slides](docs/guide/authoring.md): the Markdown dialect, and `presenter check`.

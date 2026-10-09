@@ -15,8 +15,9 @@ after the command: `presenter -q check slides.md` and `presenter check slides.md
 same. `RUST_LOG` (for example `RUST_LOG=presenter=debug`) adds log filters on top.
 
 **Output.** Standard output carries only a command's result: the `Wrote …` line of `build`
-and `export pdf`, the URL line of `serve`, the JSON of `dump`, the findings of
-`check --format json`. Warnings, errors and logs go to standard error, as
+and `export pdf`, the URL line of `serve`, the JSON of `dump` (TOML with
+`--default-config`), the findings of `check --format json`, and the reports of `init` and
+the `theme` commands. Warnings, errors and logs go to standard error, as
 `path:line: level: message`, in colour when it is a terminal (`NO_COLOR=1` turns colour
 off). Paths in messages are relative to the current directory.
 
@@ -25,7 +26,7 @@ off). Paths in messages are relative to the current directory.
 | Code | Meaning |
 |---|---|
 | 0 | Success (warnings do not count, except with `check --deny-warnings`) |
-| 1 | The deck or theme has an error: a parse, template or style error, a missing image in `build`, a `check` finding of level error (or any finding, with `--deny-warnings`) |
+| 1 | The deck or theme has an error: a parse, template or style error, a missing image in `build`, a `check` finding of level error (or any finding, with `--deny-warnings`). Also any other failure while the command runs: a port that is in use, a file that cannot be read or written, Chrome failing during `export pdf` |
 | 2 | Wrong usage: a bad argument, an unknown file extension, an invalid `presenter.toml`, an output that would overwrite an input, a `theme` argument that names nothing usable |
 | 3 | `export pdf` found no Chrome or Chromium |
 
@@ -153,7 +154,7 @@ Options:
 - Prints `Serving http://127.0.0.1:3000/` as its first line. Ctrl-C stops it (exit 0).
 - Stylesheet changes swap in place; other changes replace the slides and keep the current
   slide; errors show in an overlay in the page ([the live-reload loop](themes.md#the-live-reload-loop)).
-- When the port is taken, it says so; `--port 0` picks a free one.
+- When the port is taken, it says so and exits 1; `--port 0` picks a free one.
 - It answers only requests for `localhost`, `127.0.0.1`, `[::1]` or the `--host` given,
   other host names get `403 Forbidden` ([Security](themes.md#security)).
 - `--site-preview` serves the deck the way `build --site` lays it out, to check a site build
@@ -308,16 +309,17 @@ Options:
       --config <PATH>      Use this presenter.toml instead of searching for one next to the input
       --pretty             Pretty-print the JSON (the default)
       --compact            Print the JSON on one line
-      --default-config     Print presenter.toml with every setting at its built-in default instead
-                           (no INPUT)
+      --default-config     Print every presenter.toml setting with its default, commented out,
+                           instead (no INPUT)
   -h, --help               Print help
 ```
 
 - `presenter dump slides.md` prints the deck as presenter parsed it: slides, their
   attributes and HTML, notes, the assets it found. Keys are sorted.
 - `--context` prints the data the theme's templates receive ([Themes](themes.md#what-templates-receive)).
-- `--default-config` prints a `presenter.toml` with every setting at its default
-  ([Configuration](configuration.md#every-setting)).
+- `--default-config` lists every `presenter.toml` setting with its default, each
+  commented out: a reference to copy single lines from, not a file to save as it is
+  ([Configuration](configuration.md#every-setting)). It ignores `--config`.
 
 ## check
 

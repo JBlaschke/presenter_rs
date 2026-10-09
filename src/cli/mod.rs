@@ -308,7 +308,7 @@ pub struct DumpArgs {
     /// Print the JSON on one line
     #[arg(long, conflicts_with = "pretty")]
     pub compact: bool,
-    /// Print presenter.toml with every setting at its built-in default instead (no INPUT)
+    /// Print every presenter.toml setting with its default, commented out, instead (no INPUT)
     #[arg(
         long,
         conflicts_with_all = ["input", "context", "theme", "pretty", "compact"]

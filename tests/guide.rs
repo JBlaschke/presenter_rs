@@ -6,8 +6,12 @@
 //! - `configuration.md`: the ```` ```toml ```` block after the line
 //!   `<!-- generated: presenter dump --default-config -->` is exactly what
 //!   `presenter dump --default-config` prints, and the per-table key tables list every key of
-//!   that output with its value as the default (rows whose default is `unset` must name keys
-//!   that `presenter.toml` accepts).
+//!   the config itself (`Config::default()` with the built-in `[reveal]` options, serialized,
+//!   so also the keys without a default) with its default, or `unset` for a key without one,
+//!   and nothing else.
+//! - `presenter dump --default-config` names every key of the config too, and every setting
+//!   in it is commented out: as it is, the text is the default config; with the `#` of its
+//!   `#key = value` lines removed, it is the built-in defaults spelled out.
 //! - Every relative link and image in `README.md` and `docs/guide/*.md` names a file that
 //!   exists, and a `#fragment` into a Markdown file names one of its headings (GitHub's
 //!   anchors).
@@ -275,39 +279,111 @@ fn documented_defaults(text: &str) -> BTreeMap<(String, String), String> {
     rows
 }
 
+/// Every setting with its built-in default: [`Config::default`] with the built-in `[reveal]`
+/// options.
+fn builtin_config() -> Config {
+    Config {
+        reveal: Config::builtin_reveal_defaults(),
+        ..Config::default()
+    }
+}
+
+/// Every key of [`builtin_config`], `(table, key)` in struct order, with its default as
+/// TOML (inline), or `None` for a key without a default. From the JSON form, where a
+/// `None` field is `null` (no field of `Config` skips serialization), so a new key cannot
+/// be missed because it has no default.
+fn config_keys() -> Vec<((String, String), Option<String>)> {
+    let json = serde_json::to_value(builtin_config()).expect("the config serializes");
+    let mut keys = Vec::new();
+    for (table, values) in json.as_object().expect("the config is an object") {
+        let values = values.as_object().expect("every config entry is a table");
+        for (key, value) in values {
+            let default = (!value.is_null()).then(|| {
+                toml::Value::try_from(value)
+                    .expect("a TOML value")
+                    .to_string()
+            });
+            keys.push(((table.clone(), key.clone()), default));
+        }
+    }
+    keys
+}
+
 #[test]
 fn configuration_tables_list_every_key_with_its_default() {
     let text = read(&guide("configuration.md"));
     let documented = documented_defaults(&text);
-    let printed = presenter_stdout(&["dump", "--default-config"]);
-    let defaults: toml::Table = toml::from_str(&printed).expect("the default config is TOML");
+    let keys = config_keys();
+    for ((table, key), default) in &keys {
+        let expected = match default {
+            Some(value) => format!("`{value}`"),
+            None => "unset".to_string(),
+        };
+        assert_eq!(
+            documented.get(&(table.clone(), key.clone())),
+            Some(&expected),
+            "configuration.md: `{key}` under `[{table}]` must be listed with the default {expected}"
+        );
+    }
+    let known: BTreeSet<&(String, String)> = keys.iter().map(|(key, _)| key).collect();
+    for (table, key) in documented.keys() {
+        assert!(
+            known.contains(&(table.clone(), key.clone())),
+            "configuration.md lists `{key}` under `[{table}]`, which is not a setting"
+        );
+    }
+}
 
-    let mut generated = BTreeSet::new();
-    for (table, values) in &defaults {
-        let values = values.as_table().expect("every top-level entry is a table");
-        for (key, value) in values {
-            generated.insert((table.clone(), key.clone()));
-            let cell = documented.get(&(table.clone(), key.clone()));
-            assert_eq!(
-                cell.map(String::as_str),
-                Some(format!("`{value}`").as_str()),
-                "configuration.md: `{key}` under `[{table}]` must be listed with the default `{value}`"
-            );
+/// `text` with the `#` of its commented-out settings (`#key = value`) removed.
+fn uncomment(text: &str) -> String {
+    let setting = Regex::new(r"^#([A-Za-z0-9_]+ = .*)$").unwrap();
+    text.lines()
+        .map(|line| match setting.captures(line) {
+            Some(caps) => caps[1].to_string(),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn default_config_names_every_key_and_sets_none() {
+    let printed = presenter_stdout(&["dump", "--default-config"]);
+    assert_eq!(
+        Config::from_toml_str(&printed).expect("valid TOML"),
+        Config::default(),
+        "saved as presenter.toml, the default config must change nothing"
+    );
+    let table: toml::Table = printed.parse().expect("valid TOML");
+    assert!(
+        table
+            .values()
+            .all(|keys| keys.as_table().is_some_and(toml::Table::is_empty)),
+        "the default config sets something: {table:?}"
+    );
+    assert_eq!(
+        Config::from_toml_str(&uncomment(&printed)).expect("valid TOML when uncommented"),
+        builtin_config(),
+        "uncommented, the default config must be the built-in defaults"
+    );
+
+    let mut current = String::new();
+    let mut lines = BTreeSet::new();
+    for line in printed.lines() {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            current = name.to_string();
+        } else {
+            lines.insert((current.clone(), line.to_string()));
         }
     }
-    for ((table, key), cell) in &documented {
-        if generated.contains(&(table.clone(), key.clone())) {
-            continue;
-        }
-        assert_eq!(
-            cell, "unset",
-            "configuration.md lists `{key}` under `[{table}]`, which `presenter dump \
-             --default-config` does not print; only keys without a default (`unset`) may be extra"
-        );
-        let probe = format!("[{table}]\n{key} = \"x\"\n");
+    for ((table, key), default) in config_keys() {
+        let line = match default {
+            Some(value) => format!("#{key} = {value}"),
+            None => format!("# {key}: unset"),
+        };
         assert!(
-            Config::from_toml_str(&probe).is_ok(),
-            "configuration.md lists `{key}` under `[{table}]`, which presenter.toml rejects"
+            lines.contains(&(table.clone(), line.clone())),
+            "`presenter dump --default-config` has no `{line}` under `[{table}]`"
         );
     }
 }

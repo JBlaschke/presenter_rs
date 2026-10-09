@@ -32,7 +32,9 @@ cp presenter-v0.1.0-aarch64-apple-darwin/presenter ~/.local/bin/
 ```
 
 `~/.local/bin` must be on your `PATH`. The archive also holds `LICENSE`, `README.md` and
-`THIRD-PARTY-LICENSES/`, the notices of the code built into the binary.
+`THIRD-PARTY-LICENSES/`, the notices of the code built into the binary. It does not hold
+this guide or the examples: the README's links and pictures point into the repository, so
+read them on the project's GitHub page or in a checkout.
 
 The binaries are not signed. macOS quarantines files downloaded with a browser, and
 Gatekeeper then refuses to run the binary. If that happens, remove the mark once:

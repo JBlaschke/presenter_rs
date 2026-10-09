@@ -103,7 +103,10 @@ venue: PyData Berlin               # anything else: for templates (meta.vars.ven
 ```
 
 - Content before the first separator is the first slide.
-- Two separators in a row make an empty slide.
+- Two separators in a row make an empty slide, and `presenter check` warns ("slide 2 is
+  empty"). That includes `--` directly after `---`: the new stack gets an empty first
+  slide. To start a stack, put the first slide's content after the `---` and the `--`
+  after that.
 - Separator lines inside fenced code, lists, block quotes and directives are content, not
   separators. So a code block may show a `---` line safely.
 - A `---` closes a vertical stack; the next `--` opens a new one under the new slide.
@@ -197,6 +200,38 @@ The built-in theme has four layouts; themes can add more ([Themes](themes.md#lay
 | ![The title layout](../screenshots/title.png) | ![The section layout](../screenshots/section.png) |
 
 An unknown layout renders like `default`, and `presenter check` warns.
+
+## Attributes on elements
+
+The same braces after a heading (other than the slide's first), a link, an image or
+inline code put the attributes on that element. `.fragment` is the common case: it makes
+one heading, image or word appear on a click.
+
+```markdown
+## Plan
+
+`cargo build`{.fragment} then [the docs](https://doc.rust-lang.org){target=_blank}.
+
+![Plot](figures/plot.png){.fragment width=50% title="A damped oscillation"}
+
+## The surprise {.fragment .fade-up #surprise}
+```
+
+| You write | presenter emits |
+|---|---|
+| `## The surprise {.fragment .fade-up #surprise}` | `<h2 id="surprise" class="fragment fade-up">` |
+| `[the docs](https://…){target=_blank}` | `<a href="https://…" target="_blank">` |
+| `` `cargo build`{.fragment} `` | `<code class="fragment">` |
+| `![Plot](figures/plot.png){width=50%}` | `<img src="…" alt="Plot" width="50%">` |
+
+- `title=` on a link or an image is its tooltip. A Markdown title (`[a](url "Title")`) wins
+  over it.
+- On a slide's first heading the braces are [slide attributes](#slide-attributes). To give
+  that heading itself a class, put `<!-- .element: class="fragment" -->` on the line under
+  it.
+- Code blocks take attributes too ([Code](#code)); list items and paragraphs take them
+  through the `<!-- .element: -->` comment ([reveal.js habits](#revealjs-markdown-habits)).
+- The rules for values are the same as for slides ([Writing values](#writing-values)).
 
 ## Directives
 
@@ -384,8 +419,8 @@ Mention that the second run used the cache.
 ```
 
 Notes go in `:::notes` blocks anywhere on the slide (several are joined). As in reveal's
-Markdown plugin, a paragraph starting with `Note:` also starts the notes: it and everything
-after it on the slide become notes. Press <kbd>S</kbd> in the browser for the speaker view.
+Markdown plugin, a paragraph starting with `Note:` or `Notes:` also starts the notes: it
+and everything after it on the slide become notes. Press <kbd>S</kbd> in the browser for the speaker view.
 
 ## Raw HTML
 
@@ -430,7 +465,7 @@ Decks written for reveal.js's Markdown plugin keep working:
 |---|---|
 | `<!-- .slide: data-background="#f00" class="dark" -->` | slide attributes ([above](#slide-attributes)) |
 | `- item <!-- .element: class="fragment" -->` | attributes for the element before the comment (here the `<li>`), or the enclosing element; `class` values are added |
-| `Note:` paragraph | speaker notes |
+| `Note:` or `Notes:` paragraph | speaker notes |
 | `data-background="image.png"` | treated as `data-background-image`, and the file is embedded |
 
 ## Check a deck

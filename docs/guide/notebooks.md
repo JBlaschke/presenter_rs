@@ -75,9 +75,11 @@ notebook:
 ```
 
 The block is removed from the cell; a cell that holds only front matter opens no slide.
-Two other places work too, with lower precedence: the notebook's `metadata.title`, then a
-`metadata.presenter` object in the notebook metadata with the same keys as the front
-matter. Front matter in a later Markdown cell is ignored, with a warning.
+Two places in the notebook's own metadata work too, below the first cell's front matter:
+a `metadata.presenter` object with the same keys as the front matter, and below that the
+notebook's `metadata.title`. So the first cell's `title:` wins over
+`metadata.presenter.title`, which wins over `metadata.title`. Front matter in a later
+Markdown cell is ignored, with a warning.
 
 ## Markdown cells
 

@@ -278,12 +278,12 @@ prints exactly the data the templates get, with your theme and configuration app
 | Key | Holds |
 |---|---|
 | `meta` | `title`, `subtitle`, `author`, `date`, `description`, `lang`, `theme`, `reveal`, and `vars`: every other front matter key |
-| `slides` | the slides: `id`, `layout`, `layout_template`, `classes`, `attrs`, `title`, `blocks`, `notes`, `children` |
+| `slides` | the slides: `id`, `layout`, `layout_template`, `classes`, `attrs`, `title`, `blocks`, `notes`, `children`, and `span`: where the slide is in the source (`start_line`, `end_line`, and `cell` for a notebook) |
 | `features` | `math`, `code`, `notes`, `notebook`: what the deck uses |
 | `config` | the effective [configuration](configuration.md) (`config.notebook.show_prompts`, …) |
 | `reveal` | `config_json` (the merged reveal options), `plugins`, `plugin_scripts` |
 | `theme` | `name`, `chain`, `reveal_theme`, `highlight_style`, `scripts`, and `vars` from `[vars]` |
-| `build` | `mode` (`build` or `serve`), `standalone`, `live_reload`, `version` |
+| `build` | `mode` (`build` or `serve`), `standalone`, `live_reload`, `version`, and `id`: `presenter serve`'s rebuild counter (`0` in `presenter build`), e.g. to tell rebuilds apart |
 | `deck` | the deck as `presenter dump slides.md` prints it: `meta`, `slides`, `features`, `source` (the file), `assets` |
 
 A block is `{"type": "html", "html": "…"}` (insert it with `|safe`) or a notebook cell

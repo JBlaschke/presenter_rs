@@ -11,8 +11,9 @@ From highest to lowest precedence:
 1. **Command-line flags**: `--theme`, `--site`/`--standalone`, `--port`, `--host`, `--open`,
    `-o`.
 2. **The deck's front matter** (for a notebook: the first Markdown cell's front matter,
-   then the notebook's `metadata.presenter`): `theme:`, and the `reveal:`, `slides:`,
-   `markdown:`, `math:` and `notebook:` maps.
+   then the notebook's `metadata.presenter`, then its `metadata.title`, which sets only
+   the title): `theme:`, and the `reveal:`, `slides:`, `markdown:`, `math:` and
+   `notebook:` maps.
 3. **`presenter.toml`**, the project file.
 4. **The theme's `theme.toml` `[reveal]` table**: reveal.js defaults that come with a
    theme ([Themes](themes.md#a-theme-directory)).
@@ -55,59 +56,83 @@ unknown field `incremental_list`, expected one of `split`, `slide_level`, `incre
 
 ## Every setting
 
-`presenter dump --default-config` prints a `presenter.toml` with every setting at its
-built-in default:
+`presenter dump --default-config` lists every setting with its built-in default. It is a
+reference: every setting in it is commented out, so saved as `presenter.toml` it changes
+nothing. To change a setting, copy its line into your `presenter.toml` under the same
+`[table]` and delete the `#`; for a starter file, use `presenter init`.
+
+Setting a key to its default is not always the same as leaving it out:
+
+- `[build] out_dir`, when set, is relative to the `presenter.toml` that sets it, so every
+  deck below that file writes into one directory. Unset, each deck writes to `dist/` next
+  to itself.
+- A `[reveal]` key in `presenter.toml` overrides the theme's `theme.toml` `[reveal]` value
+  ([how settings combine](#how-settings-combine)): `transition = "slide"` replaces a
+  theme's `"fade"`.
+- A `[reveal] plugins` list that names `notes` loads the notes plugin in every deck.
+  Unset, it is loaded only for decks with speaker notes.
 
 <!-- generated: presenter dump --default-config -->
 ```toml
-# presenter.toml with every setting at its built-in default
+# Every presenter.toml setting with its built-in default, commented out: saved as it is,
+# this file changes nothing. To change a setting, copy its line into presenter.toml under
+# the same [table] and delete the `#`. (`presenter init` writes a starter presenter.toml.)
+#
+# Setting these keys, even to the default shown, is not the same as leaving them out:
+# - [build] out_dir is relative to the presenter.toml that sets it, so every deck below
+#   that file writes into one directory; unset, each deck writes to dist/ next to itself.
+# - A [reveal] key overrides the theme's theme.toml [reveal] value for that key.
+# - [reveal] plugins: listing `notes` loads the notes plugin in every deck; unset, it is
+#   loaded only for decks with speaker notes.
 
 [deck]
-theme = "default"
-lang = "en"
+#theme = "default"
+#lang = "en"
+# title: unset
+# author: unset
+# date: unset
 
 [build]
-out_dir = "dist"
-standalone = true
-minify = false
+#out_dir = "dist"
+#standalone = true
+#minify = false
 
 [slides]
-split = "rules"
-slide_level = 2
-incremental_lists = false
+#split = "rules"
+#slide_level = 2
+#incremental_lists = false
 
 [markdown]
-smart_punctuation = false
-sourcepos = false
+#smart_punctuation = false
+#sourcepos = false
 
 [reveal]
-hash = true
-slideNumber = false
-transition = "slide"
-controls = true
-progress = true
-center = true
-width = 1280
-height = 720
-plugins = ["highlight", "notes", "zoom", "search"]
+#hash = true
+#slideNumber = false
+#transition = "slide"
+#controls = true
+#progress = true
+#center = true
+#width = 1280
+#height = 720
+#plugins = ["highlight", "notes", "zoom", "search"]
 
 [math]
-enabled = "auto"
-
-[math.katex_options]
+#enabled = "auto"
+#katex_options = {}
 
 [notebook]
-mime_priority = ["text/html", "image/svg+xml", "image/png", "image/jpeg", "image/gif", "image/webp", "text/markdown", "text/latex", "application/json", "text/plain"]
-hide_input_tags = ["hide-input", "remove-input"]
-hide_output_tags = ["hide-output", "remove-output"]
-remove_cell_tags = ["remove-cell", "hide-cell", "skip"]
-split_markdown_cells = false
-show_prompts = true
+#mime_priority = ["text/html", "image/svg+xml", "image/png", "image/jpeg", "image/gif", "image/webp", "text/markdown", "text/latex", "application/json", "text/plain"]
+#hide_input_tags = ["hide-input", "remove-input"]
+#hide_output_tags = ["hide-output", "remove-output"]
+#remove_cell_tags = ["remove-cell", "hide-cell", "skip"]
+#split_markdown_cells = false
+#show_prompts = true
 
 [serve]
-host = "127.0.0.1"
-port = 3000
-open = false
+#host = "127.0.0.1"
+#port = 3000
+#open = false
 ```
 
 ### `[deck]`
