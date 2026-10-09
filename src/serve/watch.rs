@@ -82,7 +82,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use crate::assets::registry::{AssetData, AssetRegistry, normalize_lexically};
 use crate::config::Config;
 use crate::error::{Diagnostics, Error, Result};
-use crate::ir::{Deck, DeckMeta, Features, SourceInfo, SourceKind};
+use crate::ir::{Deck, DeckMeta, Features, Parsed, SourceInfo, SourceKind};
 use crate::markdown::render::missing_asset_path;
 use crate::pipeline::{self, Build, BuildFailure, BuildOptions};
 use crate::theme::resolve::{MANIFEST_FILE, MAX_CHAIN_LEN};
@@ -182,20 +182,88 @@ pub fn watch_set_for(build: &Build) -> WatchSet {
 /// directory and the current directory, and where each parent named by `extends` is
 /// looked for), so that fixing or creating it rebuilds.
 ///
-/// This parses the deck again (the failed build's parse is not kept).
+/// This parses the deck again; [`try_build_watched`] builds and returns this set from the
+/// build's own parse instead.
 pub fn watch_set_for_failed(opts: &BuildOptions) -> WatchSet {
     match pipeline::parse_only(opts) {
         Ok((parsed, config, config_path)) => {
-            let mut files = vec![opts.input.clone()];
-            files.extend(asset_files(&parsed.assets, &parsed.diagnostics));
-            files.extend(config_path.iter().cloned());
-            let themes = theme_dirs(opts, &parsed.deck, &config, config_path.as_deref());
-            WatchSet::new(files, with_builtin_theme(themes))
+            ParsedInputs::new(opts, &parsed, &config, config_path.as_deref()).watch_set(opts)
         }
-        Err(err) => {
-            tracing::debug!("watching a deck that does not parse: {err}");
-            watch_set_before_build(opts)
+        Err(err) => unparsed_watch_set(opts, &err),
+    }
+}
+
+/// Builds `opts` ([`pipeline::try_build_deck`]; nothing is written) and returns the result
+/// with the inputs to watch: [`watch_set_for`] the build, or when it failed, the set
+/// [`watch_set_for_failed`] gives, taken from the failed build's own parse
+/// ([`pipeline::try_build_deck_inspecting`]), so the deck is parsed once.
+pub fn try_build_watched(
+    opts: &BuildOptions,
+) -> (std::result::Result<Build, BuildFailure>, WatchSet) {
+    let mut inputs = None;
+    let result = pipeline::try_build_deck_inspecting(opts, |parsed, config, config_path| {
+        inputs = Some(ParsedInputs::new(opts, parsed, config, config_path));
+    });
+    let set = match (&result, inputs) {
+        (Ok(build), _) => watch_set_for(build),
+        (Err(_), Some(inputs)) => inputs.watch_set(opts),
+        (Err(failure), None) => unparsed_watch_set(opts, &failure.error),
+    };
+    (result, set)
+}
+
+/// The watch set of a deck that does not parse (`err`): [`watch_set_before_build`].
+fn unparsed_watch_set(opts: &BuildOptions, err: &Error) -> WatchSet {
+    tracing::debug!("watching a deck that does not parse: {err}");
+    watch_set_before_build(opts)
+}
+
+/// What [`watch_set_for_failed`] watches of a deck that parses, kept so that the set can
+/// be made after the parsed deck is gone (moved into the build's later stages).
+struct ParsedInputs {
+    /// The source, the deck's file assets (missing ones included) and the
+    /// `presenter.toml` that was used.
+    files: Vec<PathBuf>,
+    /// The deck without its slides: what [`theme_dirs`] reads (`meta.theme`, `source`).
+    deck: Deck,
+    /// The config with the front matter merged.
+    config: Config,
+    /// The `presenter.toml` that was used.
+    config_path: Option<PathBuf>,
+}
+
+impl ParsedInputs {
+    /// The inputs of `parsed`, which [`pipeline::try_parse_only`] returned for `opts` with
+    /// `config` and `config_path`.
+    fn new(
+        opts: &BuildOptions,
+        parsed: &Parsed,
+        config: &Config,
+        config_path: Option<&Path>,
+    ) -> ParsedInputs {
+        let mut files = vec![opts.input.clone()];
+        files.extend(asset_files(&parsed.assets, &parsed.diagnostics));
+        files.extend(config_path.map(Path::to_path_buf));
+        let deck = Deck {
+            meta: parsed.deck.meta.clone(),
+            slides: Vec::new(),
+            features: Features::default(),
+            source: parsed.deck.source.clone(),
+            assets: Vec::new(),
+        };
+        ParsedInputs {
+            files,
+            deck,
+            config: config.clone(),
+            config_path: config_path.map(Path::to_path_buf),
         }
+    }
+
+    /// The watch set: the files, the theme directories ([`theme_dirs`]) and the built-in
+    /// theme in a debug build.
+    fn watch_set(self, opts: &BuildOptions) -> WatchSet {
+        let themes = theme_dirs(opts, &self.deck, &self.config, self.config_path.as_deref());
+        WatchSet::new(self.files, with_builtin_theme(themes))
     }
 }
 
@@ -972,7 +1040,8 @@ pub fn run_build_watch(opts: BuildOptions, out: PathBuf) -> Result<()> {
 /// change saved while that build runs triggers a rebuild, and it watches the inputs of each
 /// build before that build is reported, so that whatever is changed in response to the
 /// report counts. A failed build is reported and the loop goes on, watching
-/// [`watch_set_for_failed`] together with the inputs of the last successful build. Changes
+/// [`watch_set_for_failed`] (taken from the failed build's own parse: [`try_build_watched`])
+/// together with the inputs of the last successful build. Changes
 /// to `out` itself (or below it, for a site), and to the directories above it that the
 /// build creates inside a watched theme directory, are ignored, so an output inside a
 /// watched directory does not loop. Batches that queue up during a rebuild are merged into
@@ -1016,10 +1085,10 @@ fn build_and_write(
     last_good: &mut Option<WatchSet>,
     report: &mut impl FnMut(WatchStatus<'_>) -> ControlFlow<()>,
 ) -> ControlFlow<(), WatchSet> {
-    match pipeline::try_build_deck(opts) {
+    let (result, mut set) = try_build_watched(opts);
+    match result {
         Ok(build) => {
             let written = pipeline::write_output(&build, out, &opts.output);
-            let set = watch_set_for(&build);
             watch(watcher, &set);
             match written {
                 Ok(written) => report(WatchStatus::Built {
@@ -1035,7 +1104,6 @@ fn build_and_write(
             ControlFlow::Continue(set)
         }
         Err(failure) => {
-            let mut set = watch_set_for_failed(opts);
             if let Some(good) = last_good {
                 set.merge(good);
             }

@@ -218,6 +218,70 @@ fn reveal_pdf_options_pass_through_and_the_pdf_goes_next_to_the_html() {
     assert_eq!(page_count(&read_pdf(&dir.path().join("separate.pdf"))), 5);
 }
 
+/// `TMPDIR` relative to the current directory: the deck's `file://` URL must name the
+/// directory presenter created there (it used to become `file:///reltmp/…`, which Chrome
+/// could not load).
+#[cfg(unix)]
+#[test]
+fn a_relative_tmpdir_works() {
+    if chrome().is_none() {
+        return;
+    }
+    let dir = project(&[("deck.md", "# One\n\n---\n\n# Two\n")]);
+    let reltmp = dir.path().join("reltmp");
+    std::fs::create_dir(&reltmp).unwrap();
+    let output = presenter(dir.path())
+        .env("TMPDIR", "reltmp")
+        .args(["export", "pdf", "deck.md", "-o", "rel.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote(&output, "rel.pdf"), 2);
+    assert_eq!(page_count(&read_pdf(&dir.path().join("rel.pdf"))), 2);
+    // Chrome's profile was in reltmp (as an absolute path: the processes name the real one).
+    assert_cleaned_up(&std::fs::canonicalize(&reltmp).unwrap());
+}
+
+/// Other spellings of a relative `TMPDIR`: `..` after a symbolic link (the system follows
+/// the link first, Chrome would drop `lnk/..` from the URL), and an empty `TMPDIR=`, which
+/// counts as unset (`/tmp`) and must not put the export's directory into the deck's.
+#[cfg(unix)]
+#[test]
+fn tmpdir_spellings_with_dot_dot_or_empty_work() {
+    if chrome().is_none() {
+        return;
+    }
+    let dir = project(&[("deck.md", "# One\n\n---\n\n# Two\n")]);
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(elsewhere.path().join("sub")).unwrap();
+    std::fs::create_dir(elsewhere.path().join("t")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path().join("sub"), dir.path().join("lnk")).unwrap();
+    let output = presenter(dir.path())
+        .env("TMPDIR", "lnk/../t")
+        .args(["export", "pdf", "deck.md", "-o", "dotdot.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote(&output, "dotdot.pdf"), 2);
+    assert!(!dir.path().join("t").exists());
+    assert_cleaned_up(&std::fs::canonicalize(elsewhere.path().join("t")).unwrap());
+
+    let output = presenter(dir.path())
+        .env("TMPDIR", "")
+        .args(["export", "pdf", "deck.md", "-o", "empty.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote(&output, "empty.pdf"), 2);
+    assert_eq!(page_count(&read_pdf(&dir.path().join("empty.pdf"))), 2);
+    let mut left = entries(dir.path());
+    left.sort();
+    assert_eq!(left, ["deck.md", "dotdot.pdf", "empty.pdf", "lnk"]);
+}
+
 #[test]
 fn quiet_exports_print_nothing() {
     if chrome().is_none() {

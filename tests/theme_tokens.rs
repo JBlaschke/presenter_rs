@@ -356,7 +356,7 @@ fn only_images_reveal_stretches_lose_the_size_caps() {
     assert_eq!(caps.len(), 1, "{caps:?}");
     assert_eq!(
         caps[0].selector,
-        ".reveal :is(img, video):not(section > .r-stretch, section > .stretch)"
+        ".reveal :where(.slides section) :is(img, video):not(section > .r-stretch, section > .stretch)"
     );
     assert_eq!(
         caps[0].get("max-width"),
@@ -369,6 +369,113 @@ fn only_images_reveal_stretches_lose_the_size_caps() {
             "exempts every .r-stretch element: {}",
             r.selector
         );
+    }
+}
+
+/// The selectors of a selector list (split at the commas outside parentheses).
+fn complex_selectors(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0usize, 0);
+    for (i, c) in list.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(list[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(list[start..].trim());
+    parts
+}
+
+#[test]
+fn complex_selectors_split_only_at_top_level_commas() {
+    assert_eq!(
+        complex_selectors(".a :is(img, video), .b:not(x, y) > p"),
+        [".a :is(img, video)", ".b:not(x, y) > p"]
+    );
+}
+
+/// A selector prefix that keeps a rule inside slide content: a slide's `section`
+/// (`.slides section`, `section.layout-…`), or a class the theme's slide markup guarantees
+/// (theme-format.md §6: `.cell…`, `.output…`, `.column(s)`), which only occurs inside one.
+fn slide_content_scope() -> Regex {
+    Regex::new(r"(^|[\s>+~(,])section\b|\.(cell|output|column)(s|-[a-z-]+)?\b").unwrap()
+}
+
+/// reveal puts images, videos and iframes inside `.reveal` and sizes them itself: slide
+/// backgrounds (`background-video` must cover the slide, a `background-iframe` has no
+/// frame) and the lightbox of `data-preview-image`/`-video`. In the normal view they are
+/// outside `.slides`, but in print view (`?print-pdf`, what `presenter export pdf` loads)
+/// and scroll view (`?view=scroll`, and narrow screens) reveal moves each background into
+/// `.slides`, next to its slide's `section` (in `.pdf-page` / `.scroll-page-content`).
+/// Every theme rule that selects one of these elements must therefore be scoped to slide
+/// content ([`slide_content_scope`] before the element in the selector; `.slides` alone is
+/// not enough), and the default theme's own media rules must not gain specificity over the
+/// unscoped rules they replaced (`:where(.slides section)`), so child themes still win as
+/// before.
+#[test]
+fn media_rules_style_slide_content_only() {
+    let media = Regex::new(r"(^|[\s>+~(,])(img|video|iframe)\b").unwrap();
+    let scope = slide_content_scope();
+    let rules = rules(&css());
+    let mut checked = 0;
+    for r in &rules {
+        for selector in complex_selectors(&r.selector) {
+            let Some(m) = media.find(selector) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                scope.is_match(&selector[..m.start()]),
+                "`{selector}` ({}) also matches outside slide content (reveal's \
+                 backgrounds in print and scroll view)",
+                r.context
+            );
+        }
+    }
+    assert!(checked >= 6, "{checked}");
+    for selector in [
+        ".reveal :where(.slides section) img, .reveal :where(.slides section) video, \
+         .reveal :where(.slides section) iframe",
+        ".reveal :where(.slides section) img",
+        ".reveal :where(.slides section) iframe",
+    ] {
+        rule(&rules, selector);
+    }
+    let frame = rule(&rules, ".reveal :where(.slides section) iframe");
+    assert_eq!(frame.get("border"), Some("1px solid var(--p-border)"));
+}
+
+/// The rule test above must reject the scopes that leak onto reveal's backgrounds or its
+/// lightbox, `.slides` among them.
+#[test]
+fn scopes_outside_slide_content_are_rejected() {
+    let scope = slide_content_scope();
+    for leaky in [
+        ".reveal ",
+        ".reveal .slides ",
+        ".reveal :where(.slides) ",
+        ".reveal .slides > .pdf-page ",
+        ".reveal .slide-background ",
+        ".reveal .r-overlay-content ",
+        ".reveal .sections ",
+        ".reveal .cellar ",
+    ] {
+        assert!(!scope.is_match(leaky), "{leaky}");
+    }
+    for scoped in [
+        ".reveal :where(.slides section) ",
+        ".reveal .slides section > ",
+        ".reveal .slides section.layout-blank > p:has(> :is(",
+        ".reveal .cell-outputs ",
+        ".reveal .output-display ",
+        ".reveal .columns > .column ",
+    ] {
+        assert!(scope.is_match(scoped), "{scoped}");
     }
 }
 

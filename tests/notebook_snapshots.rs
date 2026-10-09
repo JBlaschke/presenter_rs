@@ -1578,6 +1578,124 @@ fn attachment_urls_resolve_in_css_urls() {
     );
 }
 
+/// reveal.js' lightbox reads `data-preview-image` / `-video`, and a script may write an
+/// attachment URL: these resolved when attachments were rewritten in the cell source, and
+/// must not be left silently broken now that they are resolved in the rendered HTML. Text
+/// attributes and code stay as written.
+#[test]
+fn attachment_urls_resolve_in_other_attributes_and_scripts() {
+    let source = "<img src=\"attachment:a+b.png\" data-preview-image=\"attachment:a+b.png\" \
+                  alt=\"attachment:a+b.png\" title=\"attachment:a+b.png\">\n\
+                  <img src=attachment:a+b.png data-preview-image='attachment:a%2Bb.png'>\n\
+                  <span data-preview-video=\"attachment:v.mp4\">play</span>\n\
+                  <a data-preview-link=\"attachment:page.html\">page</a>\n\
+                  <span data-preview-image=\"attachment:nope.png\">nope</span>\n\
+                  <button onclick=\"show('attachment:a+b.png')\">show</button>\n\
+                  <button onclick=\"show('attachment:a&amp;b.gif')\">amp</button>\n\
+                  <iframe srcdoc=\"<img src='attachment:a+b.png'><p>attachment:a+b.png</p>\"></iframe>\n\
+                  <meta http-equiv=\"refresh\" content=\"30; url=attachment:page.html\">\n\
+                  <div data-cfg='{\"img\":\"attachment:a+b.png\"}'>cfg</div>\n\
+                  <a href=\"https://example.org/attachment:a+b.png\">elsewhere</a>\n\n\
+                  <script>document.write('<img src=\"attachment:a+b.png\">');\n\
+                  var plot = \"attachment:my plot.png?v=2\", other = 'attachment:a%2Bb.png';\n\
+                  var gone = 'attachment:gone.png', built = 'attachment:' + name;\n\
+                  var o = {attachment:true}; f({attachment:x}); // see attachment:notes\n\
+                  var u = `attachment:${name}`;</script>\n\n\
+                  Shown: `<span data-preview-image=\"attachment:a+b.png\">` and\n\n\
+                  ```html\n<script>document.write('<img src=\"attachment:a+b.png\">')</script>\n```\n";
+    let cell = json!({
+        "cell_type": "markdown", "metadata": {}, "source": source,
+        "attachments": {
+            "a+b.png": {"image/png": PIXEL_PNG},
+            "my plot.png": {"image/svg+xml": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>"},
+            "v.mp4": {"video/mp4": "AAAAGGZ0eXBtcDQy"},
+            "page.html": {"text/html": "PHA+cGFnZTwvcD4="},
+            "a&b.gif": {"image/gif": "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"},
+        },
+    });
+    let parsed = inline(json!([cell]));
+    let body = html(&parsed.deck.slides[0].blocks[0]);
+    let id = |mime: &str| {
+        let asset = parsed.deck.assets.iter().find(|a| a.mime == mime);
+        format!("asset:{}", asset.unwrap_or_else(|| panic!("{mime}")).id)
+    };
+    let (png, svg, mp4, page, gif) = (
+        id("image/png"),
+        id("image/svg+xml"),
+        id("video/mp4"),
+        id("text/html"),
+        id("image/gif"),
+    );
+    for resolved in [
+        format!("<img src=\"{png}\" data-preview-image=\"{png}\""),
+        "alt=\"attachment:a+b.png\" title=\"attachment:a+b.png\"".to_owned(),
+        format!("<img src={png} data-preview-image='{png}'>"),
+        format!("data-preview-video=\"{mp4}\""),
+        format!("data-preview-link=\"{page}\""),
+        "data-preview-image=\"attachment:nope.png\"".to_owned(),
+        format!("onclick=\"show('{png}')\""),
+        format!("onclick=\"show('{gif}')\""),
+        // Inside other values: HTML in `srcdoc` (its text stays), a refresh, JSON.
+        format!("srcdoc=\"<img src='{png}'><p>attachment:a+b.png</p>\""),
+        format!("content=\"30; url={page}\""),
+        format!("data-cfg='{{\"img\":\"{png}\"}}'"),
+        "href=\"https://example.org/attachment:a+b.png\"".to_owned(),
+        format!("document.write('<img src=\"{png}\">');"),
+        format!("var plot = \"{svg}?v=2\", other = '{png}';"),
+        "var gone = 'attachment:gone.png', built = 'attachment:' + name;".to_owned(),
+        // Script code that only uses the word: no URL, no warning.
+        "var o = {attachment:true}; f({attachment:x}); // see attachment:notes".to_owned(),
+        "var u = `attachment:${name}`;".to_owned(),
+        "<code>&lt;span data-preview-image=&quot;attachment:a+b.png&quot;&gt;</code>".to_owned(),
+        "&lt;script&gt;document.write('&lt;img src=\"attachment:a+b.png\"&gt;')&lt;/script&gt;"
+            .to_owned(),
+    ] {
+        assert!(body.contains(&resolved), "{resolved} in {body}");
+    }
+    assert_eq!(parsed.deck.assets.len(), 5);
+    let messages: Vec<(&str, &str)> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.message.as_str()))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            (
+                "missing-attachment",
+                "`attachment:nope.png`: the cell has no attachment `nope.png`"
+            ),
+            (
+                "missing-attachment",
+                "`attachment:gone.png`: the cell has no attachment `gone.png`"
+            ),
+        ]
+    );
+
+    // The built deck inlines them (standalone: data: URIs, also inside the script).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deck.ipynb");
+    std::fs::write(&path, notebook(json!([cell]), python())).unwrap();
+    let options = presenter::pipeline::BuildOptions::new(&path);
+    let built = presenter::pipeline::build_deck(&options)
+        .unwrap()
+        .document
+        .html;
+    let png = format!("data:image/png;base64,{PIXEL_PNG}");
+    for inlined in [
+        format!("data-preview-image=\"{png}\""),
+        format!("data-preview-image='{png}'"),
+        "data-preview-video=\"data:video/mp4;base64,".to_owned(),
+        format!("document.write('<img src=\"{png}\">');"),
+        format!("show('{png}')"),
+        format!("srcdoc=\"<img src='{png}'>"),
+        format!("data-cfg='{{\"img\":\"{png}\"}}'"),
+        "show('data:image/gif;base64,".to_owned(),
+    ] {
+        assert!(built.contains(&inlined), "{inlined}");
+    }
+}
+
 #[test]
 fn notes_in_markdown_outputs_are_speaker_notes() {
     let outputs = json!([

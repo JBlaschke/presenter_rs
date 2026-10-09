@@ -28,8 +28,10 @@
 //! [`try_parse_only`], [`try_prepare`] and [`try_build_deck`] are [`parse_only`],
 //! [`prepare`] and [`build_deck`] that keep the diagnostics collected before a failure
 //! ([`BuildFailure`]), so a failed build can still report its warnings and every missing
-//! asset, also when the front matter is rejected. [`resolve_theme`] is stage 3's theme
-//! lookup on its own (for commands that lint without rendering).
+//! asset, also when the front matter is rejected. [`try_build_deck_inspecting`] also shows
+//! the caller the parsed deck (the watcher takes a failed build's inputs from it).
+//! [`resolve_theme`] is stage 3's theme lookup on its own (for commands that lint without
+//! rendering).
 //!
 //! Output locations: [`default_output_path`] is `<out_dir>/<stem>.html` (standalone) or
 //! `<out_dir>/<stem>/` (site). A relative `out_dir` is relative to the `presenter.toml`
@@ -195,7 +197,19 @@ pub fn build_deck(opts: &BuildOptions) -> Result<Build> {
 
 /// [`build_deck`], keeping the diagnostics collected before a failure ([`BuildFailure`]).
 pub fn try_build_deck(opts: &BuildOptions) -> std::result::Result<Build, BuildFailure> {
-    let prepared = try_prepare(opts)?;
+    try_build_deck_inspecting(opts, |_, _, _| {})
+}
+
+/// [`try_build_deck`] that hands the parsed deck, the config and the `presenter.toml` that
+/// was used (what [`try_parse_only`] returns) to `inspect` as soon as the input has parsed,
+/// before the later stages run. For a caller that needs the deck's inputs also when a later
+/// stage fails (the watcher: `serve::watch`), without parsing the deck a second time.
+/// `inspect` is not called when [`try_parse_only`] fails.
+pub fn try_build_deck_inspecting(
+    opts: &BuildOptions,
+    inspect: impl FnOnce(&Parsed, &Config, Option<&Path>),
+) -> std::result::Result<Build, BuildFailure> {
+    let prepared = try_prepare_inspecting(opts, inspect)?;
     let document =
         match render::render(prepared.render_input(opts.output.clone(), opts.build.clone())) {
             Ok(document) => document,
@@ -243,8 +257,18 @@ pub fn prepare(opts: &BuildOptions) -> Result<Prepared> {
 
 /// [`prepare`], keeping the diagnostics collected before a failure ([`BuildFailure`]).
 pub fn try_prepare(opts: &BuildOptions) -> std::result::Result<Prepared, BuildFailure> {
+    try_prepare_inspecting(opts, |_, _, _| {})
+}
+
+/// [`try_prepare`] that calls `inspect` once the input has parsed
+/// ([`try_build_deck_inspecting`]).
+fn try_prepare_inspecting(
+    opts: &BuildOptions,
+    inspect: impl FnOnce(&Parsed, &Config, Option<&Path>),
+) -> std::result::Result<Prepared, BuildFailure> {
     let (parsed, config, config_path) = try_parse_only(opts)
         .map_err(|failure| raise_missing_assets(failure, opts.missing_asset_is_error))?;
+    inspect(&parsed, &config, config_path.as_deref());
     let Parsed {
         deck,
         assets,

@@ -13,12 +13,15 @@
 //! network port, so no other local user or process can drive it.
 //!
 //! 1. A private temporary directory (mode 0700) holds the deck, `deck.html`, and Chrome's
-//!    fresh profile: in the system's temporary directory (`$TMPDIR`), or for a snap browser
-//!    in its `~/snap/<name>/common` when that exists (a snap has a private `/tmp`, and
-//!    `~/snap/<name>/common` is its `$SNAP_USER_COMMON`, which it can read). Chrome starts
-//!    headless with a quiet throwaway configuration (no first-run UI, sync, extensions or
-//!    keychain access; plus `--no-sandbox` when running as root on Linux, which Chrome
-//!    requires); `/bin/sh` moves presenter's pipes to descriptors 3 and 4 and `exec`s it.
+//!    fresh profile: in the system's temporary directory (`$TMPDIR`; an empty one counts as
+//!    unset, `/tmp`), or for a snap browser in its `~/snap/<name>/common` when that exists
+//!    (a snap has a private `/tmp`, and `~/snap/<name>/common` is its `$SNAP_USER_COMMON`,
+//!    which it can read). Once created, the directory is named by its real path (absolute,
+//!    no symbolic links, `.` or `..`): a relative `$TMPDIR` must not make the deck's URL
+//!    depend on the current directory. Chrome starts headless with a quiet throwaway
+//!    configuration (no first-run UI, sync, extensions or keychain access; plus
+//!    `--no-sandbox` when running as root on Linux, which Chrome requires); `/bin/sh` moves
+//!    presenter's pipes to descriptors 3 and 4 and `exec`s it.
 //! 2. `Target.createTarget` (about:blank) and `Target.attachToTarget {flatten: true}` open a
 //!    page; `Page.enable`, `Runtime.enable`, `Inspector.enable`; `Page.navigate` to
 //!    `file://<dir>/deck.html?print-pdf`, the same kind of page as the output of
@@ -360,8 +363,21 @@ fn is_executable(path: &Path) -> bool {
 pub fn html_to_pdf(chrome: &Path, html: &str, timeout: Duration) -> Result<Vec<u8>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let (base, source) = placement(chrome, home.as_deref());
-    let base = base.unwrap_or_else(std::env::temp_dir);
+    let base = base.unwrap_or_else(|| system_temp_dir(std::env::temp_dir()));
     print_in(chrome, html, timeout, &base, source)
+}
+
+/// The system's temporary directory, given [`std::env::temp_dir`]: that returns `$TMPDIR`
+/// as set, so an empty `TMPDIR=` gives the empty path, which would put the export's
+/// directory into the current directory. An empty `$TMPDIR` counts as unset instead
+/// (`/tmp`), as for `mktemp`, Python and Go. A relative one stays relative here
+/// ([`TempDir::new`] resolves it).
+fn system_temp_dir(temp_dir: PathBuf) -> PathBuf {
+    if temp_dir.as_os_str().is_empty() {
+        PathBuf::from("/tmp")
+    } else {
+        temp_dir
+    }
 }
 
 /// How Chrome gets the deck (module docs, step 2).
@@ -1332,8 +1348,16 @@ struct TempDir {
 
 impl TempDir {
     /// Creates `<base>/<prefix>-<pid>-<n>` (mode 0700 on Unix) and starts its watchdog.
+    ///
+    /// The directory is then named by its real path ([`std::fs::canonicalize`]; made
+    /// absolute if that fails): that path becomes the deck's `file://` URL and Chrome's
+    /// `--user-data-dir`. A relative `base` (`TMPDIR=tmp`; [`std::env::temp_dir`] returns
+    /// `$TMPDIR` as set) would make them depend on Chrome's current directory, and a `..`
+    /// after a symbolic link (`TMPDIR=lnk/../t`) would name another directory in the URL:
+    /// the system follows `lnk` before `..`, Chrome drops `lnk/..` from the URL.
     fn new(base: &Path, prefix: &str) -> Result<TempDir> {
-        let path = create_private_dir(base, prefix)?;
+        let created = create_private_dir(base, prefix)?;
+        let path = std::fs::canonicalize(&created).unwrap_or_else(|_| absolute(&created));
         match Janitor::start(&path) {
             Ok(janitor) => Ok(TempDir { path, janitor }),
             Err(e) => {
@@ -1791,7 +1815,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let dir = TempDir::new(base.path(), "presenter-test").unwrap();
         let path = dir.path().to_path_buf();
-        assert!(path.starts_with(base.path()));
+        assert!(path.starts_with(std::fs::canonicalize(base.path()).unwrap()));
         std::fs::create_dir_all(path.join("profile/nested")).unwrap();
         std::fs::write(path.join("profile/nested/file"), "x").unwrap();
         {
@@ -1807,6 +1831,110 @@ mod tests {
         assert!(entries(base.path()).is_empty());
         // The watchdogs were told `done` and exited at once.
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// `path` (absolute) as a path relative to the current directory: `..` up to the root,
+    /// then `path` below it.
+    #[cfg(unix)]
+    fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let up = cwd.components().skip(1).map(|_| Path::new(".."));
+        up.collect::<PathBuf>()
+            .join(path.strip_prefix("/").unwrap())
+    }
+
+    /// The file a deck's `file://…?print-pdf` URL names for Chrome, which resolves `.` and
+    /// `..` in the URL lexically (before the system sees the path, so `lnk/..` is dropped
+    /// even when `lnk` is a symbolic link).
+    #[cfg(unix)]
+    fn file_chrome_loads(url: &str) -> PathBuf {
+        use std::path::Component;
+        let page = url
+            .strip_prefix("file://")
+            .and_then(|url| url.strip_suffix("?print-pdf"))
+            .unwrap_or_else(|| panic!("{url}"));
+        assert!(page.starts_with('/') && !page.contains('%'), "{url}");
+        let mut path = PathBuf::new();
+        for component in Path::new(page).components() {
+            match component {
+                Component::ParentDir => {
+                    path.pop();
+                }
+                Component::CurDir => {}
+                other => path.push(other),
+            }
+        }
+        path
+    }
+
+    /// Creates a [`TempDir`] in `base` and checks that its path is real (absolute, no
+    /// symbolic link, `.` or `..`) and that the deck's URL names the deck written into it;
+    /// returns the directory.
+    #[cfg(unix)]
+    fn assert_deck_url_names_the_deck(base: &Path) -> TempDir {
+        let dir = TempDir::new(base, "presenter-test").unwrap();
+        let path = dir.path();
+        assert!(path.is_absolute(), "{path:?}");
+        assert_eq!(std::fs::canonicalize(path).unwrap(), path);
+        let deck = Deck::new(&dir, "<p>deck</p>", DeckSource::File).unwrap();
+        let page = file_chrome_loads(&deck.url);
+        assert_eq!(
+            std::fs::read_to_string(&page).ok().as_deref(),
+            Some("<p>deck</p>"),
+            "{} names the deck",
+            deck.url
+        );
+        dir
+    }
+
+    /// `TMPDIR=tmp` makes [`std::env::temp_dir`] relative: the deck's `file://` URL (and
+    /// Chrome's profile) must still name the directory that was created, not `/tmp`.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_temporary_base_gives_absolute_paths_and_urls() {
+        let _serial = serial();
+        let base = tempfile::tempdir().unwrap();
+        let relative = relative_to_cwd(base.path());
+        assert!(relative.is_relative() && relative.is_dir(), "{relative:?}");
+        let dir = assert_deck_url_names_the_deck(&relative);
+        assert_eq!(entries(base.path()).len(), 1, "created below the base");
+        drop(dir);
+        assert!(entries(base.path()).is_empty());
+    }
+
+    /// `TMPDIR=lnk/../t` with `lnk` a symbolic link: the system follows `lnk` before `..`,
+    /// but Chrome drops `lnk/..` from the URL, so the URL must name the real directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_base_with_dot_dot_after_a_symbolic_link_gives_the_real_directory() {
+        let _serial = serial();
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("elsewhere/sub")).unwrap();
+        std::fs::create_dir(base.path().join("elsewhere/t")).unwrap();
+        std::os::unix::fs::symlink("elsewhere/sub", base.path().join("lnk")).unwrap();
+        for spelling in [
+            base.path().join("lnk/../t"),
+            base.path().join("lnk/./../t/."),
+        ] {
+            let dir = assert_deck_url_names_the_deck(&spelling);
+            assert_eq!(entries(&base.path().join("elsewhere/t")).len(), 1);
+            drop(dir);
+            assert!(entries(&base.path().join("elsewhere/t")).is_empty());
+        }
+        // Relative to the current directory as well.
+        let relative = relative_to_cwd(base.path()).join("lnk/../t");
+        let dir = assert_deck_url_names_the_deck(&relative);
+        assert_eq!(entries(&base.path().join("elsewhere/t")).len(), 1);
+        drop(dir);
+        assert!(!base.path().join("t").exists());
+    }
+
+    /// `TMPDIR=` (set, but empty) counts as unset: `/tmp`, not the current directory.
+    #[test]
+    fn an_empty_tmpdir_means_tmp() {
+        assert_eq!(system_temp_dir(PathBuf::new()), Path::new("/tmp"));
+        assert_eq!(system_temp_dir("/var/tmp".into()), Path::new("/var/tmp"));
+        assert_eq!(system_temp_dir("reltmp".into()), Path::new("reltmp"));
     }
 
     #[cfg(unix)]
