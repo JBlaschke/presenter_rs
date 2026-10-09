@@ -6,6 +6,10 @@
 //!   fenced code, links and images (`node.data().attrs`, converted with `From`); the separator
 //!   form `--- {…}` is parsed by [`parse_attr_block`] with the same grammar plus two
 //!   conveniences comrak lacks: single-quoted values and bare keys (`{auto-animate}`).
+//!   comrak also rejects unquoted values with characters other than letters, digits and
+//!   `- _ . : %` (`background=#222`, `lines=1|3`); such a block on a heading, fence, link,
+//!   image or inline code is read again with [`read_element_attrs`] (the same tokenizer; no
+//!   bare keys), see [`recover`](crate::markdown::recover) (A3).
 //! - [`SlideAttrs`] is the slide-level normalization (§3.2): `#id` → id, `.class` → classes,
 //!   `layout=` consumed, shorthand keys expanded to reveal's `data-*` attributes by
 //!   [`normalize_key`], unknown keys kept verbatim and recorded for `check`, keys that are not
@@ -73,6 +77,79 @@ pub fn parse_attr_block(s: &str) -> Result<ParsedAttrs> {
     Ok(out)
 }
 
+/// How an attribute block that comrak left as text reads with the dialect §3.1 grammar
+/// ([`read_element_attrs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElementAttrs {
+    /// Every item is an `#id`, a `.class` or a `key=value` pair with a valid key name: the
+    /// attributes, exactly as [`parse_attr_block`] reads the block.
+    Attrs(ParsedAttrs),
+    /// Not meant as attributes (`{1, 2}`, `{curly braces}`, R Markdown's `{r}`): the block
+    /// stays text and nothing is reported.
+    Text,
+    /// Meant as attributes (some item is a valid one, or the block is a bare slide shorthand
+    /// such as `{auto-animate}`), but not valid; the reason, for a warning.
+    Invalid(String),
+}
+
+/// Reads `block` (`{…}`, braces included) as the attributes of a heading, fenced code,
+/// link, image or inline code (dialect §3.1, A3 contract note): with [`parse_attr_block`]'s
+/// tokenizer, so single-quoted values and unquoted values with any character but whitespace
+/// work, but stricter in what an item may be. Each item must be `#id`, `.class` (both
+/// non-empty or quoted) or `key=value` with an unquoted key that [`is_valid_attr_name`]
+/// accepts; a bare key (`{auto-animate}`) needs a value there (`auto-animate=""`), as §3.2
+/// says. The strictness keeps ordinary text in braces as text.
+///
+/// [`ElementAttrs::Invalid`] when the block has an unbalanced quote and starts like
+/// attributes (`#x`, `.x` or `key=`), or when some item is invalid while another one is
+/// valid or the block names a known slide key without a value (`{.dark auto-animate}`,
+/// `{auto-animate}`); [`ElementAttrs::Text`] for anything else that is not attributes.
+pub fn read_element_attrs(block: &str) -> ElementAttrs {
+    let Some(inner) = block
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return ElementAttrs::Text;
+    };
+    let tokens = match tokenize(inner) {
+        Ok(tokens) => tokens,
+        Err(quote) if starts_like_attrs(inner) => {
+            return ElementAttrs::Invalid(format!("unbalanced {quote} quote"));
+        }
+        Err(_) => return ElementAttrs::Text,
+    };
+    let mut out = ParsedAttrs::default();
+    let (mut valid, mut known_bare, mut problem) = (0, false, None);
+    for token in tokens {
+        match token.element_problem() {
+            None => {
+                valid += 1;
+                token.classify_into(&mut out);
+            }
+            Some(reason) => {
+                known_bare |= token.is_known_bare_key();
+                problem.get_or_insert(reason);
+            }
+        }
+    }
+    match problem {
+        None => ElementAttrs::Attrs(out),
+        Some(reason) if valid > 0 || known_bare => ElementAttrs::Invalid(reason),
+        Some(_) => ElementAttrs::Text,
+    }
+}
+
+/// Whether the inside of a block starts like an attribute item: `#x`, `.x` or `key=`.
+fn starts_like_attrs(inner: &str) -> bool {
+    let inner = inner.trim_start();
+    if let Some(rest) = inner.strip_prefix(['#', '.']) {
+        return rest.starts_with(|c: char| !c.is_whitespace());
+    }
+    inner
+        .split_once('=')
+        .is_some_and(|(key, _)| is_valid_attr_name(key))
+}
+
 /// One whitespace-separated item of an attribute block, with its quotes removed.
 #[derive(Default)]
 struct Token {
@@ -89,6 +166,42 @@ struct Token {
 }
 
 impl Token {
+    /// Why this item is not a valid element attribute ([`read_element_attrs`]); `None` when
+    /// it is one.
+    fn element_problem(&self) -> Option<String> {
+        match (self.lead, self.eq) {
+            (Some(marker @ ('#' | '.')), _) => {
+                let rest = &self.text[marker.len_utf8()..];
+                (rest.is_empty() && !self.quoted)
+                    .then(|| format!("`{marker}` without a name after it"))
+            }
+            (lead, Some(at)) => {
+                let key = &self.text[..at];
+                (lead.is_none() || !is_valid_attr_name(key))
+                    .then(|| format!("`{key}` is not a valid attribute name"))
+            }
+            (_, None) if is_valid_attr_name(&self.text) => Some(format!(
+                "`{key}` has no value: write `{key}=\"\"` (a key without a value works only in \
+                 `--- {{…}}` and `<!-- .slide: -->`)",
+                key = self.text
+            )),
+            (_, None) => Some(format!(
+                "`{}` is not an attribute (`#id`, `.class` or `key=value`)",
+                self.text
+            )),
+        }
+    }
+
+    /// A bare key (no `=`) that names a slide attribute: a shorthand of dialect §3.2, a
+    /// `data-`/`aria-` key, `layout`, `id` or `class`.
+    fn is_known_bare_key(&self) -> bool {
+        if self.eq.is_some() || matches!(self.lead, Some('#' | '.')) || self.text.is_empty() {
+            return false;
+        }
+        let key = self.text.to_lowercase();
+        matches!(key.as_str(), "layout" | "id" | "class") || normalize_key(&key, "").1
+    }
+
     fn classify_into(self, out: &mut ParsedAttrs) {
         match self.lead {
             Some('#') => {
@@ -566,6 +679,96 @@ mod tests {
             assert_eq!(from_separator, from_heading, "{block}");
             assert_eq!(from_separator, slide_attrs(block), "{block}");
         }
+    }
+
+    /// A3: blocks comrak rejects on a heading but §3.1 allows; the heading form reads them
+    /// as the separator form does (`markdown::recover`).
+    const RECOVERED_CASES: &[&str] = &[
+        "{.dark background=#222}",
+        "{background=figures/bg.png}",
+        "{background=https://ex.com/a.png?x=1&y=2}",
+        "{lines=1|3 .numbered}",
+        "{lines=1,3}",
+        "{k='v w' #id}",
+        "{title='say \"hi\"' data-x='a\\'b'}",
+        "{data-x=a(b);c data-y=+!*@~$^}",
+    ];
+
+    #[test]
+    fn read_element_attrs_reads_what_parse_attr_block_reads() {
+        for block in SHARED_CASES.iter().chain(RECOVERED_CASES) {
+            assert_eq!(
+                read_element_attrs(block),
+                ElementAttrs::Attrs(parse_attr_block(block).unwrap()),
+                "{block}"
+            );
+        }
+        for block in RECOVERED_CASES {
+            assert_eq!(comrak_heading_attrs(block), None, "comrak accepts {block}");
+        }
+    }
+
+    #[test]
+    fn read_element_attrs_keeps_text_and_reports_mistakes() {
+        for text in [
+            "{1, 2, 3}",
+            "{curly braces}",
+            "{r}",
+            "{python}",
+            "{it's}",
+            "{=v}",
+            "no braces",
+        ] {
+            assert_eq!(read_element_attrs(text), ElementAttrs::Text, "{text}");
+        }
+        let invalid = |block: &str| match read_element_attrs(block) {
+            ElementAttrs::Invalid(reason) => reason,
+            other => panic!("{block}: {other:?}"),
+        };
+        assert_eq!(
+            invalid("{.dark auto-animate}"),
+            "`auto-animate` has no value: write `auto-animate=\"\"` (a key without a value \
+             works only in `--- {…}` and `<!-- .slide: -->`)"
+        );
+        assert!(invalid("{auto-animate}").starts_with("`auto-animate` has no value"));
+        assert!(invalid("{layout}").starts_with("`layout` has no value"));
+        assert_eq!(invalid("{k='v}"), "unbalanced ' quote");
+        assert_eq!(invalid("{.a k=\"v}"), "unbalanced \" quote");
+        assert_eq!(
+            invalid("{r, echo=FALSE}"),
+            "`r,` is not an attribute (`#id`, `.class` or `key=value`)"
+        );
+        assert_eq!(invalid("{.a 1x=2}"), "`1x` is not a valid attribute name");
+        assert_eq!(invalid("{.a \"k\"=v}"), "`k` is not a valid attribute name");
+        assert_eq!(invalid("{# .a}"), "`#` without a name after it");
+    }
+
+    /// Every block comrak accepts on a heading reads the same with `read_element_attrs`.
+    #[test]
+    fn read_element_attrs_agrees_with_comrak_on_random_blocks() {
+        let alphabet: Vec<char> = "ab#.=\" \\'-_:%1\tZé/|".chars().collect();
+        let mut rng = Lcg(0xa3);
+        let mut accepted = 0;
+        for _ in 0..20_000 {
+            let len = rng.below(12);
+            let body: String = (0..len)
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect();
+            let block = format!("{{{body}}}");
+            let Some(from_comrak) = comrak_heading_attrs(&block) else {
+                continue;
+            };
+            accepted += 1;
+            assert_eq!(
+                read_element_attrs(&block),
+                ElementAttrs::Attrs(from_comrak),
+                "{block:?}"
+            );
+        }
+        assert!(
+            accepted > 1_000,
+            "only {accepted} blocks accepted by comrak"
+        );
     }
 
     #[test]

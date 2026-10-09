@@ -2,7 +2,7 @@
 source: tests/diagnostics.rs
 expression: "printed(&err, Some(\"slides.md\"), \"slides.md\", deck)"
 ---
-error: front matter: mapping values are not allowed in this context at line 2 column 19
+error: front matter: mapping values are not allowed in this context at line 2 column 19 (put the value in quotes: `title: "Diagnostics: a talk"`)
  --> slides.md:2:19
   |
 2 | title: Diagnostics: a talk

@@ -160,7 +160,8 @@ fn codes(diagnostics: &Diagnostics) -> Vec<(&'static str, usize)> {
 }
 
 /// Fixtures with a dedicated test below.
-const DEDICATED: [&str; 8] = [
+const DEDICATED: [&str; 10] = [
+    "attribute-recovery",
     "attributes",
     "code",
     "directives",
@@ -168,6 +169,7 @@ const DEDICATED: [&str; 8] = [
     "math",
     "minimal",
     "notes",
+    "pandoc-directives",
     "separators",
 ];
 
@@ -436,6 +438,88 @@ fn notes_md() {
     );
 }
 
+/// A3 (F04, F34, F35): attribute blocks comrak rejects are read with the dialect §3.1
+/// grammar on headings, fences, images, links and inline code.
+#[test]
+fn attribute_recovery_md() {
+    let parsed = check_fixture("attribute-recovery", &[0; 6]);
+    let slides = &parsed.deck.slides;
+    let id = AssetRegistry::new().register_file(&fixture_dir().join("images/ok.png"));
+    // headings: lifted, clean, no literal `{…}` and no autolink
+    assert_eq!(slides[0].classes, ["dark"]);
+    assert_eq!(slides[0].attrs["data-background-color"], "#222");
+    assert_eq!(slides[0].title.as_deref(), Some("Dark"));
+    assert!(html(&slides[0]).starts_with("<h1>Dark</h1>\n"));
+    assert_eq!(
+        slides[1].attrs["data-background-image"],
+        format!("asset:{id}")
+    );
+    assert!(html(&slides[1]).starts_with("<h2>Image</h2>\n"));
+    assert_eq!(
+        slides[2].attrs["data-background-image"],
+        "https://example.org/bg.png"
+    );
+    assert!(
+        html(&slides[2]).starts_with("<h2>Remote</h2>\n"),
+        "{}",
+        html(&slides[2])
+    );
+    assert_eq!(slides[3].id.as_deref(), Some("q"));
+    assert_eq!(slides[3].attrs["data-note"], "two words");
+    // fences
+    let code = html(&slides[3]);
+    assert!(code.contains(
+        "<pre><code class=\"language-python\" data-trim data-line-numbers=\"1|3\">a = 1"
+    ));
+    assert!(
+        code.contains("<pre><code data-trim data-line-numbers=\"1,3\">x"),
+        "{code}"
+    );
+    // images, links, inline code; `title=` without a Markdown title
+    let inline = html(&slides[4]);
+    for expected in [
+        format!(r#"<img src="asset:{id}" alt="Half" width="50%" />"#),
+        r#"<a href="https://example.org" data-x="y z">a link</a>"#.to_string(),
+        r#"<code data-x="a/b">code</code>."#.to_string(),
+        r#"<a href="https://example.org" title="Link title">Titled link</a>"#.to_string(),
+        format!(r#"<img src="asset:{id}" alt="Titled image" title="Image title" />"#),
+    ] {
+        assert!(inline.contains(&expected), "{expected}\n{inline}");
+    }
+    assert!(!inline.contains('{'), "{inline}");
+    // math in a title; text in braces; a block that is not valid stays and is reported
+    assert_eq!(slides[5].title.as_deref(), Some("The E=mc^2 law"));
+    let last = html(&slides[5]);
+    assert!(last.contains("<p>The set {1, 2, 3} stays text.</p>"));
+    assert!(last.contains("<h3>Not attributes {.big auto-animate}</h3>"));
+    assert_eq!(codes(&parsed.diagnostics), [("unparsed-attr-block", 68)]);
+    assert_eq!(parsed.deck.assets.len(), 1);
+}
+
+/// A3 (F26, F14): pandoc's `::: {.class}` directives and the fragment index.
+#[test]
+fn pandoc_directives_md() {
+    let parsed = check_fixture("pandoc-directives", &[0, 0]);
+    let slides = &parsed.deck.slides;
+    assert_eq!(
+        html(&slides[0]),
+        "<h2>Pandoc fenced divs</h2>\n\
+         <div class=\"fragment fade-up\">\n<p>Fades up.</p>\n</div>\n\
+         <div class=\"columns\" style=\"grid-template-columns: 1fr 2fr\">\n\
+         <div class=\"column\">\n<p>Left.</p>\n</div>\n\
+         <div id=\"intro\" class=\"note\">\n<p>Right.</p>\n</div>\n\
+         </div>\n"
+    );
+    assert_eq!(
+        slides[0].notes.as_deref(),
+        Some("<p>Speaker notes in pandoc syntax.</p>\n")
+    );
+    let fragments = html(&slides[1]);
+    assert!(fragments.contains("<div class=\"fragment\">\n<p>Not a number"));
+    assert!(fragments.contains("<div class=\"fragment\" data-fragment-index=\"2\">"));
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive-arg", 38)]);
+}
+
 fn ctx_parts() -> (AssetRegistry, Diagnostics) {
     (AssetRegistry::new(), Diagnostics::new())
 }
@@ -535,18 +619,29 @@ fn notebook_cells_lift_a_leading_heading_on_request() {
     let mut slide = Slide::new();
     presenter::markdown::attrs::SlideAttrs::from_parsed(lifted).apply_to(&mut slide);
     assert_eq!(slide.layout, "title");
-    // render_fragment never lifts
+    assert!(ctx.diagnostics.is_empty());
+    // render_fragment never lifts; the layout left on the heading is reported (A3)
     let plain = render_fragment(cell, &opts, &mut ctx).unwrap();
     assert!(plain.html.starts_with("<h1 layout=\"title\">Analysis</h1>"));
-    assert!(diagnostics.is_empty());
+    assert_eq!(codes(&diagnostics), [("unlifted-slide-attr", 1)]);
 }
 
 #[test]
 fn front_matter_errors_and_bad_separators() {
-    assert!(matches!(
-        parse_text("---\n- a list\n---\n\n# x\n"),
-        Err(Error::FrontMatter(message)) if message == "expected a mapping"
-    ));
+    // A3 (F05): the root value's position and the front matter's extent, with the question
+    match parse_text("---\n- a list\n---\n\n# x\n") {
+        Err(err @ Error::FrontMatter(_)) => {
+            assert_eq!(
+                err.to_string(),
+                "front matter: expected a mapping at line 2 column 1 (the front matter runs from \
+                 line 1 to the `---` on line 3; is its closing `---` missing, or was line 1 \
+                 meant as a slide separator?)"
+            );
+            assert_eq!(err.span().map(|span| span.start_line), Some(2));
+            assert_eq!(err.column(), Some(1));
+        }
+        other => panic!("expected Error::FrontMatter, got {other:?}"),
+    }
     match parse_text("# One\n\n--- {title=\"unclosed}\n\n# Two\n") {
         Err(Error::Parse { path, line, .. }) => {
             assert_eq!(path, source("inline").path);
@@ -578,4 +673,252 @@ fn front_matter_markdown_options_apply_to_the_deck() {
         html(&plain.deck.slides[0]),
         "<h1>&quot;Quoted&quot; -- dash</h1>\n"
     );
+}
+
+/// The `Config` with `slides.split = "headings"`.
+fn headings_config() -> Config {
+    Config::from_toml_str("[slides]\nsplit = \"headings\"\n").unwrap()
+}
+
+/// A3 (F05): front matter that swallowed slide content is reported, not silent.
+#[test]
+fn front_matter_that_swallows_slides_is_reported() {
+    // a deck that starts with a `---` rule: the heading is a YAML comment
+    let parsed = parse_text("---\n\n# Real\n\n---\n\n# Two\n").unwrap();
+    assert_eq!(parsed.deck.slides.len(), 1);
+    assert_eq!(codes(&parsed.diagnostics), [("front-matter-empty", 1)]);
+    let warning = parsed.diagnostics.iter().next().unwrap();
+    assert_eq!(warning.span.as_ref().map(|s| s.end_line), Some(5));
+    assert!(
+        warning
+            .message
+            .contains("to the `---` on line 5 and sets nothing"),
+        "{warning}"
+    );
+    // a missing closing `---`: the title slide is a YAML comment
+    let unclosed =
+        "---\ntitle: My talk\nauthor: Me\n\n# My talk {layout=title}\n\n---\n\n## Next\n\nMore\n";
+    let parsed = parse_text(unclosed).unwrap();
+    assert_eq!(parsed.deck.meta.title.as_deref(), Some("My talk"));
+    assert_eq!(codes(&parsed.diagnostics), [("front-matter-unclosed", 5)]);
+    assert_eq!(
+        parsed.diagnostics.iter().next().unwrap().message,
+        "`# My talk {layout=title}` on line 5 is a YAML comment, not a slide: the front \
+         matter runs from line 1 to the `---` on line 7. Is its closing `---` missing (before \
+         line 5)?"
+    );
+    // with body text it is a YAML error: located, with the same question
+    let with_body = "---\ntitle: T\n\n# Title\n\nSome text\n\n---\n\n## Next\n";
+    match parse_text(with_body) {
+        Err(err @ Error::FrontMatter(_)) => {
+            let message = err.to_string();
+            assert!(
+                message.ends_with(
+                    "(the front matter runs from line 1 to the `---` on line 8; is its closing \
+                     `---` missing?)"
+                ),
+                "{message}"
+            );
+            assert_eq!(err.span().map(|s| s.start_line), Some(7));
+        }
+        other => panic!("expected a front matter error, got {other:?}"),
+    }
+}
+
+/// The scaffold of `presenter init` with its placeholders filled in.
+fn scaffold() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/scaffold/slides.md");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .replace("{{child_theme}}", "")
+        .replace("{{name_yaml}}", "\"Talk\"")
+        .replace("{{name}}", "Talk")
+}
+
+/// A3 (F05): the scaffold's own front matter comments are no false alarm, and the scaffold
+/// with its closing `---` deleted is reported.
+#[test]
+fn scaffold_front_matter_is_not_reported_unless_unclosed() {
+    let text = scaffold();
+    let parsed = parse_text(&text).unwrap();
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    // delete the closing `---` and the notes under the title (which would be a YAML error)
+    let mut lines: Vec<&str> = text.lines().collect();
+    let closing = lines.iter().skip(1).position(|l| *l == "---").unwrap() + 1;
+    lines.remove(closing);
+    let notes = lines.iter().position(|l| *l == ":::notes").unwrap();
+    let end = notes + lines[notes..].iter().position(|l| *l == ":::").unwrap();
+    lines.drain(notes..=end);
+    let parsed = parse_text(&lines.join("\n")).unwrap();
+    let found = codes(&parsed.diagnostics);
+    assert_eq!(
+        found,
+        [("front-matter-unclosed", closing + 2)],
+        "{lines:#?}"
+    );
+}
+
+/// A3 (F36): `---` directly followed by `---` is empty front matter, as `---`, blank, `---`.
+#[test]
+fn dashes_on_lines_one_and_two_are_empty_front_matter() {
+    for (text, line) in [("---\n---\n", 2), ("---\n\n---\n", 3)] {
+        let parsed = parse_text(text).unwrap();
+        assert_eq!(parsed.deck.slides.len(), 1, "{text:?}");
+        // the one empty slide of an empty document, after the front matter
+        assert_eq!(
+            codes(&parsed.diagnostics),
+            [("empty-slide", line)],
+            "{text:?}"
+        );
+    }
+    let parsed = parse_text("---\n---\n\n# Only\n").unwrap();
+    assert_eq!(shape(&parsed.deck), [0]);
+    assert_eq!(parsed.deck.slides[0].title.as_deref(), Some("Only"));
+    assert!(parsed.diagnostics.is_empty());
+    // a `***` rule or `---` later in the deck is still a separator
+    let parsed = parse_text("***\n---\n\n# x\n").unwrap();
+    assert_eq!(parsed.deck.slides.len(), 2);
+}
+
+/// A3 (F12): `:::notes` before a slide's heading is not visible content.
+#[test]
+fn notes_before_the_heading_do_not_hide_it() {
+    // rules mode: the heading's attributes are lifted
+    let parsed =
+        parse_text(":::notes\nSay hi.\n:::\n\n# Welcome {layout=section .x #w}\n").unwrap();
+    let slide = &parsed.deck.slides[0];
+    assert_eq!(
+        (slide.layout.as_str(), slide.id.as_deref()),
+        ("section", Some("w"))
+    );
+    assert_eq!(slide.classes, ["x"]);
+    assert_eq!(html(slide), "<h1>Welcome</h1>\n");
+    assert_eq!(slide.notes.as_deref(), Some("<p>Say hi.</p>\n"));
+    assert!(parsed.diagnostics.is_empty());
+    // headings mode: no notes-only blank slide, the notes stay with the title slide
+    let text = ":::notes\nWelcome everyone.\n:::\n\n# Intro {layout=title}\n\n# Part two\n\ntext\n";
+    let parsed = parse(&source("inline"), text, &headings_config()).unwrap();
+    let slides = &parsed.deck.slides;
+    assert_eq!(slides.len(), 2);
+    assert_eq!(slides[0].layout, "title");
+    assert_eq!(
+        slides[0].notes.as_deref(),
+        Some("<p>Welcome everyone.</p>\n")
+    );
+    assert_eq!(slides[1].title.as_deref(), Some("Part two"));
+    // after a separator, too
+    let text = "# A\n\n---\n\n:::notes\nn\n:::\n\n## B {.b}\n";
+    let parsed = parse(&source("inline"), text, &headings_config()).unwrap();
+    assert_eq!(parsed.deck.slides.len(), 2);
+    assert_eq!(parsed.deck.slides[1].classes, ["b"]);
+    // a heading that is not lifted keeps its slide attributes, with a warning
+    let parsed = parse_text("# A\n\nText.\n\n## B {layout=section data-id=b}\n").unwrap();
+    assert!(html(&parsed.deck.slides[0]).contains(r#"<h2 layout="section" data-id="b">B</h2>"#));
+    assert_eq!(codes(&parsed.diagnostics), [("unlifted-slide-attr", 5)]);
+}
+
+/// A3 (F12): a notebook markdown cell that starts with notes lifts its heading.
+#[test]
+fn notebook_cells_lift_a_heading_after_notes() {
+    let (mut assets, mut diagnostics) = ctx_parts();
+    let dir = fixture_dir();
+    let mut ctx = RenderCtx {
+        assets: &mut assets,
+        base_dir: &dir,
+        mode: RenderMode::Notebook,
+        diagnostics: &mut diagnostics,
+        missing_asset_is_error: false,
+    };
+    let opts = comrak_options(&Default::default());
+    let cell = "<!-- intro -->\n\n:::notes\nHello.\n:::\n\n# Title {layout=section}\n";
+    let (rendered, lifted) = render_fragment_with_lift(cell, &opts, &mut ctx, true).unwrap();
+    assert_eq!(
+        lifted.unwrap().pairs,
+        [("layout".to_string(), "section".to_string())]
+    );
+    assert!(
+        rendered.html.ends_with("<h1>Title</h1>\n"),
+        "{}",
+        rendered.html
+    );
+    assert_eq!(rendered.notes.as_deref(), Some("<p>Hello.</p>\n"));
+    // A3 (F04): attribute blocks comrak rejects are read in cells too
+    let cell = "# T {.dark background=#222}\n\n![i](images/ok.png){width='50%'}\n";
+    let (rendered, lifted) = render_fragment_with_lift(cell, &opts, &mut ctx, true).unwrap();
+    let lifted = lifted.unwrap();
+    assert_eq!(lifted.classes, ["dark"]);
+    assert_eq!(
+        lifted.pairs,
+        [("background".to_string(), "#222".to_string())]
+    );
+    assert!(
+        rendered
+            .html
+            .starts_with("<h1>T</h1>\n<p><img src=\"asset:")
+    );
+    assert!(rendered.html.ends_with(" alt=\"i\" width=\"50%\" /></p>\n"));
+    assert!(diagnostics.is_empty());
+}
+
+/// A3 (F13): same-length nested directive fences are reported in both split modes.
+#[test]
+fn same_length_nested_directives_are_reported() {
+    let text = "# Title\n\n---\n\n## Cols\n\n:::columns\n:::column\nLeft\n:::\n:::column\nRight\n:::\n:::\n\n---\n\n## Next slide\n";
+    let parsed = parse_text(text).unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 14)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.contains("`::::columns` … `:::column` … `:::` … `::::`"),
+        "{message}"
+    );
+    let headings = "# Title\n\n## Cols\n\n:::columns\n:::column\nL\n:::\n:::column\nR\n:::\n:::\n\n## Next slide\n";
+    let parsed = parse(&source("inline"), headings, &headings_config()).unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 12)]);
+    // the longer outer fence is fine
+    let fixed = text.replacen(":::columns", "::::columns", 1).replacen(
+        ":::\n\n---\n\n## Next",
+        "::::\n\n---\n\n## Next",
+        1,
+    );
+    let parsed = parse_text(&fixed).unwrap();
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    assert_eq!(parsed.deck.slides.len(), 3);
+}
+
+/// A3 (F22): a deck image found only by letter case is reported (on a case-insensitive
+/// file system; elsewhere it is missing).
+#[test]
+fn images_found_only_by_letter_case_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("figures")).unwrap();
+    std::fs::copy(
+        fixture_dir().join("images/ok.png"),
+        dir.path().join("figures/plain.png"),
+    )
+    .unwrap();
+    let source = SourceInfo {
+        path: dir.path().join("deck.md"),
+        kind: SourceKind::Markdown,
+        base_dir: dir.path().to_path_buf(),
+    };
+    let text = "![](figures/plain.png)\n\n![](Figures/plain.PNG)\n\n<img src=\"./figures/../figures/PLAIN.png\">\n";
+    let parsed = parse(&source, text, &Config::default()).unwrap();
+    let insensitive = dir.path().join("FIGURES/PLAIN.PNG").is_file();
+    let found = codes(&parsed.diagnostics);
+    if insensitive {
+        assert_eq!(
+            found,
+            [("asset-case-mismatch", 3), ("asset-case-mismatch", 5)]
+        );
+        let first = &parsed.diagnostics.iter().next().unwrap().message;
+        assert_eq!(
+            first,
+            "image `Figures/plain.PNG` matches `figures/plain.png` only by letter case: it is \
+             found on this file system, but not on a case-sensitive one (Linux); write \
+             `figures/plain.png`"
+        );
+        assert_eq!(parsed.deck.assets.len(), 1);
+    } else {
+        assert_eq!(found, [("missing-asset", 3), ("missing-asset", 5)]);
+    }
 }

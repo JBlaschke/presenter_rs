@@ -70,6 +70,18 @@ slide 4
 - Values that are not strings for string fields (e.g. `date: 2026-10-08` parses as a
   date/plain scalar) are converted with their YAML scalar text; `title: 42` → `"42"`.
 
+> **A3 note (2026-10-09):** `---` on line 1 directly followed by `---` on line 2 is empty front
+> matter (as in Jekyll and pandoc), like `---`, blank line, `---`. Markdown headings are YAML
+> comments, so front matter can swallow slides silently; the frontend warns: `front-matter-empty`
+> when the block sets nothing but has `#` lines (a deck that starts with a `---` rule), and
+> `front-matter-unclosed` when a Markdown heading (`# Title`, not a commented-out key such as
+> `# date: …` or a label ending with `:`) follows a blank line after the last YAML line (the
+> closing `---` is probably missing). "expected a mapping" gets the root value's position, and
+> it and other YAML errors in such a block name the block's extent and ask whether the closing
+> `---` is missing. A `mapping values are not allowed` error on `key: value` with `: ` in the
+> plain value ends with `(put the value in quotes: `title: "Rust: the good parts"`)`; a line
+> indented with a tab with `(indent with spaces, not tabs)`.
+
 ### 2.2 Separators (rules mode, the default `slides.split = "rules"`)
 Decided on the comrak AST of the whole document, walking the `Document`'s direct children:
 
@@ -110,6 +122,10 @@ initial slide only if it is non-blank.
 > heading. A `data-background` value that reveal treats as an image moves to `data-background-image`
 > (and is registered as an asset).
 
+> **A3 note (2026-10-09):** "visible content" excludes HTML comments and `:::notes` blocks (also
+> pandoc's `::: {.notes}`): speaker notes before a boundary heading go with that heading's slide
+> instead of making a blank slide of their own.
+
 ## 3. Attributes
 
 ### 3.1 Syntax
@@ -120,6 +136,18 @@ comrak parses these natively for headings, fenced code, links and images into
 (`--- {…}`) is parsed by our own `markdown::attrs::parse_attr_block(&str)` with the same
 grammar (T11), and the two must agree (shared unit tests).
 
+> **A3 note (2026-10-09):** comrak 0.56 rejects a whole block on headings, fenced code, links,
+> images and inline code when a value is single-quoted or an unquoted value has characters other
+> than letters, digits and `- _ . : %` (`background=#222`, `background=figures/bg.png`,
+> `lines=1|3`), and leaves the `{…}` as text. The frontend then reads the block with
+> `parse_attr_block`'s tokenizer and removes it from the text, so these forms agree with
+> `--- {…}`. Outside `--- {…}` and `<!-- .slide: -->` every item must be `#id`, `.class` or
+> `key=value` with a valid key: a bare key needs a value (`auto-animate=""`), and text such as
+> `{1, 2}` stays text. A block meant as attributes that is not valid (`{.dark auto-animate}`,
+> an unbalanced quote) stays text and is an `unparsed-attr-block` warning. Not covered: notebook
+> markdown cells with `split_markdown_cells = true`, whose headings, links, images and inline
+> code comrak alone reads (their fences are covered).
+
 ### 3.2 Slide attributes: where they come from and how they normalize
 Sources, applied in this order (later wins for the same key; classes accumulate):
 1. the separator line `--- {…}` / `-- {…}` that opened the slide,
@@ -127,6 +155,11 @@ Sources, applied in this order (later wins for the same key; classes accumulate)
 3. attributes on the slide's **first** node when it is a heading: `# Title {layout=title .x}`.
    They are *lifted*: removed from the heading node (so the `<h1>` is clean) and applied to
    the slide. The heading's `#id` becomes the section id.
+
+> **A3 note (2026-10-09):** "first node" is the first *visible* node: HTML comments and
+> `:::notes` blocks before the heading do not count. Slide attributes (`layout=`, `background=`
+> and the other shorthands below; not `data-`/`aria-` keys) on a heading that is not lifted stay
+> on the element and are an `unlifted-slide-attr` warning.
 
 Normalization into `Slide` fields:
 - `#id` → `Slide.id`; `.class` → `Slide.classes` (deduplicated, order kept);
@@ -153,6 +186,9 @@ into the HTML (`id`, `class`, `k="v"`). T12 must verify that comrak's HTML forma
 the node to `HtmlInline`/`HtmlBlock` before formatting. The reveal-compat
 `<!-- .element: class="fragment" -->` comment form is T43.
 
+> **A3 note (2026-10-09):** on links and images a `title=` attribute is written when there is no
+> Markdown title (`[a](u){title="T"}`); a Markdown title (`[a](u "T")`) wins.
+
 ## 4. Directives
 
 `:::name arg arg` … `:::` is a comrak block directive. To nest directives the **outer**
@@ -178,6 +214,15 @@ not consumed by the table above are emitted as `data-<key>="<value>"`.
 Directive opening lines may not contain `:` after the fence (comrak 0.56 then does not open a
 directive; T12 warns `invalid-directive`); write `&#58;` instead. comrak resolves backslash
 escapes in the info string, so a value containing `"` must be single-quoted.
+
+> **A3 note (2026-10-09):** pandoc's attribute block is accepted as the info string:
+> `::: {.fragment .fade-up}` is `:::fragment fade-up`, `:::: {.columns}` is `::::columns`,
+> `::: {.column width="40%"}` is `:::column width=40%`, `::: {#intro .note}` adds
+> `id="intro"`, and `::: {.notes}` is `:::notes` (the first class is the name). `index=N` of
+> `:::fragment` must be a non-negative integer (reveal.js never shows a fragment with another
+> index); any other value is dropped with an `invalid-directive-arg` warning. A directive opened
+> by a bare `:::` line (mostly a nested closing fence as long as the outer one's, as pandoc
+> allows) is an `invalid-directive` warning that names the longer-outer-fence fix.
 
 ## 5. Code blocks
 
@@ -226,6 +271,11 @@ and set `Features.math`.
 - Links (`[text](file.pdf)`) are **not** registered; they stay as written.
 - Remote URLs are never fetched.
 
+> **A3 note (2026-10-09):** like theme files, local files must match the letter case of the
+> reference exactly. A file found only by letter case (`plain.PNG` for `plain.png` on a
+> case-insensitive file system such as macOS's) is still used and is an `asset-case-mismatch`
+> warning, since a case-sensitive file system (Linux CI) would not find it.
+
 ## 7. Speaker notes
 - `:::notes … :::` anywhere in a slide (§4). Multiple blocks append in order.
 - Compat (T43): a top-level `Paragraph` starting with `Note:` or `Notes:` ends the slide
@@ -237,6 +287,9 @@ and set `Features.math`.
   `<span data-math-style="inline|display">TeX</span>` with TeX HTML-escaped. KaTeX
   renders these on load (`assets/presenter/math.js`, T15). `Features.math` becomes true.
 - A literal dollar sign is written `\$`.
+
+> **A3 note (2026-10-09):** `Slide.title` keeps inline math as its TeX without the dollars
+> (`# The $E=mc^2$ law` → `The E=mc^2 law`).
 
 ## 9. Raw HTML and reveal features
 Because `render.r#unsafe = true`, authors can write `<video>`, `<iframe>`, `<div class="r-stack">`,

@@ -53,12 +53,13 @@
 //! - Every slide without nodes is reported as `empty-slide` (two consecutive separators, a
 //!   `--` right after `---`, a trailing separator), also when it carries attributes.
 //! - A horizontal separator closes an open vertical stack.
-//! - HTML blocks made only of comments ([`compat::is_blank`]) render nothing, so they do not
-//!   count when looking for a slide's *first node*: its first visible node is (a licence,
-//!   lint or TODO comment before the title changes nothing).
+//! - HTML blocks made only of comments render nothing, and a top-level `:::notes` block goes
+//!   to the speaker notes ([`compat::is_invisible`]), so they do not count when looking for a
+//!   slide's *first node*: its first visible node is (a licence, lint or TODO comment, or
+//!   the speaker notes, before the title change nothing; A3).
 //! - A `<!-- .slide: … -->` comment (a top-level HTML block that is exactly that comment, see
-//!   [`compat::slide_comment`]) among the comments that start the slide, or among those right
-//!   after the slide's first visible node when that is a heading, gives the slide attributes
+//!   [`compat::slide_comment`]) among the invisible nodes that start the slide, or among those
+//!   right after the slide's first visible node when that is a heading, gives the slide attributes
 //!   and is removed from its nodes; several are all read, in order. One anywhere else, also
 //!   nested in a list or directive or inline in a paragraph or heading, stays a plain comment
 //!   and is reported as `misplaced-slide-comment`. An unbalanced quote in one that is read is
@@ -91,13 +92,15 @@
 //!   node, so its `{…}` attributes are lifted and the `.slide:` comments under it are read as
 //!   usual.
 //! - The open slide does not end at a boundary heading while it has no visible content yet:
-//!   nothing at all, or only HTML comments ([`compat::is_blank`]). Then the heading joins it
+//!   nothing at all, or only HTML comments and `:::notes` blocks ([`compat::is_invisible`]).
+//!   Then the heading joins it
 //!   instead. That gives dialect §2.3's "content before the first heading becomes an initial
 //!   slide only if it is non-blank", and makes `---` (or `--`) directly followed by a heading,
 //!   possibly with comments between them, one slide, as in rules mode: the separator decides
 //!   the direction and its attributes apply. A rules-mode deck whose slides start with
 //!   headings therefore keeps its shape in headings mode.
-//! - Likewise only HTML comments before the first separator are not a slide of their own:
+//! - Likewise only HTML comments and `:::notes` blocks before the first separator are not a
+//!   slide of their own:
 //!   they go to the slide that separator opens (so a leading `--` after a licence comment is
 //!   still reported as `orphan-vertical`). In rules mode they stay slide 1 (§2.2).
 //! - `---` starts a horizontal stack that no section heading started, so the `##` headings
@@ -111,7 +114,7 @@ use comrak::nodes::{AstNode, NodeValue};
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::SourceSpan;
 use crate::markdown::attrs::{ParsedAttrs, SlideAttrs, parse_attr_block};
-use crate::markdown::compat;
+use crate::markdown::{compat, render};
 
 /// How slide boundaries are found (`slides.split` in the config).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,9 +256,10 @@ pub fn lift_heading_attrs<'a>(nodes: &[&'a AstNode<'a>]) -> Option<ParsedAttrs> 
 /// The headings searched are the `nodes` themselves and, depth first, those inside a
 /// directive (`:::center`, `::::columns`, …; not `:::notes`), so a title wrapped in a layout
 /// directive still names the slide. Headings in block quotes, lists, alerts or footnotes do
-/// not count. The text is every `Text` (also inside emphasis, links, …) plus code spans'
-/// literals; soft and hard line breaks (multi-line setext headings) become spaces; images
-/// (including their alt text), math, raw HTML and footnote references are skipped. Runs of
+/// not count. The text is every `Text` (also inside emphasis, links, …) plus the literals of
+/// code spans and inline math (the TeX without its `$`, so `# The $E=mc^2$ law` is
+/// `The E=mc^2 law`); soft and hard line breaks (multi-line setext headings) become spaces;
+/// images (including their alt text), raw HTML and footnote references are skipped. Runs of
 /// whitespace collapse to one space and the result is trimmed; `None` when there is no
 /// heading or the first heading has no text.
 pub fn first_heading_text<'a>(nodes: &[&'a AstNode<'a>]) -> Option<String> {
@@ -271,9 +275,7 @@ pub fn first_heading_text<'a>(nodes: &[&'a AstNode<'a>]) -> Option<String> {
 fn find_heading<'a>(node: &'a AstNode<'a>) -> Option<&'a AstNode<'a>> {
     let descend = match &node.data().value {
         NodeValue::Heading(_) => return Some(node),
-        NodeValue::BlockDirective(directive) => {
-            directive.info.split_whitespace().next() != Some("notes")
-        }
+        NodeValue::BlockDirective(directive) => !render::is_notes_info(&directive.info),
         _ => false,
     };
     if descend {
@@ -289,9 +291,10 @@ fn push_plain_text<'a>(node: &'a AstNode<'a>, out: &mut String) {
         match &child.data().value {
             NodeValue::Text(text) => out.push_str(text),
             NodeValue::Code(code) => out.push_str(&code.literal),
+            NodeValue::Math(math) => out.push_str(&math.literal),
             NodeValue::SoftBreak | NodeValue::LineBreak => out.push(' '),
             NodeValue::Image(_) => {}
-            // math, raw HTML and footnote references have no children: nothing is added
+            // raw HTML and footnote references have no children: nothing is added
             _ => push_plain_text(child, out),
         }
     }
@@ -826,7 +829,7 @@ impl<'a, 's> Builder<'a, 's> {
     /// has no visible content yet.
     fn heading(&mut self, node: &'a AstNode<'a>, section: bool, start: usize, end: usize) {
         let open = self.current.1.last().unwrap_or(&self.current.0);
-        if open.nodes.iter().all(|node| compat::is_blank(node)) {
+        if open.nodes.iter().all(|node| compat::is_invisible(node)) {
             if section && self.current.1.is_empty() {
                 self.section = true;
             }
@@ -874,14 +877,15 @@ impl<'a, 's> Builder<'a, 's> {
     }
 
     /// While slide 1 is implicit: whether it has no content, so the first separator opens
-    /// slide 1 itself. In headings mode HTML comments alone ([`compat::is_blank`]) do not
-    /// count either (dialect §2.3 "only if it is non-blank"); in rules mode they are slide 1
-    /// (§2.2 "content before the first separator").
+    /// slide 1 itself. In headings mode HTML comments and `:::notes` blocks alone
+    /// ([`compat::is_invisible`]) do not count either (dialect §2.3 "only if it is
+    /// non-blank"); in rules mode they are slide 1 (§2.2 "content before the first
+    /// separator").
     fn nothing_before_first_separator(&self) -> bool {
         let nodes = &self.current.0.nodes;
         match self.mode {
             SplitMode::Rules => nodes.is_empty(),
-            SplitMode::Headings { .. } => nodes.iter().all(|node| compat::is_blank(node)),
+            SplitMode::Headings { .. } => nodes.iter().all(|node| compat::is_invisible(node)),
         }
     }
 
@@ -1022,10 +1026,11 @@ fn finish_slide<'a>(
 
 /// Removes the `<!-- .slide: -->` comments the slide's attributes come from and returns their
 /// attributes merged in order, with the index of the slide's first visible node (once they
-/// are removed). They are read among the HTML comments ([`compat::is_blank`] blocks) that
-/// start the slide, and, when the first visible node is a heading, among those right after
-/// it. Other comments there are invisible and stay where they are, so a licence or lint
-/// comment before the title changes nothing. `None` when there are no such comments.
+/// are removed). They are read among the invisible nodes ([`compat::is_invisible`]: HTML
+/// comments and `:::notes` blocks) that start the slide, and, when the first visible node is
+/// a heading, among those right after it. Other invisible nodes there stay where they are,
+/// so a licence comment or speaker notes before the title change nothing. `None` when there
+/// are no such comments.
 fn take_slide_comments<'a>(
     nodes: &mut Vec<&'a AstNode<'a>>,
 ) -> Result<(Option<SlideAttrs>, usize)> {
@@ -1040,15 +1045,15 @@ fn take_slide_comments<'a>(
     Ok((attrs, lead))
 }
 
-/// Removes the `.slide:` comments among the comment-only HTML blocks starting at
-/// `nodes[at]`, merging their attributes into `attrs` in order. Returns the index of the
-/// first node after those blocks.
+/// Removes the `.slide:` comments among the invisible nodes (comment-only HTML blocks and
+/// `:::notes` blocks) starting at `nodes[at]`, merging their attributes into `attrs` in
+/// order. Returns the index of the first node after them.
 fn take_slide_comments_from<'a>(
     nodes: &mut Vec<&'a AstNode<'a>>,
     mut at: usize,
     attrs: &mut Option<SlideAttrs>,
 ) -> Result<usize> {
-    while let Some(&node) = nodes.get(at).filter(|node| compat::is_blank(node)) {
+    while let Some(&node) = nodes.get(at).filter(|node| compat::is_invisible(node)) {
         let Some(text) = compat::slide_comment_node(node) else {
             at += 1;
             continue;
@@ -1088,8 +1093,9 @@ fn report_misplaced_slide_comments<'a>(
         }
         let message = format!(
             "`<!-- .slide: … -->` on slide {label} is ignored (kept as a plain comment): it is \
-             read only from a top-level HTML block holding just that comment, among the \
-             comments that start the slide or that follow the slide's first heading"
+             read only from a top-level HTML block holding just that comment, among the HTML \
+             comments (and `:::notes` blocks) that start the slide or that follow the slide's \
+             first heading"
         );
         diagnostics.warn("misplaced-slide-comment", message).span = Some(SourceSpan {
             start_line: data.sourcepos.start.line,
@@ -2138,6 +2144,56 @@ mod tests {
         }
     }
 
+    /// A3 (F12): `:::notes` before the title is invisible, like a comment: the heading is
+    /// still the slide's first visible node, and in headings mode it joins the slide.
+    #[test]
+    fn notes_before_the_first_heading_change_nothing() {
+        let notes_first = ":::notes\nHi.\n:::\n\n<!-- .slide: data-state=\"s\" -->\n\n\
+                           # A {#a .x layout=title}\n\ntext\n\n# B\n";
+        for mode in [SplitMode::Rules, headings(2)] {
+            for via in BOTH {
+                let label = format!("{mode:?} {via:?}");
+                let arena = Arena::new();
+                let deck = run_mode(&arena, notes_first, via, mode);
+                assert_eq!(diags(&deck), [], "{label}");
+                let first = &deck.slides[0].0;
+                assert_eq!(first.attrs.id.as_deref(), Some("a"), "{label}");
+                assert_eq!(first.attrs.classes, ["x"], "{label}");
+                assert_eq!(first.attrs.layout.as_deref(), Some("title"), "{label}");
+                assert_eq!(first.attrs.attrs["data-state"], "s", "{label}");
+                assert!(compat::is_invisible(first.nodes[0]), "{label}");
+                assert!(first.nodes[1].data().attrs.is_none(), "{label}");
+            }
+            // notes after a separator, then the heading
+            let after_rule = "# A\n\n---\n\n:::notes\nn\n:::\n\n## B {.b}\n\n## C\n";
+            for via in BOTH {
+                let arena = Arena::new();
+                let deck = run_mode(&arena, after_rule, via, mode);
+                let expected = match mode {
+                    SplitMode::Rules => "1-1 | 3-11",
+                    SplitMode::Headings { .. } => "1-1 | 3-9 | 11-11",
+                };
+                assert_eq!(shape(&deck), expected, "{mode:?} {via:?}");
+                assert_eq!(deck.slides[1].0.attrs.classes, ["b"], "{mode:?} {via:?}");
+            }
+        }
+        // headings mode: the heading joined the notes-only slide 1
+        for via in BOTH {
+            let arena = Arena::new();
+            let deck = run_mode(&arena, notes_first, via, headings(2));
+            assert_eq!(shape(&deck), "1-9 | 11-11", "{via:?}");
+        }
+        // a notes block that is not first is content as before: no lifting after a paragraph
+        let arena = Arena::new();
+        let deck = run_mode(
+            &arena,
+            "text\n\n:::notes\nn\n:::\n\n# H {.h}\n",
+            Via::Source,
+            SplitMode::Rules,
+        );
+        assert!(deck.slides[0].0.attrs.classes.is_empty());
+    }
+
     #[test]
     fn headings_mode_fixture_shapes() {
         let text = fixture("headings-mode.md");
@@ -2554,7 +2610,12 @@ text
             // image alt text is skipped; whitespace runs collapse
             ("# ![logo](x.png) Title\n", Some("Title")),
             ("# ![logo](x.png)\n", None),
-            ("# Euler $e^{i\\pi}$ identity\n", Some("Euler identity")),
+            // inline math is its TeX (A3)
+            (
+                "# Euler $e^{i\\pi}$ identity\n",
+                Some("Euler e^{i\\pi} identity"),
+            ),
+            ("# The $E=mc^2$ law\n", Some("The E=mc^2 law")),
             ("# A <b>bold</b>  move\n", Some("A bold move")),
             // headings inside layout directives count, `:::notes` does not
             (":::center\n# Title\n:::\n", Some("Title")),

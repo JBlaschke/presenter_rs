@@ -40,7 +40,7 @@ use comrak::Options;
 use comrak::nodes::{AstNode, NodeValue};
 
 use crate::error::Result;
-use crate::markdown::render::{RenderCtx, RenderMode, Rendered, render_nodes};
+use crate::markdown::render::{self, RenderCtx, RenderMode, Rendered, render_nodes};
 use crate::markdown::split;
 
 /// The text after `.slide:` when `literal` (an HTML block's literal) is exactly one HTML
@@ -89,6 +89,19 @@ pub fn element_comment(content: &str) -> Option<&str> {
 pub fn is_blank<'a>(node: &'a AstNode<'a>) -> bool {
     match &node.data().value {
         NodeValue::HtmlBlock(block) => is_comment_only(&block.literal),
+        _ => false,
+    }
+}
+
+/// Whether a top-level node shows nothing on the slide: a comment-only HTML block
+/// ([`is_blank`]) or a `:::notes` directive (also pandoc's `::: {.notes}`), whose content
+/// goes to the speaker notes (dialect §4, §7). Such nodes do not count when the splitter
+/// looks for a slide's first visible node, nor when headings mode asks whether a slide has
+/// visible content yet (A3).
+pub fn is_invisible<'a>(node: &'a AstNode<'a>) -> bool {
+    match &node.data().value {
+        NodeValue::HtmlBlock(block) => is_comment_only(&block.literal),
+        NodeValue::BlockDirective(directive) => render::is_notes_info(&directive.info),
         _ => false,
     }
 }

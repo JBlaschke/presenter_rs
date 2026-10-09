@@ -1,0 +1,167 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Attribute recovery",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [
+        "dark"
+      ],
+      "attrs": {
+        "data-background-color": "#222"
+      },
+      "title": "Dark",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>Dark</h1>\n<p>Heading attributes with a <code>#</code> in a value.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 21,
+        "end_line": 23,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {
+        "data-background-image": "asset:000000000001"
+      },
+      "title": "Image",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Image</h2>\n<p>A relative image background on a heading.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 25,
+        "end_line": 29,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {
+        "data-background-image": "https://example.org/bg.png"
+      },
+      "title": "Remote",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Remote</h2>\n<p>A URL in a heading's attributes.</p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 31,
+        "end_line": 35,
+        "cell": null
+      }
+    },
+    {
+      "id": "q",
+      "layout": "default",
+      "classes": [],
+      "attrs": {
+        "data-note": "two words"
+      },
+      "title": "Quoted",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Quoted</h2>\n<pre><code class=\"language-python\" data-trim data-line-numbers=\"1|3\">a = 1\nb = 2\nc = 3</code></pre>\n<pre><code data-trim data-line-numbers=\"1,3\">x\ny\nz</code></pre>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 37,
+        "end_line": 51,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Inline elements",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Inline elements</h2>\n<p><img src=\"asset:000000000001\" alt=\"Half\" width=\"50%\" /> and <a href=\"https://example.org\" data-x=\"y z\">a link</a>\nand <code data-x=\"a/b\">code</code>.</p>\n<p><a href=\"https://example.org\" title=\"Link title\">Titled link</a> <img src=\"asset:000000000001\" alt=\"Titled image\" title=\"Image title\" /></p>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 53,
+        "end_line": 60,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "The E=mc^2 law",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h1>The <span data-math-style=\"inline\">E=mc^2</span> law</h1>\n<p>The set {1, 2, 3} stays text.</p>\n<h3>Not attributes {.big auto-animate}</h3>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 62,
+        "end_line": 68,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": true,
+    "code": true,
+    "notes": false,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": [
+    {
+      "id": "000000000001",
+      "mime": "image/png",
+      "origin": "file:images/ok.png"
+    }
+  ]
+}
