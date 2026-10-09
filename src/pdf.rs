@@ -67,6 +67,13 @@
 //! command line still names the directory) and removes the directory. presenter's own
 //! signal handling is left alone, so an interrupted export ends the way an interrupted
 //! process does.
+//!
+//! # Other uses
+//!
+//! [`devtools::Page`] starts Chrome the same way and opens one page to navigate and
+//! evaluate JavaScript in (the headless-browser smoke tests, `tests/browser.rs`, use it).
+
+pub mod devtools;
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -1035,6 +1042,18 @@ impl<'a> Cdp<'a> {
                 tracing::debug!("page console.{kind}: {text}");
                 if kind == "error" {
                     self.page_errors.push(format!("console.error: {text}"));
+                }
+            }
+            // Only with `Log.enable`, which [`devtools::Page`] sends (the export does not).
+            Some("Log.entryAdded") => {
+                let entry = &params["entry"];
+                let text = entry["text"].as_str().unwrap_or("");
+                tracing::debug!("page log ({}): {text}", entry["level"]);
+                if entry["level"] == "error" {
+                    self.page_errors.push(match entry["url"].as_str() {
+                        Some(url) if !url.is_empty() => format!("{text} ({url})"),
+                        _ => text.to_string(),
+                    });
                 }
             }
             Some("Inspector.targetCrashed" | "Target.targetCrashed") => {

@@ -53,6 +53,26 @@ jobs:
       - name: cargo test --release (embedded assets)
         run: cargo test --release
 
+  # Opt-in headless-browser smoke tests (T24, tests/browser.rs): the example deck runs in
+  # Chrome (reveal.js ready, KaTeX and highlight.js ran, no console errors) and `serve`
+  # swaps the theme stylesheet without a reload. The runner image ships Google Chrome;
+  # PRESENTER_REQUIRE_CHROME turns a missing browser into a failure instead of a skip.
+  # Allowed to fail while the job settles in (first week; then drop continue-on-error).
+  browser:
+    name: headless-browser smoke tests
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      PRESENTER_REQUIRE_CHROME: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: browser version
+        run: google-chrome --version || chromium --version || true
+      - name: cargo test --features browser-tests --test browser
+        run: cargo test --features browser-tests --test browser -- --nocapture
+
   vendor-drift:
     name: vendored assets match scripts/vendor.sh
     runs-on: ubuntu-latest

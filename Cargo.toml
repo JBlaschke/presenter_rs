@@ -49,6 +49,12 @@ lol_html = "3"
 grass = { version = "0.13", default-features = false }
 codemap = "0.1"
 
+[features]
+# Opt-in headless-browser smoke tests (T24): `cargo test --features browser-tests --test browser`.
+# They drive Chrome with presenter's own DevTools client (`presenter::pdf::devtools`, the
+# PDF export's machinery), so the feature adds no dependency.
+browser-tests = []
+
 [dev-dependencies]
 insta = { version = "1.49", features = ["json", "filters", "redactions"] }
 assert_cmd = "2"
