@@ -46,7 +46,12 @@
 //! compared in its canonical form, so a symbolic link in its prefix (such as `/tmp` →
 //! `/private/tmp` on macOS) does not keep it absolute. A `..` is resolved as the file
 //! system resolves it, so after a symbolic link it leaves the directory the link points to
-//! and the message names the file that is really read or written.
+//! and the message names the directory that is really read or written. The names after
+//! the last `..` are kept as typed: a symbolic link among them (the file itself or a
+//! directory) is not replaced by its target, and their letter case is not changed, so
+//! `build` and `check` show `../decks-link/talk.md` alike. Only a canonical form that is
+//! shorter replaces a directory link (as for a link in the prefix); the last name is never
+//! replaced.
 //!
 //! # Global behaviour
 //!
@@ -493,19 +498,19 @@ pub fn display_path(path: &Path) -> PathBuf {
 
 /// [`display_path`] with the current directory `cwd` (`None`: unknown; `path` is returned
 /// as given). A relative `path` is taken from `cwd`. A path with a `..` is first resolved
-/// as the file system resolves it ([`pipeline::path_after_creating_dirs`]): after a
+/// up to its last `..` as the file system resolves it ([`resolve_directories`]): after a
 /// symbolic link, `..` leaves the directory the link points to, so `link/../x` is not
-/// `x`. A path below `cwd` as spelled is shown relative to it; otherwise the canonical
-/// forms ([`canonical_form`]) are compared too and the shorter relative form wins (a
-/// symbolic link in the prefix of either), else `path`.
+/// `x`. The names after the last `..` are always kept as typed. A path below `cwd` as
+/// spelled is shown relative to it; otherwise the canonical forms ([`canonical_form`]) are
+/// compared too and the shorter relative form wins (a symbolic link in the prefix of
+/// either), else `path`.
 fn relative_to(path: &Path, cwd: Option<&Path>) -> PathBuf {
     let Some(cwd) = cwd else {
         return path.to_path_buf();
     };
     let joined = cwd.join(path);
     let absolute = if path.components().any(|c| c == Component::ParentDir) {
-        // `joined` is absolute (`cwd` is), so it always resolves.
-        pipeline::path_after_creating_dirs(&joined).unwrap_or_else(|| normalize_lexically(&joined))
+        resolve_directories(&joined)
     } else {
         normalize_lexically(&joined)
     };
@@ -516,7 +521,7 @@ fn relative_to(path: &Path, cwd: Option<&Path>) -> PathBuf {
     {
         return below.clone();
     }
-    let canonical = match (canonical_form(&absolute), canonical_form(cwd)) {
+    let canonical = match (canonical_form(&absolute), std::fs::canonicalize(cwd).ok()) {
         (Some(path), Some(cwd)) => relative_path(&path, &cwd),
         _ => None,
     };
@@ -558,14 +563,36 @@ fn relative_path(path: &Path, base: &Path) -> Option<PathBuf> {
     Some(relative)
 }
 
-/// `path` with symbolic links resolved: its canonical form, or for a file that does not
-/// exist yet its parent's canonical form joined with its name. `None` when neither exists.
+/// The absolute path `path` with its part up to and including its last `..` resolved as
+/// the file system resolves it ([`pipeline::path_after_creating_dirs`]: after a symbolic
+/// link, `..` leaves the directory the link points to) and the names after it kept as
+/// typed: a symbolic link among them, the file or a directory, is not replaced by its
+/// target, and on a case-insensitive file system they keep the letter case typed (reviews
+/// of the A1 fixes and of W8FIX: `-o ../w/alias.html` was shown as the file `alias.html`
+/// links to, and `build ../decks-link/talk.md` as `../decks/talk.md` while `check` showed
+/// it as typed). A path without a `..` is only normalized.
+fn resolve_directories(path: &Path) -> PathBuf {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let Some(last_up) = components.iter().rposition(|c| *c == Component::ParentDir) else {
+        return normalize_lexically(path);
+    };
+    let (up_to, names) = components.split_at(last_up + 1);
+    let prefix: PathBuf = up_to.iter().collect();
+    // `path` is absolute, so it always resolves; the lexical form is a fallback only.
+    pipeline::path_after_creating_dirs(&prefix)
+        .map(|dir| names.iter().fold(dir, |dir, name| dir.join(name)))
+        .unwrap_or_else(|| normalize_lexically(path))
+}
+
+/// `path` (absolute, normalized) with the symbolic links of its directories resolved: its
+/// parent's canonical form joined with its name, which is kept as given (a final symbolic
+/// link is not followed), or the canonical form of a path without a name (`/`). `None`
+/// when the parent does not exist.
 fn canonical_form(path: &Path) -> Option<PathBuf> {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return Some(canonical);
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => Some(std::fs::canonicalize(parent).ok()?.join(name)),
+        _ => std::fs::canonicalize(path).ok(),
     }
-    let parent = std::fs::canonicalize(path.parent()?).ok()?;
-    Some(parent.join(path.file_name()?))
 }
 
 /// The usage error for an output that would overwrite one of the build's inputs (audit
@@ -1130,6 +1157,85 @@ mod tests {
             assert_eq!(
                 relative_to(Path::new("new/../out.html"), Some(&work)),
                 PathBuf::from("out.html")
+            );
+            // The last name stays as typed (wave-8 review of the A1 fixes): a final
+            // symbolic link is not replaced by its target, with or without a `..`.
+            std::os::unix::fs::symlink("s.md", real.join("talk/alias.html")).unwrap();
+            let talk = real.join("talk");
+            for typed in ["alias.html", "../talk/alias.html", "work/../alias.html"] {
+                assert_eq!(
+                    relative_to(Path::new(typed), Some(&talk)),
+                    PathBuf::from("alias.html"),
+                    "{typed}"
+                );
+            }
+            assert_eq!(
+                relative_to(Path::new("../../talk/alias.html"), Some(&work)),
+                PathBuf::from("../alias.html")
+            );
+            // From a sibling directory, as `check` shows it.
+            let sibling = real.join("sibling");
+            std::fs::create_dir(&sibling).unwrap();
+            assert_eq!(
+                relative_to(Path::new("../talk/alias.html"), Some(&sibling)),
+                PathBuf::from("../talk/alias.html")
+            );
+            // So does a symbolic link to a directory after the last `..` (wave-8 review of
+            // W8FIX: `../decks-link/s.md` was shown as `../talk/s.md` by build only), for a
+            // file that exists or not; a `..` after it still leaves its target.
+            std::os::unix::fs::symlink(real.join("talk"), real.join("decks-link")).unwrap();
+            for typed in [
+                "../decks-link/s.md",
+                "../decks-link/new.html",
+                "../decks-link",
+            ] {
+                assert_eq!(
+                    relative_to(Path::new(typed), Some(&sibling)),
+                    PathBuf::from(typed),
+                    "{typed}"
+                );
+            }
+            assert_eq!(
+                relative_to(Path::new("../decks-link/work/up/../s.md"), Some(&sibling)),
+                PathBuf::from("../s.md")
+            );
+            assert_eq!(
+                relative_to(
+                    Path::new("../decks-link/../decks-link/s.md"),
+                    Some(&sibling)
+                ),
+                PathBuf::from("../decks-link/s.md")
+            );
+            // Unless its target's relative form is shorter (as for a link in the prefix).
+            std::fs::create_dir_all(real.join("a/b")).unwrap();
+            std::os::unix::fs::symlink(real.join("talk"), real.join("a/b/deep-link")).unwrap();
+            assert_eq!(
+                relative_to(Path::new("../a/b/deep-link/s.md"), Some(&sibling)),
+                PathBuf::from("../talk/s.md")
+            );
+            // A link whose target has a shorter relative form keeps its own name too.
+            std::fs::create_dir_all(real.join("a/b")).unwrap();
+            std::os::unix::fs::symlink(real.join("talk/s.md"), real.join("a/b/far.md")).unwrap();
+            assert_eq!(
+                relative_to(&real.join("a/b/far.md"), Some(&talk)),
+                PathBuf::from("../a/b/far.md")
+            );
+        }
+        // On a case-insensitive file system the name keeps the letter case typed.
+        if real.join("talk/S.MD").exists() {
+            let talk = real.join("talk");
+            for typed in ["S.MD", "../talk/S.MD"] {
+                assert_eq!(
+                    relative_to(Path::new(typed), Some(&talk)),
+                    PathBuf::from("S.MD"),
+                    "{typed}"
+                );
+            }
+            // And so do the directories after the last `..`.
+            std::fs::create_dir_all(real.join("other")).unwrap();
+            assert_eq!(
+                relative_to(Path::new("../TALK/S.MD"), Some(&real.join("other"))),
+                PathBuf::from("../TALK/S.MD")
             );
         }
         assert_eq!(

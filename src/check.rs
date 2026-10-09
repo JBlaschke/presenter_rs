@@ -52,19 +52,23 @@
 //! - `theme-error` (level error): the deck's theme cannot be resolved; `unknown-layout` and the
 //!   theme problems below are then skipped.
 //! - Theme problems ([`Theme::deck_problems`], located in the theme's `theme.toml`, template
-//!   or stylesheet; audit F10). Errors, each a failure of this deck's build:
+//!   or stylesheet; audit F10). Errors, each a problem the build of this deck may meet:
 //!   `theme-style-entry`, `theme-script-entry` (a missing entry, or one outside its theme),
 //!   `theme-highlight-style` (a `highlight_style` file that is missing or outside its theme),
 //!   `theme-template` (a template of a disk theme that does not compile and that the build
-//!   of this deck loads), `theme-plugins` (an invalid merged `[reveal] plugins` list) and
+//!   of this deck can load), `theme-plugins` (an invalid merged `[reveal] plugins` list) and
 //!   `style-error` (the theme's stylesheet does not compile: a Sass error, a local `@import`
-//!   or `url()` that finds no file). Warnings: `theme-template` for a template that does not
-//!   compile but that this deck does not use (a layout no slide uses, a partial nothing
-//!   includes: which templates a build loads is followed through the names written as
-//!   string literals in `include`/`extends`/`import` tags, plus the deck's layouts), and
-//!   `theme-link-outside` (a symbolic link in a theme whose target is outside it, which
-//!   lookups ignore). So a deck whose build fails on its theme does not pass `check`, unless
-//!   a template is reached only through a name built at render time.
+//!   or `url()` that finds no file). Which templates a build can load is followed
+//!   statically, through the names written as string literals in `include`/`extends`/
+//!   `import` tags, plus the deck's layouts, whether or not a condition guards the tag: an
+//!   `{% include %}` inside an `{% if %}` counts although minijinja loads it only when the
+//!   condition holds, so a build that skips it (the built-in title layout includes
+//!   `partials/logo.html` only when the deck has a logo) can pass while `check` reports the
+//!   broken template as an error. Warnings: `theme-template` for a template that does not
+//!   compile but that this deck cannot load (a layout no slide uses, a partial nothing
+//!   includes), and `theme-link-outside` (a symbolic link in a theme whose target is outside
+//!   it, which lookups ignore). So a deck whose build fails on its theme does not pass
+//!   `check`, unless a template is reached only through a name built at render time.
 //!
 //! Failures that leave no deck to lint (the input cannot be read or parsed, invalid front
 //! matter or `presenter.toml`) are [`run`]'s `Err`; [`error_diagnostic`] turns them into an

@@ -178,9 +178,11 @@ impl Error {
     /// then the notebook), read through `source_cache`, with the part to underline: the
     /// character at the [`column`](Self::column) (a notebook JSON error's byte column is
     /// converted), the reference to the missing file of a [`Error::MissingAsset`] when the
-    /// line contains it, else the line's text. A missing asset located in a notebook cell
-    /// whose line does not mention the file has no excerpt: it is a file an output of the
-    /// cell names, and the cell's source line would be unrelated (audit F38).
+    /// line contains it, else the line's text. A missing asset located in a notebook code
+    /// cell whose line does not mention the file has no excerpt: a code cell's source names
+    /// no files the build reads, so it is a file an output of the cell names, and the cell's
+    /// source line would be unrelated (audit F38). In a Markdown or raw cell the line is
+    /// where the author wrote the reference (maybe encoded, `my%20pic.png`) and is quoted.
     ///
     /// `file` is the file the span is in: [`path`](Self::path), or the deck source for a
     /// missing asset or front matter error, which the caller knows (`cli::locate`,
@@ -195,7 +197,7 @@ impl Error {
         source_cache: &dyn Fn(&Path) -> Option<String>,
     ) -> Option<Excerpt> {
         let span = self.span()?;
-        let line = source_line(&source_cache(file)?, &span)?;
+        let (line, cell_type) = located_line(&source_cache(file)?, &span)?;
         let target = match (self, self.column()) {
             // serde_json counts bytes (notebook JSON); YAML counts characters.
             (Error::Parse { .. }, Some(column)) => {
@@ -205,10 +207,10 @@ impl Error {
             (_, Some(column)) => Some((column - 1, column)),
             (Error::MissingAsset { path, .. }, None) => match reference_range(path, &line) {
                 Some(range) => Some(range),
-                // In a notebook cell, a missing file that its line does not mention is named
-                // by an output of the cell (whose span is the whole cell): the cell's source
-                // line is unrelated, so none is quoted (audit F38).
-                None if span.cell.is_some() => return None,
+                // In a notebook code cell, a missing file that its line does not mention is
+                // named by an output of the cell (whose span is the whole cell): the cell's
+                // source line is unrelated, so none is quoted (audit F38).
+                None if cell_type.as_deref() == Some("code") => return None,
                 None => text_range(&line),
             },
             _ => text_range(&line),
@@ -306,19 +308,47 @@ impl Excerpt {
 /// (cell indices count every cell of the notebook, as in [`SourceSpan`]). `None` when the
 /// line (or the cell) does not exist.
 pub fn source_line(text: &str, span: &SourceSpan) -> Option<String> {
+    located_line(text, span).map(|(line, _)| line)
+}
+
+/// [`source_line`], with the `cell_type` of the cell when `span.cell` is set (the notebook
+/// is parsed once: an excerpt is made for each missing file of a failed build).
+fn located_line(text: &str, span: &SourceSpan) -> Option<(String, Option<String>)> {
     let index = span.start_line.checked_sub(1)?;
-    // One leading byte order mark is ignored, as the frontends ignore it (audit F43).
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(cell) = span.cell else {
-        return text.lines().nth(index).map(str::to_string);
+        let line = without_bom(text).lines().nth(index)?;
+        return Some((line.to_string(), None));
     };
-    let notebook: serde_json::Value = serde_json::from_str(text).ok()?;
-    let source: String = match notebook.get("cells")?.get(cell)?.get("source")? {
+    let cell = notebook_cell(text, cell)?;
+    let source: String = match cell.get("source")? {
         serde_json::Value::String(source) => source.clone(),
         serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p.as_str()).collect(),
         _ => return None,
     };
-    source.lines().nth(index).map(str::to_string)
+    let cell_type = cell
+        .get("cell_type")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    Some((source.lines().nth(index)?.to_string(), cell_type))
+}
+
+/// `text` without one leading byte order mark, which the frontends ignore (audit F43).
+fn without_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
+/// Cell `cell` of the notebook JSON `text`; `None` when it is not there.
+fn notebook_cell(text: &str, cell: usize) -> Option<serde_json::Value> {
+    #[cfg(test)]
+    NOTEBOOK_PARSES.set(NOTEBOOK_PARSES.get() + 1);
+    let mut notebook: serde_json::Value = serde_json::from_str(without_bom(text)).ok()?;
+    Some(notebook.get_mut("cells")?.get_mut(cell)?.take())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many notebooks [`notebook_cell`] parsed on this thread (tests count them).
+    static NOTEBOOK_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `cell N, line M: rest` or `cell N: rest` at the start of `message` (the notebook
@@ -1190,6 +1220,35 @@ mod tests {
         let excerpt = excerpt_of(&missing("/nb/plot.png", 1, 1), notebook).unwrap();
         assert_eq!(excerpt.text, "display(Image('plot.png'))");
         assert_eq!(excerpt.marker, Some((15, 8)));
+    }
+
+    /// Wave-8 review of the A4 fixes: in a Markdown (or raw) cell the line is the author's
+    /// reference, quoted whole when it spells the file another way (`my%20pic.png`, as in a
+    /// Markdown deck); only a code cell's line is unrelated to a missing file.
+    #[test]
+    fn missing_files_of_markdown_cells_quote_their_line() {
+        let notebook = r##"{"cells": [
+            {"cell_type": "markdown", "source": "# T\n\n![x](my%20pic.png)"},
+            {"cell_type": "raw", "source": "<img src=\"a&amp;b.png\">"},
+            {"cell_type": "code", "source": "show()"}]}"##;
+        let missing = |path: &str, line, cell| Error::MissingAsset {
+            path: PathBuf::from(path),
+            span: Some(cell_span(line, cell)),
+        };
+        let excerpt = excerpt_of(&missing("/nb/my pic.png", 3, 0), notebook).unwrap();
+        assert_eq!(excerpt.line, 3);
+        assert_eq!(excerpt.text, "![x](my%20pic.png)");
+        assert_eq!(excerpt.marker, Some((0, 18)));
+        let excerpt = excerpt_of(&missing("/nb/a&b.png", 1, 1), notebook).unwrap();
+        assert_eq!(excerpt.text, "<img src=\"a&amp;b.png\">");
+        // The notebook is parsed once for each excerpt (wave-8 review of W8FIX).
+        let before = NOTEBOOK_PARSES.get();
+        assert_eq!(excerpt_of(&missing("/nb/out.png", 1, 2), notebook), None);
+        assert_eq!(NOTEBOOK_PARSES.get() - before, 1);
+        // With a byte order mark too (audit F43).
+        let bom = format!("\u{feff}{notebook}");
+        assert!(excerpt_of(&missing("/nb/my pic.png", 3, 0), &bom).is_some());
+        assert_eq!(excerpt_of(&missing("/nb/out.png", 1, 2), &bom), None);
     }
 
     /// The excerpt of `err` in a file with `text`.

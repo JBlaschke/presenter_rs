@@ -39,7 +39,8 @@
 //!   calls itself, whether a condition that is never met guards it or not, in one file or
 //!   several) overflows the worker's stack and ends the worker only: an [`Error::Style`]
 //!   that names the recursion when the SCSS files read show one (`recursion` module),
-//!   else says what happened.
+//!   lists the candidates (each with its file and line) when they show several that a
+//!   condition guards, else says what happened.
 //!
 //! A library user without a worker (a test binary is no presenter; [`with_worker`] names
 //! one) compiles on a thread of its own process with the same stack and time limit, which
@@ -314,7 +315,9 @@ fn style_message(error: &Error) -> String {
 
 /// The [`Error::Style`] for a stack overflow while compiling `key` (`source`) for `theme`
 /// after reading `reads`: the recursion that the SCSS files read show
-/// ([`recursion::recursion_hint`]), at its call; `None` when they show none.
+/// ([`recursion::recursion_hint`]), at its call; when they show several that a condition
+/// guards, an error of `key` that lists each with its file and line, blaming none; `None`
+/// when they show none.
 fn overflow_error(theme: &Theme, key: &str, source: &str, reads: &Reads) -> Option<Error> {
     let fs = VirtualFs::new(theme);
     let mut files: Vec<(String, String)> = Vec::new();
@@ -334,7 +337,24 @@ fn overflow_error(theme: &Theme, key: &str, source: &str, reads: &Reads) -> Opti
             files.push((file.clone(), text));
         }
     }
-    let (at, found) = recursion::recursion_hint(&files)?;
+    let (at, found) = match recursion::recursion_hint(&files)? {
+        recursion::Hint::One(at, found) => (at, found),
+        recursion::Hint::Candidates(found) => {
+            let list: Vec<String> = found
+                .iter()
+                .map(|(at, recursion)| recursion.summary(&files[*at].0))
+                .collect();
+            return Some(Error::Style {
+                file: key.to_string(),
+                message: format!(
+                    "Sass ran out of stack, most likely in a recursion whose condition meant \
+                     to end it is never met; the stylesheets have several, any of which may \
+                     be it: {}",
+                    list.join(", ")
+                ),
+            });
+        }
+    };
     let (file, text) = &files[at];
     let error = Error::Style {
         file: file.clone(),
@@ -395,6 +415,11 @@ fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -
         Ok(result) => {
             // It has sent its result: the thread is ending, and its stack is freed.
             let _ = thread.join();
+            note_reads(
+                theme,
+                key,
+                &reads.lock().unwrap_or_else(PoisonError::into_inner),
+            );
             Outcome::Finished(result)
         }
         Err(RecvTimeoutError::Timeout) => Outcome::Abandoned {
@@ -412,6 +437,24 @@ fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -
 /// The files a compilation read through its [`VirtualFs`], by canonical key, with a hash
 /// of their contents, in the order read.
 type Reads = Vec<(String, blake3::Hash)>;
+
+/// Notes the files of disk themes among `reads`, the files the compilation of `key` read
+/// on its own thread or in its worker process, as read on this thread
+/// ([`crate::theme::recording_reads`]); nothing when nothing is recording. They were read
+/// through [`crate::theme::ThemeDir::read`], so their paths are noted as they are
+/// ([`crate::theme::ThemeDir::note_read_elsewhere`]); `key` itself was given (its caller
+/// read it).
+fn note_reads(theme: &Theme, key: &str, reads: &Reads) {
+    if !crate::theme::recording() {
+        return;
+    }
+    let fs = VirtualFs::new(theme);
+    for (read, _) in reads.iter().filter(|(read, _)| read != key) {
+        if let Some(Location::Theme(dir, rel)) = fs.locate(read) {
+            dir.note_read_elsewhere(rel);
+        }
+    }
+}
 
 /// What a compilation reports while it runs ([`Reporter`]).
 enum Report {
@@ -1505,6 +1548,58 @@ a::before { content: "@import url(string.css);" }
             key(&format!("{}/../x.scss", "@t/styles\u{1}")).as_deref(),
             Some("@t/x.scss")
         );
+    }
+
+    /// Wave-8 review of W8FIX: the files a Sass compilation read (on its thread or in its
+    /// worker) are noted as read for `recording_reads` without checking them on disk again,
+    /// which listed their directories once per file (a theme with many partials built
+    /// 13-18 % slower), and not at all when nothing is recording (`check`).
+    #[test]
+    fn the_files_sass_read_are_noted_without_listing_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("styles/parts")).unwrap();
+        let mut entry = String::new();
+        let mut expected = BTreeSet::from([root.join("styles/theme.scss")]);
+        for i in 0..40 {
+            let partial = root.join(format!("styles/parts/_p{i}.scss"));
+            std::fs::write(&partial, format!(".p{i} {{ width: {i}px; }}\n")).unwrap();
+            entry.push_str(&format!("@use \"parts/p{i}\";\n"));
+            expected.insert(partial);
+        }
+        std::fs::write(root.join("styles/theme.scss"), entry).unwrap();
+        std::fs::write(root.join("theme.toml"), "").unwrap();
+        let theme = Theme {
+            chain: vec![ThemeDir {
+                name: "t".into(),
+                source: ThemeSource::Disk { dir: root.clone() },
+                manifest: crate::theme::ThemeManifest::default(),
+            }],
+        };
+        let before = crate::theme::directory_listings();
+        let (css, read) =
+            crate::theme::recording_reads(|| compile_scss(&theme, "@t/styles/theme.scss"));
+        assert!(css.unwrap().contains(".p39"));
+        assert_eq!(read, expected, "the entry and every partial");
+        // This thread listed the directories of the entry only (styles/ and the theme
+        // directory): the partials were read on the compilation's thread.
+        assert_eq!(crate::theme::directory_listings() - before, 2);
+        // Reads reported elsewhere: noted as they are, the given entry skipped, nothing
+        // outside the theme; nothing at all when nothing is recording.
+        let hash = blake3::hash(b"");
+        let reads: Reads = [
+            "@t/styles/theme.scss",
+            "@t/styles/parts/_p1.scss",
+            "@t/../x.scss",
+        ]
+        .map(|key| (key.to_string(), hash))
+        .into();
+        let before = crate::theme::directory_listings();
+        note_reads(&theme, "@t/styles/theme.scss", &reads);
+        let ((), read) =
+            crate::theme::recording_reads(|| note_reads(&theme, "@t/styles/theme.scss", &reads));
+        assert_eq!(read, BTreeSet::from([root.join("styles/parts/_p1.scss")]));
+        assert_eq!(crate::theme::directory_listings() - before, 0);
     }
 
     #[test]

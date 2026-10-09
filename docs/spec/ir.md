@@ -181,6 +181,17 @@ pub struct AssetInfo {
    unrelated code changes. Use `BTreeMap`, never `HashMap`, in the IR.
 8. Line numbers in `SourceSpan` are 1-based, as editors show them.
 
+> **Contract note (W8FIX, 2026-10-09; records the exception of audit F08 as A4 implemented
+> it):** invariant 4 has two exceptions, where a local URL stays as written instead of
+> becoming `asset:<id>`. (a) A URL that names a file that does not exist:
+> the frontend warns `missing-asset` (§4), and a build that escalates the warning fails
+> instead. (b) Notebook outputs (`CellOutput::Display.html` of `text/html` and
+> `text/markdown` outputs): they are written by executed code, so only files inside the
+> notebook's directory (subdirectories included, symbolic links resolved) are embedded; a URL
+> that names a file outside it stays as written and an `output-file-outside` warning names it
+> (notebook-mapping.md §4, A4 clarification box). Markdown and raw cells, which the author
+> wrote, follow invariant 4 like a Markdown deck.
+
 ## 3. Asset placeholders and the registry (`src/assets/registry.rs`)
 
 > **Contract change (coordinator, 2026-10-08):** the core registry API below is implemented

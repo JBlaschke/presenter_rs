@@ -580,8 +580,11 @@ const OUTPUT_EXTENSIONS: [&str; 3] = ["html", "htm", "pdf"];
 /// top-level files (`theme.toml` among them) except `.html`, `.htm` and `.pdf` files,
 /// which may be earlier outputs; every file in its `templates/`, `styles/`, `assets/` and
 /// `scripts/` directories; and the files its `theme.toml` names (`[styles] entries`,
-/// `[scripts] entries`, a `highlight_style` file). Other files below a theme directory (a
-/// `dist/` there, say) are not inputs. Built-in themes have no files on disk.
+/// `[scripts] entries`, a `highlight_style` file); and every other file of a disk theme
+/// that the render read ([`RenderedDocument::theme_files`]: an image the theme stylesheet
+/// reaches with `url("../img/x.png")`, a file a template names with `asset()`). Other
+/// files below a theme directory (a `dist/` there, say) are not inputs. Built-in themes
+/// have no files on disk.
 pub fn input_files(build: &Build) -> Vec<(PathBuf, InputRole)> {
     let mut inputs = vec![(build.deck.source.path.clone(), InputRole::Source)];
     inputs.extend(
@@ -601,6 +604,13 @@ pub fn input_files(build: &Build) -> Vec<(PathBuf, InputRole)> {
                 .map(|path| (path, InputRole::Theme)),
         );
     }
+    inputs.extend(
+        build
+            .document
+            .theme_files
+            .iter()
+            .map(|path| (path.clone(), InputRole::Theme)),
+    );
     inputs
 }
 
@@ -944,28 +954,19 @@ pub fn missing_asset_as_error(diagnostic: &Diagnostic) -> Option<Error> {
 }
 
 /// Strict check of the theme chain's merged `[reveal] plugins` (themes are not validated
-/// when they are loaded). A bad list is an [`Error::Theme`] naming the theme of the chain
-/// whose `theme.toml` sets the winning `plugins` value, so the message points at the
+/// when they are loaded; the check of `presenter check` and `presenter theme check` too,
+/// [`Theme::plugins_problem`]). A bad list is an [`Error::Theme`] naming the theme of the
+/// chain whose `theme.toml` sets the winning `plugins` value, so the message points at the
 /// theme rather than at `presenter.toml`.
 fn check_theme_plugins(theme: &Theme) -> Result<()> {
-    let probe = Config {
-        reveal: theme.reveal_defaults(),
-        ..Config::default()
+    let Some((dir, message)) = theme.plugins_problem() else {
+        return Ok(());
     };
-    probe.validate_plugins().map_err(|err| {
-        let message = match err {
-            Error::Config(message) => message,
-            other => other.to_string(),
-        };
-        let name = theme
-            .chain
-            .iter()
-            .find(|dir| dir.manifest.reveal.contains_key("plugins"))
-            .map_or(theme.name(), |dir| dir.name.as_str());
-        Error::Theme {
-            name: name.to_string(),
-            message: format!("theme.toml [reveal]: {message}"),
-        }
+    Err(Error::Theme {
+        name: dir
+            .map_or(theme.name(), |dir| dir.name.as_str())
+            .to_string(),
+        message: format!("theme.toml [reveal]: {message}"),
     })
 }
 
@@ -1320,6 +1321,64 @@ mod tests {
                 .iter()
                 .all(|(_, role)| *role != InputRole::Theme)
         );
+    }
+
+    #[test]
+    fn the_theme_files_a_render_reads_are_inputs_wherever_they_are() {
+        // Wave-8 review of the A1 fixes: `url("../img/x.png")` from styles/ (and a Sass
+        // partial outside styles/, read by the Sass thread) reach files outside the
+        // directories that are inputs as a whole.
+        let dir = project(&[
+            ("slides.md", "# One\n"),
+            (
+                "t/theme.toml",
+                "name = \"t\"\nextends = \"default\"\n[styles]\nentries = \
+                 [\"styles/theme.scss\"]\n",
+            ),
+            (
+                "t/styles/theme.scss",
+                "@use \"../lib/tokens\";\n.reveal { color: tokens.$ink; background: \
+                 url(\"../img/x.png\"); }\n",
+            ),
+            ("t/lib/_tokens.scss", "$ink: #010203;\n"),
+            ("t/lib/_unused.scss", "$other: red;\n"),
+            ("t/img/x.png", "png"),
+            ("t/img/unused.png", "png"),
+        ]);
+        let input = dir.path().join("slides.md");
+        let opts = BuildOptions {
+            cli: CliOverrides {
+                theme: Some(dir.path().join("t").display().to_string()),
+                ..CliOverrides::default()
+            },
+            ..BuildOptions::new(&input)
+        };
+        let build = build_deck(&opts).unwrap();
+        assert!(build.document.html.contains("#010203"));
+        let theme_dir = std::fs::canonicalize(dir.path().join("t")).unwrap();
+        let read: Vec<String> = build
+            .document
+            .theme_files
+            .iter()
+            .map(|path| {
+                let rel = path.strip_prefix(&theme_dir).unwrap();
+                rel.to_string_lossy().replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(read, ["img/x.png", "lib/_tokens.scss", "styles/theme.scss"]);
+        for (rel, input) in [
+            ("t/img/x.png", true),
+            ("t/lib/_tokens.scss", true),
+            ("t/img/unused.png", false),
+            ("t/lib/_unused.scss", false),
+        ] {
+            let out = dir.path().join(rel);
+            let clash = output_clash(&build, &out, &OutputMode::Standalone);
+            assert_eq!(clash.is_some(), input, "{rel}");
+            if let Some(clash) = clash {
+                assert_eq!(clash.role, InputRole::Theme);
+            }
+        }
     }
 
     #[test]

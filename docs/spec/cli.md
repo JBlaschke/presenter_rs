@@ -32,7 +32,10 @@ presenter build <INPUT> [-o/--out PATH] [--theme NAME|PATH] [--standalone|--site
   with the input, the `presenter.toml` in use, the deck's local assets and the files of a theme
   directory in use (its `theme.toml` and its other top-level files except `.html`, `.htm` and
   `.pdf` files, which may be earlier outputs; everything in its `templates/`, `styles/`, `assets/`
-  and `scripts/`; the files its `theme.toml` names), so a symbolic or hard link and another
+  and `scripts/`; the files its `theme.toml` names; and every other file of it that the build
+  read (contract change, W8FIX 2026-10-09), such as an image its stylesheet reaches with
+  `url("../img/x.png")`, a file a template names with `asset()` or a Sass partial outside
+  `styles/`), so a symbolic or hard link and another
   spelling of the name on a case-insensitive file system count too, and so does a path that
   reaches the file once its missing directories are created (`new/../link/../x.md`). A clash
   exits 2 with `error: refusing to write <out>: it is the input file <input>; choose another
@@ -116,6 +119,17 @@ presenter export pdf <INPUT> [-o FILE] [--chrome PATH] [--theme …]
 - The PDF is not byte-for-byte reproducible: Chrome stamps the export time and its version into
   it (the PLAN goal 7 exception, audit F21). `export pdf --help` lists this under Limitations.
 
+> **Clarification (W8FIX, 2026-10-09; audit F15 as A5 resolved it):** a slide taller than a page
+> continues on extra pages. The default theme sets the lines of code blocks and notebook outputs
+> about 5 % closer in print, to leave room for the line Chrome moves at each page break, while
+> reveal.js reserves a slide's pages from its height on screen; so a slide that ends within a
+> line or two past a page boundary on screen ends a page earlier in print, and its last page is
+> empty but for the slide's background (about one in ten to twenty of the slides that span
+> pages; nothing is lost). `export pdf --help` lists this under Limitations, and the theme
+> README's "Print and PDF" section explains it. Dropping that page would need a print-time
+> step in `export pdf` (re-measuring each slide with the print rules before Chrome prints),
+> which is not implemented.
+
 ## Global behaviour
 - `-v` info, `-vv` debug (`tracing-subscriber` with `EnvFilter`; `RUST_LOG` also honoured).
 - `--config PATH` bypasses `presenter.toml` discovery.
@@ -125,4 +139,9 @@ presenter export pdf <INPUT> [-o FILE] [--chrome PATH] [--theme …]
   are relative to the current directory, with `..` for a path outside it when that is no longer
   than the absolute path; a symbolic link in a path's prefix does not keep it absolute, and a `..`
   in a path is resolved as the file system resolves it (after a link it leaves the directory the
-  link points to), so the message names the file really read or written (audit F39).
+  link points to), so the message names the file really read or written (audit F39). Contract
+  change (W8FIX, 2026-10-09): a path is resolved only up to its last `..`; the names after it are
+  shown as typed, so a final symbolic link is not replaced by its target and the letter case is
+  kept (`-o ../w/alias.html` is `alias.html` from `w/`), and a symbolic link to a directory
+  among them is kept too (`../decks-link/talk.md`, as `check` shows it), unless resolving it
+  gives a shorter relative path (the rule for a link in a path's prefix).

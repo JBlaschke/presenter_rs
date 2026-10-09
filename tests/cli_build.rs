@@ -1263,9 +1263,49 @@ fn build_refuses_to_overwrite_the_files_of_its_theme() {
         tmp.path().join("theme/bg.png"),
     )
     .unwrap();
+    // Wave-8 review: a file the stylesheet reaches outside the theme's standard
+    // directories (`url("../img/x.png")` from styles/) is an input too, as are the files a
+    // template names with asset() and a Sass partial loaded from another directory: every
+    // file of the theme that the build read.
+    std::fs::create_dir_all(tmp.path().join("theme/img")).unwrap();
+    std::fs::copy(
+        root().join("tests/fixtures/md/images/ok.png"),
+        tmp.path().join("theme/img/x.png"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join("theme/media")).unwrap();
+    std::fs::copy(
+        root().join("tests/fixtures/md/images/ok.png"),
+        tmp.path().join("theme/media/logo.png"),
+    )
+    .unwrap();
+    let title = tmp.path().join("theme/templates/layouts/title.html");
+    let text = std::fs::read_to_string(&title).unwrap().replace(
+        "{{- super() }}",
+        "{{- super() }}\n<img src=\"{{ asset('@' ~ theme.name ~ '/media/logo.png') }}\">",
+    );
+    std::fs::write(&title, text).unwrap();
+    std::fs::create_dir_all(tmp.path().join("theme/lib")).unwrap();
+    std::fs::write(
+        tmp.path().join("theme/lib/_accent.scss"),
+        "$accent: #123456;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("theme/styles/extra.scss"),
+        "@use \"../lib/accent\";\n.reveal h1 { color: accent.$accent; }\n",
+    )
+    .unwrap();
+    let manifest = tmp.path().join("theme/theme.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+        "entries = [\"styles/theme.css\"]",
+        "entries = [\"styles/theme.css\", \"styles/extra.scss\"]",
+    );
+    std::fs::write(&manifest, text).unwrap();
     let css = tmp.path().join("theme/styles/theme.css");
     let mut text = std::fs::read_to_string(&css).unwrap();
     text.push_str("\n.reveal .slides { background-image: url(\"../bg.png\"); }\n");
+    text.push_str(".reveal .backgrounds { background-image: url(\"../img/x.png\"); }\n");
     std::fs::write(&css, text).unwrap();
     let protected = [
         "slides.md",
@@ -1274,7 +1314,22 @@ fn build_refuses_to_overwrite_the_files_of_its_theme() {
         "theme/styles/theme.css",
         "theme/templates/layouts/title.html",
         "theme/bg.png",
+        "theme/img/x.png",
+        "theme/media/logo.png",
+        "theme/lib/_accent.scss",
     ];
+    let html = tmp.path().join("check.html");
+    presenter()
+        .current_dir(tmp.path())
+        .args(["-q", "build", "slides.md", "-o", "check.html"])
+        .assert()
+        .success();
+    let html = std::fs::read_to_string(html).unwrap();
+    assert!(html.contains("#123456"), "the partial is compiled in");
+    assert!(
+        html.matches("data:image/png;base64,").count() >= 3,
+        "bg.png, x.png and logo.png are inlined"
+    );
     for out in &protected[2..] {
         let stderr = assert_refused(tmp.path(), &["build", "slides.md", "-o", out], &protected);
         let shown = Path::new(out).display().to_string();
@@ -1494,4 +1549,113 @@ fn paths_through_a_symlinked_prefix_are_shown_relative() {
         .clone();
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with("Wrote out.html (1 slide, "), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_with_dot_dot_keeps_its_last_name_as_typed() {
+    // Wave-8 review of the A1 fixes: a path with `..` was shown with its last name replaced
+    // by the target of a final symbolic link (or its on-disk letter case), so build and
+    // check named the same input differently.
+    let tmp = project(&[
+        ("w/a.md", "# A\n"),
+        ("decks/talk-v2.md", "# T\n\n![x](missing.png)\n"),
+        ("site/v/v3.html", "old\n"),
+        ("sib/s.md", "# S\n"),
+    ]);
+    std::os::unix::fs::symlink("a.md", tmp.path().join("w/alias.html")).unwrap();
+    std::os::unix::fs::symlink("talk-v2.md", tmp.path().join("decks/current.md")).unwrap();
+    std::os::unix::fs::symlink("v/v3.html", tmp.path().join("site/current.html")).unwrap();
+    let w = tmp.path().join("w");
+    let stderr = assert_refused(&w, &["build", "a.md", "-o", "../w/alias.html"], &["a.md"]);
+    assert_eq!(
+        stderr,
+        "error: refusing to write alias.html: it is the input file a.md; choose another \
+         output path with -o\n"
+    );
+    if w.join("A.MD").exists() {
+        let stderr = assert_refused(&w, &["build", "a.md", "-o", "../w/A.MD"], &["a.md"]);
+        assert!(
+            stderr.starts_with("error: refusing to write A.MD: it is the input file a.md;"),
+            "{stderr}"
+        );
+    }
+    let sib = tmp.path().join("sib");
+    let output = presenter()
+        .current_dir(&sib)
+        .args(["build", "../decks/current.md"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("\n --> ../decks/current.md:3\n"),
+        "{stderr}"
+    );
+    let output = presenter()
+        .current_dir(&sib)
+        .args(["check", "../decks/current.md"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.starts_with("../decks/current.md:3: warning: "),
+        "{stderr}"
+    );
+    let stdout = stdout_of(presenter().current_dir(&sib).args([
+        "build",
+        "s.md",
+        "-o",
+        "../site/current.html",
+    ]));
+    assert!(
+        stdout.starts_with("Wrote ../site/current.html (1 slide, "),
+        "{stdout}"
+    );
+    // Wave-8 review of W8FIX: so are the directories after the last `..`, a symbolic link
+    // to a directory included; build and check show the same path, and `Wrote` the one
+    // given.
+    std::os::unix::fs::symlink("decks", tmp.path().join("decks-link")).unwrap();
+    let output = presenter()
+        .current_dir(&sib)
+        .args(["build", "../decks-link/talk-v2.md"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.starts_with("error: asset not found: ../decks-link/missing.png\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\n --> ../decks-link/talk-v2.md:3\n"),
+        "{stderr}"
+    );
+    let output = presenter()
+        .current_dir(&sib)
+        .args(["check", "../decks-link/talk-v2.md"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.starts_with("../decks-link/talk-v2.md:3: warning: "),
+        "{stderr}"
+    );
+    let stdout = stdout_of(presenter().current_dir(&sib).args([
+        "build",
+        "s.md",
+        "-o",
+        "../decks-link/out.html",
+    ]));
+    assert!(
+        stdout.starts_with("Wrote ../decks-link/out.html (1 slide, "),
+        "{stdout}"
+    );
+    assert!(tmp.path().join("decks/out.html").is_file());
 }

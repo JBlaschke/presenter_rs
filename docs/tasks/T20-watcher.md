@@ -66,3 +66,13 @@ HTTP server, SSE, browser client (T21/T22/T23).
 ## Amendments (coordinator, 2026-10-08)
 - `ChangeKind` already exists in `src/serve/watch.rs` (T00 contract stub); keep it as is.
 - Delete T16's `watch_is_a_usage_error_until_t20` test in `src/cli/build.rs` when you wire `--watch`.
+
+## Superseded (W8FIX, 2026-10-09; historical task, kept as written above)
+- `pub fn run_build_watch(opts, out)` (Interface, step 5) no longer exists: A2 removed it
+  (audit F50). `build --watch` runs `serve::watch::run_build_watch_with(opts, out, report)`,
+  whose `report` callback prints the status lines (`src/cli/build.rs`).
+- The ignore list of step 1 no longer contains `target/` and `dist/` (audit F18): below a
+  recursively watched theme directory only `.git/` and editor files (backups, swap, lock and
+  auto-save files, vim's `4913` probe, `.DS_Store`) are ignored, because a theme may keep
+  inputs in such directories (`serve::watch::is_ignored`; live-reload.md §5, A2 note). An
+  output written inside a watched theme directory does not trigger a rebuild.

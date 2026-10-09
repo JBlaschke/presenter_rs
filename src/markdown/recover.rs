@@ -852,6 +852,34 @@ mod tests {
         );
     }
 
+    /// Wave-8 review of the A3 fixes: two blocks written without a space, or a stray `}`,
+    /// were read as one block whose items kept the braces (`class="dark}{background=#222"`)
+    /// and the text vanished. They stay text, with a warning; quoted braces still work.
+    #[test]
+    fn unquoted_braces_inside_a_block_keep_it_text() {
+        for text in [
+            "## Title {.dark}{background='#222'}\n",
+            "## Title {.dark}{background=\"#222\"}\n",
+            "## Title {k='v'}}\n",
+        ] {
+            let (found, edited, codes) = recover(text);
+            assert!(found.is_empty(), "{text}: {found:?}");
+            assert_eq!(edited, text);
+            assert_eq!(codes, [(UNPARSED_ATTR_BLOCK, 1)], "{text}");
+        }
+        let (found, _, codes) = recover("## Title {data-x='a {b}' .c}\n");
+        assert_eq!(
+            found,
+            [(Kind::Heading, attrs(None, &["c"], &[("data-x", "a {b}")]))]
+        );
+        assert!(codes.is_empty(), "{codes:?}");
+        let info = "python {.a}{lines='1|3'}";
+        assert!(matches!(
+            fence_attrs(info),
+            Some((rest, _, ElementAttrs::Invalid(_))) if rest == info
+        ));
+    }
+
     #[test]
     fn several_blocks_on_one_line_keep_their_nodes() {
         let text = "![a](a.png){w='1'} ![b](b.png){w='2'} `c`{k='3'}\n";

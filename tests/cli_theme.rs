@@ -506,7 +506,7 @@ fn check_reports_every_problem_with_its_location() {
     for expected in [
         "theme.toml:5: error: [styles] entry 'styles/missing.css' is not found",
         "theme.toml:6: error: [styles] highlight_style 'styles/hl.css' (not monokai, zenburn or none, so a CSS file) is not found",
-        "theme.toml:9: error: [scripts] entry '../outside.js' is outside the theme directory",
+        "theme.toml:9: error: [scripts] entry '../outside.js' must stay inside the theme directory (paths are relative to the theme directory)",
         "theme.toml:15: error: [layouts] documents the layout 'fancy', but neither this theme nor a parent has templates/layouts/fancy.html",
         "broken.html:2: error: syntax error: unexpected end of input",
         "theme.toml:12: error: [reveal] unknown reveal plugin 'notez' (did you mean 'notes'?)",
@@ -522,6 +522,65 @@ fn check_reports_every_problem_with_its_location() {
     assert_eq!(code, 1);
     assert!(stdout.is_empty(), "{stdout}");
     assert_eq!(quiet_stderr, stderr);
+}
+
+/// Wave-8 (A4 follow-up): `theme check` and `presenter check` (`Theme::problems`) share
+/// their rules and `theme.toml` line finders, so they locate the same problems at the same
+/// lines (`theme check` also checks `[layouts]`, which never fails a build).
+#[test]
+fn theme_check_and_check_locate_the_same_problems() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(
+        tmp.path(),
+        &[
+            (
+                "bad/theme.toml",
+                "name = \"bad\"\nextends = \"default\"\n\n[styles]\n\
+                 entries = [\n  \"styles/ok.css\",  # \"styles/gone.css\"\n  \
+                 \"styles/gone.css\",\n]\nhighlight_style = '../hl.css'\n\n[scripts]\n\
+                 entries = [\"/abs.js\", \"scripts/\"]\n\n[ reveal ]\n\"plugins\" = [\"zom\"]\n",
+            ),
+            ("bad/styles/ok.css", ""),
+            ("bad/scripts/keep.js", ""),
+            ("bad/templates/partials/broken.html", "a\n{% for %}\n"),
+        ],
+    );
+    let (code, _, stderr) = run(tmp.path(), &["theme", "check", "bad"]);
+    assert_eq!(code, 1, "{stderr}");
+    let location = Regex::new(r"(?m)^\S*?([^/\s]+):(\d+): error: ").unwrap();
+    let mut from_theme_check: Vec<String> = location
+        .captures_iter(&stderr)
+        .map(|c| format!("{}:{}", &c[1], &c[2]))
+        .collect();
+    from_theme_check.sort();
+    let theme = resolve(tmp.path().join("bad").to_str().unwrap(), &[]).unwrap();
+    let mut from_check: Vec<String> = theme
+        .problems()
+        .iter()
+        .map(|d| {
+            let file = d
+                .path
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
+            format!("{file}:{}", d.span.as_ref().unwrap().start_line)
+        })
+        .collect();
+    from_check.sort();
+    assert_eq!(
+        from_theme_check,
+        [
+            "broken.html:2",
+            "theme.toml:12",
+            "theme.toml:12",
+            "theme.toml:15",
+            "theme.toml:7",
+            "theme.toml:9"
+        ]
+    );
+    assert_eq!(from_check, from_theme_check);
 }
 
 /// A `theme check` failure case: directory, its files, part of the expected message.

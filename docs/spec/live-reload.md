@@ -139,6 +139,14 @@ fullReload(): location.reload()      // reveal `hash: true` restores the slide f
 >   or a stack overflow, compiling the same entry with the files it read unchanged fails at
 >   once with the same error. The serve runtime's threads, where the pipeline runs, have
 >   the 8 MiB stack of `presenter build`'s main thread.
+>
+> **Clarification (W8FIX, 2026-10-09):** "names the `@mixin` or `@function`" holds when the
+> files read show one recursion that always recurses, or only one that a condition guards.
+> When they show several guarded ones (a correct helper among them, such as a `str-replace`
+> that recurses inside an `@if`), any of them may be the one that never ends, so none is
+> blamed at a line: the error is the entry's and lists each with its file and the line of
+> its call (`… any of which may be it: @function str-replace (@t/styles/_lib.scss:4),
+> @function spacing (@t/styles/_spacing.scss:3)`).
 
 - State: `Arc<RwLock<ServeState { build_id, document: Option<String>, theme_css: String,
   assets: AssetRegistry, status: Status }>>` plus a `tokio::sync::broadcast::Sender<BuildEvent>`

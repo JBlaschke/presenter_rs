@@ -98,14 +98,16 @@ pub enum ElementAttrs {
 /// work, but stricter in what an item may be. Each item must be `#id`, `.class` (both
 /// non-empty or quoted) or `key=value` with an unquoted key that [`is_valid_attr_name`]
 /// accepts; a bare key (`{auto-animate}`) needs a value there (`auto-animate=""`), as §3.2
-/// says, and no item may end with an unquoted comma (`{debug=true, verbose=false}` is prose
-/// or another tool's syntax: items are separated by spaces). The strictness keeps ordinary
-/// text in braces as text.
+/// says, no item may end with an unquoted comma (`{debug=true, verbose=false}` is prose
+/// or another tool's syntax: items are separated by spaces), and no item may have a `{` or
+/// `}` outside quotes (two blocks written together, `{.dark}{k=v}`, which reach here as one
+/// block, or a stray `}`). The strictness keeps ordinary text in braces as text.
 ///
-/// [`ElementAttrs::Invalid`] when the block has an unbalanced quote and starts like
-/// attributes (`#x`, `.x` or `key=`), or when some item is invalid while another one is
-/// valid or the block names a known slide key without a value (`{.dark auto-animate}`,
-/// `{auto-animate}`); [`ElementAttrs::Text`] for anything else that is not attributes.
+/// [`ElementAttrs::Invalid`] when the block has an unbalanced quote or an unquoted brace
+/// in an item and starts like attributes (`#x`, `.x` or `key=`), or when some item is
+/// invalid while another one is valid or the block names a known slide key without a
+/// value (`{.dark auto-animate}`, `{auto-animate}`); [`ElementAttrs::Text`] for anything
+/// else that is not attributes.
 pub fn read_element_attrs(block: &str) -> ElementAttrs {
     let Some(inner) = block
         .strip_prefix('{')
@@ -122,6 +124,7 @@ pub fn read_element_attrs(block: &str) -> ElementAttrs {
     };
     let mut out = ParsedAttrs::default();
     let (mut valid, mut known_bare, mut problem) = (0, false, None);
+    let brace = tokens.iter().any(|token| token.brace);
     for token in tokens {
         match token.element_problem() {
             None => {
@@ -137,6 +140,7 @@ pub fn read_element_attrs(block: &str) -> ElementAttrs {
     match problem {
         None => ElementAttrs::Attrs(out),
         Some(reason) if valid > 0 || known_bare => ElementAttrs::Invalid(reason),
+        Some(reason) if brace && starts_like_attrs(inner) => ElementAttrs::Invalid(reason),
         Some(_) => ElementAttrs::Text,
     }
 }
@@ -167,12 +171,22 @@ struct Token {
     quoted: bool,
     /// Whether the item's last character was inside quotes.
     ends_quoted: bool,
+    /// Whether the item has a `{` or `}` outside quotes.
+    brace: bool,
 }
 
 impl Token {
     /// Why this item is not a valid element attribute ([`read_element_attrs`]); `None` when
     /// it is one.
     fn element_problem(&self) -> Option<String> {
+        if self.brace {
+            // Two blocks written together (`{.dark}{k=v}`), read as one, or a stray brace.
+            return Some(format!(
+                "`{}` has a `{{` or `}}` outside quotes: write one block with its items \
+                 separated by spaces, or quote the brace",
+                self.text
+            ));
+        }
         let comma = (self.text.ends_with(',') && !self.ends_quoted).then(|| {
             format!(
                 "`{}` ends with a comma: items are separated by spaces, not commas",
@@ -266,6 +280,7 @@ fn tokenize(s: &str) -> std::result::Result<Vec<Token>, char> {
                 if !token.started {
                     token.lead = Some(c);
                 }
+                token.brace |= matches!(c, '{' | '}');
                 token.text.push(c);
             }
         }
@@ -762,6 +777,27 @@ mod tests {
         assert!(invalid("{.a, .b}").starts_with("`.a,` ends with a comma"));
         assert!(invalid("{#a, .b}").starts_with("`#a,` ends with a comma"));
         assert_eq!(read_element_attrs("{a, b}"), ElementAttrs::Text);
+        // Wave-8 review: two blocks written together reach here as one block, and a stray
+        // `}` ends up in an item; neither may become mangled attributes.
+        assert_eq!(
+            invalid("{.dark}{background='#222'}"),
+            "`.dark}{background=#222` has a `{` or `}` outside quotes: write one block with \
+             its items separated by spaces, or quote the brace"
+        );
+        assert!(invalid("{.dark}{background=\"#222\"}").starts_with("`.dark}{background=#222`"));
+        assert!(invalid("{k='v'}}").starts_with("`k=v}` has a `{` or `}` outside quotes"));
+        assert!(invalid("{.a}{lines='1|3'}").starts_with("`.a}{lines=1|3` has a `{`"));
+        assert!(invalid("{.a k=v}x}").starts_with("`k=v}x` has a `{`"));
+        assert_eq!(read_element_attrs("{a}{b}"), ElementAttrs::Text);
+        // quoted braces are content
+        assert_eq!(
+            read_element_attrs("{data-x='a {b}' .c}"),
+            ElementAttrs::Attrs(ParsedAttrs {
+                id: None,
+                classes: vec!["c".into()],
+                pairs: vec![("data-x".into(), "a {b}".into())],
+            })
+        );
         // a comma inside a value or quoted is fine
         for block in ["{lines=1,3}", "{k=\"a,\"}", "{k='a,' j=b}", "{.\"a,\"}"] {
             assert!(

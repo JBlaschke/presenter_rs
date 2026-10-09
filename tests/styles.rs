@@ -794,6 +794,67 @@ fn recursion_that_never_ends_only_ends_the_worker() {
     assert!(css.contains(".deep {\n  x: y;\n}"), "{css}");
 }
 
+/// Wave-8 review of the A2 fixes: when the files read have several recursions that a
+/// condition guards, the overflow error blames none of them (a correct helper such as
+/// Bootstrap's `str-replace` would be blamed for the bug in `spacing`): it is an error of
+/// the entry that lists each with its file and line.
+#[test]
+fn an_overflow_with_several_conditional_recursions_lists_them_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lib = "@function str-replace($string, $search, $replace: \"\") {\n  \
+               $index: str-index($string, $search);\n  @if $index {\n    \
+               @return str-slice($string, 1, $index - 1) + $replace + \
+               str-replace(str-slice($string, $index + str-length($search)), $search, \
+               $replace);\n  }\n  @return $string;\n}\n";
+    let spacing = "@function spacing($n) {\n  @if $n == 0 { @return 0px; }\n  \
+                   @return spacing($n - 2) + 4px;\n}\n";
+    let theme = scss_theme(
+        tmp.path(),
+        "theme.scss",
+        &[
+            (
+                "styles/theme.scss",
+                "@use \"lib\";\n@use \"spacing\";\n.a { content: lib.str-replace(\"a-b\", \
+                 \"-\", \"_\"); margin: spacing.spacing(3); }\n",
+            ),
+            ("styles/_lib.scss", lib),
+            ("styles/_spacing.scss", spacing),
+        ],
+    );
+    let err = compile_in_worker(&theme).unwrap_err();
+    assert_eq!(err.quoted_line(), None, "no line is blamed");
+    let (file, message) = style_error(err);
+    assert_eq!(file, "@t/styles/theme.scss");
+    assert_eq!(
+        message,
+        "Sass ran out of stack, most likely in a recursion whose condition meant to end it is \
+         never met; the stylesheets have several, any of which may be it: @function \
+         str-replace (@t/styles/_lib.scss:4), @function spacing (@t/styles/_spacing.scss:3)"
+    );
+    // The correct helper alone compiles; the buggy function alone is named.
+    std::fs::write(
+        tmp.path().join("t/styles/theme.scss"),
+        "@use \"lib\";\n.a { content: lib.str-replace(\"a-b\", \"-\", \"_\"); }\n",
+    )
+    .unwrap();
+    let (css, _) = compile_in_worker(&theme).unwrap();
+    assert!(css.contains("content: \"a_b\""), "{css}");
+    std::fs::write(
+        tmp.path().join("t/styles/theme.scss"),
+        "@use \"spacing\";\n.a { margin: spacing.spacing(3); }\n",
+    )
+    .unwrap();
+    let (file, message) = style_error(compile_in_worker(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/_spacing.scss");
+    assert!(
+        message.starts_with(
+            "line 3: Sass ran out of stack, most likely in the recursion of @function \
+             spacing, which calls itself here"
+        ),
+        "{message}"
+    );
+}
+
 /// Audit F06 (live-reload.md §4): an endless `@while` that emits CSS is a style error after
 /// `SASS_TIME_LIMIT`; its worker is killed, so neither its CPU nor its memory outlives the
 /// error (`tests/cli_serve.rs` checks that no worker is left). Compiling the same files

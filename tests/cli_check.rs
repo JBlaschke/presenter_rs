@@ -614,6 +614,26 @@ fn templates_the_deck_does_not_use_only_warn() {
     assert_eq!(run(dir.path(), &["build", "e.md", "-o", "o.html"]).0, 1);
 }
 
+/// Wave-8 review of the F10 fix (documented in the check module docs and theme-format §3):
+/// which templates a build can load is decided from the tags as written, so a partial that
+/// a layout includes only under a condition is an error of `check` although a build that
+/// skips the include passes.
+#[test]
+fn a_conditionally_included_template_is_checked_as_loaded() {
+    let dir = project(&[
+        ("t/theme.toml", "name = \"t\"\nextends = \"default\"\n"),
+        ("t/templates/partials/logo.html", "{% if x %}"),
+        ("deck.md", "---\ntheme: ./t\n---\n# A {layout=title}\n"),
+    ]);
+    assert_eq!(run(dir.path(), &["build", "deck.md", "-o", "o.html"]).0, 0);
+    let (code, entries) = check_json(dir.path(), &["deck.md"]);
+    assert_eq!(code, 1);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["code"], "theme-template");
+    assert_eq!(entries[0]["level"], "error");
+    assert_eq!(entries[0]["path"], "t/templates/partials/logo.html");
+}
+
 /// F10 (review): `check` compiles the theme's stylesheet as a build does, so a Sass error or
 /// a `url()` that finds no file fails the check too, located in the stylesheet.
 #[test]
@@ -870,6 +890,23 @@ fn missing_files_of_outputs_name_the_cell_and_the_output() {
     assert!(
         !stderr.contains("| x") && !stderr.contains("| y = 2") && !stderr.contains("| show()"),
         "no line of the code is quoted for an output: {stderr}"
+    );
+}
+
+/// Wave-8 review of the F38 fix: a missing file that a Markdown cell names in another
+/// spelling (`my%20pic.png`) still gets its line quoted, as in a Markdown deck; only code
+/// cells, whose files come from outputs, quote nothing.
+#[test]
+fn missing_files_of_markdown_cells_quote_the_line_in_any_spelling() {
+    use serde_json::json;
+    let cell = nb_cell("markdown", "# T\n\n![x](my%20pic.png)", json!({}));
+    let dir = project(&[("enc.ipynb", &notebook(&[cell]))]);
+    let (code, _, stderr) = run(dir.path(), &["build", "enc.ipynb", "-o", "o.html"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr,
+        "error: asset not found: my pic.png\n --> enc.ipynb: cell 0, line 3\n  |\n3 | \
+         ![x](my%20pic.png)\n  | ^^^^^^^^^^^^^^^^^^\n"
     );
 }
 
