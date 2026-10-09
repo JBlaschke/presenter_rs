@@ -99,8 +99,7 @@ is relative to the surrounding text.
 | `--p-alert-caution` | `color-mix(in oklab, #dc2626 75%, currentColor)` | `> [!CAUTION]` alerts. |
 | `--p-alert-color` | `var(--p-alert-note)` | Set on each `.markdown-alert` from the five tokens above; the alert box reads it. Override the five instead. |
 | `--p-cell-gap` | `0.5em` | Vertical space around a notebook `.cell`. |
-| `--p-cell-border` | `1px solid rgba(128, 128, 128, 0.4)` | Frame of a notebook cell's output area, under its input. |
-| `--p-output-max-height` | `40vh` | Taller notebook cell outputs scroll. More notebook tokens: [Notebook cells](#notebook-cells). |
+| `--p-cell-border` | `1px solid rgba(128, 128, 128, 0.4)` | Frame of a notebook cell's output area, under its input. More notebook tokens: [Notebook cells](#notebook-cells). |
 
 ### reveal variables the theme overrides
 
@@ -190,16 +189,22 @@ the input is a highlighted code block, and the outputs sit in a frame under it.
 - **Errors:** the traceback sits in a box with a bar in `--p-error-color` and a tint of it.
 - **DataFrames** (pandas' `table.dataframe`, and any HTML table in a result): compact text
   (`--p-cell-font-size`), numbers right-aligned in tabular figures, the index column bold and
-  left-aligned, and the header row stays in view while the frame scrolls.
+  left-aligned. The header rows (two for a named index) stay in view at the top of the frame
+  while it scrolls, on the deck's background colour (`--r-background-color`). On a slide with
+  its own background (a `background=` colour, image, video or gradient) they scroll with the
+  table instead, since the slide's colour is not known to the stylesheet.
 - **Rendered Markdown and LaTeX** results keep the slide's text size.
 - **`hide-input`** (tag, or `metadata.jupyter.source_hidden`): the outputs become slide
   content, without frame or prompts. Hidden inputs and outputs stay in the markup with
   `display: none`, so a theme can show them faintly instead.
 - **`fragment`** (slide type or tag): the whole cell is one reveal fragment.
-- **ANSI colours** in streams and tracebacks are spans that read `var(--red)`, `var(--green)`,
-  `var(--yellow)`, `var(--blue)`, `var(--magenta)` and `var(--cyan)` (the converter's names, not
-  `--p-` tokens). `.cell-outputs` sets them mixed with the text colour, so they stay readable on
-  light and dark slides; set them on `.reveal .cell-outputs` to change them.
+- **ANSI colours** in streams and tracebacks (text and background, SGR 30–37, 40–47, 90–97
+  and 100–107) are spans that read one of 16 variables, the converter's names rather than
+  `--p-` tokens: `--black`, `--red`, `--green`, `--yellow`, `--blue`, `--magenta`, `--cyan`,
+  `--white`, and `--bright-black` … `--bright-white`. `.cell-outputs` sets all 16: the six
+  colours mixed with the text colour, so they stay readable as text on light and dark slides;
+  each bright colour equal to the normal one; black, white and their bright variants as shades
+  of the text colour. Set them on `.reveal .cell-outputs` to change them.
 
 | token | default | purpose |
 |---|---|---|
@@ -207,12 +212,9 @@ the input is a highlighted code block, and the outputs sit in a frame under it.
 | `--p-prompt-color` | `color-mix(in srgb, currentColor 50%, transparent)` | Colour of the `In [n]:` and `Out [n]:` prompts. |
 | `--p-stderr-color` | `var(--p-alert-warning)` | Text and background tint of stderr output. |
 | `--p-error-color` | `var(--p-alert-caution)` | Bar and background tint of an error's traceback. |
+| `--p-output-max-height` | `288px` | Taller outputs scroll inside their frame; images shrink to fit it. 40 % of the default 720px slide height. Use slide pixels, not `vh`: reveal scales the slide to the window, so a `vh` length grows with the window and can overflow the slide. |
 
-The layout tokens `--p-cell-gap`, `--p-cell-border` and `--p-output-max-height` are in the
-[token table](#tokens). `--p-output-max-height` defaults to `40vh`, 40 % of the browser
-window's height rather than the slide's: reveal scales the slide to the window, so in a large
-window an output may grow taller, compared with the slide, than in a small one. A length in
-slide pixels (`--p-output-max-height: 300px`) gives the same result in every window.
+`--p-cell-gap` and `--p-cell-border` are in the [token table](#tokens).
 
 **Your own cell markup.** Put a `templates/cell.html` in a child theme. It receives `cell`
 (`index`, `language`, `source`, `execution_count`, `outputs`, `hide_input`, `hide_output`,

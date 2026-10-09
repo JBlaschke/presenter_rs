@@ -9,8 +9,10 @@
  * (`[notebook] show_prompts`) are small labels: the input prompt above the code, the output
  * prompt above an execute result.
  *
- * Every --p-* token is documented in ../README.md (section "Notebook cells"). --p-cell-gap,
- * --p-cell-border and --p-output-max-height are declared with the other tokens in theme.css.
+ * The tokens below are documented in ../README.md, section "Notebook cells". --p-cell-gap
+ * and --p-cell-border are declared with the other tokens in theme.css and documented in the
+ * README's token table. theme.css also declares --p-output-max-height (40vh); the
+ * declaration below replaces it.
  */
 
 :root {
@@ -18,6 +20,10 @@
   --p-prompt-color: color-mix(in srgb, currentColor 50%, transparent); /* input and output prompts */
   --p-stderr-color: var(--p-alert-warning);                            /* stderr tint */
   --p-error-color: var(--p-alert-caution);                             /* error bar and tint */
+  /* Longer cell outputs scroll. Slide pixels (40 % of a 720px-high slide), like the other
+     max-height tokens: reveal scales the whole slide to the window, so a vh length would grow
+     with the window and overflow the slide in large ones. */
+  --p-output-max-height: 288px;
 }
 
 /* ------------------------------------------------------------------------------------
@@ -58,16 +64,29 @@
  * ------------------------------------------------------------------------------------ */
 
 .reveal .cell-outputs {
-  /* ANSI colours of streams and tracebacks (`color:var(--red,#a00)` spans), mixed with the
-     text colour so they stay readable on light and dark slides. */
+  /* The 16 ANSI colours of streams and tracebacks (`color:var(--red,#a00)` spans; SGR 30-37,
+     90-97 and their backgrounds), mixed with the text colour so they stay readable on light
+     and dark slides. Black and white are shades of the text colour, the bright colours are the
+     normal ones. */
+  --black: color-mix(in oklab, #000 40%, currentColor);
   --red: color-mix(in oklab, #dc2626 80%, currentColor);
   --green: color-mix(in oklab, #16a34a 75%, currentColor);
   --yellow: color-mix(in oklab, #ca8a04 75%, currentColor);
   --blue: color-mix(in oklab, #2563eb 80%, currentColor);
   --magenta: color-mix(in oklab, #c026d3 80%, currentColor);
   --cyan: color-mix(in oklab, #0891b2 75%, currentColor);
+  --white: color-mix(in oklab, #fff 40%, currentColor);
+  --bright-black: color-mix(in oklab, #808080 50%, currentColor);
+  --bright-red: var(--red);
+  --bright-green: var(--green);
+  --bright-yellow: var(--yellow);
+  --bright-blue: var(--blue);
+  --bright-magenta: var(--magenta);
+  --bright-cyan: var(--cyan);
+  --bright-white: color-mix(in oklab, #fff 20%, currentColor);
   box-sizing: border-box;
   max-height: var(--p-output-max-height);
+  /* The sticky DataFrame header below is offset by this padding-top. */
   padding: 0.3em 0.6em;
   overflow: auto;
   border: var(--p-cell-border);
@@ -130,6 +149,8 @@
   margin-bottom: 0;
 }
 
+/* 1em covers the frame's padding and border; an execute result's output prompt above the
+   image takes about 0.6em more. */
 .reveal .output-display img.output-image,
 .reveal .output-display figure.output-image > svg {
   display: block;
@@ -139,22 +160,38 @@
   object-fit: contain;
 }
 
+.reveal .output-display > .cell-prompt + img.output-image,
+.reveal .output-display > .cell-prompt + figure.output-image > svg {
+  max-height: calc(var(--p-output-max-height) - 1.7em);
+}
+
 .reveal .output-display figure.output-image {
   margin: 0;
 }
 
 /* ------------------------------------------------------------------------------------
  * DataFrames (pandas' table.dataframe, and any other HTML table in a result): compact,
- * numbers right-aligned in tabular figures, the header row stays in view while the output
+ * numbers right-aligned in tabular figures, the header rows stay in view while the output
  * area scrolls. A table wider than the slide scrolls the output area sideways.
+ *
+ * The whole thead sticks (pandas writes two header rows for a named index or MultiIndex
+ * columns), flush with the frame's top edge: `top` is minus the frame's padding-top, so the
+ * text size is set on the rows, not on the table (thead's em is the frame's). Separate
+ * borders, so the header's underline moves with it.
  * ------------------------------------------------------------------------------------ */
 
 .reveal .output-display table {
   margin: 0;
   overflow: visible;
   border: 0;
-  font-size: var(--p-cell-font-size);
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: inherit;
   font-variant-numeric: tabular-nums;
+}
+
+.reveal .output-display table :is(tr, caption) {
+  font-size: var(--p-cell-font-size);
 }
 
 .reveal .output-display table :is(th, td) {
@@ -171,12 +208,37 @@
   text-align: left;
 }
 
-.reveal .output-display table thead th {
+.reveal .output-display table thead {
   position: sticky;
-  top: 0;
+  top: -0.3em;
   z-index: 1;
-  border-bottom: 2px solid var(--p-muted);
+}
+
+.reveal .output-display table thead th {
   background: var(--r-background-color, #fff);
+}
+
+.reveal .output-display table thead tr:last-child th {
+  border-bottom: 2px solid var(--p-muted);
+}
+
+.reveal .cell.hide-input .output-display table thead {
+  top: 0;
+}
+
+/* A slide with its own background (a colour, which reveal marks has-dark-background or
+   has-light-background, or an image, video, iframe or gradient) shows through the header:
+   its colour is not known here, so the header scrolls with the table instead of covering it. */
+.reveal .slides section:is(.has-dark-background, .has-light-background, [data-background],
+  [data-background-color], [data-background-image], [data-background-video],
+  [data-background-iframe], [data-background-gradient]) .output-display table thead {
+  position: static;
+}
+
+.reveal .slides section:is(.has-dark-background, .has-light-background, [data-background],
+  [data-background-color], [data-background-image], [data-background-video],
+  [data-background-iframe], [data-background-gradient]) .output-display table thead th {
+  background: none;
 }
 
 /* ------------------------------------------------------------------------------------
