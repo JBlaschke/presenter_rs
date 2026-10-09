@@ -610,3 +610,359 @@ fn an_unreadable_config_is_reported_and_serve_changes_need_a_restart() {
         "{stderr}"
     );
 }
+
+/// Polls `/__presenter/state` like [`Server::wait_for`], for at most `timeout`; each poll
+/// must be answered within 2 s (the server stays responsive while a build runs).
+fn wait_for_within(server: &Server, after: u64, status: &str, timeout: Duration) -> Value {
+    let start = Instant::now();
+    loop {
+        let asked = Instant::now();
+        let state = server.state();
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "GET /__presenter/state took {:?}",
+            asked.elapsed()
+        );
+        if build_id(&state) > after && state["status"] == status {
+            return state;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "no {status} build after {after} within {timeout:?}: {state}\nstderr:\n{}",
+            server.stderr()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A deck `a.md` using the theme `t/` (extends default) whose only style entry is
+/// `styles/theme.scss`, with `scss` in it.
+fn scss_project(scss: &str) -> tempfile::TempDir {
+    project(&[
+        (
+            "t/theme.toml",
+            "name = \"t\"\nextends = \"default\"\n[styles]\nentries = [\"styles/theme.scss\"]\n",
+        ),
+        ("t/styles/theme.scss", scss),
+        ("a.md", &format!("---\ntheme: ./t\n---\n\n{}", minimal())),
+    ])
+}
+
+/// Audit F02/F06 (live-reload.md §4, cli.md: rebuild errors do not stop the server): a
+/// theme stylesheet that would overflow the Sass compiler's stack or never finish is a
+/// style error in the overlay, while the server keeps answering; deep but finite
+/// recursion compiles; fixing the file brings the deck back.
+#[test]
+fn runaway_stylesheets_never_stop_the_server() {
+    let dir = scss_project("h1 { color: red; }\n");
+    let scss = dir.path().join("t/styles/theme.scss");
+    let mut server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    assert_eq!(server.state()["status"], "ok", "{}", server.stderr());
+    let document = server.text("/");
+
+    // A mixin without its base case: an error, not a crash.
+    write(
+        &scss,
+        "@mixin pad($n) { padding: $n; @include pad($n - 1); }\nbody { @include pad(3px); }\n",
+    );
+    let failed = server.wait_for(1, "error");
+    let error = &failed["error"];
+    assert_eq!(error["kind"], "style", "{failed}");
+    assert_eq!(error["file"], "@t/styles/theme.scss", "{failed}");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("@mixin pad always includes itself"),
+        "{message}"
+    );
+    assert_eq!(server.text("/"), document, "the last good document stays");
+
+    // Deep but finite: 1500 nested @includes and 800 nested rules compile.
+    let deep = format!(
+        "@mixin pad($n) {{ @if $n > 0 {{ @include pad($n - 1); }} @else {{ .deep {{ x: y; }} }} }}\n\
+         @include pad(1500);\n{}color: red;{}\n",
+        "a{".repeat(800),
+        "}".repeat(800)
+    );
+    write(&scss, &deep);
+    let deep_ok = server.wait_for(build_id(&failed), "ok");
+    assert!(server.text("/__presenter/theme.css").contains(".deep {"));
+
+    // An endless loop: an error once the time limit has passed; the server answers
+    // meanwhile.
+    write(&scss, "$i: 0;\n@while $i < 1 { $x: 1; }\n");
+    let timed_out = wait_for_within(
+        &server,
+        build_id(&deep_ok),
+        "error",
+        Duration::from_secs(40),
+    );
+    let message = timed_out["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("the Sass compilation did not finish within 10 s"),
+        "{timed_out}"
+    );
+
+    // Fixed: ok again.
+    write(&scss, "h1 { color: blue; }\n");
+    let fixed = wait_for_within(&server, build_id(&timed_out), "ok", Duration::from_secs(20));
+    assert_eq!(fixed["error"], Value::Null);
+    assert!(
+        server
+            .text("/__presenter/theme.css")
+            .contains("color: blue;")
+    );
+    assert!(
+        server.child.try_wait().unwrap().is_none(),
+        "the server is running"
+    );
+}
+
+/// Audit F02: a recursive stylesheet present when `presenter serve` starts: the URL is
+/// printed and the error overlay served (the process used to abort before both).
+#[test]
+fn a_recursive_stylesheet_at_startup_still_serves() {
+    let dir = scss_project("@function f() { @return f(); }\nh1 { width: f(); }\n");
+    let server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    let state = server.state();
+    assert_eq!(state["status"], "error", "{state}");
+    assert_eq!(state["error"]["kind"], "style", "{state}");
+    let page = server.text("/");
+    assert!(page.contains("id=\"presenter-overlay\""), "{page}");
+    assert!(page.contains("@function f always calls itself"), "{page}");
+    assert!(server.stderr().contains("error: "), "{}", server.stderr());
+}
+
+/// Audit F03 (live-reload.md §4): in serve mode theme files carry content versions. An
+/// edited image that the theme stylesheet's `url()` names is a `css` build whose
+/// stylesheet names the new version; an edited image that the document loads with
+/// `asset()` (the title slide's logo) is reported as a `content` build, so the client
+/// swaps the slides, whose document names the new version. The new URLs serve the new
+/// files.
+#[test]
+fn edited_theme_images_get_new_urls() {
+    let dir = project(&[
+        (
+            "t/theme.toml",
+            "name = \"t\"\nextends = \"default\"\n[styles]\nentries = [\"styles/t.css\"]\n\
+             [vars]\nlogo = \"logo.svg\"\n",
+        ),
+        (
+            "t/styles/t.css",
+            ".reveal h1 { background-image: url(../assets/bg.svg); }\n",
+        ),
+        (
+            "t/assets/bg.svg",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" fill=\"red\"/>",
+        ),
+        (
+            "t/assets/logo.svg",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\"/>",
+        ),
+        ("a.md", "---\ntheme: ./t\n---\n\n# Title {layout=title}\n"),
+    ]);
+    let server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    assert_eq!(server.state()["status"], "ok", "{}", server.stderr());
+    let events = events(&server);
+    assert_eq!(events.recv_timeout(REBUILD_TIMEOUT).unwrap().0, "hello");
+    let bg_url = |css: &str| -> String {
+        let pattern =
+            Regex::new(r"url\((/__presenter/asset/@t/assets/bg\.svg\?v=[0-9]+)\)").unwrap();
+        pattern.captures(css).unwrap_or_else(|| panic!("{css}"))[1].to_string()
+    };
+    let logo_url = |html: &str| -> String {
+        let pattern =
+            Regex::new(r#"<img class="logo" src="(/__presenter/asset/logo\.svg\?v=[0-9]+)""#)
+                .unwrap();
+        pattern.captures(html).unwrap_or_else(|| panic!("{html}"))[1].to_string()
+    };
+    let bg = bg_url(&server.text("/__presenter/theme.css"));
+    let logo = logo_url(&server.text("/"));
+
+    // The stylesheet's image: a css build, and the stylesheet names the new version.
+    let blue = "<svg xmlns=\"http://www.w3.org/2000/svg\" fill=\"blue\"/>";
+    write(&dir.path().join("t/assets/bg.svg"), blue);
+    let build = next_build(&events);
+    assert_eq!(
+        (build["status"].as_str(), build["kind"].as_str()),
+        (Some("ok"), Some("css")),
+        "{build}"
+    );
+    let new_bg = bg_url(&server.text("/__presenter/theme.css"));
+    assert_ne!(new_bg, bg);
+    assert_eq!(server.text(&new_bg), blue);
+    assert_eq!(
+        logo_url(&server.text("/")),
+        logo,
+        "the document did not change"
+    );
+
+    // The document's image: reported as a content build, and the document names the new
+    // version.
+    let wide = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\"/>";
+    write(&dir.path().join("t/assets/logo.svg"), wide);
+    let build = next_build(&events);
+    assert_eq!(
+        (build["status"].as_str(), build["kind"].as_str()),
+        (Some("ok"), Some("content")),
+        "{build}"
+    );
+    let new_logo = logo_url(&server.text("/"));
+    assert_ne!(new_logo, logo);
+    assert_eq!(server.text(&new_logo), wide);
+    server.wait_for_stderr(r"(?m)^rebuilt in \d+ ms \(content\)$", 1);
+}
+
+/// The status of `GET path` sent to `server` with the `Host` header `host` (`None`: an
+/// HTTP/1.0 request without one) over a plain TCP connection (ureq sets the header
+/// itself). Only the status line is read, so an event stream does not hold it.
+fn status_for_host(server: &Server, path: &str, host: Option<&str>) -> u16 {
+    use std::io::Write as _;
+    let addr = server
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = match host {
+        Some(host) => format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+        None => format!("GET {path} HTTP/1.0\r\n\r\n"),
+    };
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let status = line.split_whitespace().nth(1);
+    status
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("status line {line:?}"))
+}
+
+/// live-reload.md §4 (audit F07): the dev server answers only requests for itself
+/// (`localhost`, an IP address, with the port it listens on: the one port 0 picked), so a
+/// web page that rebinds its own name to 127.0.0.1 cannot read the deck, its theme files
+/// or the build events.
+#[test]
+fn requests_for_other_hosts_are_refused() {
+    let dir = project(&[("a.md", &minimal())]);
+    let server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    let port: u16 = server
+        .url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let foreign = format!("evil.example:{port}");
+    for path in [
+        "/",
+        "/__presenter/state",
+        "/__presenter/events",
+        "/__presenter/theme.css",
+        "/__presenter/asset/@default/theme.toml",
+        "/__presenter/asset/vendor/reveal/dist/reveal.js",
+        "/__presenter/live-reload.js",
+        "/no/such/page",
+    ] {
+        assert_eq!(
+            status_for_host(&server, path, Some(&foreign)),
+            403,
+            "{path}"
+        );
+    }
+    for host in [
+        "evil.example".to_string(),
+        "localhost".to_string(),
+        format!("localhost:{}", port.wrapping_add(1)),
+        format!("127.0.0.1.evil.example:{port}"),
+    ] {
+        assert_eq!(status_for_host(&server, "/", Some(&host)), 403, "{host}");
+    }
+    for host in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("LocalHost:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        assert_eq!(status_for_host(&server, "/", Some(&host)), 200, "{host}");
+        assert_eq!(
+            status_for_host(&server, "/__presenter/events", Some(&host)),
+            200,
+            "{host}"
+        );
+    }
+    assert_eq!(
+        status_for_host(&server, "/", None),
+        200,
+        "HTTP/1.0 without a Host header"
+    );
+    // ureq's own requests (Host 127.0.0.1:<port>) pass, as every other test shows.
+    assert_eq!(server.state()["status"], "ok");
+}
+
+/// Audit F11: a front matter error is located in the deck source in `/__presenter/state`,
+/// the `hello` and `build` events and the overlay page (file, line, `a.md:2:` prefix and the
+/// line itself), as the terminal shows it; on the first build and on a rebuild.
+#[test]
+fn front_matter_errors_are_located_in_the_deck() {
+    let broken = format!("---\ntitle: a: b\n---\n\n{}", minimal());
+    let dir = project(&[("a.md", &broken)]);
+    let server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    let state = server.state();
+    let error = state["error"].clone();
+    assert_eq!(error["kind"], "front-matter", "{state}");
+    assert_eq!(error["file"], "a.md", "{state}");
+    assert_eq!(error["line"], 2, "{state}");
+    assert_eq!(error["excerpt"], "title: a: b", "{state}");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("a.md:2: front matter: "), "{message}");
+    let events = events(&server);
+    let (name, hello) = events.recv_timeout(REBUILD_TIMEOUT).unwrap();
+    assert_eq!(name, "hello");
+    assert_eq!(hello["error"], error, "{hello}");
+    let page = server.text("/");
+    assert!(page.contains("a.md:2: front matter: "), "{page}");
+    assert!(page.contains(">title: a: b</pre>"), "{page}");
+
+    // Fixed, then broken again: the build event carries the same located error.
+    write(&dir.path().join("a.md"), &minimal());
+    assert_eq!(next_build(&events)["status"], "ok");
+    write(&dir.path().join("a.md"), &broken);
+    let build = next_build(&events);
+    assert_eq!(build["status"], "error", "{build}");
+    assert_eq!(build["error"], error, "{build}");
+}
+
+/// Audit F33: a `presenter.toml` error is located in that file: its name (relative, as the
+/// terminal shows it) and line, and `toml`'s explanation without the lines it quotes, the
+/// offending line being the excerpt.
+#[test]
+fn config_errors_are_located_in_presenter_toml() {
+    let dir = project(&[
+        (
+            "presenter.toml",
+            "[deck]\ntitle = \"x\"\n\n[slides]\nsplt = \"rules\"\n",
+        ),
+        ("a.md", &minimal()),
+    ]);
+    let server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    let state = server.state();
+    let error = &state["error"];
+    assert_eq!(error["kind"], "config", "{state}");
+    assert_eq!(error["file"], "presenter.toml", "{state}");
+    assert_eq!(error["line"], 5, "{state}");
+    assert_eq!(error["excerpt"], "splt = \"rules\"", "{state}");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("presenter.toml:5: unknown field `splt`, expected one of"),
+        "{message}"
+    );
+    assert!(!message.contains(" | "), "{message}");
+    let page = server.text("/");
+    assert_eq!(
+        page.matches("splt = &quot;rules&quot;").count() + page.matches("splt = \"rules\"").count(),
+        1,
+        "{page}"
+    );
+}

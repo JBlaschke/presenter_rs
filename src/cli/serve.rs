@@ -8,12 +8,17 @@
 //!    change saved during the first build is not lost.
 //! 2. The first build (id 1, serve mode, missing assets are warnings) runs **before** the
 //!    port is bound, so `GET /` is never empty. A failed first build does not stop the
-//!    command: its error is printed and stored ([`server::apply_error`]; `GET /` then shows
-//!    the error overlay) and the failed build's inputs are watched until it is fixed.
+//!    command: its error is printed and stored ([`server::apply_error_payload`] with
+//!    [`ErrorPayload::for_input`], which locates a front matter error in the deck source and
+//!    quotes its line; `GET /` then shows the error overlay) and the failed build's inputs
+//!    are watched until it is fixed.
 //! 3. The server binds `host:port` (`--host`/`--port`, else `[serve]` of `presenter.toml`,
 //!    else `127.0.0.1:3000`; port 0 picks a free one) and prints
 //!    `Serving http://<address>:<port>/` as the **first line on stdout** (always, also with
-//!    `-q`: with port 0 it is the only place the port is shown). A port in use ends the
+//!    `-q`: with port 0 it is the only place the port is shown). It answers only requests
+//!    for `localhost`, an IP address or the `host` it was started with, on the port it
+//!    listens on ([`server::AllowedHosts`]; live-reload.md §4: other `Host` headers get
+//!    `403`, against DNS rebinding). A port in use ends the
 //!    command with exit 1 and the hint to use `--port 0`, also when the other server
 //!    listens on the wildcard address (`0.0.0.0` or a dual-stack `[::]`), which macOS would
 //!    let the bind shadow: unless the port is 0, the address is first probed with a
@@ -25,12 +30,14 @@
 //! 4. Every change batch of the watcher is rebuilt on the blocking pool (batches that queue
 //!    up meanwhile are merged into one rebuild, classified `css` or `content` by
 //!    [`classify`]); the result is stored ([`server::apply_build`] or
-//!    [`server::apply_error`]), the watch set is updated to the new build's inputs (after a
-//!    failure: the failed build's inputs plus those of the last good build) and a
+//!    [`server::apply_error_payload`]), the watch set is updated to the new build's inputs
+//!    (after a failure: the failed build's inputs plus those of the last good build) and a
 //!    [`BuildEvent`] with the build's duration is broadcast to the browsers. stderr gets
 //!    one line per rebuild: `rebuilt in <n> ms (css|content)` (not with `-q`), or the
 //!    build's error; diagnostics are printed as `presenter build` prints them. Rebuild
-//!    errors never stop the server.
+//!    errors never stop the server: the pipeline runs on threads with 8 MiB stacks, as
+//!    `presenter build` does on the main thread, and theme stylesheets compile on a thread
+//!    of their own with a large stack and a time limit (`theme::styles`, "Isolation").
 //! 5. Ctrl-C (SIGINT) shuts the server down gracefully ([`server::serve_until`]) and the
 //!    command exits 0. The handler is installed before anything else happens (only the
 //!    arguments are checked and the async runtime is started before it), so a Ctrl-C
@@ -53,9 +60,15 @@
 //! that one. The route ignores the query, and the client disregards `?v=<digits>` when it
 //! compares pages (live-reload.md §3), so neither the protocol nor the client changes; the
 //! URL shape differs from live-reload.md §1 by the query only (a contract note for the
-//! coordinator). Images that theme templates reference with `asset()` (e.g. the title
-//! slide's logo) are served from `/__presenter/asset/…` and are not versioned: editing one
-//! is a `css` build, after which an open page keeps showing the old image until a reload.
+//! coordinator).
+//!
+//! Theme files are versioned by the renderer (`?v=<content version>` on the URLs of
+//! `asset()` and of the theme stylesheets' `url()`s; live-reload.md §4, audit F03). An
+//! edited theme image is a `css` change by its path, which updates a stylesheet's
+//! background; but an image the document itself loads (e.g. the title slide's logo, an
+//! `asset()` in a template) is only updated by a content swap. So a `css` batch whose build
+//! changed a versioned `/__presenter/asset/…?v=` URL in the document is reported as a
+//! `content` build.
 //!
 //! # `--site-preview`
 //!
@@ -78,7 +91,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, PoisonError, RwLock, mpsc};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -88,6 +101,7 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use regex::Regex;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
@@ -102,7 +116,7 @@ use crate::error::{Diagnostic, Diagnostics, Error};
 use crate::pipeline::{self, Build, BuildFailure, BuildOptions, SITE_ASSETS_DIR};
 use crate::render::BuildInfo;
 use crate::serve::events::{BuildEvent, ErrorPayload};
-use crate::serve::server::{self, ServeState, Shared};
+use crate::serve::server::{self, AllowedHosts, ServeState, Shared};
 use crate::serve::watch::{
     ChangeBatch, ChangeKind, WatchSet, Watcher, classify, watch_set_before_build, watch_set_for,
     watch_set_for_failed,
@@ -110,6 +124,10 @@ use crate::serve::watch::{
 
 /// The files of the latest site-preview build by path below `assets/` (`--site-preview`).
 type SiteFiles = Arc<RwLock<BTreeMap<String, Bytes>>>;
+
+/// The stack size of the server runtime's threads, where the builds run: the 8 MiB of the
+/// main thread on macOS and Linux, where `presenter build` runs them.
+const BUILD_STACK_SIZE: usize = 8 << 20;
 
 /// Runs `presenter serve` (module docs). Returns only on Ctrl-C (exit 0, also during the
 /// first build) or when the server cannot start: an input whose format cannot be told
@@ -119,6 +137,9 @@ pub fn run(args: &ServeArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("presenter-serve")
+        // The builds run on the blocking pool: give them the stack `presenter build` has on
+        // the main thread (tokio's default is 2 MiB), so a deck that builds also serves.
+        .thread_stack_size(BUILD_STACK_SIZE)
         .build()
         .context("cannot start the server runtime")?;
     let served = runtime.block_on(start(opts, args.site_preview, global));
@@ -246,7 +267,8 @@ async fn serve(
         })
         .context("cannot start the rebuild thread")?;
     let rebuilds = tokio::spawn(rebuild_loop(session, rx));
-    let served = server::serve_until(listener, router, shutdown).await;
+    let hosts = AllowedHosts::new(addr).with_name(&config.host);
+    let served = server::serve_until_allowing(listener, router, shutdown, hosts).await;
     rebuilds.abort();
     tracing::info!("dev server stopped");
     Ok(served?)
@@ -448,6 +470,9 @@ struct Session {
     set: WatchSet,
     /// The inputs of the latest successful build.
     last_good: Option<WatchSet>,
+    /// The versioned theme-file URLs of the latest successful build's document
+    /// ([`document_versions`]).
+    versions: BTreeSet<String>,
     /// The `[serve]` settings the server was started with (read once).
     listening: ServeConfig,
     /// The last [`restart_note`] printed, so that it is printed once per change.
@@ -473,6 +498,7 @@ impl Session {
             watcher,
             set: WatchSet::default(),
             last_good: None,
+            versions: BTreeSet::new(),
             listening: listening.clone(),
             restart_note: None,
         }
@@ -520,7 +546,8 @@ impl Session {
 
     /// Builds the deck as the next attempt, stores the result, watches the attempt's
     /// inputs and prints its diagnostics (and error). Returns the event to broadcast; a
-    /// successful build reports `kind`.
+    /// successful build reports `kind`, or `content` when a versioned theme-file URL of
+    /// the document changed (module docs).
     fn build(&mut self, kind: ChangeKind) -> BuildEvent {
         let opts = BuildOptions {
             build: self.build_info(server::next_build_id(&self.state)),
@@ -531,6 +558,12 @@ impl Session {
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         match result {
             Ok(build) => {
+                let versions = document_versions(&build.document.html);
+                let kind = match kind {
+                    ChangeKind::Css if versions != self.versions => ChangeKind::Content,
+                    kind => kind,
+                };
+                self.versions = versions;
                 let build_id = self.store(build);
                 BuildEvent::Ok {
                     build_id,
@@ -539,8 +572,9 @@ impl Session {
                 }
             }
             Err(BuildFailure { error, diagnostics }) => {
-                let build_id = server::apply_error(&self.state, &error);
-                let payload = ErrorPayload::from(&error);
+                // Located in the deck source (a front matter error), as the terminal shows it.
+                let payload = ErrorPayload::for_input(&error, &self.opts.input);
+                let build_id = server::apply_error_payload(&self.state, payload.clone());
                 let mut set = watch_set_for_failed(&self.opts);
                 if let Some(good) = &self.last_good {
                     set.merge(good);
@@ -675,6 +709,22 @@ fn versioned_urls(html: &str, versions: &BTreeMap<&str, u64>) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The versioned theme-file URLs in the serve-mode document `html`
+/// (`/__presenter/asset/<path>?v=<digits>`, from `asset()`), so that a build whose document
+/// loads another version of a theme file can be told from one that changed stylesheets only
+/// (module docs).
+fn document_versions(html: &str) -> BTreeSet<String> {
+    static VERSIONED: LazyLock<Regex> = LazyLock::new(|| {
+        // A constant pattern covered by the unit tests: compiling it cannot fail.
+        Regex::new(r#"/__presenter/asset/[^"'\s?#<>()]*\?v=[0-9]+"#)
+            .expect("versioned URL regex is valid")
+    });
+    VERSIONED
+        .find_iter(html)
+        .map(|found| found.as_str().to_string())
+        .collect()
 }
 
 /// A number that changes when the file at `path` is rewritten: a hash of its modification
@@ -987,6 +1037,24 @@ mod tests {
         // A file that cannot be read has no version (its URL is left as rendered).
         std::fs::remove_file(&image).unwrap();
         assert_eq!(file_version(&image), None);
+    }
+
+    #[test]
+    fn document_versions_are_the_versioned_theme_file_urls() {
+        let html = "<img class=\"logo\" src=\"/__presenter/asset/@t/assets/logo.svg?v=12\">\
+                    <link href=\"/__presenter/asset/vendor/reveal/dist/reveal.css\">\
+                    <link id=\"presenter-theme\" href=\"/__presenter/theme.css?v=3\">\
+                    <img src=\"/__presenter/deck-asset/0123456789ab?v=7\">\
+                    <div style=\"background: url(/__presenter/asset/bg%20x.png?v=34)\"></div>";
+        let found: Vec<String> = document_versions(html).into_iter().collect();
+        assert_eq!(
+            found,
+            [
+                "/__presenter/asset/@t/assets/logo.svg?v=12",
+                "/__presenter/asset/bg%20x.png?v=34"
+            ]
+        );
+        assert!(document_versions("<p>no assets</p>").is_empty());
     }
 
     #[test]

@@ -56,6 +56,15 @@ fn site() -> OutputMode {
     }
 }
 
+/// The serve-mode URL of the theme file at helper path `path` whose contents are `bytes`
+/// (live-reload.md §4, audit F03): `/__presenter/asset/<path>?v=<version>`, the version
+/// being the first 8 bytes of the contents' BLAKE3 hash, little-endian, in decimal.
+fn versioned(path: &str, bytes: &[u8]) -> String {
+    let hash = blake3::hash(bytes);
+    let version = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+    format!("/__presenter/asset/{path}?v={version}")
+}
+
 fn build_info(output: &OutputMode) -> BuildInfo {
     match output {
         OutputMode::Standalone => BuildInfo::build(true),
@@ -543,6 +552,78 @@ fn disk_theme(dir: &Path, manifest: &str, files: &[(&str, &[u8])]) -> Theme {
     theme::resolve(dir.to_str().unwrap(), &[]).unwrap()
 }
 
+/// Audit F03 (live-reload.md §4): in serve mode, the URLs of theme files that `asset()`
+/// returns and that the theme stylesheet's `url()`s name carry the file's content version,
+/// which changes with the file; embedded files keep plain URLs. A theme stylesheet linked
+/// with `style()` is served with its `url()`s versioned the same way
+/// (`render::html::serve_stylesheet`); references that name nothing stay as written.
+#[test]
+fn theme_file_urls_carry_their_content_version_in_serve_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v");
+    let manifest = "name = \"v\"\nextends = \"default\"\n[styles]\nentries = [\"styles/v.css\"]\n\
+                    [vars]\nlogo = \"logo.svg\"\n";
+    let linked = ".x { background: url(../assets/bg.svg); } .y { background: url(nope.png); } \
+                  .z { background: url(/abs.png); }";
+    let theme = disk_theme(
+        &dir,
+        manifest,
+        &[
+            (
+                "styles/v.css",
+                b".reveal h1 { background: url(../assets/bg.svg); }",
+            ),
+            ("styles/linked.css", linked.as_bytes()),
+            ("assets/bg.svg", b"<svg>red</svg>"),
+            ("assets/logo.svg", b"<svg>10</svg>"),
+        ],
+    );
+    let deck = sample_deck();
+    let render = || render_with(&deck, &theme, &Config::default(), OutputMode::Serve);
+    let doc = render();
+    let logo = versioned("logo.svg", b"<svg>10</svg>");
+    let bg = versioned("@v/assets/bg.svg", b"<svg>red</svg>");
+    assert!(
+        doc.html
+            .contains(&format!("<img class=\"logo\" src=\"{logo}\"")),
+        "{}",
+        doc.html
+    );
+    assert!(
+        doc.theme_css.contains(&format!("url({bg})")),
+        "{}",
+        doc.theme_css
+    );
+    assert!(
+        doc.html
+            .contains(r#"<script src="/__presenter/asset/vendor/reveal/dist/reveal.js"></script>"#)
+    );
+    let served = render::html::serve_stylesheet(&theme, "@v/styles/linked.css", linked).unwrap();
+    assert_eq!(
+        served,
+        format!(
+            ".x {{ background: url({bg}); }} .y {{ background: url(nope.png); }} \
+             .z {{ background: url(/abs.png); }}"
+        )
+    );
+
+    // Edited: other versions, of these files only.
+    std::fs::write(dir.join("assets/bg.svg"), "<svg>blue</svg>").unwrap();
+    std::fs::write(dir.join("assets/logo.svg"), "<svg>200</svg>").unwrap();
+    let edited = render();
+    let new_logo = versioned("logo.svg", b"<svg>200</svg>");
+    let new_bg = versioned("@v/assets/bg.svg", b"<svg>blue</svg>");
+    assert_ne!(new_logo, logo);
+    assert!(edited.html.contains(&new_logo) && !edited.html.contains(&logo));
+    assert!(edited.theme_css.contains(&new_bg) && !edited.theme_css.contains(&bg));
+    // The other modes are unaffected: the file is inlined (standalone).
+    let standalone = render_with(&deck, &theme, &Config::default(), OutputMode::Standalone);
+    assert!(
+        !standalone.html.contains("?v="),
+        "versions are for serve mode only"
+    );
+}
+
 #[test]
 fn helpers_with_an_unknown_path_name_the_path_and_the_template() {
     let tmp = tempfile::tempdir().unwrap();
@@ -671,35 +752,33 @@ entries = ["scripts/extra.js"]
             .contains(r#"<link rel="stylesheet" href="/__presenter/asset/@mine/styles/hl.css">"#)
     );
     assert!(!doc.theme_css.contains("deck-asset"), "{}", doc.theme_css);
+    // Theme files carry their content version (audit F03); the reference's own query
+    // follows it.
+    let bg = versioned("@mine/assets/bg.png", b"bg-bytes");
     assert!(
         doc.theme_css
-            .contains(".mine { background: url(/__presenter/asset/@mine/assets/bg.png); }"),
+            .contains(&format!(".mine {{ background: url({bg}); }}")),
         "{}",
         doc.theme_css
     );
     // Found through the §5 assets/ fallback: named by its theme-root helper path.
+    let logo = versioned("@mine/assets/logo.png", b"logo-bytes");
     assert!(
-        doc.theme_css.contains(
-            ".logo { background: url('/__presenter/asset/@mine/assets/logo.png?v=2#x'); }"
-        ),
+        doc.theme_css
+            .contains(&format!(".logo {{ background: url('{logo}&v=2#x'); }}")),
         "{}",
         doc.theme_css
     );
     let served = |url: &str| {
         let path = url.strip_prefix(render::html::SERVE_HELPER_PREFIX).unwrap();
+        let path = path.split('?').next().unwrap();
         render::resolve_helper_path(&theme, path)
             .unwrap()
             .unwrap()
             .0
     };
-    assert_eq!(
-        served("/__presenter/asset/@mine/assets/bg.png"),
-        b"bg-bytes"
-    );
-    assert_eq!(
-        served("/__presenter/asset/@mine/assets/logo.png"),
-        b"logo-bytes"
-    );
+    assert_eq!(served(&bg), b"bg-bytes");
+    assert_eq!(served(&logo), b"logo-bytes");
     assert!(
         doc.theme_css
             .find("/* @default/styles/theme.css */")
@@ -871,7 +950,7 @@ fn style_entry_assets_fallback_serves_the_theme_file() {
     );
     for (selector, bytes, path) in FALLBACK_HITS {
         let url = background_url(&doc.theme_css, selector);
-        assert_eq!(url, format!("/__presenter/asset/{path}"));
+        assert_eq!(url, versioned(path, bytes));
         let served = render::resolve_helper_path(&theme, path).unwrap().unwrap();
         assert_eq!(served, (bytes.to_vec(), "image/png".to_string()));
     }
@@ -1335,9 +1414,10 @@ fn backslash_style_entries_resolve_urls_next_to_the_stylesheet() {
         &Config::default(),
         OutputMode::Serve,
     );
+    let b = versioned("@c/styles/img/b.png", b"b-bytes");
     assert!(
         doc.theme_css
-            .contains(".x { background: url(/__presenter/asset/@c/styles/img/b.png); }")
+            .contains(&format!(".x {{ background: url({b}); }}"))
     );
 }
 

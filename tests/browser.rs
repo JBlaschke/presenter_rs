@@ -634,3 +634,157 @@ fn serve_reloads_the_page_once_when_the_reveal_config_changes() {
     assert_eq!(after["buildId"], reloaded["buildId"], "{after}");
     assert_no_page_errors(&mut page);
 }
+
+/// L-T24-1: a page that navigates its frame again before its own `load` event (an inline
+/// script that sets `location`; the live-reload client reloads from its `hello` handler,
+/// which can run that early) does not leave `navigate` waiting for a `load` that never
+/// comes: it returns once the document that replaced it has loaded.
+#[test]
+fn navigate_follows_a_page_that_replaces_itself_before_its_load() {
+    let _turn = serial();
+    let Some(chrome) = chrome() else {
+        return;
+    };
+    let dir = scratch(&chrome);
+    std::fs::write(
+        dir.path().join("a.html"),
+        "<!doctype html><title>a</title><script>location.href = 'b.html';</script>\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.html"),
+        "<!doctype html><title>b</title>\n",
+    )
+    .unwrap();
+    // A short timeout: waiting for a.html's `load` would fail the call after 8 s.
+    let mut page = Page::launch(&chrome, Duration::from_secs(8)).unwrap_or_else(|e| panic!("{e}"));
+    let start = Instant::now();
+    page.navigate(&file_url(&dir.path().join("a.html")))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(5), "returned after {took:?}");
+    let loaded = evaluate(&mut page, "[document.title, document.readyState]");
+    assert_eq!(loaded, json!(["b", "complete"]));
+    assert_no_page_errors(&mut page);
+}
+
+/// The heading's background image URL, the title slide's logo's `src` and natural width,
+/// the natural width of the corner logo outside the slides, and the resources the page has
+/// fetched.
+const THEME_IMAGES: &str = r#"(() => {
+  const logo = document.querySelector('img.logo');
+  const corner = document.querySelector('img.corner');
+  const width = (img) => (img && img.complete ? img.naturalWidth : null);
+  return {
+    bg: getComputedStyle(document.querySelector('.reveal h1')).backgroundImage,
+    logo: logo?.getAttribute('src') ?? null,
+    width: width(logo),
+    corner: width(corner),
+    fetched: performance.getEntriesByType('resource').map((entry) => new URL(entry.name).pathname + new URL(entry.name).search),
+  };
+})()"#;
+
+/// Polls [`THEME_IMAGES`] (at most 20 s) until `done` accepts it; fails with what it saw.
+fn wait_for_images(page: &mut Page, server: &Server, done: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let images = evaluate(page, THEME_IMAGES);
+        if done(&images) {
+            return images;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not within 20 s: {images}\nserver stderr:\n{}",
+            server.stderr()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Audit F03: serve a deck whose child theme sets the heading's background with a
+/// stylesheet `url()` and shows a logo through `asset()`, on the title slide and in a corner
+/// outside the slides (`deck.html`); open it, edit both images, and check that the page
+/// shows them without a reload: the background's URL changes and the new image is fetched
+/// (a css swap), and both logos change their natural width (the build is reported as
+/// content, so the slides are swapped in place and the corner logo takes its new URL).
+#[test]
+fn serve_shows_edited_theme_images_without_a_reload() {
+    let _turn = serial();
+    let Some(chrome) = chrome() else {
+        return;
+    };
+    let dir = scratch(&chrome);
+    let svg = |size: u32, fill: &str| {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{size}\" height=\"{size}\">\
+             <rect width=\"{size}\" height=\"{size}\" fill=\"{fill}\"/></svg>\n"
+        )
+    };
+    let files = [
+        (
+            "t/theme.toml",
+            "name = \"t\"\nextends = \"default\"\n[styles]\nentries = [\"styles/t.css\"]\n\
+             [vars]\nlogo = \"logo.svg\"\n"
+                .to_string(),
+        ),
+        (
+            "t/styles/t.css",
+            ".reveal h1 { background-image: url(../assets/bg.svg); }\n".to_string(),
+        ),
+        (
+            "t/templates/deck.html",
+            "{% extends \"@default/deck.html\" %}\n{% block body_start %}\
+             <img class=\"corner\" src=\"{{ asset('logo.svg') }}\" alt=\"\">{% endblock %}\n"
+                .to_string(),
+        ),
+        ("t/assets/bg.svg", svg(10, "red")),
+        ("t/assets/logo.svg", svg(10, "green")),
+        (
+            "a.md",
+            "---\ntheme: ./t\n---\n\n# Title {layout=title}\n".to_string(),
+        ),
+    ];
+    for (path, text) in &files {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let server = Server::start(dir.path(), &["a.md", "--port", "0"]);
+    let (mut page, _) = open_live_page(&chrome, &server);
+    let first = wait_for_images(&mut page, &server, |images| {
+        images["width"] == 10 && images["corner"] == 10
+    });
+    let old_bg = first["bg"].as_str().unwrap().to_string();
+    assert!(
+        old_bg.contains("/__presenter/asset/@t/assets/bg.svg?v="),
+        "{first}"
+    );
+
+    std::fs::write(dir.path().join("t/assets/bg.svg"), svg(20, "blue")).unwrap();
+    let swapped = wait_for_images(&mut page, &server, |images| images["bg"] != old_bg.as_str());
+    let new_bg = swapped["bg"].as_str().unwrap();
+    let path = Regex::new(r#"(/__presenter/asset/@t/assets/bg\.svg\?v=[0-9]+)"#).unwrap();
+    let fetched_path = path.captures(new_bg).unwrap_or_else(|| panic!("{swapped}"))[1].to_string();
+    let swapped = wait_for_images(&mut page, &server, |images| {
+        images["fetched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|url| *url == fetched_path.as_str())
+    });
+
+    std::fs::write(dir.path().join("t/assets/logo.svg"), svg(200, "green")).unwrap();
+    let wide = wait_for_images(&mut page, &server, |images| {
+        images["width"] == 200 && images["corner"] == 200
+    });
+    assert_ne!(wide["logo"], first["logo"], "{wide}");
+
+    let after = evaluate(&mut page, PAGE_STATE);
+    eprintln!("serve: {first} -> {swapped} -> {wide}, {after}");
+    assert_eq!(
+        after["marker"], "still here",
+        "the page was reloaded: {after}"
+    );
+    assert_eq!(after["navigations"], json!(["navigate"]), "{after}");
+    assert_no_page_errors(&mut page);
+}

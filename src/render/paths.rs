@@ -6,6 +6,10 @@
 //! then resolved by its first segment: `vendor/…` and `presenter/…` in the embedded tree,
 //! `@<theme>/<path>` relative to that theme's root directory, anything else in the chain's
 //! `assets/` directories.
+//!
+//! In serve mode, the URLs of theme-chain files that a page loads through `asset()` or
+//! that a stylesheet's `url()` names carry the file's content version
+//! ([`versioned_serve_url`]; live-reload.md §4, audit F03).
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -137,6 +141,31 @@ pub(super) fn unknown_reason(theme: &Theme, path: &str) -> String {
     }
 }
 
+/// The content version of a file in serve-mode URLs (`?v=<version>`; live-reload.md §4,
+/// audit F03): the first 8 bytes of the BLAKE3 hash of `bytes`, as a decimal number. It
+/// changes whenever the file's bytes do, so a browser that swaps a stylesheet or the slides
+/// in place loads an edited image instead of reusing the one it has for the old URL; and it
+/// is digits only, which the live-reload client disregards when it compares pages.
+pub(super) fn content_version(bytes: &[u8]) -> u64 {
+    let hash = blake3::hash(bytes);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first)
+}
+
+/// The dev server URL a page or stylesheet uses for the file at the normalized helper path
+/// `key`: [`serve_url`], plus `?v=<`[`content_version`]`>` for a file of the theme chain
+/// (`@<theme>/…` or the `assets/` form; the files of the embedded `vendor/…` and
+/// `presenter/…` trees do not change while presenter runs). `Ok(None)` when no file is
+/// there; errors only when an existing file cannot be read.
+pub(super) fn versioned_serve_url(theme: &Theme, key: &str) -> Result<Option<String>> {
+    if is_builtin(key) {
+        return Ok(helper_path_exists(theme, key).then(|| serve_url(key)));
+    }
+    Ok(resolve_helper_path(theme, key)?
+        .map(|(bytes, _)| format!("{}?v={}", serve_url(key), content_version(&bytes))))
+}
+
 /// The dev server URL of helper path `key`: [`SERVE_HELPER_PREFIX`] + `key`, with every byte
 /// other than ASCII letters, digits and `-._~/@` percent-encoded.
 pub(super) fn serve_url(key: &str) -> String {
@@ -206,6 +235,29 @@ mod tests {
                 "{base} + {rel}"
             );
         }
+    }
+
+    #[test]
+    fn theme_files_get_a_content_version_and_builtin_files_none() {
+        let theme = crate::theme::resolve("default", &[]).unwrap();
+        let css = "@default/styles/theme.css";
+        let bytes = theme.chain[0].read("styles/theme.css").unwrap().unwrap();
+        assert_eq!(
+            versioned_serve_url(&theme, css).unwrap(),
+            Some(format!(
+                "/__presenter/asset/{css}?v={}",
+                content_version(&bytes)
+            ))
+        );
+        let reveal = "vendor/reveal/dist/reveal.js";
+        assert_eq!(
+            versioned_serve_url(&theme, reveal).unwrap(),
+            Some(format!("/__presenter/asset/{reveal}"))
+        );
+        assert_eq!(versioned_serve_url(&theme, "nope.png").unwrap(), None);
+        assert_eq!(versioned_serve_url(&theme, "vendor/nope.js").unwrap(), None);
+        assert_ne!(content_version(b"a"), content_version(b"b"));
+        assert_eq!(content_version(b"a"), content_version(b"a"));
     }
 
     #[test]

@@ -174,8 +174,6 @@ fn unrelated_and_ignored_paths_do_not_count() {
     write(&theme.join("styles/.x.css.swp"), "x");
     write(&theme.join("templates/4913"), "x");
     write(&theme.join(".git/HEAD"), "x");
-    write(&theme.join("dist/x.html"), "x");
-    write(&theme.join("target/x.css"), "x");
     assert_eq!(drain(&rx, QUIET), vec![]);
 
     write(&theme.join("templates/deck.html"), "{{ x }}");
@@ -186,6 +184,39 @@ fn unrelated_and_ignored_paths_do_not_count() {
         vec![canonical(&theme.join("templates/deck.html"))]
     );
     assert_eq!(batch.kind, ChangeKind::Content);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+}
+
+/// Audit F18: a theme may keep inputs in directories named `dist` or `target` (a bundled
+/// script entry, a vendored library's stylesheet), at any depth; editing them counts like
+/// any other theme file. Only `.git/` and editor files are ignored.
+#[test]
+fn theme_files_in_dist_and_target_directories_count() {
+    let (_dir, deck, theme, _css) = deck_and_theme();
+    let lib = theme.join("scripts/dist/lib.js");
+    let vendored = theme.join("styles/target/x.css");
+    let top = theme.join("dist/extra.css");
+    write(&lib, "window.LIB = 1;\n");
+    write(&vendored, "a { b: c; }\n");
+    write(&top, "a { b: c; }\n");
+    let set = WatchSet::new([deck], [theme.clone()]);
+    let (_watcher, rx) = start(&set);
+
+    write(&lib, "window.LIB = 2;\n");
+    let batch = next(&rx, "editing scripts/dist/lib.js");
+    assert_eq!(batch.paths, vec![canonical(&lib)]);
+    assert_eq!(batch.kind, ChangeKind::Content);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    write(&vendored, "a { b: d; }\n");
+    let batch = next(&rx, "editing styles/target/x.css");
+    assert_eq!(batch.paths, vec![canonical(&vendored)]);
+    assert_eq!(batch.kind, ChangeKind::Css);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    write(&top, "a { b: d; }\n");
+    let batch = next(&rx, "editing dist/extra.css");
+    assert_eq!(batch.paths, vec![canonical(&top)]);
     assert_eq!(drain(&rx, QUIET), vec![]);
 }
 

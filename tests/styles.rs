@@ -607,6 +607,120 @@ fn a_panic_inside_grass_is_a_style_error() {
     );
 }
 
+/// Audit F02 (live-reload.md §4): grass has no recursion limit, and a stack overflow aborts
+/// the process. A mixin or function that always recurses is a style error pointing at the
+/// call, in a partial too; deep but finite recursion and nesting compile, on the
+/// compiler's own big stack (a test thread has 2 MiB, which holds a few hundred levels).
+#[test]
+fn recursive_stylesheets_are_style_errors_and_deep_ones_compile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pad =
+        "@mixin pad($n) { padding: $n; @include pad($n - 1); }\nbody { @include pad(3px); }\n";
+    let theme = scss_theme(tmp.path(), "theme.scss", &[("styles/theme.scss", pad)]);
+    let err = compile(&theme).unwrap_err();
+    assert_eq!(
+        err.quoted_line(),
+        Some("@mixin pad($n) { padding: $n; @include pad($n - 1); }")
+    );
+    let (file, message) = style_error(err);
+    assert_eq!(file, "@t/styles/theme.scss");
+    assert!(
+        message.starts_with("line 1: @mixin pad always includes itself, so Sass would recurse"),
+        "{message}"
+    );
+
+    // In a partial, through another function: the partial, and the entry being compiled.
+    let partial = "\n@function f($n) { @return g($n); }\n@function g($n) { @return f($n); }\n";
+    let theme = scss_theme(
+        &tmp.path().join("2"),
+        "theme.scss",
+        &[
+            (
+                "styles/theme.scss",
+                "@use \"parts/fns\";\na { b: fns.f(1); }\n",
+            ),
+            ("styles/parts/_fns.scss", partial),
+        ],
+    );
+    let (file, message) = style_error(compile(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/parts/_fns.scss");
+    assert!(
+        message.starts_with("line 2: @function f always calls itself before any @return through g"),
+        "{message}"
+    );
+    assert!(
+        message.contains("(compiling '@t/styles/theme.scss')"),
+        "{message}"
+    );
+
+    // Finite: 1500 nested @includes, 800 nested rules, 1600 nested parentheses.
+    let deep = format!(
+        "@mixin pad($n) {{ @if $n > 0 {{ @include pad($n - 1); }} @else {{ .deep {{ x: y; }} }} }}\n\
+         @include pad(1500);\n{}color: red;{}\n.p {{ width: {}1px{}; }}\n",
+        "a{".repeat(800),
+        "}".repeat(800),
+        "(".repeat(1600),
+        ")".repeat(1600)
+    );
+    let theme = scss_theme(
+        &tmp.path().join("3"),
+        "theme.scss",
+        &[("styles/theme.scss", &deep)],
+    );
+    let (css, _) = compile(&theme).unwrap();
+    assert!(
+        css.contains(".deep {\n  x: y;\n}"),
+        "{}",
+        &css[..css.len().min(500)]
+    );
+    assert!(css.contains("color: red;"));
+    assert!(css.contains("width: 1px;"));
+}
+
+/// Audit F06 (live-reload.md §4): an endless `@while` is a style error after
+/// `SASS_TIME_LIMIT` instead of a compilation that never returns; compiling the same files
+/// again fails at once (the first compilation still runs in the background), and the fixed
+/// file compiles.
+#[test]
+fn an_endless_loop_is_a_style_error_after_the_time_limit() {
+    use presenter::theme::styles::SASS_TIME_LIMIT;
+    let tmp = tempfile::tempdir().unwrap();
+    let endless = "$i: 0;\n@while $i < 1 { $x: 1; }\n";
+    let theme = scss_theme(tmp.path(), "theme.scss", &[("styles/theme.scss", endless)]);
+    let start = Instant::now();
+    let (file, message) = style_error(compile(&theme).unwrap_err());
+    let took = start.elapsed();
+    assert!(
+        took >= SASS_TIME_LIMIT && took < SASS_TIME_LIMIT + Duration::from_secs(20),
+        "{took:?}"
+    );
+    assert_eq!(file, "@t/styles/theme.scss");
+    assert!(
+        message.starts_with("the Sass compilation did not finish within 10 s"),
+        "{message}"
+    );
+
+    let start = Instant::now();
+    let (_, message) = style_error(compile(&theme).unwrap_err());
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(
+        message.starts_with("an earlier compilation of the same files"),
+        "{message}"
+    );
+
+    std::fs::write(
+        tmp.path().join("t/styles/theme.scss"),
+        "h1 { color: blue; }\n",
+    )
+    .unwrap();
+    let (css, _) = compile(&theme).unwrap();
+    assert!(css.contains("color: blue;"), "{css}");
+}
+
 #[test]
 fn compile_scss_names_what_is_missing() {
     let theme = default_theme();

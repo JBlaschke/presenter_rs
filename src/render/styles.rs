@@ -32,7 +32,11 @@
 //! registry that receives the file's bytes (standalone and site; the emitter inlines or
 //! emits it), or in serve mode the dev server URL of its helper path,
 //! `/__presenter/asset/<path>` (nothing is copied; the asset route serves it from the
-//! theme chain on each request, like every other helper path).
+//! theme chain on each request, like every other helper path), with `?v=<content version>`
+//! for a file of the theme chain (live-reload.md §4, audit F03: the browser reuses the
+//! image it has for a URL, so an edited one needs a new URL). A query the reference has
+//! itself follows it: `url(logo.png?x=1#y)` becomes
+//! `url(/__presenter/asset/@t/assets/logo.png?v=<version>&x=1#y)`.
 //!
 //! Text files are decoded as UTF-8 with one leading byte order mark removed
 //! ([`decode_text`]): a BOM is only skipped at the very start of a stylesheet, so one that
@@ -46,8 +50,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::paths::{
-    helper_path_exists, is_builtin, join_relative, normalize_helper_path, resolve_helper_path,
-    serve_url,
+    is_builtin, join_relative, normalize_helper_path, resolve_helper_path, versioned_serve_url,
 };
 use crate::assets::emit::register_css_urls;
 use crate::assets::registry::{AssetData, AssetRegistry};
@@ -94,13 +97,22 @@ impl UrlRules {
     pub(super) fn is_lenient(self) -> bool {
         self.lenient
     }
+
+    /// The same rules, leaving unresolvable references as written.
+    pub(super) fn leniently(self) -> UrlRules {
+        UrlRules {
+            lenient: true,
+            ..self
+        }
+    }
 }
 
 /// What resolved `url()` references become.
 pub(super) enum Targets<'r> {
     /// `asset:<id>` placeholders of this registry, which receives the files' bytes.
     Placeholders(&'r mut AssetRegistry),
-    /// `/__presenter/asset/<helper path>` URLs; nothing is read.
+    /// `/__presenter/asset/<helper path>` URLs, versioned for theme files (module docs);
+    /// nothing is copied.
     ServeUrls,
 }
 
@@ -233,22 +245,43 @@ pub(super) fn rewrite_urls(
             Ok(css)
         }
         Targets::ServeUrls => {
-            // A scratch registry is the id → helper path table: each target is registered
-            // with its helper path as its "bytes" (ids are content hashes, so one path is
-            // one id), and the placeholders are then replaced by the paths' URLs.
+            // A scratch registry is the id → URL table: each target is registered with its
+            // versioned URL as its "bytes" (ids are content hashes, so one URL is one id),
+            // and the placeholders are then replaced by the URLs.
             let mut table = AssetRegistry::new();
             let mut fetch =
-                |path: &str| Ok(helper_path_exists(theme, path).then(|| path.as_bytes().to_vec()));
+                |path: &str| Ok(versioned_serve_url(theme, path)?.map(String::into_bytes));
             let mut css = register_urls(lookup, css, &mut table, &mut fetch)?;
             for asset in table.iter() {
-                if let AssetData::Bytes(path) = &asset.data {
-                    let url = serve_url(&String::from_utf8_lossy(path));
-                    css = css.replace(&AssetRegistry::placeholder(&asset.id), &url);
+                if let AssetData::Bytes(url) = &asset.data {
+                    let placeholder = AssetRegistry::placeholder(&asset.id);
+                    css = replace_placeholder(&css, &placeholder, &String::from_utf8_lossy(url));
                 }
             }
             Ok(css)
         }
     }
+}
+
+/// `css` with every `placeholder` replaced by `url`. When `url` has a query and the
+/// reference its own (the suffix after the placeholder, `?x=1#y`), they are joined:
+/// `<url>&x=1#y`.
+fn replace_placeholder(css: &str, placeholder: &str, url: &str) -> String {
+    let mut out = String::with_capacity(css.len() + url.len());
+    let mut rest = css;
+    while let Some(at) = rest.find(placeholder) {
+        out.push_str(&rest[..at]);
+        out.push_str(url);
+        rest = &rest[at + placeholder.len()..];
+        if url.contains('?')
+            && let Some(query) = rest.strip_prefix('?')
+        {
+            out.push('&');
+            rest = query;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The RFC 8081 type for the legacy font MIME types `mime_guess` reports
@@ -392,6 +425,23 @@ a { background: url(https://x.example/not-an-import.png) }"#;
                 "http://x.example/b.css",
                 "//cdn.example/c.css"
             ]
+        );
+    }
+
+    #[test]
+    fn placeholders_take_the_versioned_url_and_keep_their_own_query() {
+        let placeholder = "asset:0123456789ab";
+        let css = format!(
+            "a {{ b: url({placeholder}); c: url('{placeholder}?x=1#y'); d: url({placeholder}#z) }}"
+        );
+        assert_eq!(
+            replace_placeholder(&css, placeholder, "/u.png?v=5"),
+            "a { b: url(/u.png?v=5); c: url('/u.png?v=5&x=1#y'); d: url(/u.png?v=5#z) }"
+        );
+        // A URL without a query (a builtin file) keeps the reference's query as it is.
+        assert_eq!(
+            replace_placeholder(&css, placeholder, "/v.woff"),
+            "a { b: url(/v.woff); c: url('/v.woff?x=1#y'); d: url(/v.woff#z) }"
         );
     }
 

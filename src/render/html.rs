@@ -19,7 +19,7 @@
 //! |---|---|---|---|
 //! | `style(path)` | `<style>` with `url()`s inlined as `data:` | `<link rel="stylesheet" href="assets/<name>-<hash>.css">`, file emitted (its `url()`s emitted next to it) | `<link rel="stylesheet" href="/__presenter/asset/<path>">` |
 //! | `script(path)` | `<script>` with the file inlined | `<script src="assets/<name>-<hash>.js">`, file emitted | `<script src="/__presenter/asset/<path>">` |
-//! | `asset(path)` | `data:` URI | `assets/<name>-<hash>.<ext>`, file emitted | `/__presenter/asset/<path>` |
+//! | `asset(path)` | `data:` URI | `assets/<name>-<hash>.<ext>`, file emitted | `/__presenter/asset/<path>`, with `?v=<content version>` for a theme file |
 //! | `theme_style()` | `<style id="presenter-theme">` | `<link id="presenter-theme" … href="assets/theme-<hash>.css">` | `<link id="presenter-theme" … href="/__presenter/theme.css?v=<build id>">` |
 //! | `reveal_init()` | `<script>Reveal.initialize(Object.assign(<config_json>, { plugins: [...] }));</script>` | same | same |
 //! | `live_reload()` | empty | empty | `<script src="/__presenter/live-reload.js"></script>` (when `build.live_reload`) |
@@ -30,6 +30,14 @@
 //! stylesheet `url()`s resolve (the same files in every mode) is described in the
 //! `render::styles` module docs; in serve mode the theme stylesheet refers to its files as
 //! `/__presenter/asset/<helper path>`, so the dev server needs no registry for them.
+//!
+//! **Content versions (serve mode; live-reload.md §4, audit F03).** A browser reuses the
+//! image it has for a URL, also after it swapped a stylesheet or the slides in place, so the
+//! URL of a theme-chain file that `asset()` returns or a stylesheet's `url()` names ends in
+//! `?v=<content version>` (a number that changes with the file's bytes). The dev server
+//! serves a theme stylesheet linked with `style()` through [`serve_stylesheet`], which
+//! versions its `url()`s the same way. `script()` and `style()` URLs are not versioned: the
+//! client re-requests the linked stylesheets on every build itself.
 //!
 //! **Inlined text** never ends its element early: `</style` and `</script` inside inlined
 //! files are written `<\/style` / `<\/script`. Nor does it keep the element open: a script
@@ -75,6 +83,7 @@ use minijinja::{Environment, ErrorKind, Value};
 
 use super::paths::{
     helper_path_exists, normalize_helper_path, resolve_helper_path, serve_url, unknown_reason,
+    versioned_serve_url,
 };
 use super::reveal::{self, PluginInfo};
 use super::styles::{self, Targets, UrlRules};
@@ -96,6 +105,18 @@ pub const SERVE_THEME_CSS: &str = "/__presenter/theme.css";
 
 /// URL of the live-reload client script (live-reload.md §1).
 pub const SERVE_LIVE_RELOAD_JS: &str = "/__presenter/live-reload.js";
+
+/// The text the dev server serves for `css`, the stylesheet at the normalized helper path
+/// `key` of `theme`'s chain (a file a template links with `style()`): each relative `url()`
+/// that names a file (next to the stylesheet, as `style()` resolves it) becomes that file's
+/// absolute dev-server URL, versioned like the theme stylesheet's (module docs, "Content
+/// versions"); a reference that names nothing stays as written.
+///
+/// Errors only when an existing file cannot be read.
+pub fn serve_stylesheet(theme: &Theme, key: &str, css: &str) -> Result<String> {
+    let rules = UrlRules::for_style(key).leniently();
+    styles::rewrite_urls(theme, key, css, rules, Targets::ServeUrls)
+}
 
 /// Renders `input` into the final document (see the module docs). `input.config` is used
 /// as given: it must already be the effective config ([`super::RenderInput::config`]).
@@ -380,7 +401,9 @@ impl HelperState {
     fn asset(&mut self, path: &str) -> Result<String> {
         let key = self.lookup("asset", path)?;
         match &self.mode {
-            OutputMode::Serve => Ok(serve_url(&key)),
+            OutputMode::Serve => {
+                versioned_serve_url(&self.theme, &key)?.ok_or_else(|| self.unknown("asset", path))
+            }
             OutputMode::Site { .. } => {
                 let (bytes, mime) = self.read("asset", path, &key)?;
                 let url = self.emit_bytes(bytes, &mime, &key)?;

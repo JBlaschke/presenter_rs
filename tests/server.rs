@@ -335,6 +335,15 @@ fn deck_assets_are_served_by_id() {
     );
 }
 
+/// The serve-mode URL of the theme file at helper path `path` whose contents are `bytes`
+/// (live-reload.md §4, audit F03): `/__presenter/asset/<path>?v=<version>`, the version
+/// being the first 8 bytes of the contents' BLAKE3 hash, little-endian, in decimal.
+fn versioned(path: &str, bytes: &[u8]) -> String {
+    let hash = blake3::hash(bytes);
+    let version = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+    format!("/__presenter/asset/{path}?v={version}")
+}
+
 /// A deck whose theme `mytheme` (extends default) has an extra stylesheet with one
 /// `url()` next to it and one found through the theme's `assets/` (theme-format.md §5).
 fn theme_deck(dir: &Path) -> PathBuf {
@@ -366,28 +375,30 @@ fn theme_assets_resolve_in_every_helper_path_form() {
     let (state, _) = state_with(&theme_deck(tmp.path()));
     let server = TestServer::start(state);
 
-    // The served stylesheet links its url()s through the asset route.
+    // The served stylesheet links its url()s through the asset route, with the files'
+    // content versions (audit F03).
     let css = server.text("/__presenter/theme.css");
-    let urls = css_urls(&css);
-    for expected in [
-        "/__presenter/asset/@mytheme/assets/logo.png",
-        "/__presenter/asset/@mytheme/styles/img/b.png",
-    ] {
+    let logo = versioned("@mytheme/assets/logo.png", b"logo-bytes");
+    let b = versioned("@mytheme/styles/img/b.png", b"b-bytes");
+    for expected in [&logo, &b] {
         assert!(
-            urls.iter().any(|url| url == expected),
-            "{expected} in {urls:?}"
+            css.contains(&format!("url({expected})")),
+            "{expected} in {css}"
         );
     }
+    // A theme stylesheet the asset route serves (one `style()` links) gets its url()s
+    // versioned too; one that names nothing stays as written.
+    let extra = format!(".logo {{ background: url(logo.png); }}\n.b {{ background: url({b}); }}\n");
     let cases: [(&str, &[u8]); 6] = [
-        ("/__presenter/asset/@mytheme/assets/logo.png", b"logo-bytes"),
-        ("/__presenter/asset/@mytheme/styles/img/b.png", b"b-bytes"),
+        (&logo, b"logo-bytes"),
+        (&b, b"b-bytes"),
         // The chain's assets/ form, as `asset("logo.png")` writes it.
         ("/__presenter/asset/logo.png", b"logo-bytes"),
         // Percent-encoded, as the renderer writes it.
         ("/__presenter/asset/a%20b.png", b"space-bytes"),
         (
             "/__presenter/asset/@mytheme/styles/extra.css",
-            b".logo { background: url(logo.png); }\n.b { background: url(img/b.png); }\n",
+            extra.as_bytes(),
         ),
         (
             "/__presenter/asset/@default/theme.toml",
@@ -929,4 +940,86 @@ fn serve_child() {
         let result = server::serve(listener, router).await;
         println!("SERVE RETURNED {result:?}");
     });
+}
+
+/// The status of `GET path` to `addr` with the `Host` header `host`, over a plain TCP
+/// connection (ureq sets the header itself); only the status line is read.
+fn status_for_host(addr: SocketAddr, path: &str, host: &str) -> u16 {
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let status = line.split_whitespace().nth(1);
+    status
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("status line {line:?}"))
+}
+
+/// live-reload.md §4 (audit F07): `serve_until` answers only requests for the address it
+/// listens on (`localhost` or an IP address, with its port); any other `Host` gets 403 on
+/// every route, merged ones included. `serve_until_allowing` adds a name (`--host`).
+#[test]
+fn requests_for_other_hosts_get_403() {
+    let (state, _) = state_with(&fixture("md/minimal.md"));
+    let server = TestServer::start(state);
+    let port = server.addr.port();
+    for path in [
+        "/",
+        "/__presenter/state",
+        "/__presenter/events",
+        "/__presenter/theme.css",
+    ] {
+        let evil = format!("evil.example:{port}");
+        assert_eq!(status_for_host(server.addr, path, &evil), 403, "{path}");
+        let local = format!("localhost:{port}");
+        assert_eq!(status_for_host(server.addr, path, &local), 200, "{path}");
+    }
+    let response = server.get_with("/", &[("Host", "evil.example")]);
+    assert_eq!(response.status, 403);
+    let body = String::from_utf8(response.body).unwrap();
+    assert!(body.contains("DNS rebinding"), "{body}");
+
+    // A name given to the server, and a route merged into the router.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (addr_tx, addr_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        addr_tx.send(addr).unwrap();
+        let state: Shared = Arc::new(RwLock::new(ServeState::default()));
+        let router = server::router(state, server::event_channel())
+            .merge(axum::Router::new().route("/extra", axum::routing::get(|| async { "extra" })));
+        let hosts = server::AllowedHosts::new(addr).with_name("Deck.Example");
+        let shutdown = async move {
+            let _ = stop_rx.await;
+        };
+        server::serve_until_allowing(listener, router, shutdown, hosts)
+            .await
+            .unwrap();
+    });
+    let addr = addr_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let port = addr.port();
+    assert_eq!(
+        status_for_host(addr, "/extra", &format!("deck.example:{port}")),
+        200
+    );
+    assert_eq!(
+        status_for_host(addr, "/extra", &format!("other.example:{port}")),
+        403
+    );
+    assert_eq!(
+        status_for_host(addr, "/", &format!("127.0.0.1:{port}")),
+        200
+    );
+    let _ = stop_tx.send(());
+    runtime.shutdown_timeout(Duration::from_secs(5));
 }
