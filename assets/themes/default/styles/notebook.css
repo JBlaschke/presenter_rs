@@ -132,33 +132,37 @@
 }
 
 /* ------------------------------------------------------------------------------------
- * Text on an ANSI background (SGR 40-47 and 100-107, and reverse video, SGR 7) sits on a
- * fixed colour instead of the slide, so there the 16 colours are a terminal palette of
- * Tailwind shades: the normal colours dark enough for white text, except yellow and white,
- * the bright colours light enough for black text, except bright black.
+ * Text on an ANSI background (SGR 40-47, 100-107, 48;5;n and 48;2;r;g;b, and reverse video,
+ * SGR 7) sits on a fixed colour instead of the slide, so there the 16 colours are a terminal
+ * palette for the background and the text. Black, white and the normal colours read on each
+ * other (4.5:1): red, green, blue, magenta, cyan and bright black have a relative luminance
+ * of about 0.177, the middle where black and white text both read, and white is all but
+ * white. Yellow and the other bright colours are light, for black text.
  *
  * - Text in an ANSI colour keeps that colour, taken from this palette. The converter often
  *   writes the colour on a span that encloses the background's span (SGR 97;41 is a `color:`
  *   span around a `background:` span), so every colour span passes its colour down in
  *   --ansi-fg.
  * - Text without an ANSI colour is black or white (--ansi-default-fg), whichever reads on the
- *   background.
+ *   background. On an 8-bit or RGB background, which CSS cannot read, the converter writes
+ *   that colour itself.
  * - Reverse video writes text and background in one span, the terminal's default background
  *   as black text: that text has no ANSI colour of its own either (SGR 31;7 is white on red).
  *
- * Only inside `pre`, where the converter's spans are.
+ * Only in the converter's outputs: streams, errors and text/plain results.
  * ------------------------------------------------------------------------------------ */
 
-.reveal .cell-outputs pre span[style*="background:var(--"] {
+.reveal .cell-outputs pre:is(.output, .output-text) span:is([style*="background:var(--"],
+  [style*="background:#"]) {
   --black: #000;
-  --red: #b91c1c;
-  --green: #15803d;
+  --red: #e02b2a;
+  --green: #04873a;
   --yellow: #fde047;
-  --blue: #1d4ed8;
-  --magenta: #a21caf;
-  --cyan: #0e7490;
-  --white: #f3f4f6;
-  --bright-black: #4b5563;
+  --blue: #2d6bf4;
+  --magenta: #c128d4;
+  --cyan: #067f9d;
+  --white: #fdfdfd;
+  --bright-black: #6e7583;
   --bright-red: #fca5a5;
   --bright-green: #86efac;
   --bright-yellow: #fef08a;
@@ -171,39 +175,42 @@
 }
 
 /* The backgrounds white text reads on. */
-.reveal .cell-outputs pre span:is([style*="background:var(--black,"],
-  [style*="background:var(--red,"], [style*="background:var(--green,"],
-  [style*="background:var(--blue,"], [style*="background:var(--magenta,"],
-  [style*="background:var(--cyan,"], [style*="background:var(--bright-black,"]) {
+.reveal .cell-outputs pre:is(.output, .output-text)
+  span:is([style*="background:var(--black,"], [style*="background:var(--red,"],
+  [style*="background:var(--green,"], [style*="background:var(--blue,"],
+  [style*="background:var(--magenta,"], [style*="background:var(--cyan,"],
+  [style*="background:var(--bright-black,"]) {
   --ansi-default-fg: #fff;
 }
 
 /* Reverse video's default text (its colour is in the span's style attribute, hence
    !important). */
-.reveal .cell-outputs pre span[style^="color:var(--black,"][style*="background:var(--"] {
+.reveal .cell-outputs pre:is(.output, .output-text)
+  span[style^="color:var(--black,"][style*="background:var(--"] {
   --ansi-fg: initial;
   color: var(--ansi-default-fg) !important;
 }
 
 /* Each ANSI text colour in the palette above (keep the values equal), and an 8-bit or RGB
-   colour as written. */
-.reveal .cell-outputs pre span[style*="color:var(--black,"] { --ansi-fg: #000; }
-.reveal .cell-outputs pre span[style*="color:var(--red,"] { --ansi-fg: #b91c1c; }
-.reveal .cell-outputs pre span[style*="color:var(--green,"] { --ansi-fg: #15803d; }
-.reveal .cell-outputs pre span[style*="color:var(--yellow,"] { --ansi-fg: #fde047; }
-.reveal .cell-outputs pre span[style*="color:var(--blue,"] { --ansi-fg: #1d4ed8; }
-.reveal .cell-outputs pre span[style*="color:var(--magenta,"] { --ansi-fg: #a21caf; }
-.reveal .cell-outputs pre span[style*="color:var(--cyan,"] { --ansi-fg: #0e7490; }
-.reveal .cell-outputs pre span[style*="color:var(--white,"] { --ansi-fg: #f3f4f6; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-black,"] { --ansi-fg: #4b5563; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-red,"] { --ansi-fg: #fca5a5; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-green,"] { --ansi-fg: #86efac; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-yellow,"] { --ansi-fg: #fef08a; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-blue,"] { --ansi-fg: #93c5fd; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-magenta,"] { --ansi-fg: #f0abfc; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-cyan,"] { --ansi-fg: #67e8f9; }
-.reveal .cell-outputs pre span[style*="color:var(--bright-white,"] { --ansi-fg: #fff; }
-.reveal .cell-outputs pre span[style*="color:#"] { --ansi-fg: currentColor; }
+   colour as written (a span that starts with it; the converter appends the black or white
+   it writes for other text). */
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--black,"] { --ansi-fg: #000; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--red,"] { --ansi-fg: #e02b2a; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--green,"] { --ansi-fg: #04873a; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--yellow,"] { --ansi-fg: #fde047; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--blue,"] { --ansi-fg: #2d6bf4; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--magenta,"] { --ansi-fg: #c128d4; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--cyan,"] { --ansi-fg: #067f9d; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--white,"] { --ansi-fg: #fdfdfd; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-black,"] { --ansi-fg: #6e7583; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-red,"] { --ansi-fg: #fca5a5; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-green,"] { --ansi-fg: #86efac; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-yellow,"] { --ansi-fg: #fef08a; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-blue,"] { --ansi-fg: #93c5fd; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-magenta,"] { --ansi-fg: #f0abfc; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-cyan,"] { --ansi-fg: #67e8f9; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style*="color:var(--bright-white,"] { --ansi-fg: #fff; }
+.reveal .cell-outputs pre:is(.output, .output-text) span[style^="color:#"] { --ansi-fg: currentColor; }
 
 .reveal .cell-outputs .output-unsupported {
   color: var(--p-muted);

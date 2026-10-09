@@ -796,8 +796,11 @@ fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
 /// grey). Inside a background span, notebook.css switches to a fixed terminal palette for the
 /// background and the text: an ANSI text colour comes from its own span or an enclosing one
 /// (`--ansi-fg`, set by every colour span), other text and reverse video's default text are
-/// black or white by background (`--ansi-default-fg`). The selectors match the converter's
-/// spans, and the palette keeps that text readable (WCAG AA, 4.5:1).
+/// black or white by background (`--ansi-default-fg`). On an 8-bit or RGB background the
+/// converter writes that black or white itself. The selectors match the converter's spans in
+/// its outputs (streams, errors, text/plain), and the palette keeps text readable (WCAG AA,
+/// 4.5:1): default text on every background, black on every colour (and every colour on
+/// black), white and `--white` on the colours white text reads on.
 #[test]
 fn ansi_backgrounds_and_reverse_video_keep_their_text_readable() {
     let html = |sgr: &str| presenter::notebook::outputs::ansi_to_html(&format!("\u{1b}[{sgr}mx"));
@@ -822,6 +825,24 @@ fn ansi_backgrounds_and_reverse_video_keep_their_text_readable() {
         html("38;5;241;43"),
         "<span style='color:#626262'><span style='background:var(--yellow,#a60)'>x</span></span>"
     );
+    // 8-bit and RGB backgrounds are hex values; the converter colours the text without an
+    // ANSI colour on them, also in reverse video of an 8-bit text colour.
+    assert_eq!(
+        html("38;5;100;7"),
+        "<span style='color:#878700'><span style='color:#000;background:#878700'>x</span></span>"
+    );
+    assert_eq!(
+        html("38;5;241;7"),
+        "<span style='color:#626262'><span style='color:#fff;background:#626262'>x</span></span>"
+    );
+    assert_eq!(
+        html("48;2;39;40;34"),
+        "<span style='background:#272822;color:#fff'>x</span>"
+    );
+    assert_eq!(
+        html("31;48;5;250"),
+        "<span style='color:var(--red,#a00)'><span style='background:#bcbcbc'>x</span></span>"
+    );
     let background = Regex::new(r"background:var\(--([a-z-]+),").unwrap();
     let names: Vec<String> = (40..=47)
         .chain(100..=107)
@@ -835,10 +856,20 @@ fn ansi_backgrounds_and_reverse_video_keep_their_text_readable() {
         .collect();
     assert_eq!(names.len(), 16);
 
+    // The converter's outputs are these `pre`s.
+    let template = read("templates/cell.html");
+    for class in ["output output-stream", "output output-error"] {
+        assert!(
+            template.contains(&format!("<pre class=\"{class}")),
+            "{class}"
+        );
+    }
+    assert!(html("41").starts_with("<span style='background:var(--"));
+    let scope = ".reveal .cell-outputs pre:is(.output, .output-text)";
     let rules = rules(&notebook_css());
     let palette = rule(
         &rules,
-        r#".reveal .cell-outputs pre span[style*="background:var(--"]"#,
+        &format!(r#"{scope} span:is([style*="background:var(--"], [style*="background:#"])"#),
     );
     let colour = |name: &str| {
         hex_rgb(
@@ -856,6 +887,11 @@ fn ansi_backgrounds_and_reverse_video_keep_their_text_readable() {
         .iter()
         .find(|r| r.get("--ansi-default-fg") == Some("#fff"))
         .expect("a rule for the backgrounds white text reads on");
+    assert!(
+        white_text.selector.starts_with(scope),
+        "{}",
+        white_text.selector
+    );
     let on_white: BTreeSet<String> = background
         .captures_iter(&white_text.selector)
         .map(|caps| format!("--{}", &caps[1]))
@@ -872,7 +908,7 @@ fn ansi_backgrounds_and_reverse_video_keep_their_text_readable() {
     assert_eq!(on_white, BTreeSet::from(expected.map(String::from)));
     let reverse = rule(
         &rules,
-        r#".reveal .cell-outputs pre span[style^="color:var(--black,"][style*="background:var(--"]"#,
+        &format!(r#"{scope} span[style^="color:var(--black,"][style*="background:var(--"]"#),
     );
     assert_eq!(reverse.get("--ansi-fg"), Some("initial"));
     assert_eq!(
@@ -880,28 +916,41 @@ fn ansi_backgrounds_and_reverse_video_keep_their_text_readable() {
         Some("var(--ansi-default-fg) !important")
     );
     for name in &names {
-        let selector = format!(r#".reveal .cell-outputs pre span[style*="color:var({name},"]"#);
+        let selector = format!(r#"{scope} span[style*="color:var({name},"]"#);
         assert_eq!(rule(&rules, &selector).get("--ansi-fg"), palette.get(name));
     }
-    let raw = rule(
-        &rules,
-        r#".reveal .cell-outputs pre span[style*="color:#"]"#,
-    );
+    // An 8-bit or RGB text colour starts its span; the colour the converter appends to a
+    // background is not an ANSI colour.
+    let raw = rule(&rules, &format!(r#"{scope} span[style^="color:#"]"#));
     assert_eq!(raw.get("--ansi-fg"), Some("currentColor"));
 
     let (black, white) = ([0, 0, 0], [255, 255, 255]);
+    assert_eq!(colour("--black"), black);
+    assert_eq!(colour("--bright-white"), white);
     for name in &names {
         let bg = colour(name);
-        let (default, pairs): ([u8; 3], &[&str]) = if on_white.contains(name) {
-            (white, &["--white", "--bright-white"])
+        let default = if on_white.contains(name) {
+            white
         } else {
-            (black, &["--black"])
+            black
         };
         let ratio = contrast(default, bg);
         assert!(ratio >= 4.5, "default text on {name}: {ratio:.2}");
-        for &fg in pairs {
-            let ratio = contrast(colour(fg), bg);
-            assert!(ratio >= 4.5, "{fg} on {name}: {ratio:.2}");
+        if name != "--black" {
+            let ratio = contrast(black, bg);
+            assert!(
+                ratio >= 4.5,
+                "--black on {name} and {name} on --black: {ratio:.2}"
+            );
+        }
+        if on_white.contains(name) {
+            for fg in ["--white", "--bright-white"] {
+                let ratio = contrast(colour(fg), bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{fg} on {name} and {name} on {fg}: {ratio:.2}"
+                );
+            }
         }
     }
     let ratio = contrast(hex_rgb("#626262"), colour("--yellow"));
