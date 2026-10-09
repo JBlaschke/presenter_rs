@@ -5,10 +5,18 @@
 //! `presenter.toml` that applies; the output path is `-o`, else
 //! [`pipeline::default_output_path`]. Missing local assets are errors. On success stdout
 //! gets exactly one line, `Wrote <path> (<n> slides, <size>)` (for a site, `<path>` is its
-//! `index.html` and `<size>` the total of all files written; `<path>` is relative to the
-//! current directory when below it); diagnostics go to stderr. A failed build prints the
-//! diagnostics found before the error (warnings, and every other missing asset as an
-//! error), then the error.
+//! `index.html` and `<size>` the total of all files written; `<path>` as
+//! [`super::display_path`] shows it); diagnostics go to stderr. A failed build prints the
+//! diagnostics found before the error, then the error; a build that failed on missing
+//! assets reports each of them as a located error, in source order
+//! ([`report::report_build_failure`]).
+//!
+//! The output never overwrites an input (audit F01): before building, the document's path
+//! (`-o`, the default path, or `<out>/index.html` for a site) is compared by file identity
+//! with the input and the `presenter.toml` in use, and after building, everything to be
+//! written with the deck's local assets too ([`pipeline::output_clash`]). A clash is a
+//! usage error (exit 2) and nothing is written. A standalone `-o` that names a directory
+//! (a trailing `/` or an existing directory) is a usage error too.
 //!
 //! `--watch` ([`watch`], T20) builds once, then rebuilds on every change of the deck's
 //! inputs ([`crate::serve::watch`]) until interrupted: each build prints exactly what a
@@ -16,7 +24,9 @@
 //! `Watching for changes (Ctrl-C to stop)` after the first build and `Rebuilding (<kind>):
 //! <paths>` before every rebuild (neither with `-q`). A `presenter.toml` that cannot be
 //! loaded at startup is reported the same way and watched until it can (the output path
-//! and mode depend on it); then the first build runs.
+//! and mode depend on it); then the first build runs. An output that would overwrite the
+//! input or the `presenter.toml` ends the command before watching starts (exit 2); one
+//! that would overwrite an asset the deck starts to use later fails that rebuild.
 
 use std::io::Write as _;
 use std::ops::ControlFlow;
@@ -25,12 +35,12 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 
 use super::{
-    BuildArgs, GlobalArgs, display_path, input_format, locate, print_stdout, report,
-    report_diagnostics,
+    BuildArgs, GlobalArgs, clash_error, display_path, input_format, print_stdout, reject_directory,
+    report, report_diagnostics,
 };
 use crate::config::CliOverrides;
 use crate::error::Error;
-use crate::pipeline::{self, Build, BuildFailure, BuildOptions};
+use crate::pipeline::{self, Build, BuildOptions, InputRole};
 use crate::render::BuildInfo;
 use crate::serve::watch::{self as watcher, ChangeBatch, ChangeKind, WatchStatus, Watcher};
 
@@ -43,7 +53,7 @@ pub fn run(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
         return watch(args, global);
     }
     let (opts, out) = build_options(args, global)?;
-    build_once(&opts, &out, global)?;
+    build_once(&opts, &out, args.out.is_some(), global)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -120,17 +130,17 @@ fn print_watch_status(
                 let _ = print_stdout(&wrote_line(build, document));
             }
         }
-        WatchStatus::Failed(BuildFailure { error, diagnostics }) => {
-            report_diagnostics(&diagnostics, global);
-            report::report_error(&locate(error, &opts.input));
+        WatchStatus::Failed(failure) => {
+            let error = report::report_build_failure(failure, &opts.input, global);
+            report::report_error(&error);
         }
         WatchStatus::Watching(_) => status_line(WATCHING, global),
         WatchStatus::Changed(batch) => status_line(&rebuilding_line(batch), global),
     }
 }
 
-/// `Rebuilding (<kind>): <paths>` for a change batch: at most three paths (relative to the
-/// current directory when below it), then `and N more`.
+/// `Rebuilding (<kind>): <paths>` for a change batch: at most three paths (as
+/// [`display_path`] shows them), then `and N more`.
 fn rebuilding_line(batch: &ChangeBatch) -> String {
     const SHOWN: usize = 3;
     let kind = match batch.kind {
@@ -158,19 +168,32 @@ fn status_line(text: &str, global: &GlobalArgs) {
 
 /// The pipeline options for `args` and the output path (file or site directory).
 ///
-/// Errors: an input whose format cannot be told ([`super::UsageError`]) and `presenter.toml`
-/// problems ([`crate::error::Error::Config`]).
+/// Errors: an input whose format cannot be told, a standalone `-o` that names a directory,
+/// an output document that is the input or the `presenter.toml` in use (each a
+/// [`super::UsageError`]), and `presenter.toml` problems ([`crate::error::Error::Config`]).
 pub fn build_options(
     args: &BuildArgs,
     global: &GlobalArgs,
 ) -> anyhow::Result<(BuildOptions, PathBuf)> {
     let mut opts = base_options(args, global)?;
-    let (config, _) = pipeline::load_config(&opts)?;
+    let (config, config_path) = pipeline::load_config(&opts)?;
     let standalone = config.build.standalone;
+    if let Some(out) = args.out.as_deref().filter(|_| standalone) {
+        reject_directory(
+            out,
+            "give the HTML file to write, or use --site to write a directory",
+        )?;
+    }
     let out = args
         .out
         .clone()
         .unwrap_or_else(|| pipeline::default_output_path(&args.input, &config, standalone));
+    let mut inputs = vec![(args.input.clone(), InputRole::Source)];
+    inputs.extend(config_path.map(|path| (path, InputRole::Config)));
+    let document = pipeline::document_path(&out, standalone);
+    if let Some(clash) = pipeline::find_clash([document.as_path()], &inputs) {
+        return Err(clash_error(&clash, args.out.is_some()));
+    }
     opts.output = pipeline::output_mode(standalone, &out);
     opts.build = BuildInfo::build(standalone);
     opts.missing_asset_is_error = true;
@@ -194,16 +217,24 @@ fn base_options(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<BuildOp
 
 /// Builds `opts`, prints its diagnostics, writes the output to `out` and prints the
 /// `Wrote …` line (not with `-q`). On failure the diagnostics found before the error are
-/// printed and the error is returned with the input's location ([`locate`]).
-pub fn build_once(opts: &BuildOptions, out: &Path, global: &GlobalArgs) -> anyhow::Result<()> {
+/// printed and the error is returned with the input's location
+/// ([`report::report_build_failure`]). An output that would overwrite one of the build's
+/// inputs ([`pipeline::output_clash`]) is a usage error and nothing is written; `explicit`
+/// says whether `out` came from `-o` (for the message).
+pub fn build_once(
+    opts: &BuildOptions,
+    out: &Path,
+    explicit: bool,
+    global: &GlobalArgs,
+) -> anyhow::Result<()> {
     let build = match pipeline::try_build_deck(opts) {
         Ok(build) => build,
-        Err(BuildFailure { error, diagnostics }) => {
-            report_diagnostics(&diagnostics, global);
-            return Err(locate(error, &opts.input));
-        }
+        Err(failure) => return Err(report::report_build_failure(failure, &opts.input, global)),
     };
     report_diagnostics(&build.diagnostics, global);
+    if let Some(clash) = pipeline::output_clash(&build, out, &opts.output) {
+        return Err(clash_error(&clash, explicit));
+    }
     let written = pipeline::write_output(&build, out, &opts.output)?;
     if global.quiet {
         return Ok(());
@@ -212,8 +243,8 @@ pub fn build_once(opts: &BuildOptions, out: &Path, global: &GlobalArgs) -> anyho
     print_stdout(&wrote_line(&build, document))
 }
 
-/// `Wrote <document> (<n> slides, <size>)`: `document` relative to the current directory
-/// when below it, `<size>` the document plus every file written next to it.
+/// `Wrote <document> (<n> slides, <size>)`: `document` as [`display_path`] shows it,
+/// `<size>` the document plus every file written next to it.
 fn wrote_line(build: &Build, document: &Path) -> String {
     let bytes = build.document.html.len()
         + build

@@ -32,8 +32,14 @@
 //! mode and for syntax errors converted with `?` ([`crate::error::template_error`]); `build`
 //! renders without it, so a template error there names the template and line only (the
 //! source cache is never asked for a template: its name is not a path the report could
-//! read). Paths are relative to the current directory when they are below it. Errors that
-//! are not library errors print `error: outer: inner`.
+//! read). Paths are shown as [`super::display_path`] shows them (relative to the current
+//! directory, also with `..`). Errors that are not library errors print
+//! `error: outer: inner`.
+//!
+//! A failed build ([`report_build_failure`]) prints the diagnostics found before the error,
+//! then the error. When it failed on a missing asset, every missing asset of the build is
+//! printed as such a report, in source order, rather than the first one framed and the
+//! others as `path:line: error:` lines.
 //!
 //! [`print_error_in`] prints one library error the same way, given the deck source;
 //! [`print_error`] without it (a missing asset or front matter error is then located by
@@ -56,10 +62,12 @@
 //! # Contract with `cli/mod.rs`
 //!
 //! `cli/mod.rs` and the commands print only through [`report_error`] (a failed command,
-//! from `cli::run_from`), [`report_diagnostics`] (re-exported as `cli::report_diagnostics`)
-//! and [`install_panic_hook`] (called once by `cli::run`). The signatures of those three
-//! functions are the contract; [`stderr_color`] is also used by the logging setup.
+//! from `cli::run_from`), [`report_diagnostics`] (re-exported as `cli::report_diagnostics`),
+//! [`report_build_failure`] (a failed build's diagnostics and missing assets) and
+//! [`install_panic_hook`] (called once by `cli::run`). The signatures of those functions
+//! are the contract; [`stderr_color`] is also used by the logging setup.
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
@@ -69,6 +77,7 @@ use std::sync::Once;
 use super::{GlobalArgs, relative_to};
 use crate::error::{Diagnostic, Diagnostics, Error, Level};
 use crate::ir::SourceSpan;
+use crate::pipeline::{BuildFailure, missing_asset_as_error};
 
 /// A source cache for [`print_error`] and [`format_error`]: the text of a file, or `None`.
 pub type SourceCache<'a> = &'a dyn Fn(&Path) -> Option<String>;
@@ -120,8 +129,8 @@ pub fn read_source(path: &Path) -> Option<String> {
 }
 
 /// Prints `diagnostics` on stderr, one `path:line: level: message` line each (cli.md),
-/// with paths relative to the current directory when they are below it. With `-q` only
-/// error-level diagnostics are printed.
+/// with paths as [`super::display_path`] shows them. With `-q` only error-level
+/// diagnostics are printed.
 pub fn report_diagnostics(diagnostics: &Diagnostics, global: &GlobalArgs) {
     let cwd = std::env::current_dir().ok();
     let color = stderr_color();
@@ -415,13 +424,77 @@ impl Location<'_> {
 }
 
 /// `message` with the absolute path it starts with (a theme or config error names its
-/// `theme.toml` or `presenter.toml` first) relative to `cwd` when it is below it.
-fn relative_lead<'m>(message: &'m str, cwd: Option<&Path>) -> &'m str {
-    let Some(cwd) = cwd else {
-        return message;
-    };
-    let prefix = format!("{}{}", cwd.display(), std::path::MAIN_SEPARATOR);
-    message.strip_prefix(&prefix).unwrap_or(message)
+/// `theme.toml` or `presenter.toml` first, followed by `: `) shown as
+/// [`super::display_path`] shows paths, relative to `cwd`.
+fn relative_lead<'m>(message: &'m str, cwd: Option<&Path>) -> Cow<'m, str> {
+    match message.split_once(": ") {
+        Some((lead, rest)) if Path::new(lead).is_absolute() => {
+            let shown = relative_to(Path::new(lead), cwd);
+            Cow::Owned(format!("{}: {rest}", shown.display()))
+        }
+        _ => Cow::Borrowed(message),
+    }
+}
+
+/// `err` with the paths in its message shown as the error report shows them
+/// ([`super::display_path`]): the file a config or theme error starts with, the missing
+/// file of a missing asset. For errors that are printed in another form, such as
+/// `check`'s diagnostics (audit F39). Other errors are returned unchanged.
+pub fn with_display_paths(err: Error) -> Error {
+    let cwd = std::env::current_dir().ok();
+    let cwd = cwd.as_deref();
+    match err {
+        Error::Config(message) => Error::Config(relative_lead(&message, cwd).into_owned()),
+        Error::Theme { name, message } => Error::Theme {
+            name,
+            message: relative_lead(&message, cwd).into_owned(),
+        },
+        Error::MissingAsset { path, span } => Error::MissingAsset {
+            path: relative_to(&path, cwd),
+            span,
+        },
+        other => other,
+    }
+}
+
+/// Prints a failed build of `input` (`build`, `build --watch`, `export pdf`) and returns
+/// its error, located in `input` ([`super::locate`]), for the caller to report last with
+/// [`report_error`]. The diagnostics found before the error are printed first
+/// ([`report_diagnostics`]). When the build failed on a missing asset, every missing asset
+/// is reported the same way, as a located error with its source line, in source order
+/// (audit F37): those before the last are printed here, the last is returned.
+pub fn report_build_failure(
+    failure: BuildFailure,
+    input: &Path,
+    global: &GlobalArgs,
+) -> anyhow::Error {
+    let BuildFailure { error, diagnostics } = failure;
+    if !matches!(error, Error::MissingAsset { .. }) {
+        report_diagnostics(&diagnostics, global);
+        return super::locate(error, input);
+    }
+    let (missing, others): (Vec<Diagnostic>, Vec<Diagnostic>) = diagnostics
+        .into_iter()
+        .partition(|d| d.level == Level::Error && missing_asset_as_error(d).is_some());
+    report_diagnostics(&Diagnostics::from(others), global);
+    let mut errors: Vec<Error> = std::iter::once(error)
+        .chain(missing.iter().filter_map(missing_asset_as_error))
+        .collect();
+    // Stable: errors on the same line (or without one, last) keep their order.
+    errors.sort_by_key(|err| {
+        err.span().map_or((usize::MAX, usize::MAX), |span| {
+            (span.cell.unwrap_or(0), span.start_line)
+        })
+    });
+    let last = errors.pop();
+    for err in errors {
+        report_error(&super::locate(err, input));
+    }
+    match last {
+        Some(err) => super::locate(err, input),
+        // The list starts with `error`, so it is never empty.
+        None => anyhow::anyhow!("the build failed"),
+    }
 }
 
 /// The text after `-->`: `file:line[:column]` for a file, `file: cell C, line L[, column N]`
@@ -698,6 +771,50 @@ mod tests {
         let config = Error::Config("/work/presenter.toml: TOML parse error".into());
         let report = Report::new(&config, None, Some(Path::new("/work")));
         assert_eq!(report.message, "config: presenter.toml: TOML parse error");
+        // Outside the current directory: with `..`, like `path:line:` lines (audit F39).
+        let report = Report::new(&config, None, Some(Path::new("/work/talk")));
+        assert_eq!(
+            report.message,
+            "config: ../presenter.toml: TOML parse error"
+        );
+        // Only a leading absolute path is rewritten.
+        let read = Error::Config("cannot read /work/presenter.toml: denied".into());
+        let report = Report::new(&read, None, Some(Path::new("/work")));
+        assert_eq!(report.message, read.to_string());
+    }
+
+    #[test]
+    fn errors_for_other_reports_show_the_same_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let config = Error::Config(format!(
+            "{}: unknown field",
+            cwd.join("c/presenter.toml").display()
+        ));
+        assert_eq!(
+            with_display_paths(config).to_string(),
+            format!(
+                "config: {}: unknown field",
+                Path::new("c/presenter.toml").display()
+            )
+        );
+        let theme = Error::Theme {
+            name: "t".into(),
+            message: format!("{}: bad", cwd.join("t/theme.toml").display()),
+        };
+        assert_eq!(
+            with_display_paths(theme).to_string(),
+            format!("theme 't': {}: bad", Path::new("t/theme.toml").display())
+        );
+        let missing = Error::MissingAsset {
+            path: cwd.join("fig/x.png"),
+            span: None,
+        };
+        assert_eq!(
+            with_display_paths(missing).to_string(),
+            format!("asset not found: {}", Path::new("fig/x.png").display())
+        );
+        let other = Error::Other("/abs/thing: as is".into());
+        assert_eq!(with_display_paths(other).to_string(), "/abs/thing: as is");
     }
 
     /// [`use_color`] with exactly the variables `vars` (name, value) set.

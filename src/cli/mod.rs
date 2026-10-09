@@ -11,42 +11,40 @@
 //! pub fn run(args: &<Cmd>Args, global: &GlobalArgs) -> anyhow::Result<std::process::ExitCode>
 //! ```
 //!
-//! | command | module | task |
-//! |---|---|---|
-//! | `build` | [`build`] (`--watch`: `build::watch`) | T16 (watch: T20) |
-//! | `serve` | [`serve`] | T23 |
-//! | `init` | [`init`] | T40 |
-//! | `theme list/eject/new/check` | [`theme`] | T41 |
-//! | `dump` | [`dump`] | T16 |
-//! | `check` | [`check`] | T34 |
-//! | `export pdf` | [`export`] | T45 |
+//! | command | module |
+//! |---|---|
+//! | `build` | [`build`] (`--watch`: `build::watch`) |
+//! | `serve` | [`serve`] |
+//! | `init` | [`init`] |
+//! | `theme list/eject/new/check` | [`theme`] |
+//! | `dump` | [`dump`] |
+//! | `check` | [`check`] |
+//! | `export pdf` | [`export`] |
 //!
-//! A command that is not implemented yet prints `<command>: not implemented yet` on stderr
-//! and exits 2 ([`not_implemented`]); its task replaces the body of `run` and never needs to
-//! touch this file. `run` returns the exit code for the outcomes it handles itself (e.g.
+//! `run` returns the exit code for the outcomes it handles itself (e.g.
 //! `check --deny-warnings` → 1, `export` without Chrome → 3) and `Err` for failures, which
 //! [`run`] prints as `error: …` and maps with [`exit_code_for`]: [`UsageError`] and
 //! [`Error::Config`] → 2, everything else → 1. Helpers for commands:
-//! [`report_diagnostics`] (prints `path:line: level: message` on stderr, paths relative to
-//! the current directory, honouring `-q`), [`locate`] (adds the input's location to an
-//! error that lacks it), [`print_stdout`], [`display_path`], [`input_kind`] (the input's
-//! format by extension) and [`input_format`] (the same for a command with `--format md|ipynb`).
+//! [`report_diagnostics`] (prints `path:line: level: message` on stderr, paths as
+//! [`display_path`] shows them, honouring `-q`), [`locate`] (adds the input's location to
+//! an error that lacks it), [`print_stdout`], [`display_path`], [`input_kind`] (the input's
+//! format by extension), [`input_format`] (the same for a command with `--format md|ipynb`),
+//! [`clash_error`] (an output that would overwrite an input) and [`reject_directory`] (an
+//! output file argument that names a directory).
 //!
-//! Stub commands are tested in their own module (a `#[cfg(test)]` test that the owning task
-//! deletes with the stub), never end to end.
+//! All printing on stderr goes through [`report`]; `--version` prints [`version`], which
+//! appends ` (<sha>)` when the build script sets `PRESENTER_GIT_SHA`; `presenter export pdf
+//! --help` ends with [`export::PDF_LIMITATIONS`].
 //!
-//! # Hooks for later tasks
+//! # Paths in messages
 //!
-//! Besides the stub bodies, later tasks change behaviour defined here only through files
-//! they own:
-//!
-//! - all printing on stderr goes through [`report`] (T44: source excerpts, panic hook);
-//! - `--version` prints [`version`], which appends ` (<sha>)` when the build script sets
-//!   `PRESENTER_GIT_SHA` (T47 adds the build script only);
-//! - `presenter export pdf --help` ends with [`export::PDF_LIMITATIONS`] (T45).
-//!
-//! A new flag still means a new field in this file (e.g. T46's optional
-//! `dump --default-config`, which cli.md does not list): that needs the coordinator.
+//! Every path a message shows goes through [`display_path`] (terminal output of every
+//! command: `Wrote …` lines, `path:line:` diagnostics, error reports, `check --format
+//! json`): relative to the current directory, with `..` when the path is outside it but
+//! shares more than the root with it and the relative form is no longer than the absolute
+//! one; else as given. A path that is not below the current directory as spelled is also
+//! compared in its canonical form, so a symbolic link in its prefix (such as `/tmp` →
+//! `/private/tmp` on macOS) does not keep it absolute.
 //!
 //! # Global behaviour
 //!
@@ -72,14 +70,16 @@ pub mod theme;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
+use crate::assets::registry::normalize_lexically;
 use crate::error::Error;
 use crate::ir::SourceKind;
+use crate::pipeline;
 
 pub use report::report_diagnostics;
 
@@ -108,7 +108,8 @@ pub struct GlobalArgs {
     /// Log more: -v info, -vv debug (RUST_LOG directives apply on top)
     #[arg(short, long, action = ArgAction::Count, global = true)]
     pub verbose: u8,
-    /// Print only errors (no warnings, no summary line; RUST_LOG is ignored)
+    /// Print only errors (no warnings, no summary line; RUST_LOG is ignored). `check
+    /// --deny-warnings` still prints the warnings it fails on
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
     /// Use this presenter.toml instead of searching for one next to the input
@@ -165,8 +166,9 @@ pub struct BuildArgs {
         long = "out",
         value_name = "PATH",
         help = "Output file (standalone) or directory (site) [default: <build.out_dir>/<stem>.html, \
-                or <build.out_dir>/<stem>/ with --site; out_dir is relative to presenter.toml, \
-                or to the input's directory without one]"
+                or <build.out_dir>/<stem>/ with --site; an out_dir set in presenter.toml is \
+                relative to that file, the default dist/ to the input's directory]. Never the \
+                input itself"
     )]
     pub out: Option<PathBuf>,
     /// Theme name or directory (overrides front matter and presenter.toml)
@@ -446,13 +448,6 @@ pub fn exit_code_for(err: &anyhow::Error) -> u8 {
     if usage { EXIT_USAGE } else { EXIT_BUILD_ERROR }
 }
 
-/// The stub body of a command that a later task implements: prints
-/// `<command>: not implemented yet` on stderr and exits [`EXIT_USAGE`].
-pub fn not_implemented(command: &str) -> anyhow::Result<ExitCode> {
-    let _ = writeln!(std::io::stderr().lock(), "{command}: not implemented yet");
-    Ok(ExitCode::from(EXIT_USAGE))
-}
-
 /// The input format for a command with `--format md|ipynb` (`build`): the flag when given,
 /// else [`input_kind`], whose error then suggests the flag.
 pub fn input_format(path: &Path, format: Option<InputFormat>) -> anyhow::Result<SourceKind> {
@@ -487,19 +482,109 @@ pub fn locate(err: Error, input: &Path) -> anyhow::Error {
     anyhow::Error::new(err).context(location)
 }
 
-/// `path` for messages: relative to the current directory when it is an absolute path below
-/// it (as diagnostics print paths), else unchanged.
+/// `path` for messages (the module docs' "Paths in messages"): relative to the current
+/// directory, with `..` when that is no longer than the absolute path, else as given.
 pub fn display_path(path: &Path) -> PathBuf {
     let cwd = std::env::current_dir().ok();
     relative_to(path, cwd.as_deref())
 }
 
-/// `path` relative to `cwd` when it is below it, else `path`.
+/// [`display_path`] with the current directory `cwd` (`None`: unknown; `path` is returned
+/// as given). A relative `path` is taken from `cwd`. A path below `cwd` as spelled is shown
+/// relative to it; otherwise the canonical forms ([`canonical_form`]) are compared too and
+/// the shorter relative form wins (a symbolic link in the prefix of either), else `path`.
 fn relative_to(path: &Path, cwd: Option<&Path>) -> PathBuf {
-    match cwd.map(|cwd| path.strip_prefix(cwd)) {
-        Some(Ok(relative)) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
-        _ => path.to_path_buf(),
+    let Some(cwd) = cwd else {
+        return path.to_path_buf();
+    };
+    let absolute = normalize_lexically(&cwd.join(path));
+    let spelled = relative_path(&absolute, cwd);
+    if let Some(below) = spelled
+        .as_ref()
+        .filter(|relative| !relative.starts_with(".."))
+    {
+        return below.clone();
     }
+    let canonical = match (canonical_form(&absolute), canonical_form(cwd)) {
+        (Some(path), Some(cwd)) => relative_path(&path, &cwd),
+        _ => None,
+    };
+    match (spelled, canonical) {
+        (Some(spelled), Some(canonical)) => {
+            if canonical.components().count() < spelled.components().count() {
+                canonical
+            } else {
+                spelled
+            }
+        }
+        (Some(relative), None) | (None, Some(relative)) => relative,
+        (None, None) => path.to_path_buf(),
+    }
+}
+
+/// `path` relative to `base` (both absolute and normalized), with `..` for the components
+/// of `base` that `path` does not share, or `None` when they share no more than the root,
+/// when the relative form has more components than `path` has names (`../../../x` for
+/// `/a/x`), or when `path` is `base`.
+fn relative_path(path: &Path, base: &Path) -> Option<PathBuf> {
+    let path: Vec<Component<'_>> = path.components().collect();
+    let base: Vec<Component<'_>> = base.components().collect();
+    let common = path.iter().zip(&base).take_while(|(a, b)| a == b).count();
+    let shares_a_name = path[..common]
+        .iter()
+        .any(|component| matches!(component, Component::Normal(_)));
+    let names = path
+        .iter()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    let ups = base.len() - common;
+    let rest = &path[common..];
+    if !shares_a_name || ups + rest.len() > names || ups + rest.len() == 0 {
+        return None;
+    }
+    let mut relative: PathBuf = std::iter::repeat_n(Component::ParentDir, ups).collect();
+    relative.extend(rest);
+    Some(relative)
+}
+
+/// `path` with symbolic links resolved: its canonical form, or for a file that does not
+/// exist yet its parent's canonical form joined with its name. `None` when neither exists.
+fn canonical_form(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(canonical);
+    }
+    let parent = std::fs::canonicalize(path.parent()?).ok()?;
+    Some(parent.join(path.file_name()?))
+}
+
+/// The usage error for an output that would overwrite one of the build's inputs (audit
+/// F01): the [`pipeline::Clash`] message with paths as [`display_path`] shows them, then
+/// how to avoid it. `explicit`: the output path was given with `-o` (else it is the
+/// default output path, which `[build] out_dir` decides).
+pub fn clash_error(clash: &pipeline::Clash, explicit: bool) -> anyhow::Error {
+    let shown = pipeline::Clash {
+        output: display_path(&clash.output),
+        input: display_path(&clash.input),
+        role: clash.role,
+    };
+    let hint = if explicit {
+        "choose another output path with -o"
+    } else {
+        "it is the default output path ([build] out_dir); choose another one with -o"
+    };
+    UsageError(format!("{shown}; {hint}")).into()
+}
+
+/// A [`UsageError`] when the output file argument `out` (`-o` of a command that writes one
+/// file) names a directory: it ends with a path separator or is an existing directory
+/// (audit F41). `hint` says what to give instead.
+pub fn reject_directory(out: &Path, hint: &str) -> anyhow::Result<()> {
+    let text = out.as_os_str().to_string_lossy();
+    let separator = text.ends_with('/') || text.ends_with(std::path::MAIN_SEPARATOR);
+    if separator || out.is_dir() {
+        return Err(UsageError(format!("-o {} names a directory; {hint}", out.display())).into());
+    }
+    Ok(())
 }
 
 /// Writes `text` and a line break to stdout. A closed pipe (`presenter dump x.md | head`)
@@ -801,14 +886,6 @@ mod tests {
     }
 
     #[test]
-    fn stubs_print_not_implemented_and_exit_2() {
-        assert_eq!(
-            not_implemented("serve").unwrap(),
-            ExitCode::from(EXIT_USAGE)
-        );
-    }
-
-    #[test]
     fn rust_log_applies_on_top_of_the_verbosity_flags() {
         let flags = |verbose: u8, quiet: bool| GlobalArgs {
             verbose,
@@ -966,6 +1043,98 @@ mod tests {
             relative_to(Path::new("/work/x"), None),
             PathBuf::from("/work/x")
         );
+        // Outside the current directory: `..` when it is no longer than the absolute path
+        // (audit F39), so `path:line:` lines match the paths typed on the command line.
+        let talk = Some(Path::new("/work/talk"));
+        assert_eq!(
+            relative_to(Path::new("/work/m2/setext.md"), talk),
+            PathBuf::from("../m2/setext.md")
+        );
+        assert_eq!(
+            relative_to(Path::new("../m2/./setext.md"), talk),
+            PathBuf::from("../m2/setext.md")
+        );
+        assert_eq!(
+            relative_to(Path::new("./slides.md"), talk),
+            PathBuf::from("slides.md")
+        );
+        assert_eq!(relative_to(Path::new("/work"), talk), PathBuf::from(".."));
+        let deep = Some(Path::new("/a/b/c/d"));
+        assert_eq!(
+            relative_to(Path::new("/a/x.md"), deep),
+            PathBuf::from("/a/x.md"),
+            "../../../x.md is longer"
+        );
+        assert_eq!(
+            relative_to(Path::new("/a/b/x/y.md"), deep),
+            PathBuf::from("../../x/y.md")
+        );
+    }
+
+    #[test]
+    fn paths_through_a_symlinked_prefix_are_shown_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+        std::fs::create_dir_all(real.join("talk")).unwrap();
+        std::fs::write(real.join("talk/s.md"), "# A\n").unwrap();
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            // The current directory is canonical (getcwd); the typed path is not.
+            assert_eq!(
+                relative_to(&link.join("talk/s.md"), Some(&real)),
+                PathBuf::from("talk/s.md")
+            );
+            // A file that does not exist yet: its parent decides.
+            assert_eq!(
+                relative_to(&link.join("talk/out.html"), Some(&real)),
+                PathBuf::from("talk/out.html")
+            );
+        }
+        assert_eq!(
+            relative_to(&real.join("talk/s.md"), Some(&real)),
+            PathBuf::from("talk/s.md")
+        );
+    }
+
+    #[test]
+    fn directory_outputs_are_usage_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hint = "give a file name";
+        for out in [
+            PathBuf::from("out/"),
+            tmp.path().to_path_buf(),
+            tmp.path().join("."),
+        ] {
+            let err = reject_directory(&out, hint).unwrap_err();
+            assert_eq!(exit_code_for(&err), EXIT_USAGE, "{out:?}");
+            assert_eq!(
+                err.to_string(),
+                format!("-o {} names a directory; {hint}", out.display())
+            );
+        }
+        assert!(reject_directory(Path::new("out/a.html"), hint).is_ok());
+        assert!(reject_directory(&tmp.path().join("new.html"), hint).is_ok());
+    }
+
+    #[test]
+    fn clashes_are_usage_errors_with_a_hint() {
+        let clash = pipeline::Clash {
+            output: PathBuf::from("alias.html"),
+            input: PathBuf::from("deck.md"),
+            role: pipeline::InputRole::Source,
+        };
+        let err = clash_error(&clash, true);
+        assert_eq!(exit_code_for(&err), EXIT_USAGE);
+        assert_eq!(
+            err.to_string(),
+            "refusing to write alias.html: it is the input file deck.md; choose another \
+             output path with -o"
+        );
+        assert!(clash_error(&clash, false).to_string().ends_with(
+            "; it is the default output path ([build] out_dir); choose another one with -o"
+        ));
     }
 
     #[test]

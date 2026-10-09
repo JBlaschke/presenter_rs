@@ -5,7 +5,9 @@
 //! with `--notebook`), `theme/` (a child of the built-in `default` theme that overrides the
 //! `title` layout and sets a few CSS custom properties), `.gitignore` (`dist/`) and
 //! `README.md`. With `--full-theme`, `theme/` is a copy of the built-in `themes/default/`
-//! instead; its `theme.toml` gets a new header comment, `name` and `description`.
+//! instead, without the theme's own `README.md` (it documents the built-in theme in the
+//! repository; audit F48); its `theme.toml` gets a new header comment, `name` and
+//! `description`.
 //!
 //! # The target directory
 //!
@@ -48,6 +50,7 @@ use std::process::ExitCode;
 use anyhow::{Context as _, anyhow};
 use serde_json::Value;
 
+use super::theme::BUILTIN_THEME_README;
 use super::{GlobalArgs, InitArgs, UsageError, print_stdout};
 use crate::assets::registry::normalize_lexically;
 use crate::theme::resolve::MANIFEST_FILE;
@@ -222,15 +225,16 @@ impl Scaffold {
     }
 
     /// The built-in default theme's files below `theme/`, with a manifest made for this
-    /// project ([`copied_manifest`]).
+    /// project ([`copied_manifest`]) and without its [`BUILTIN_THEME_README`].
     fn default_theme_files(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
         let keys = vendor::list(DEFAULT_THEME_PREFIX);
         if keys.is_empty() {
             return Err(anyhow!("the built-in default theme is not embedded"));
         }
         keys.iter()
-            .map(|key| {
-                let rel = key.strip_prefix(DEFAULT_THEME_PREFIX).unwrap_or(key);
+            .map(|key| (key, key.strip_prefix(DEFAULT_THEME_PREFIX).unwrap_or(key)))
+            .filter(|(_, rel)| *rel != BUILTIN_THEME_README)
+            .map(|(key, rel)| {
                 let mut data = embedded(key)?;
                 if rel == MANIFEST_FILE {
                     let text = String::from_utf8(data)

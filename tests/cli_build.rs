@@ -434,7 +434,7 @@ fn usage_and_config_errors_exit_2() {
 }
 
 #[test]
-fn failed_builds_print_the_warnings_and_other_missing_assets_first() {
+fn failed_builds_print_the_warnings_then_every_missing_asset_in_source_order() {
     let tmp = project(&[(
         "two.md",
         "# A {bogus=1}\n\n![a](a1.png)\n\n---\n\n---\n\n![b](b2.png)\n",
@@ -449,26 +449,66 @@ fn failed_builds_print_the_warnings_and_other_missing_assets_first() {
         .clone();
     let stderr = stderr_of(&output);
     let lines: Vec<&str> = stderr.lines().collect();
-    assert_eq!(lines.len(), 8, "{stderr}");
+    assert_eq!(lines.len(), 12, "{stderr}");
     assert!(lines[0].starts_with("two.md:1: warning: "), "{stderr}");
     assert!(lines[0].contains("bogus"), "{stderr}");
     assert!(lines[1].starts_with("two.md:5: warning: "), "{stderr}");
-    assert!(
-        lines[2].starts_with("two.md:9: error: ") && lines[2].contains("b2.png"),
-        "{stderr}"
-    );
+    // Audit F37: every missing asset in the same form, in source order.
     assert_eq!(
-        lines[3..],
+        lines[2..],
         [
             "error: asset not found: a1.png",
             " --> two.md:3",
             "  |",
             "3 | ![a](a1.png)",
+            "  |      ^^^^^^",
+            "error: asset not found: b2.png",
+            " --> two.md:9",
+            "  |",
+            "9 | ![b](b2.png)",
             "  |      ^^^^^^"
         ],
         "{stderr}"
     );
     assert!(!tmp.path().join("two.html").exists());
+}
+
+#[test]
+fn missing_assets_of_every_kind_are_reported_in_source_order() {
+    // The finding's repro: an image, an <img> and a slide background, none of which
+    // exist; the frontend reports them in different passes.
+    let tmp = project(&[(
+        "img.md",
+        "# Title\n\n---\n\n![](figures/plot.png)\n\n<img src=\"figures/raw.png\">\n\n\
+         --- {background=figures/bg.jpg}\n\n## Background\n",
+    )]);
+    let output = presenter()
+        .current_dir(tmp.path())
+        .args(["build", "img.md"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    let located: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with(" --> "))
+        .collect();
+    assert_eq!(
+        located,
+        [" --> img.md:5", " --> img.md:7", " --> img.md:9"],
+        "{stderr}"
+    );
+    let errors: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("error: "))
+        .collect();
+    assert_eq!(errors.len(), 3, "{stderr}");
+    assert!(
+        !stderr.contains("img.md:7: error:"),
+        "no one-line form: {stderr}"
+    );
 }
 
 #[test]
@@ -791,4 +831,431 @@ fn git_in_root(args: &[&str]) -> Option<String> {
     let stdout = String::from_utf8(output.stdout).ok()?;
     let stdout = stdout.trim();
     (output.status.success() && !stdout.is_empty()).then(|| stdout.to_string())
+}
+
+// --- Audit fixes (A1): output safety, out_dir, messages --------------------------------
+
+/// The bytes of each of `files` (relative to `dir`).
+fn snapshot(dir: &Path, files: &[&str]) -> Vec<(String, Vec<u8>)> {
+    files
+        .iter()
+        .map(|file| (file.to_string(), std::fs::read(dir.join(file)).unwrap()))
+        .collect()
+}
+
+/// Runs `presenter <args>` in `dir` and asserts the audit F01 refusal: exit 2, nothing on
+/// stdout, one `error: refusing to write …` line on stderr, and every file of `protected`
+/// unchanged. Returns stderr.
+fn assert_refused(dir: &Path, args: &[&str], protected: &[&str]) -> String {
+    let before = snapshot(dir, protected);
+    let output = presenter()
+        .current_dir(dir)
+        .args(args)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .code(2)
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(stderr.starts_with("error: refusing to write "), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert_eq!(
+        snapshot(dir, protected),
+        before,
+        "{args:?} changed an input"
+    );
+    stderr
+}
+
+#[test]
+fn build_refuses_to_overwrite_its_input() {
+    let tmp = project(&[("slides.md", "# My talk\n\nprecious content\n")]);
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "slides.md", "-o", "slides.md"],
+        &["slides.md"],
+    );
+    assert_eq!(
+        stderr,
+        "error: refusing to write slides.md: it is the input file slides.md; choose another \
+         output path with -o\n"
+    );
+    // Other spellings of the same path, and -q, which hides no error.
+    assert_refused(
+        tmp.path(),
+        &[
+            "-q",
+            "build",
+            "./slides.md",
+            "-o",
+            "sub/../slides.md",
+            "--standalone",
+        ],
+        &["slides.md"],
+    );
+    let absolute = tmp.path().join("slides.md");
+    assert_refused(
+        tmp.path(),
+        &["build", "slides.md", "-o", absolute.to_str().unwrap()],
+        &["slides.md"],
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        1,
+        "nothing else was written"
+    );
+}
+
+#[test]
+fn build_refuses_to_overwrite_a_notebook() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        root().join("tests/fixtures/ipynb/minimal.ipynb"),
+        tmp.path().join("nb.ipynb"),
+    )
+    .unwrap();
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "nb.ipynb", "-o", "nb.ipynb"],
+        &["nb.ipynb"],
+    );
+    assert!(stderr.contains("it is the input file nb.ipynb"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn build_refuses_links_to_its_input() {
+    let tmp = project(&[("deck.md", "# Deck\n")]);
+    std::os::unix::fs::symlink("deck.md", tmp.path().join("alias.html")).unwrap();
+    std::fs::hard_link(tmp.path().join("deck.md"), tmp.path().join("hard.html")).unwrap();
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "deck.md", "-o", "alias.html"],
+        &["deck.md"],
+    );
+    assert_eq!(
+        stderr,
+        "error: refusing to write alias.html: it is the input file deck.md; choose another \
+         output path with -o\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(tmp.path().join("alias.html"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "deck.md", "-o", "hard.html"],
+        &["deck.md", "hard.html"],
+    );
+    assert!(
+        stderr.contains("hard.html: it is the input file deck.md"),
+        "{stderr}"
+    );
+    // The input given through a link, the output by its real name.
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "alias.html", "--format", "md", "-o", "deck.md"],
+        &["deck.md"],
+    );
+    assert!(
+        stderr.contains("deck.md: it is the input file alias.html"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn build_refuses_another_spelling_of_its_input_on_a_case_insensitive_file_system() {
+    let tmp = project(&[("s.md", "# Small\n")]);
+    if !tmp.path().join("S.MD").exists() {
+        eprintln!("the file system is case-sensitive; skipped");
+        return;
+    }
+    let stderr = assert_refused(tmp.path(), &["build", "s.md", "-o", "S.MD"], &["s.md"]);
+    assert!(
+        stderr.contains("refusing to write S.MD: it is the input file s.md"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn build_refuses_a_default_output_path_that_is_its_input() {
+    let tmp = project(&[
+        ("presenter.toml", "[build]\nout_dir = \".\"\n"),
+        ("notes.html", "# Notes\n"),
+        ("index/index.html", "# Site\n"),
+    ]);
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "notes.html", "--format", "md"],
+        &["notes.html"],
+    );
+    assert_eq!(
+        stderr,
+        "error: refusing to write notes.html: it is the input file notes.html; it is the \
+         default output path ([build] out_dir); choose another one with -o\n"
+    );
+    // Site mode: <out_dir>/<stem>/index.html.
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "index/index.html", "--format", "md", "--site"],
+        &["index/index.html"],
+    );
+    assert!(
+        stderr.contains(&format!(
+            "refusing to write {}: it is the input file",
+            Path::new("index/index.html").display()
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn build_refuses_a_site_index_that_is_its_input() {
+    let tmp = project(&[("s/index.html", "# Site source\n")]);
+    let stderr = assert_refused(
+        tmp.path(),
+        &[
+            "build",
+            "s/index.html",
+            "--format",
+            "md",
+            "--site",
+            "-o",
+            "s",
+        ],
+        &["s/index.html"],
+    );
+    assert!(stderr.contains("it is the input file"), "{stderr}");
+    assert!(!tmp.path().join("s/assets").exists());
+}
+
+#[test]
+fn build_watch_refuses_its_input_before_watching() {
+    let tmp = project(&[("w.md", "# Watched\n")]);
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "w.md", "-o", "w.md", "--watch"],
+        &["w.md"],
+    );
+    assert!(!stderr.contains("Watching"), "{stderr}");
+}
+
+#[test]
+fn build_refuses_to_overwrite_the_config_or_an_asset() {
+    let tmp = project(&[
+        ("presenter.toml", "[deck]\nlang = \"en\"\n"),
+        ("a.md", "# A\n\n![plot](figures/plot.png)\n"),
+    ]);
+    std::fs::create_dir(tmp.path().join("figures")).unwrap();
+    std::fs::copy(
+        root().join("tests/fixtures/md/images/ok.png"),
+        tmp.path().join("figures/plot.png"),
+    )
+    .unwrap();
+    let protected = ["presenter.toml", "a.md", "figures/plot.png"];
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "a.md", "-o", "presenter.toml"],
+        &protected,
+    );
+    assert!(
+        stderr.contains("presenter.toml: it is the config file presenter.toml"),
+        "{stderr}"
+    );
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "a.md", "-o", "figures/plot.png"],
+        &protected,
+    );
+    let plot = Path::new("figures/plot.png").display().to_string();
+    assert!(
+        stderr.contains(&format!("{plot}: it is the deck's asset {plot}")),
+        "{stderr}"
+    );
+    // The same deck builds next to its inputs.
+    presenter()
+        .current_dir(tmp.path())
+        .args(["build", "a.md", "-o", "a.html"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn a_standalone_output_that_names_a_directory_is_a_usage_error() {
+    let tmp = project(&[("slides.md", "# One\n")]);
+    std::fs::create_dir(tmp.path().join("existing")).unwrap();
+    for out in ["../outdir/", "existing"] {
+        presenter()
+            .current_dir(tmp.path())
+            .args(["build", "slides.md", "-o", out])
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(format!(
+                "error: -o {out} names a directory; give the HTML file to write, or use \
+                 --site to write a directory\n"
+            ));
+    }
+    assert!(!tmp.path().join("../outdir").exists());
+    // A directory is what --site writes.
+    presenter()
+        .current_dir(tmp.path())
+        .args(["build", "slides.md", "--site", "-o", "site/"])
+        .assert()
+        .success();
+    assert!(tmp.path().join("site/index.html").is_file());
+}
+
+#[test]
+fn decks_in_sibling_directories_keep_their_own_default_output() {
+    // Audit F09: a presenter.toml that does not set out_dir leaves dist/ next to each deck.
+    let tmp = project(&[
+        ("course/presenter.toml", "[deck]\nlang = \"en\"\n"),
+        ("course/week1/slides.md", "# Week 1\n"),
+        ("course/week2/slides.md", "# Week 2\n"),
+    ]);
+    let course = tmp.path().join("course");
+    for week in ["week1", "week2"] {
+        let stdout = stdout_of(
+            presenter()
+                .current_dir(&course)
+                .args(["build", &format!("{week}/slides.md")]),
+        );
+        let expected = Path::new(week).join("dist/slides.html");
+        assert!(
+            stdout.starts_with(&format!("Wrote {} (1 slide, ", expected.display())),
+            "{stdout}"
+        );
+    }
+    let week1 = std::fs::read_to_string(course.join("week1/dist/slides.html")).unwrap();
+    let week2 = std::fs::read_to_string(course.join("week2/dist/slides.html")).unwrap();
+    assert!(week1.contains("Week 1") && !week1.contains("Week 2"));
+    assert!(week2.contains("Week 2"));
+    assert!(!course.join("dist").exists());
+}
+
+#[test]
+fn check_and_build_name_an_invalid_config_alike() {
+    // Audit F39 (a): check's error diagnostics show the presenter.toml as build does.
+    let tmp = project(&[
+        ("c/presenter.toml", "[deck]\ntheme = 3\n"),
+        ("c/s.md", "# A\n"),
+    ]);
+    let config = Path::new("c/presenter.toml").display().to_string();
+    let output = presenter()
+        .current_dir(tmp.path())
+        .args(["build", "c/s.md"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    assert!(
+        stderr_of(&output).starts_with(&format!("error: config: {config}: ")),
+        "{}",
+        stderr_of(&output)
+    );
+    let output = presenter()
+        .current_dir(tmp.path())
+        .args(["check", "c/s.md"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let deck = Path::new("c/s.md").display().to_string();
+    assert!(
+        stderr_of(&output).starts_with(&format!("{deck}: error: config: {config}: ")),
+        "{}",
+        stderr_of(&output)
+    );
+    let output = presenter()
+        .current_dir(tmp.path())
+        .args(["check", "c/s.md", "--format", "json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let entries: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = entries[0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!("config: {config}: ")),
+        "{message}"
+    );
+}
+
+#[test]
+fn paths_outside_the_current_directory_are_shown_with_dot_dot() {
+    // Audit F39 (b): `path:line:` lines and framed errors agree.
+    let tmp = project(&[
+        ("talk/x.md", "# X\n"),
+        ("m2/w.md", "# W {bogus=1}\n\n![a](nope.png)\n"),
+    ]);
+    let talk = tmp.path().join("talk");
+    let deck = Path::new("../m2/w.md").display().to_string();
+    let output = presenter()
+        .current_dir(&talk)
+        .args(["check", "../m2/w.md"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(!stderr.is_empty());
+    for line in stderr.lines() {
+        assert!(line.starts_with(&format!("{deck}:")), "{stderr}");
+    }
+    let output = presenter()
+        .current_dir(&talk)
+        .args(["build", "../m2/w.md"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.starts_with(&format!("{deck}:1: warning: ")),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&format!("\n --> {deck}:3\n")), "{stderr}");
+    // An absolute spelling of the same file is shown the same way.
+    let absolute = tmp.path().join("m2/w.md");
+    let output = presenter()
+        .current_dir(&talk)
+        .arg("check")
+        .arg(&absolute)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    assert!(
+        stderr_of(&output).starts_with(&format!("{deck}:1: warning: ")),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn paths_through_a_symlinked_prefix_are_shown_relative() {
+    // Audit F39 (c): the current directory is canonical, the typed path goes through a link.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("ok.md"), "# OK\n").unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let output = presenter()
+        .current_dir(&real)
+        .arg("build")
+        .arg(link.join("ok.md"))
+        .arg("-o")
+        .arg(link.join("out.html"))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("Wrote out.html (1 slide, "), "{stdout}");
 }

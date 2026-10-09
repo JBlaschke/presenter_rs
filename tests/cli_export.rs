@@ -795,3 +795,170 @@ fn pages_that_never_get_ready_fail_with_the_reason_and_page_errors() {
 
 /// Time limit for the library calls above (generous; they fail within seconds).
 const DEADLINE: Duration = Duration::from_secs(60);
+
+// --- Audit fixes (A1): the PDF never overwrites an input --------------------------------
+
+/// The bytes of each of `files` (relative to `dir`).
+fn snapshot(dir: &Path, files: &[&str]) -> Vec<Vec<u8>> {
+    files
+        .iter()
+        .map(|file| std::fs::read(dir.join(file)).unwrap())
+        .collect()
+}
+
+/// Runs `presenter export pdf <args>` in `dir` with a browser that does not exist and
+/// asserts the audit F01 refusal: exit 2 (before the browser is looked for, which would
+/// exit 3), `error: refusing to write …` on stderr, `protected` unchanged. Returns stderr.
+fn assert_refused(dir: &Path, args: &[&str], protected: &[&str]) -> String {
+    let before = snapshot(dir, protected);
+    let output = presenter(dir)
+        .args(["export", "pdf"])
+        .args(args)
+        .args(["--chrome", "/nonexistent/chrome"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("error: refusing to write "),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not an executable"), "{stderr}");
+    assert_eq!(
+        snapshot(dir, protected),
+        before,
+        "{args:?} changed an input"
+    );
+    stderr
+}
+
+#[test]
+fn export_refuses_to_overwrite_its_input() {
+    let dir = project(&[("d.md", "# keep\n"), ("presenter.toml", "")]);
+    let stderr = assert_refused(dir.path(), &["d.md", "-o", "d.md"], &["d.md"]);
+    assert_eq!(
+        stderr,
+        "warning: -o d.md does not end in .pdf; the file will hold a PDF\n\
+         error: refusing to write d.md: it is the input file d.md; choose another output \
+         path with -o\n"
+    );
+    let stderr = assert_refused(
+        dir.path(),
+        &["d.md", "-o", "presenter.toml"],
+        &["presenter.toml"],
+    );
+    assert!(
+        stderr.contains("it is the config file presenter.toml"),
+        "{stderr}"
+    );
+    std::fs::copy(
+        root().join("tests/fixtures/ipynb/minimal.ipynb"),
+        dir.path().join("nb.ipynb"),
+    )
+    .unwrap();
+    assert_refused(
+        dir.path(),
+        &["-q", "nb.ipynb", "-o", "nb.ipynb"],
+        &["nb.ipynb"],
+    );
+    assert!(!dir.path().join("dist").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn export_refuses_links_to_its_input() {
+    let dir = project(&[("d.md", "# keep\n")]);
+    std::os::unix::fs::symlink("d.md", dir.path().join("alias.pdf")).unwrap();
+    std::fs::hard_link(dir.path().join("d.md"), dir.path().join("hard.pdf")).unwrap();
+    let stderr = assert_refused(dir.path(), &["d.md", "-o", "alias.pdf"], &["d.md"]);
+    assert!(
+        stderr.contains("refusing to write alias.pdf: it is the input file d.md"),
+        "{stderr}"
+    );
+    assert_refused(dir.path(), &["d.md", "-o", "hard.pdf"], &["d.md"]);
+    assert_refused(dir.path(), &["d.md", "-o", "missing/../d.md"], &["d.md"]);
+    let upper = dir.path().join("D.MD");
+    if upper.exists() {
+        assert_refused(dir.path(), &["d.md", "-o", "D.MD"], &["d.md"]);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn export_refuses_to_overwrite_an_asset_before_the_browser_starts() {
+    let dir = project(&[("d.md", "# Plot\n\n![plot](plot.png)\n")]);
+    std::fs::copy(
+        root().join("tests/fixtures/md/images/ok.png"),
+        dir.path().join("plot.png"),
+    )
+    .unwrap();
+    let marker = dir.path().join("chrome-ran");
+    let fake = fake_chrome(
+        dir.path(),
+        "fake-chrome",
+        &format!("touch '{}'\nexit 1", marker.display()),
+    );
+    let before = snapshot(dir.path(), &["d.md", "plot.png"]);
+    let output = run_settled(|| {
+        let mut cmd = presenter(dir.path());
+        cmd.args(["export", "pdf", "d.md", "-o", "plot.png", "--chrome"])
+            .arg(&fake);
+        cmd
+    });
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.ends_with(
+            "error: refusing to write plot.png: it is the deck's asset plot.png; choose \
+             another output path with -o\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!marker.exists(), "the browser ran");
+    assert_eq!(snapshot(dir.path(), &["d.md", "plot.png"]), before);
+}
+
+#[test]
+fn export_output_arguments_are_checked() {
+    let dir = project(&[("d.md", "# Slide\n")]);
+    std::fs::create_dir(dir.path().join("existing")).unwrap();
+    for out in ["out/", "existing"] {
+        presenter(dir.path())
+            .args(["export", "pdf", "d.md", "-o", out])
+            .args(["--chrome", "/nonexistent/chrome"])
+            .assert()
+            .code(2)
+            .stderr(format!(
+                "error: -o {out} names a directory; give the PDF file to write\n"
+            ));
+    }
+    // A name without .pdf is allowed, with a warning (then: no browser, exit 3).
+    let output = presenter(dir.path())
+        .args(["export", "pdf", "d.md", "-o", "slides.html"])
+        .args(["--chrome", "/nonexistent/chrome"])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "warning: -o slides.html does not end in .pdf; the file will hold a PDF\nerror: "
+        ),
+        "{stderr}"
+    );
+    let output = presenter(dir.path())
+        .args(["-q", "export", "pdf", "d.md", "-o", "slides.PDF"])
+        .args(["--chrome", "/nonexistent/chrome"])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+    assert!(text(&output.stderr).starts_with("error: "), "{output:?}");
+}

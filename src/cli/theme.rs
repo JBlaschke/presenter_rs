@@ -8,10 +8,12 @@
 //!   file's directory, then the current directory. It prints the chain child → root and
 //!   where each theme lives.
 //! - `eject NAME DIR` copies every embedded file of the built-in theme `NAME` into `DIR`,
-//!   which must not exist. The copy is named after the directory: `name` in `theme.toml`
-//!   (with a comment line on top saying where it came from) and the `@NAME/` template names
-//!   in its templates change; everything else, `extends` included, is copied as is, so
-//!   ejecting `default` gives a root theme that builds exactly like the built-in one.
+//!   which must not exist, except its top-level `README.md` (it documents the built-in theme
+//!   in the repository, with links that break in a copy). The copy is named after the
+//!   directory: `name` in `theme.toml` (with a comment line on top saying where it came
+//!   from) and the `@NAME/` template names in its templates change; everything else,
+//!   `extends` included, is copied as is, so ejecting `default` gives a root theme that
+//!   builds exactly like the built-in one.
 //! - `new DIR [--extends NAME]` writes a minimal child theme into `DIR` (which must be
 //!   empty or not exist): `theme.toml` (`name` from the directory, `extends`, `[styles]
 //!   entries`), `styles/theme.css` listing the parent's tokens (the CSS custom properties
@@ -27,8 +29,9 @@
 //!   chain, then reports every problem on stderr as `path:line: error: message`: style and
 //!   script entries and a `highlight_style` file that do not exist, `[layouts]` entries
 //!   without a template file in the chain, templates of the chain's directories that do
-//!   not compile, and an invalid `[reveal] plugins` list. What resolution itself rejects
-//!   (no `theme.toml`, unknown manifest keys, an invalid theme name, a missing parent, a
+//!   not compile, and an invalid `[reveal] plugins` list. A `DIR` that does not exist, is
+//!   not a directory or has no `theme.toml` is a usage error; what resolution of the theme
+//!   in it rejects (unknown manifest keys, an invalid theme name, a missing parent, a
 //!   cycle, required templates missing from the root theme) fails the command with that
 //!   error.
 //!
@@ -37,13 +40,17 @@
 //! final resolution of the new theme still fails, they remove the files and directories
 //! they created, so a retry is not refused.
 //!
-//! Exit codes: 0 on success; 1 when `check` finds problems, for theme errors and I/O
-//! failures; 2 for usage errors: `eject` of a theme that is not built in, an existing
-//! `eject` directory, a non-empty `new` directory, a directory name that cannot be a theme
-//! name or that a theme of the parent chain already has (`theme new default`), a `new`
-//! parent whose chain already has the most themes a chain may have, and an invalid
-//! `presenter.toml` or `--config` file in `list`. With `-q`, `eject`, `new` and `check`
-//! print nothing on stdout.
+//! Exit codes, one rule for every subcommand (audit F42): 2 when a name or path argument
+//! names nothing usable, 1 when what it names is broken. So 0 on success; 1 when `check`
+//! finds problems, for errors of a theme that exists (an invalid `theme.toml`, a missing
+//! parent named by its `extends`, …) and I/O failures; 2 for usage errors: `eject` of a
+//! theme that is not built in, an existing `eject` directory, a non-empty `new` directory,
+//! a `new --extends` theme that is neither a theme directory nor a built-in theme, a
+//! `check` directory that does not exist, is not a directory or has no `theme.toml`, a
+//! directory name that cannot be a theme name or that a theme of the parent chain already
+//! has (`theme new default`), a `new` parent whose chain already has the most themes a
+//! chain may have, and an invalid `presenter.toml` or `--config` file in `list`. With
+//! `-q`, `eject`, `new` and `check` print nothing on stdout.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -70,6 +77,11 @@ use crate::theme::{
 
 /// The parent of `presenter theme new` without `--extends` (always the built-in theme).
 const DEFAULT_PARENT: &str = "default";
+
+/// The top-level file of a built-in theme that `eject` and `init --full-theme` leave out:
+/// it documents the built-in theme in the repository, and its relative links break in a
+/// copy (audit F48).
+pub(crate) const BUILTIN_THEME_README: &str = "README.md";
 
 /// `highlight_style` values that name a bundled style rather than a file.
 const BUNDLED_HIGHLIGHT_STYLES: [&str; 3] = ["monokai", "zenburn", "none"];
@@ -237,12 +249,15 @@ pub(crate) fn eject_builtin(name: &str, dir: &Path) -> anyhow::Result<Theme> {
     Ok(ejected)
 }
 
-/// Every file of the built-in theme `builtin` as the files of its copy named `name`:
-/// `theme.toml` renamed ([`renamed_manifest`]) under a provenance comment, templates
-/// retargeted ([`retarget_template`]), everything else as is.
+/// Every file of the built-in theme `builtin` but its [`BUILTIN_THEME_README`] as the
+/// files of its copy named `name`: `theme.toml` renamed ([`renamed_manifest`]) under a
+/// provenance comment, templates retargeted ([`retarget_template`]), everything else as is.
 fn ejected_files(builtin: &ThemeDir, name: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let mut files = Vec::new();
     for rel in builtin.list("") {
+        if rel == BUILTIN_THEME_README {
+            continue;
+        }
         let bytes = builtin
             .read(&rel)?
             .ok_or_else(|| anyhow!("built-in theme '{}': cannot read {rel}", builtin.name))?;
@@ -364,6 +379,10 @@ fn new(args: &ThemeNewArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
 /// The parent of a new theme and the spec it was resolved from: `--extends` (a theme
 /// directory relative to the current directory, else a built-in name), or without it the
 /// built-in [`DEFAULT_PARENT`], never a `default/` directory that happens to be here.
+///
+/// A `--extends` that names no theme (neither a theme directory nor a built-in theme) is a
+/// [`UsageError`]; a theme that exists but does not resolve (an invalid `theme.toml`, a
+/// missing ancestor) is its theme error.
 fn new_parent(extends: Option<&str>) -> anyhow::Result<(&str, Theme)> {
     let Some(spec) = extends else {
         let parent = theme::resolve(DEFAULT_PARENT, &[])
@@ -371,9 +390,20 @@ fn new_parent(extends: Option<&str>) -> anyhow::Result<(&str, Theme)> {
         return Ok((DEFAULT_PARENT, parent));
     };
     let cwd = std::env::current_dir().context("cannot read the current directory")?;
-    let parent =
-        theme::resolve(spec, &[&cwd]).with_context(|| format!("theme new: --extends {spec}"))?;
-    Ok((spec, parent))
+    match theme::resolve(spec, &[&cwd]) {
+        Ok(parent) => Ok((spec, parent)),
+        Err(err @ Error::Theme { .. }) if names_no_theme(&err, spec) => {
+            Err(UsageError(format!("theme new: --extends {spec}: {err}")).into())
+        }
+        Err(err) => Err(anyhow::Error::new(err).context(format!("theme new: --extends {spec}"))),
+    }
+}
+
+/// Whether `err`, from resolving `spec`, says that `spec` itself names no theme (not found,
+/// or empty) rather than that the theme it names is broken.
+fn names_no_theme(err: &Error, spec: &str) -> bool {
+    matches!(err, Error::Theme { name, message }
+        if name == spec && (message.starts_with("not found") || message == "empty theme name"))
 }
 
 /// `target` (where `dir` points) must not exist or be an empty directory.
@@ -680,12 +710,16 @@ fn check(args: &ThemeCheckArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode>
     // not a theme directory would fall back to the built-in theme of that name.
     let absolute = std::path::absolute(dir)
         .map_err(|err| UsageError(format!("theme check: {}: {err}", dir.display())))?;
-    if let Some(why) = manifest_problem(&absolute) {
-        return Err(anyhow!(
+    if let Some(why) = manifest_problem(&absolute)
+        .map_err(|err| anyhow!("theme check: cannot read {}: {err}", dir.display()))?
+    {
+        // The argument names no theme: a usage error, like an unknown `eject` name.
+        return Err(UsageError(format!(
             "theme check: {} {why}; a theme is a directory with a {MANIFEST_FILE} \
              (`presenter theme new <dir>` creates one)",
             dir.display()
-        ));
+        ))
+        .into());
     }
     let spec = absolute
         .to_str()
@@ -731,24 +765,22 @@ fn check(args: &ThemeCheckArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode>
 
 /// Why `dir` is not a theme directory (an `is …`/`has …` clause), if it is not: it does
 /// not exist, is not a directory, or has no file named exactly `theme.toml` (the rule
-/// resolution applies on every platform; a `Theme.toml` is named in the message).
-fn manifest_problem(dir: &Path) -> Option<String> {
+/// resolution applies on every platform; a `Theme.toml` is named in the message). Errors:
+/// the directory cannot be read.
+fn manifest_problem(dir: &Path) -> std::io::Result<Option<String>> {
     if !dir.is_dir() {
         let why = if fs::symlink_metadata(dir).is_ok() {
             "is not a directory"
         } else {
             "does not exist"
         };
-        return Some(why.to_string());
+        return Ok(Some(why.to_string()));
     }
-    let names: Vec<String> = match fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .collect(),
-        Err(err) => return Some(format!("cannot be read ({err})")),
-    };
+    let names: Vec<String> = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
     if names.iter().any(|name| name == MANIFEST_FILE) && dir.join(MANIFEST_FILE).is_file() {
-        return None;
+        return Ok(None);
     }
     let mut why = format!("has no {MANIFEST_FILE}");
     let variant = names
@@ -761,7 +793,7 @@ fn manifest_problem(dir: &Path) -> Option<String> {
             " (it has {variant}, but the name must be {MANIFEST_FILE} exactly)"
         );
     }
-    Some(why)
+    Ok(Some(why))
 }
 
 /// Every problem of a resolved theme (see the module docs), chain order.
@@ -1283,7 +1315,10 @@ mod tests {
         assert_eq!(ejected.name(), "copy");
         assert!(matches!(ejected.chain[0].source, ThemeSource::Disk { .. }));
         let builtin = theme::resolve("default", &[]).unwrap();
-        assert_eq!(ejected.chain[0].list(""), builtin.chain[0].list(""));
+        let mut expected = builtin.chain[0].list("");
+        assert!(expected.iter().any(|rel| rel == BUILTIN_THEME_README));
+        expected.retain(|rel| rel != BUILTIN_THEME_README);
+        assert_eq!(ejected.chain[0].list(""), expected, "all but the README");
         let err = eject_builtin("default", &dir).unwrap_err();
         assert!(err.is::<UsageError>(), "{err:#}");
         let err = eject_builtin("nope", &tmp.path().join("other")).unwrap_err();

@@ -252,16 +252,12 @@ fn scaffold_has_no_diagnostics_and_passes_check() {
         let diagnostics: Vec<String> = built.diagnostics.iter().map(|d| d.to_string()).collect();
         assert!(diagnostics.is_empty(), "{deck}: {diagnostics:?}");
 
-        // `presenter check` (T34) once it exists: no warnings.
+        // `presenter check`: no warnings.
         let output = presenter(&project)
             .args(["check", deck, "--deny-warnings"])
             .output()
             .unwrap();
         let stderr = text(&output.stderr);
-        if stderr.contains("not implemented yet") {
-            eprintln!("presenter check is not implemented in this build; skipped");
-            continue;
-        }
         let stdout = text(&output.stdout);
         assert!(output.status.success(), "check {deck}: {stdout}{stderr}");
         assert!(
@@ -532,10 +528,17 @@ fn full_theme_copies_the_default_theme() {
 
     let builtin = presenter::vendor::list("themes/default/");
     assert!(!builtin.is_empty());
+    // Every file but the built-in theme's README, which documents it in the repository
+    // and whose links break in a copy (audit F48).
+    let builtin: Vec<String> = builtin
+        .into_iter()
+        .filter(|key| key != "themes/default/README.md")
+        .collect();
     let expected: BTreeSet<String> = builtin
         .iter()
         .map(|key| format!("theme/{}", &key["themes/default/".len()..]))
         .collect();
+    assert!(!project.join("theme/README.md").exists());
     let theme_files: BTreeSet<String> = files(&project)
         .into_iter()
         .filter(|f| f.starts_with("theme/"))

@@ -193,8 +193,13 @@ fn eject_default_copies_every_file_and_renames_the_theme() {
     assert!(copy.join("templates/deck.html").is_file());
 
     let builtin = resolve("default", &[]).unwrap().chain.remove(0);
-    let files = builtin.list("");
+    let mut files = builtin.list("");
     assert!(files.len() >= 6, "{files:?}");
+    // Every file but the README, which documents the built-in theme in the repository
+    // with links that break in a copy (audit F48).
+    assert!(files.iter().any(|rel| rel == "README.md"), "{files:?}");
+    files.retain(|rel| rel != "README.md");
+    assert!(!copy.join("README.md").exists());
     // Byte for byte, except that templates name their own files `@my-copy/…`.
     for rel in &files {
         let copied = fs::read(copy.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
@@ -396,29 +401,48 @@ fn new_refuses_non_empty_directories_name_clashes_and_unknown_parents() {
     assert!(stderr.contains("would be named 'default'"), "{stderr}");
     assert!(!tmp.path().join("default").exists());
 
+    // A parent that names no theme is a usage error, like an unknown `eject` name
+    // (audit F42).
     let (code, _, stderr) = run(tmp.path(), &["theme", "new", "x", "--extends", "nope"]);
-    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(code, 2, "{stderr}");
     assert!(
         stderr.contains("--extends nope: theme 'nope': not found"),
         "{stderr}"
     );
     assert!(!tmp.path().join("x").exists());
+    // A parent that exists but is broken is that theme's error: exit 1.
+    write_files(
+        tmp.path(),
+        &[(
+            "broken/theme.toml",
+            "name = \"broken\"\nextends = \"gone\"\n",
+        )],
+    );
+    let (code, _, stderr) = run(tmp.path(), &["theme", "new", "y", "--extends", "broken"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("theme 'gone': not found"), "{stderr}");
+    assert!(!tmp.path().join("y").exists());
 }
 
 #[test]
 fn check_without_theme_toml_fails_with_a_clear_message() {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir(tmp.path().join("plain")).unwrap();
+    // A directory argument that names no theme is a usage error (audit F42).
     let (code, stdout, stderr) = run(tmp.path(), &["theme", "check", "plain"]);
-    assert_eq!(code, 1, "{stdout}");
+    assert_eq!(code, 2, "{stdout}");
     assert!(
         stderr.contains("error: theme check: plain has no theme.toml"),
         "{stderr}"
     );
     assert!(stdout.is_empty(), "{stdout}");
     let (code, _, stderr) = run(tmp.path(), &["theme", "check", "missing"]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 2);
     assert!(stderr.contains("missing does not exist"), "{stderr}");
+    write_files(tmp.path(), &[("file.txt", "x")]);
+    let (code, _, stderr) = run(tmp.path(), &["theme", "check", "file.txt"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("file.txt is not a directory"), "{stderr}");
 }
 
 #[test]
@@ -716,7 +740,7 @@ fn check_checks_the_directory_never_a_builtin_theme_of_that_name() {
         )],
     );
     let (code, stdout, stderr) = run(tmp.path(), &["theme", "check", "default"]);
-    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert_eq!(code, 2, "{stdout}{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(
         stderr.contains(
