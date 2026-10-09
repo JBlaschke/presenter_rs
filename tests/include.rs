@@ -316,6 +316,15 @@ fn every_misuse_is_an_error_at_the_directive() {
         ("unclosed.md", ":::include b.md\n\n---\n\n# Swallowed\n"),
         ("missing.md", "# A\n\n---\n\n:::include nothere.md\n:::\n"),
         ("extension.md", ":::include notes.txt\n:::\n"),
+        (
+            "note.md",
+            "# A\n\n---\n\n:::include b.md\n:::\n\nNote: hi\n\n:::include c.md\n:::\n",
+        ),
+        (
+            "notes.md",
+            "# A\n\n---\n\n:::include b.md\n:::\n\n::::notes\n:::include c.md\n:::\n::::\n",
+        ),
+        ("c.md", "# C\n"),
         ("cycle-a.md", "# A\n\n---\n\n:::include cycle-b.md\n:::\n"),
         ("cycle-b.md", "# B\n\n---\n\n:::include cycle-a.md\n:::\n"),
         ("b.md", "# B\n"),
@@ -324,7 +333,7 @@ fn every_misuse_is_an_error_at_the_directive() {
     files.extend(nested_deep.iter().map(|(n, t)| (n.as_str(), t.as_str())));
     let dir = project(&files);
     let at = |name: &str| dir.path().join(name);
-    let cases: [(&str, usize, &str); 10] = [
+    let cases: [(&str, usize, &str); 12] = [
         (
             "content.md",
             3,
@@ -343,6 +352,13 @@ fn every_misuse_is_an_error_at_the_directive() {
         ("list.md", 7, "not inside a list"),
         ("quote.md", 1, "not inside a block quote"),
         ("directive.md", 2, "not inside the `:::center` directive"),
+        // a second include in the ignored notes of an include slide (dialect §4.1, §7)
+        (
+            "note.md",
+            10,
+            "not in the speaker notes that the `Note:` paragraph on line 8 starts",
+        ),
+        ("notes.md", 9, "not inside the `:::notes` directive"),
         ("body.md", 1, "takes no content, but line 2 is inside it"),
         ("unclosed.md", 1, "is not closed"),
         (
@@ -797,22 +813,41 @@ fn check_reports_an_included_notebook_without_outputs() {
             "# A\n\n---\n\n:::include \"parts/my nb.ipynb\"\n:::\n",
         ),
         ("parts/my nb.ipynb", &notebook.to_string()),
+        // the notebook on two include slides, and again through another file
+        (
+            "twice.md",
+            "# A\n\n---\n\n:::include \"parts/my nb.ipynb\"\n:::\n\n---\n\n\
+             :::include \"parts/my nb.ipynb\"\n:::\n",
+        ),
+        (
+            "thrice.md",
+            ":::include twice.md\n:::\n\n---\n\n:::include \"parts/my nb.ipynb\"\n:::\n",
+        ),
     ]);
-    let diagnostics =
-        presenter::check::run(&BuildOptions::new(dir.path().join("deck.md"))).unwrap();
-    let found: Vec<_> = diagnostics
-        .iter()
-        .filter(|d| d.code == "notebook-no-outputs")
-        .collect();
-    assert_eq!(found.len(), 1, "{diagnostics:#?}");
     let notebook_path = dir.path().join("parts/my nb.ipynb");
-    assert_eq!(found[0].path.as_deref(), Some(notebook_path.as_path()));
-    let message = &found[0].message;
-    assert!(
-        message.starts_with("none of the notebook's 2 code cells has outputs;"),
-        "{message}"
+    for deck in ["deck.md", "twice.md", "thrice.md"] {
+        let diagnostics = presenter::check::run(&BuildOptions::new(dir.path().join(deck))).unwrap();
+        let found: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == "notebook-no-outputs")
+            .collect();
+        assert_eq!(found.len(), 1, "{deck}: {diagnostics:#?}");
+        assert_eq!(found[0].path.as_deref(), Some(notebook_path.as_path()));
+        let message = &found[0].message;
+        // Each code cell counts once, however often the notebook is included.
+        assert!(
+            message.starts_with("none of the notebook's 2 code cells has outputs;"),
+            "{deck}: {message}"
+        );
+        assert!(message.contains("--inplace 'my nb.ipynb'"), "{message}");
+    }
+    let twice = parse(&dir.path().join("twice.md")).unwrap();
+    let titles: Vec<_> = titles(&twice.deck).into_iter().map(|(t, _)| t).collect();
+    assert_eq!(
+        titles,
+        ["A", "Analysis", "Analysis"],
+        "the notebook's slide twice"
     );
-    assert!(message.contains("--inplace 'my nb.ipynb'"), "{message}");
 }
 
 /// A file included twice is parsed twice, but its diagnostics are reported once.

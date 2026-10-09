@@ -8,9 +8,10 @@
 //!    vertical slides, closed by a
 //!    `:::` line right after it, is an *include slide*; any other `:::include` is an
 //!    [`Error::Parse`] at its line, with the including file's path: in a vertical slide
-//!    (after `--`), inside a list, quote or another directive, next to other content, with a
-//!    body, not closed, without a path, or a `:::include` line comrak did not open (a `:`
-//!    after the fence). Slide attributes (`--- {…}`, `<!-- .slide: -->`), `:::notes` and a
+//!    (after `--`), inside a list, quote or another directive, next to other content, after
+//!    the `Note:` paragraph of an include slide (in its ignored notes), with a body, not
+//!    closed, without a path, or a `:::include` line comrak did not open (a `:` after the
+//!    fence). Slide attributes (`--- {…}`, `<!-- .slide: -->`), `:::notes` and a
 //!    `Note:` paragraph (dialect §7) of an include slide are ignored with an
 //!    [`codes::INCLUDE_ATTRS_IGNORED`] warning.
 //! 2. `expand` replaces an include slide by every top-level slide of the included file,
@@ -273,7 +274,8 @@ fn notes_start<'a>(nodes: &[&'a AstNode<'a>], lines: &[&str]) -> usize {
 
 /// The include `slide` (a horizontal slide with `children`) consists of, if any; an error
 /// when it has an `:::include` but is not an include slide. A `Note:` paragraph after the
-/// directive and what follows it are notes, not content ([`report_ignored`] reports them).
+/// directive and what follows it are notes, not content ([`report_ignored`] reports them);
+/// a further `:::include` among them is an error at its line.
 fn include_slide<'a>(
     slide: &RawSlide<'a>,
     children: &[RawSlide<'a>],
@@ -285,7 +287,8 @@ fn include_slide<'a>(
     };
     let directive = slide.nodes[at];
     let line = start_line(directive);
-    let notes = notes_start(&slide.nodes, lines).max(at + 1);
+    let notes_at = notes_start(&slide.nodes, lines);
+    let notes = notes_at.max(at + 1);
     let other = slide.nodes[..notes]
         .iter()
         .find(|node| !std::ptr::eq(**node, directive) && !compat::is_invisible(node));
@@ -302,6 +305,15 @@ fn include_slide<'a>(
             start_line(other)
         );
         return Err((line, message));
+    }
+    if let Some(later) = slide.nodes[notes..].iter().find(|node| is_include(node)) {
+        // In bounds: `later` is at `notes` or after it, and `notes_at <= notes`.
+        let note = start_line(slide.nodes[notes_at]);
+        let message = format!(
+            "`:::include` must be a top-level block of a slide of its own, not in the speaker \
+             notes that the `Note:` paragraph on line {note} starts: put `---` before it"
+        );
+        return Err((start_line(later), message));
     }
     if let Some(child) = children.first() {
         let message = format!(
@@ -894,7 +906,7 @@ mod tests {
 
     #[test]
     fn every_misuse_is_an_error_at_the_directive() {
-        let cases: [(&str, bool, usize, &str); 15] = [
+        let cases: [(&str, bool, usize, &str); 17] = [
             (
                 "# A\n\n:::include b.md\n:::\n",
                 false,
@@ -938,6 +950,19 @@ mod tests {
                 false,
                 7,
                 "line 5 has other content",
+            ),
+            // a further `:::include` in the (ignored) notes of an include slide
+            (
+                "# A\n\n---\n\n:::include b.md\n:::\n\nNote: n\n\n:::include c.md\n:::\n",
+                false,
+                10,
+                "not in the speaker notes that the `Note:` paragraph on line 8 starts",
+            ),
+            (
+                "# A\n\n---\n\n:::include b.md\n:::\nNote: n\n\nmore\n\n:::include c.md\n:::\n",
+                true,
+                11,
+                "not in the speaker notes that the `Note:` paragraph on line 7 starts",
             ),
             (
                 "- item\n\n  :::include b.md\n  :::\n",

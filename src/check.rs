@@ -393,8 +393,8 @@ fn theme_file_path(theme: &Theme, key: &str) -> Option<PathBuf> {
 }
 
 /// `notebook-no-outputs` for a notebook deck and for every notebook a Markdown deck includes
-/// (`includes`; the cells of the slides whose `SourceSpan.file` is that notebook, reported
-/// with its path).
+/// (`includes`; the cells of the slides whose `SourceSpan.file` is that notebook, each once
+/// however often it is included, reported with its path).
 fn notebooks_without_outputs(deck: &Deck, includes: &[IncludedSource]) -> Vec<Diagnostic> {
     let slides = labelled_slides(deck);
     let mut found = Vec::new();
@@ -419,21 +419,22 @@ fn notebooks_without_outputs(deck: &Deck, includes: &[IncludedSource]) -> Vec<Di
 
 /// `notebook-no-outputs`: the notebook `path` (its `slides`) has code cells that were never
 /// executed: none has an output or an execution count (executed cells that print nothing are
-/// fine).
+/// fine). Each cell counts once (by its index in the notebook): a notebook included on two
+/// include slides has its slides in the deck twice.
 fn notebook_without_outputs<'s>(
     slides: impl Iterator<Item = &'s Slide>,
     path: &Path,
 ) -> Option<Diagnostic> {
-    let cells: Vec<_> = slides
+    let cells: BTreeMap<usize, _> = slides
         .flat_map(|slide| &slide.blocks)
         .filter_map(|block| match block {
-            Block::Cell(cell) => Some(cell),
+            Block::Cell(cell) => Some((cell.index, cell)),
             Block::Html { .. } => None,
         })
         .collect();
     if cells.is_empty()
         || cells
-            .iter()
+            .values()
             .any(|cell| !cell.outputs.is_empty() || cell.execution_count.is_some())
     {
         return None;
