@@ -18,9 +18,10 @@
 //!   ([`reveal_fallback`], T42). The theme stylesheet is processed by the renderer in every
 //!   mode, so the fallback works in serve mode too;
 //! - a stylesheet inlined by a local `@import` of an entry (T42,
-//!   [`crate::theme::styles::inline_imports`]): against its own helper path, before it is
-//!   spliced in; a theme file with the rules of an entry, an embedded file (reveal's font
-//!   CSS) leniently like `style()` of a vendor stylesheet;
+//!   [`crate::theme::styles::inline_imports`]): against its own helper path; a theme file
+//!   with the rules of an entry, an embedded file (reveal's font CSS, KaTeX's CSS) leniently
+//!   like `style()` of a vendor stylesheet. Each stylesheet's own text is processed once,
+//!   before anything is spliced into it, so what a lenient file leaves as written stays so;
 //! - `style(path)` of a theme file (`@<theme>/…` or the `assets/` form): next to the
 //!   stylesheet only, as a browser resolves it; every reference must resolve (checked in
 //!   serve mode too, although the browser loads the files there);
@@ -52,7 +53,7 @@ use crate::assets::emit::register_css_urls;
 use crate::assets::registry::{AssetData, AssetRegistry};
 use crate::error::{Error, Result};
 use crate::theme::Theme;
-use crate::theme::styles::{compile_entry, inline_imports, reveal_fallback, take_imports};
+use crate::theme::styles::{compile_entry, inline_imports, reveal_fallback};
 
 /// How the relative `url()`s of one stylesheet are resolved (see the module docs).
 #[derive(Debug, Clone, Copy)]
@@ -78,10 +79,10 @@ impl UrlRules {
         }
     }
 
-    /// The rules for the file `key` inlined by a local `@import` of a theme entry (T42):
-    /// an embedded file's are those of `style(key)` (lenient), a theme file's those of an
-    /// entry.
-    fn for_import(key: &str) -> UrlRules {
+    /// The rules for the stylesheet `key` of a theme entry's text (T42): the entry's own
+    /// and those of a theme file it imports are [`UrlRules::THEME_ENTRY`], an embedded
+    /// file's (imported) are those of `style(key)` (lenient).
+    fn for_entry_text(key: &str) -> UrlRules {
         if is_builtin(key) {
             UrlRules::for_style(key)
         } else {
@@ -121,9 +122,10 @@ impl Targets<'_> {
 ///
 /// Each entry is first compiled by [`crate::theme::styles::compile_entry`] (`.css` as
 /// written, `.scss`/`.sass` with grass, T42), then its local `@import`s are inlined
-/// ([`crate::theme::styles::inline_imports`]); the `url()`s of an imported file are resolved
-/// against that file's own helper path before it is spliced in (theme files with the rules
-/// of an entry, embedded files leniently, like `style()` of a vendor stylesheet).
+/// ([`crate::theme::styles::inline_imports`]); the `url()`s of each stylesheet's own text
+/// are resolved against its own helper path before anything is spliced into it (the entry
+/// and theme files with the rules of an entry, embedded files leniently, like `style()` of
+/// a vendor stylesheet).
 ///
 /// Errors: [`Error::Style`] (`file` = the entry as a normalized helper path,
 /// `@<theme>/<path>`, or for a Sass error the file it is in) for another extension, a file
@@ -137,10 +139,13 @@ pub fn compile_theme_css(theme: &Theme, registry: &mut AssetRegistry) -> Result<
 /// of an entry or of a stylesheet inlined into it ([`remote_imports`]) is appended to
 /// `remote` as `(entry key, URL)`.
 ///
-/// The `@import` rules left after inlining (absolute URLs) are moved to the top of the
-/// stylesheet, in entry order, each after a `/* hoisted from <entry key> */` comment (T42;
-/// the entries keep their own `/* <entry key> */` comments): CSS ignores an `@import` that
-/// follows other rules, as every import of an entry after the first would otherwise do.
+/// The top-level `@import` rules left after inlining (absolute URLs,
+/// [`crate::theme::styles::Inlined::imports`]) are moved to the top of the stylesheet, in
+/// entry order, each after a `/* hoisted from <stylesheet> */` comment naming the file
+/// that has it (T42; the entries keep their own `/* <entry key> */` comments): CSS ignores
+/// an `@import` that follows other rules, as every import of an entry after the first, or
+/// of an inlined file, would otherwise do. A rule from a file inlined by an import with
+/// media queries carries them.
 pub(super) fn compile(
     theme: &Theme,
     mut targets: Targets<'_>,
@@ -153,34 +158,29 @@ pub(super) fn compile(
         // Normalized like every helper path, so a `\`-separated entry joins correctly.
         let key = normalize_helper_path(&written).unwrap_or(written);
         let text = compile_entry(&entry, theme)?;
-        let text = inline_imports(theme, &key, &text, &mut |imported, css| {
-            let rules = UrlRules::for_import(imported);
-            rewrite_urls(theme, imported, &css, rules, targets.reborrow())
+        let inlined = inline_imports(theme, &key, &text, &mut |file, css| {
+            let rules = UrlRules::for_entry_text(file);
+            rewrite_urls(theme, file, &css, rules, targets.reborrow())
         })?;
-        remote.extend(
-            remote_imports(&text)
-                .into_iter()
-                .map(|url| (key.clone(), url)),
-        );
-        // The imports left (absolute URLs) go first: after other rules CSS ignores them.
-        let (hoisted, text) = take_imports(&text);
-        imports.extend(hoisted.into_iter().map(|rule| (key.clone(), rule)));
-        let text = rewrite_urls(
-            theme,
-            &key,
-            &text,
-            UrlRules::THEME_ENTRY,
-            targets.reborrow(),
-        )?;
+        let rules = inlined.imports.iter().map(|(_, rule)| rule.as_str());
+        for text in rules.chain([inlined.css.as_str()]) {
+            remote.extend(
+                remote_imports(text)
+                    .into_iter()
+                    .map(|url| (key.clone(), url)),
+            );
+        }
+        // The imports taken out go first: after other rules CSS ignores them.
+        imports.extend(inlined.imports);
         let _ = writeln!(css, "/* {key} */");
-        css.push_str(&text);
+        css.push_str(&inlined.css);
         if !css.ends_with('\n') {
             css.push('\n');
         }
     }
     let mut head = String::new();
-    for (key, rule) in imports {
-        let _ = writeln!(head, "/* hoisted from {key} */\n{rule}");
+    for (file, rule) in imports {
+        let _ = writeln!(head, "/* hoisted from {file} */\n{rule}");
     }
     Ok(head + &css)
 }

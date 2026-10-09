@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use presenter::assets::emit::OutputMode;
 use presenter::assets::registry::{AssetData, AssetRegistry};
 use presenter::error::Error;
@@ -138,16 +139,24 @@ fn reveal_white_scss_compiles_through_the_virtual_fs() {
     // Inlining the import (next to white.scss) leaves no relative font reference.
     let key = "vendor/reveal/css/theme/white.scss";
     let css = compile_scss(&theme, key).unwrap();
-    let mut imported = Vec::new();
+    let mut finished = Vec::new();
     let inlined = inline_imports(&theme, key, &css, &mut |file, css| {
-        imported.push(file.to_string());
+        if !finished.iter().any(|seen| seen == file) {
+            finished.push(file.to_string());
+        }
         Ok(css)
     })
     .unwrap();
+    // `finish` sees the font CSS's text first (it is spliced in before white's rules).
     assert_eq!(
-        imported,
-        ["vendor/reveal/css/theme/fonts/source-sans-pro/source-sans-pro.css"]
+        finished,
+        [
+            "vendor/reveal/css/theme/fonts/source-sans-pro/source-sans-pro.css",
+            key
+        ]
     );
+    assert!(inlined.imports.is_empty());
+    let inlined = inlined.css;
     assert!(!inlined.contains("@import"), "{inlined}");
     assert_eq!(inlined.matches("@font-face").count(), 4);
     assert!(inlined.contains("url('./source-sans-pro-regular.woff')"));
@@ -166,8 +175,9 @@ fn every_stock_reveal_theme_compiles() {
     for path in scss {
         let css = compile_scss(&theme, path).unwrap_or_else(|e| panic!("{path}: {e}"));
         assert!(css.contains("--r-background-color"), "{path}");
-        let css = inline_imports(&theme, path, &css, &mut identity).unwrap();
-        assert!(!has_relative_font_reference(&css), "{path}");
+        let inlined = inline_imports(&theme, path, &css, &mut identity).unwrap();
+        assert!(!has_relative_font_reference(&inlined.css), "{path}");
+        assert!(!inlined.css.contains("@import"), "{path}");
     }
 }
 
@@ -340,7 +350,9 @@ fn sass_finds_partials_next_to_the_entry_then_in_the_chain() {
             (
                 "styles/main.scss",
                 "\u{feff}@use \"tokens\";\n@use \"colors\";\n@use \"local/box\";\n\
-                 a { color: tokens.$accent; border-color: colors.$ink; }",
+                 @use \"../../@p/styles/tokens\" as parent;\n\
+                 a { color: tokens.$accent; border-color: colors.$ink; }\n\
+                 b { color: parent.$accent; }",
             ),
             ("styles/local/_box.scss", ".box { padding: 1px; }"),
         ],
@@ -353,6 +365,8 @@ fn sass_finds_partials_next_to_the_entry_then_in_the_chain() {
         "{part}"
     );
     assert!(flat.contains(".box{padding:1px;}"));
+    // `..` steps into another theme of the chain.
+    assert!(flat.contains("b{color:#123456;}"), "{part}");
 }
 
 #[test]
@@ -396,7 +410,14 @@ fn sass_cannot_reach_files_outside_the_tree() {
     ));
     assert!(!grass::Fs::is_file(&fs, Path::new("/etc/hosts")));
     assert!(!grass::Fs::is_dir(&fs, Path::new("/etc")));
-    assert!(grass::Fs::read(&fs, Path::new("Cargo.toml")).is_err());
+    // Reading never fails (grass would panic): a file outside the tree reads as empty and
+    // the compilation reports it.
+    assert!(!grass::Fs::is_file(&fs, Path::new("Cargo.toml")));
+    assert!(
+        grass::Fs::read(&fs, Path::new("Cargo.toml"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -414,6 +435,190 @@ fn indented_sass_entries_compile() {
     let flat = squeeze(entry_part(&css, "@t/styles/theme.sass"));
     assert!(flat.contains("--r-main-color:#333;"));
     assert!(flat.contains(".x{color:red;}"));
+}
+
+#[test]
+fn sass_urls_with_an_extension_use_the_load_paths_too() {
+    // grass 0.13.4 looks such URLs up next to the loading file only; dart-sass also
+    // searches the load paths (the chain's styles/, then reveal/…, vendor/…, @<theme>/…).
+    let tmp = tempfile::tempdir().unwrap();
+    disk_theme(
+        &tmp.path().join("p"),
+        "name = \"p\"\nextends = \"default\"\n",
+        &[
+            ("styles/_tokens.scss", "$accent: #123456;"),
+            ("styles/_shadowed.scss", "$who: parent;"),
+            ("styles/_plain-next-to.scss", "$who: parent;"),
+            ("styles/plain.css", ".plain { x: y; }"),
+        ],
+    );
+    let child = disk_theme(
+        &tmp.path().join("c"),
+        "name = \"c\"\nextends = \"../p\"\n[styles]\nentries = [\"styles/main.scss\"]\n",
+        &[
+            (
+                "styles/main.scss",
+                "@use \"reveal/theme/template/settings.scss\" with ($main-color: #333);\n\
+                 @use \"tokens.scss\";\n@use \"shadowed.scss\";\n@use \"plain.css\";\n\
+                 @use \"parts/box.scss\";\n@use \"plain-next-to.scss\";\n\
+                 a { color: tokens.$accent; content: \"#{shadowed.$who}\"; }\n\
+                 b { content: \"#{plain-next-to.$who}\"; }",
+            ),
+            // Next to the entry wins over the parent theme's file of the same name, also
+            // over a partial there when the file next to the entry is not one.
+            ("styles/_shadowed.scss", "$who: child;"),
+            ("styles/plain-next-to.scss", "$who: child;"),
+            // From a partial in a subdirectory, the load paths are the same.
+            (
+                "styles/parts/_box.scss",
+                "@import \"reveal/theme/template/mixins.scss\";\n.box { @include dark-bg-text-color(#fff); }",
+            ),
+        ],
+    );
+    let (css, _) = compile(&child).unwrap();
+    let flat = squeeze(entry_part(&css, "@c/styles/main.scss"));
+    assert!(flat.contains("--r-main-color:#333;"), "{flat}");
+    assert!(
+        flat.contains("a{color:#123456;content:\"child\";}"),
+        "{flat}"
+    );
+    assert!(flat.contains("b{content:\"child\";}"), "{flat}");
+    assert!(flat.contains(".plain{x:y;}"), "{flat}");
+    assert!(
+        flat.contains(".boxsection.has-dark-background,.boxsection.has-dark-backgroundh1"),
+        "{flat}"
+    );
+
+    // A URL with an extension that is nowhere is still Sass's error.
+    let theme = scss_theme(
+        &tmp.path().join("missing"),
+        "x.scss",
+        &[(
+            "styles/x.scss",
+            "\n@use \"reveal/theme/template/nope.scss\";",
+        )],
+    );
+    let (file, message) = style_error(compile(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/x.scss");
+    assert!(
+        message.starts_with("line 2, column 1: Can't find stylesheet"),
+        "{message}"
+    );
+}
+
+#[test]
+fn partials_that_cannot_be_loaded_are_style_errors() {
+    // grass 0.13.4 panics on these (an I/O or UTF-8 error while loading a @use'd file).
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = scss_theme(
+        &tmp.path().join("latin1"),
+        "t.scss",
+        &[
+            ("styles/t.scss", "@use \"fonts\";\na { color: red; }\n"),
+            ("styles/_fonts.scss", ""),
+        ],
+    );
+    std::fs::write(
+        tmp.path().join("latin1/t/styles/_fonts.scss"),
+        b".x { content: \"caf\xe9\"; }",
+    )
+    .unwrap();
+    let (file, message) = style_error(compile(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/_fonts.scss");
+    assert!(message.starts_with("not valid UTF-8: "), "{message}");
+    assert!(
+        message.ends_with("(compiling '@t/styles/t.scss')"),
+        "{message}"
+    );
+
+    // The same for a .scss file inlined by a CSS @import, and through the CLI.
+    let theme = scss_theme(
+        &tmp.path().join("via-css"),
+        "t.css",
+        &[
+            ("styles/t.css", "@import \"t.scss\";"),
+            ("styles/t.scss", "@use \"fonts\";"),
+            ("styles/_fonts.scss", ""),
+        ],
+    );
+    std::fs::write(tmp.path().join("via-css/t/styles/_fonts.scss"), b"\xff").unwrap();
+    let (file, message) = style_error(compile(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/_fonts.scss");
+    assert!(
+        message.ends_with("(compiling '@t/styles/t.scss')"),
+        "{message}"
+    );
+
+    std::fs::write(tmp.path().join("s.md"), "---\ntheme: latin1/t\n---\n# A\n").unwrap();
+    Command::cargo_bin("presenter")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args(["build", "s.md", "-o", "s.html"])
+        .assert()
+        .failure()
+        .code(predicates::ord::ne(101))
+        .stderr(predicates::str::contains("@t/styles/_fonts.scss"))
+        .stderr(predicates::str::contains("panicked").not());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let theme = scss_theme(
+            &tmp.path().join("locked"),
+            "t.scss",
+            &[
+                ("styles/t.scss", "@use \"fonts\";\n"),
+                ("styles/_fonts.scss", ".x { y: z; }"),
+            ],
+        );
+        let locked = tmp.path().join("locked/t/styles/_fonts.scss");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Skipped where permissions do not apply (e.g. running as root).
+        if std::fs::read(&locked).is_err() {
+            let (file, message) = style_error(compile(&theme).unwrap_err());
+            assert_eq!(file, "@t/styles/_fonts.scss");
+            assert!(message.starts_with("cannot read "), "{message}");
+            assert!(
+                message.ends_with("(compiling '@t/styles/t.scss')"),
+                "{message}"
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+#[test]
+fn a_panic_inside_grass_is_a_style_error() {
+    // `selector.simple-selectors('>')` reaches a `todo!()` in grass 0.13.4.
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = scss_theme(
+        tmp.path(),
+        "t.scss",
+        &[(
+            "styles/t.scss",
+            "@use \"sass:selector\";\na { b: selector.simple-selectors(\">\"); }\n",
+        )],
+    );
+    let (file, message) = style_error(compile(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/t.scss");
+    assert!(
+        message.starts_with("the Sass compiler (grass) failed unexpectedly: "),
+        "{message}"
+    );
+}
+
+#[test]
+fn compile_scss_names_what_is_missing() {
+    let theme = default_theme();
+    let (file, message) = style_error(compile_scss(&theme, "reveal/theme/nope.scss").unwrap_err());
+    assert_eq!(file, "vendor/reveal/css/theme/nope.scss");
+    assert_eq!(message, "no such file");
+    let (file, message) = style_error(compile_scss(&theme, "styles/x.scss").unwrap_err());
+    assert_eq!(file, "styles/x.scss");
+    assert!(
+        message.starts_with("not a file of the stylesheet tree"),
+        "{message}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -557,10 +762,40 @@ fn imports_that_cannot_be_inlined_are_errors() {
         style_error(compile(&theme).unwrap_err())
     };
 
-    let (file, message) = fail("missing", &[("styles/theme.css", "@import url(nope.css);")]);
+    // In a CSS file the message has the line of the import; reveal's sources are only
+    // mentioned for `fonts/…` and `reveal/…` URLs.
+    let (file, message) = fail(
+        "missing",
+        &[("styles/theme.css", "a {}\n@import url(nope.css);")],
+    );
     assert_eq!(file, "@t/styles/theme.css");
+    assert_eq!(
+        message,
+        "line 2: @import url(nope.css) not found next to the stylesheet"
+    );
+    let (_, message) = fail(
+        "missing-font",
+        &[("styles/theme.css", "@import 'fonts/x.css';")],
+    );
+    assert_eq!(
+        message,
+        "line 1: @import url(fonts/x.css) not found next to the stylesheet or among \
+         reveal.js's theme sources"
+    );
+    // A CSS import that Sass passes through is relative to the file compiled, also when
+    // it is written in a partial (Sass does not say where it came from).
+    let (file, message) = fail(
+        "missing-sass",
+        &[
+            ("styles/theme.css", "@import \"theme.scss\";"),
+            ("styles/theme.scss", "@use \"parts/a\";"),
+            ("styles/parts/_a.scss", "@import url(\"b.css\");"),
+            ("styles/parts/b.css", ".b {}"),
+        ],
+    );
+    assert_eq!(file, "@t/styles/theme.scss");
     assert!(
-        message.contains("@import url(nope.css) not found"),
+        message.starts_with("@import url(b.css) not found next to the stylesheet (Sass passes"),
         "{message}"
     );
 
@@ -607,14 +842,125 @@ fn imports_that_cannot_be_inlined_are_errors() {
         "{message}"
     );
 
-    let (_, message) = fail(
-        "layer",
+    for (name, condition) in [
+        ("layer", "layer(base)"),
+        ("supports", "supports(display: grid) screen"),
+        ("bare-layer", "layer"),
+    ] {
+        let (_, message) = fail(
+            name,
+            &[
+                (
+                    "styles/theme.css",
+                    &format!("@import url(a.css) {condition};"),
+                ),
+                ("styles/a.css", ""),
+            ],
+        );
+        assert_eq!(
+            message,
+            format!(
+                "line 1: @import url(a.css) {condition}: imports with layer() or supports() \
+                 cannot be inlined"
+            )
+        );
+    }
+}
+
+#[test]
+fn inlined_vendor_css_keeps_its_unresolvable_fallbacks() {
+    // KaTeX's CSS lists .woff/.ttf fallbacks that are not vendored (vendored-assets.md §2):
+    // inlined, they stay as written, even with a same-named file in the theme's assets/.
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = scss_theme(
+        tmp.path(),
+        "theme.css",
         &[
-            ("styles/theme.css", "@import url(a.css) layer(base);"),
-            ("styles/a.css", ""),
+            (
+                "styles/theme.css",
+                "@import url(\"../../vendor/katex/katex.min.css\");\n.own { background: url(fonts/own.png); }\n",
+            ),
+            ("assets/fonts/KaTeX_AMS-Regular.woff", "WRONG"),
+            ("assets/fonts/own.png", "OWN"),
         ],
     );
-    assert!(message.contains("cannot be inlined"), "{message}");
+    let (css, registry) = compile(&theme).unwrap();
+    let part = entry_part(&css, "@t/styles/theme.css");
+    assert!(part.contains("/* inlined vendor/katex/katex.min.css */"));
+    assert!(part.contains("url(fonts/KaTeX_AMS-Regular.woff)"), "{part}");
+    assert!(part.contains("url(fonts/KaTeX_AMS-Regular.ttf)"), "{part}");
+    assert!(
+        !part.contains("url(fonts/KaTeX_AMS-Regular.woff2)"),
+        "woff2 inlined"
+    );
+    // The entry's own url() still finds the theme's assets/.
+    assert!(!part.contains("url(fonts/own.png)"));
+    let bytes: Vec<&[u8]> = registry
+        .iter()
+        .filter_map(|asset| match &asset.data {
+            AssetData::Bytes(bytes) => Some(bytes.as_slice()),
+            AssetData::File(_) => None,
+        })
+        .collect();
+    assert!(bytes.contains(&b"OWN".as_slice()));
+    assert!(!bytes.contains(&b"WRONG".as_slice()));
+}
+
+#[test]
+fn remote_imports_keep_the_media_queries_of_their_import_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = scss_theme(
+        &tmp.path().join("ok"),
+        "theme.css",
+        &[
+            (
+                "styles/theme.css",
+                "@import url(print.css) print;\n.a {}\n\
+                 @media screen { @import url(https://x.example/nested.css); }\n",
+            ),
+            (
+                "styles/print.css",
+                "@import url(https://x.example/y.css);\n\
+                 @import url(https://x.example/z.css) layer(fonts);\n.p {}\n",
+            ),
+        ],
+    );
+    let (css, _) = compile(&theme).unwrap();
+    assert!(
+        css.starts_with(
+            "/* hoisted from @t/styles/print.css */\n@import url(https://x.example/y.css) print;\n\
+             /* hoisted from @t/styles/print.css */\n\
+             @import url(https://x.example/z.css) layer(fonts) print;\n\
+             /* @default/styles/theme.css */\n"
+        ),
+        "{}",
+        &css[..300]
+    );
+    let part = entry_part(&css, "@t/styles/theme.css");
+    assert!(part.contains("@media print {\n/* inlined @t/styles/print.css */\n\n\n.p {}\n}"));
+    // An @import inside a block is invalid CSS (browsers ignore it): left as written.
+    assert!(part.contains("@media screen { @import url(https://x.example/nested.css); }"));
+
+    // Two media query lists are not combined.
+    let theme = scss_theme(
+        &tmp.path().join("both"),
+        "theme.css",
+        &[
+            ("styles/theme.css", "@import url(print.css) print;"),
+            (
+                "styles/print.css",
+                "@import url(https://x.example/y.css) screen;",
+            ),
+        ],
+    );
+    let (file, message) = style_error(compile(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/print.css");
+    assert!(
+        message.contains(
+            "cannot be combined with those of the import that inlines this stylesheet (print)"
+        ),
+        "{message}"
+    );
 }
 
 #[test]

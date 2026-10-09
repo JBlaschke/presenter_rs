@@ -224,13 +224,16 @@ Set `reveal_theme = "none"` when the SCSS builds the whole reveal theme; otherwi
 theme's CSS is included as well (before the theme stylesheet). The settings become `--r-*`
 custom properties on `:root`, after the default theme's `styles/theme.css` (parent entries
 come first), so they win over the values in the table above; set
-`$heading-text-transform: none` and the like to keep the default theme's look. A stock theme as it is: `@use "reveal/theme/white";` (any of the 14 names).
+`$heading-text-transform: none` and the like to keep the default theme's look.
+
+To use a stock theme unchanged, write `@use "reveal/theme/white";` (any of the 14 names).
 Its settings are already configured, so it cannot be combined with
 `@use "reveal/theme/template/settings" with (…)`: copy the stock theme's settings into your
 own `with (…)` instead.
 
 **What Sass can load.** `@use`, `@forward` and `@import` see the theme chain, not the file
-system:
+system. A URL may be written with or without its extension (`"palette"`,
+`"palette.scss"`); every row also applies to the `.scss`/`.sass`/`.css` form:
 
 | URL | finds |
 |---|---|
@@ -238,26 +241,33 @@ system:
 | `"reveal/theme/template/settings"`, `…/theme`, `…/mixins` | reveal.js's theme template, shipped with presenter (`reveal/…` is reveal's `css/` directory) |
 | `"reveal/theme/<name>"` | a stock reveal theme's source |
 | `"@<theme>/styles/x"` | a file of that theme of the chain |
-| absolute paths, `../` out of the themes | nothing: a theme cannot read other files |
+| `"../…"` | the same tree: `..` can step into another theme of the chain (`../../@parent/styles/x` from `styles/`) or the embedded vendor files (`../../vendor/…`), never onto the disk |
+| absolute paths, anything else | nothing: a theme cannot read other files |
 
 **CSS imports are inlined.** Sass leaves CSS imports (`@import url("x.css")`,
-`@import "x.css"`) in its output, and so do `.css` entries; presenter replaces every import
-of a relative URL with the imported file, so a standalone deck needs nothing else. The file
-is looked up next to the stylesheet that imports it, then, for `reveal/…` and `fonts/…`, in
-reveal's theme sources: `@import url("reveal/theme/fonts/source-sans-pro/source-sans-pro.css")`
-brings reveal's Source Sans Pro, and the stock themes' own `@import url('./fonts/…')` works
-too. Imports nest at most 5 levels and must not form a cycle; an import with media queries
-becomes an `@media` block; `layer()` and `supports()` imports cannot be inlined (an error).
-Imports of `https://…` URLs stay as written but move to the top of the theme stylesheet
-(CSS ignores an `@import` after other rules): the fonts load when the deck is online, and a
-standalone build warns `remote-import`.
+`@import "x.css"`) in its output, and so do `.css` entries; presenter replaces every
+top-level import of a relative URL with the imported file, so a standalone deck needs
+nothing else. In a `.css` file the import is looked up next to that file. In Sass, CSS
+imports are looked up next to the **entry** file, also when they are written in a partial
+(Sass passes them through without their location), as for `url()`s below. Last, for
+`reveal/…` and `fonts/…`, they are looked up in reveal's theme sources:
+`@import url("reveal/theme/fonts/source-sans-pro/source-sans-pro.css")` brings reveal's
+Source Sans Pro, and the stock themes' own `@import url('./fonts/…')` works too. Imports
+nest at most 5 levels and must not form a cycle; an import with media queries becomes an
+`@media` block; `layer()` and `supports()` imports cannot be inlined (an error). Imports of
+`https://…` URLs stay as written but move to the top of the theme stylesheet (CSS ignores
+an `@import` after other rules), keeping the media queries of the import that inlined
+their file (`@import url(https://…) print;`): the fonts load when the deck is online, and
+a standalone build warns `remote-import`. An `@import` inside a block (`@media … { … }`)
+is invalid CSS that browsers ignore; it is left as written.
 
 **`url()`s.** Sass does not rewrite URLs, so a `url()` anywhere in the compiled SCSS is
 relative to the **entry** file (`styles/theme.scss`), then the chain's `assets/` directories
 as for CSS entries, and last, for `reveal/…` and `fonts/…`, reveal's theme sources. A
 `url()` in an imported CSS file is relative to that file (reveal's font files are found next
-to their CSS). In a standalone build every font and image becomes a `data:` URI (reveal's
-fonts are `data:font/woff`).
+to their CSS); in an imported vendor file (`../../vendor/katex/katex.min.css`) one that
+names no file stays as written, like KaTeX's `.woff`/`.ttf` fallbacks. In a standalone build
+every font and image becomes a `data:` URI (reveal's fonts are `data:font/woff`).
 
 **Errors** name the file and the position, with the line:
 
@@ -267,9 +277,12 @@ error: style '@mytheme/styles/theme.scss': line 5, column 14: Expected expressio
    |              ^^
 ```
 
-`@warn` messages are logged as warnings and `@debug` with `-vv`, which also shows how long
-each compilation took (`compiled Sass stylesheet=… elapsed_ms=…`). `random()` and
-`unique-id()` are not available: the output is deterministic.
+A partial that cannot be read or is not UTF-8 is an error naming the partial.
+
+`@warn` messages go to the log only, as warnings (they are not diagnostics: `presenter
+check --deny-warnings` and the serve overlay do not see them), and `@debug` with `-vv`,
+which also shows how long each compilation took (`compiled Sass stylesheet=… elapsed_ms=…`).
+`random()` and `unique-id()` are not available: the output is deterministic.
 
 **Live reload.** `presenter serve` watches the theme directory: saving a `.scss` (or
 `.sass`, `.css`) file recompiles the theme stylesheet and swaps it in the browser without
