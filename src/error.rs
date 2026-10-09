@@ -178,7 +178,9 @@ impl Error {
     /// then the notebook), read through `source_cache`, with the part to underline: the
     /// character at the [`column`](Self::column) (a notebook JSON error's byte column is
     /// converted), the reference to the missing file of a [`Error::MissingAsset`] when the
-    /// line contains it, else the line's text.
+    /// line contains it, else the line's text. A missing asset located in a notebook cell
+    /// whose line does not mention the file has no excerpt: it is a file an output of the
+    /// cell names, and the cell's source line would be unrelated (audit F38).
     ///
     /// `file` is the file the span is in: [`path`](Self::path), or the deck source for a
     /// missing asset or front matter error, which the caller knows (`cli::locate`,
@@ -201,9 +203,14 @@ impl Error {
                 Some((start, start + 1))
             }
             (_, Some(column)) => Some((column - 1, column)),
-            (Error::MissingAsset { path, .. }, None) => {
-                reference_range(path, &line).or_else(|| text_range(&line))
-            }
+            (Error::MissingAsset { path, .. }, None) => match reference_range(path, &line) {
+                Some(range) => Some(range),
+                // In a notebook cell, a missing file that its line does not mention is named
+                // by an output of the cell (whose span is the whole cell): the cell's source
+                // line is unrelated, so none is quoted (audit F38).
+                None if span.cell.is_some() => return None,
+                None => text_range(&line),
+            },
             _ => text_range(&line),
         };
         Some(Excerpt::cut(span.start_line, &line, target))
@@ -300,8 +307,9 @@ impl Excerpt {
 /// line (or the cell) does not exist.
 pub fn source_line(text: &str, span: &SourceSpan) -> Option<String> {
     let index = span.start_line.checked_sub(1)?;
+    // One leading byte order mark is ignored, as the frontends ignore it (audit F43).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let Some(cell) = span.cell else {
-        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         return text.lines().nth(index).map(str::to_string);
     };
     let notebook: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -1156,6 +1164,32 @@ mod tests {
         assert_eq!(source_line(notebook, &cell_span(4, 1)), None);
         assert_eq!(source_line(notebook, &cell_span(1, 2)), None);
         assert_eq!(source_line("not json", &cell_span(1, 0)), None);
+        // A notebook with a byte order mark, which the frontend accepts (audit F43).
+        let bom = format!("\u{feff}{notebook}");
+        assert_eq!(
+            source_line(&bom, &cell_span(3, 1)).as_deref(),
+            Some("![x](y.png)")
+        );
+    }
+
+    #[test]
+    fn missing_files_of_notebook_outputs_quote_no_unrelated_line() {
+        let notebook = r##"{"cells": [
+            {"cell_type": "code", "source": "x\ny = 2"},
+            {"cell_type": "code", "source": "display(Image('plot.png'))"}]}"##;
+        let missing = |path: &str, line, cell| Error::MissingAsset {
+            path: PathBuf::from(path),
+            span: Some(cell_span(line, cell)),
+        };
+        // The cell's line does not mention the file: an output names it, nothing is quoted.
+        assert_eq!(
+            excerpt_of(&missing("/nb/missing.png", 1, 0), notebook),
+            None
+        );
+        // A line that mentions it is quoted with the reference underlined.
+        let excerpt = excerpt_of(&missing("/nb/plot.png", 1, 1), notebook).unwrap();
+        assert_eq!(excerpt.text, "display(Image('plot.png'))");
+        assert_eq!(excerpt.marker, Some((15, 8)));
     }
 
     /// The excerpt of `err` in a file with `text`.

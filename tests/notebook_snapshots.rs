@@ -394,9 +394,10 @@ fn presenter_title_beats_the_notebook_title() {
 fn front_matter_blocks_that_are_not_metadata_stay_markdown() {
     // In a later cell, `---` + a line that sets no deck metadata + `---` is a rule and a
     // setext heading, as Jupyter shows it: a scalar, a key that is no DeckMeta field nor a
-    // config table (prose such as `Note: …`), or nothing at all.
+    // config table (prose such as `Note: …`), or nothing at all. (The first cell opens the
+    // slide, so that one slide of five cells is no `notebook-single-slide`.)
     let parsed = inline(json!([
-        md("x", json!({})),
+        md("x", slide_type("slide")),
         md("---\nJust a heading\n---\n\ntext", json!({})),
         md("---\n\n---\n", json!({})),
         md("---\nNote: this matters\n---\n\nbody", json!({})),
@@ -422,7 +423,7 @@ fn front_matter_blocks_that_are_not_metadata_stay_markdown() {
     // Blocks that do set deck metadata (a field, reveal options, a config table) are removed
     // from a later cell, with a warning; they change nothing.
     let parsed = inline(json!([
-        md("x", json!({})),
+        md("x", slide_type("slide")),
         md("---\nreveal: {controls: false}\n---\nA", json!({})),
         md(
             "---\nnotebook: {show_prompts: false}\nevent: X\n---\nB",
@@ -1167,7 +1168,7 @@ fn raw_cells() {
     let parsed = inline(json!([
         raw(
             "<img src=\"images/ok.png\"> <img src=\"images/missing.png\">",
-            json!({"raw_mimetype": "text/html"})
+            json!({"raw_mimetype": "text/html", "slideshow": {"slide_type": "slide"}})
         ),
         raw("<p>legacy</p>", json!({"format": "text/html"})),
         raw(
@@ -1239,7 +1240,16 @@ fn html_outputs_and_markdown_outputs_resolve_local_files() {
     assert_eq!(htmls[2], "<img src=\"nope.png\">");
     assert_eq!(deck.assets.len(), 1, "one file, registered once");
     assert!(deck.features.math);
+    // The warning has the span of the whole cell (cell-level, so the cell is known
+    // everywhere) and names the output in its message (F38).
     assert_eq!(codes(&parsed), [("missing-asset", Some(0), 1)]);
+    let diagnostic = parsed.diagnostics.iter().next().unwrap();
+    assert_eq!(diagnostic.span.as_ref().map(|s| s.end_line), Some(1));
+    let message = &diagnostic.message;
+    assert!(
+        message.starts_with("output 2: file `nope.png` not found (looked for "),
+        "{message}"
+    );
 }
 
 #[test]
@@ -1984,4 +1994,281 @@ fn writes_notebook_previews_for_manual_browser_checks() {
         )
         .unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Audit fixes (A4)
+
+/// The HTML blocks of `slide`, in order.
+fn htmls(slide: &Slide) -> Vec<&str> {
+    slide
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Html { html } => Some(html.as_str()),
+            Block::Cell(_) => None,
+        })
+        .collect()
+}
+
+/// F17: `[slides] incremental_lists`, the `.incremental` / `.no-incremental` slide classes
+/// and `<!-- .element: -->` comments apply to notebook slides as to Markdown slides.
+#[test]
+fn notebook_slides_honour_incremental_lists_and_element_comments() {
+    let list = "## List\n\n- one\n- two\n";
+    let cells = json!([
+        md(list, slide_type("slide")),
+        md(
+            list,
+            json!({"slideshow": {"slide_type": "slide"}, "presenter": {"classes": ["incremental"]}})
+        ),
+        md(
+            list,
+            json!({"slideshow": {"slide_type": "slide"}, "presenter": {"classes": ["no-incremental"]}})
+        ),
+        md(
+            "- nested in a fragment\n",
+            json!({"slideshow": {"slide_type": "fragment"}})
+        ),
+        md(
+            "## Compat\n\n- a <!-- .element: class=\"fragment\" data-x=\"1\" -->\n- b\n",
+            slide_type("slide")
+        ),
+    ]);
+    let fragments = |parsed: &Parsed, slide: usize| -> usize {
+        htmls(&parsed.deck.slides[slide])
+            .iter()
+            .map(|html| html.matches("<li class=\"fragment\"").count())
+            .sum()
+    };
+    let off = inline(cells.clone());
+    assert_eq!(
+        [0, 1, 2].map(|slide| fragments(&off, slide)),
+        [0, 2, 0],
+        "off by default; `.incremental` turns it on for its slide"
+    );
+    let mut config = Config::default();
+    config.slides.incremental_lists = true;
+    let on = parse_inline(&notebook(cells.clone(), python()), &config).unwrap();
+    assert_eq!(
+        [0, 1, 2].map(|slide| fragments(&on, slide)),
+        [2, 2, 0],
+        "on everywhere but on `.no-incremental` slides"
+    );
+    // A list inside a fragment cell is nested, so it is left alone.
+    let last = htmls(&on.deck.slides[2]).pop().unwrap();
+    assert!(last.contains("<li>nested in a fragment</li>"), "{last}");
+    // `.element:` comments are applied (and removed), as in a Markdown deck.
+    let compat = htmls(&off.deck.slides[3])[0];
+    assert!(
+        compat.contains("<li class=\"fragment\" data-x=\"1\">a </li>")
+            && !compat.contains(".element"),
+        "{compat}"
+    );
+    // The same through first-cell front matter.
+    let mut cells = cells;
+    cells.as_array_mut().unwrap().insert(
+        0,
+        md("---\nslides: {incremental_lists: true}\n---\n", json!({})),
+    );
+    let front = inline(cells);
+    assert_eq!([0, 1, 2].map(|slide| fragments(&front, slide)), [2, 2, 0]);
+}
+
+/// F17 (review): an `.element:` comment's warning names the cell that has the comment, not
+/// the cell that opened the slide; the same for a comment in a notes cell.
+#[test]
+fn element_comment_warnings_name_the_cell_that_has_the_comment() {
+    let cells = json!([
+        md("# T", slide_type("slide")),
+        code("x = 1", json!({}), json!([])),
+        md(
+            "Text\n\nMore\n\n- a <!-- .element: data-x=\"1 -->\n",
+            json!({})
+        ),
+        md(
+            "Say *this* <!-- .element: data-y=\"2 -->",
+            slide_type("notes")
+        ),
+    ]);
+    let parsed = inline(cells);
+    let ignored: Vec<_> = codes(&parsed)
+        .into_iter()
+        .filter(|(code, ..)| *code == "element-comment-ignored")
+        .collect();
+    assert_eq!(
+        ignored,
+        [
+            ("element-comment-ignored", Some(2), 1),
+            ("element-comment-ignored", Some(3), 1)
+        ]
+    );
+}
+
+/// F28: one slide without slide types is reported once there is enough on it.
+#[test]
+fn a_notebook_without_slide_types_is_one_slide_with_a_hint() {
+    let cell = |text: &str| md(text, json!({}));
+    let notes = md("Say this", slide_type("notes"));
+    let hint = |cells: Value| {
+        let parsed = inline(cells);
+        let found: Vec<_> = parsed
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "notebook-single-slide")
+            .map(|d| (d.span.clone(), d.message.clone()))
+            .collect();
+        assert!(found.len() <= 1);
+        found.into_iter().next()
+    };
+    let three = json!([cell("# A"), cell("b"), code("c", json!({}), json!([]))]);
+    let (span, message) = hint(three).expect("a hint for three cells");
+    assert_eq!(span, None);
+    assert!(
+        message.starts_with("all 3 cells are on one slide"),
+        "{message}"
+    );
+    // Two shown cells (notes and removed cells do not count) fit on a slide.
+    assert_eq!(hint(json!([cell("# A"), notes, cell("b")])), None);
+    assert_eq!(
+        hint(json!([
+            cell("# A"),
+            cell("b"),
+            code("c", json!({"tags": ["remove-cell"]}), json!([]))
+        ])),
+        None
+    );
+    // Any `slide` or `subslide` cell, even on the only slide, means the author chose.
+    assert_eq!(
+        hint(json!([
+            md("# A", slide_type("slide")),
+            cell("b"),
+            cell("c")
+        ])),
+        None
+    );
+    assert_eq!(
+        hint(json!([
+            cell("# A"),
+            md("b", slide_type("subslide")),
+            cell("c")
+        ])),
+        None
+    );
+    // Separators in split markdown cells open slides: no hint.
+    let mut config = Config::default();
+    config.notebook.split_markdown_cells = true;
+    let split = json!([cell("# A\n\n---\n\n# B"), cell("b"), cell("c")]);
+    let parsed = parse_inline(&notebook(split, python()), &config).unwrap();
+    assert_eq!(parsed.deck.slides.len(), 2);
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .all(|d| d.code != "notebook-single-slide")
+    );
+}
+
+/// F08: a symbolic link inside the notebook's directory that points outside it is outside;
+/// files inside (also through links that stay inside) are embedded; markdown cells resolve
+/// as in a Markdown deck.
+#[cfg(unix)]
+#[test]
+fn output_files_must_resolve_inside_the_notebook_directory() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("talk");
+    std::fs::create_dir_all(dir.join("figs")).unwrap();
+    std::fs::write(tmp.path().join("secret.txt"), "SECRET").unwrap();
+    std::fs::write(dir.join("figs/plot.png"), "PLOT").unwrap();
+    symlink(tmp.path().join("secret.txt"), dir.join("figs/link.png")).unwrap();
+    symlink(dir.join("figs/plot.png"), dir.join("alias.png")).unwrap();
+    let outputs = json!([
+        {"output_type": "display_data", "metadata": {},
+         "data": {"text/html": "<img src=\"figs/link.png\"><img src='alias.png'><video poster=\"../secret.txt\"></video>"}},
+        {"output_type": "display_data", "metadata": {},
+         "data": {"text/markdown": "![a](figs/link.png) ![b](figs/plot.png)\n\n:::notes\n![n](../secret.txt)\n:::\n"}},
+    ]);
+    let cells = json!([
+        md("# T\n\n![up](../secret.txt)", slide_type("slide")),
+        code("show()", json!({}), outputs),
+    ]);
+    let source = source_in(&dir, "nb");
+    let parsed = parse(&source, &notebook(cells, python()), &Config::default()).unwrap();
+    let deck = &parsed.deck;
+    assert_eq!(deck.invariant_violations(), Vec::<String>::new());
+    // The author's markdown cell may name `../secret.txt`.
+    assert!(html(&deck.slides[0].blocks[0]).contains("src=\"asset:"));
+    let cell = cell(&deck.slides[0].blocks[1]);
+    let display: Vec<&str> = cell
+        .outputs
+        .iter()
+        .map(|output| match output {
+            CellOutput::Display { html, .. } => html.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        display[0].starts_with("<img src=\"figs/link.png\"><img src='asset:"),
+        "{}",
+        display[0]
+    );
+    assert!(
+        display[0].ends_with("<video poster=\"../secret.txt\"></video>"),
+        "{}",
+        display[0]
+    );
+    assert!(
+        display[1].contains("src=\"figs/link.png\""),
+        "{}",
+        display[1]
+    );
+    assert_eq!(
+        display[1].matches("src=\"asset:").count(),
+        1,
+        "{}",
+        display[1]
+    );
+    let notes = deck.slides[0].notes.as_deref().unwrap();
+    assert!(notes.contains("src=\"../secret.txt\""), "{notes}");
+    // Embedded: the markdown cell's file and plot.png (once, also through alias.png).
+    let mut origins: Vec<&str> = deck.assets.iter().map(|a| a.origin.as_str()).collect();
+    origins.sort();
+    assert_eq!(origins.len(), 2, "{origins:?}");
+    assert!(origins.contains(&"file:figs/plot.png"), "{origins:?}");
+    let outside: Vec<&str> = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "output-file-outside")
+        .map(|d| d.message.as_str())
+        .collect();
+    // One warning per reference as written (the link names its target).
+    assert_eq!(outside.len(), 4, "{outside:?}");
+    let secret = std::fs::canonicalize(tmp.path().join("secret.txt")).unwrap();
+    for (message, (output, written)) in outside.iter().zip([
+        (0, "figs/link.png"),
+        (0, "../secret.txt"),
+        (1, "figs/link.png"),
+        (1, "../secret.txt"),
+    ]) {
+        assert!(
+            message.starts_with(&format!(
+                "output {output}: `{written}` names {}, which is outside the notebook's \
+                 directory",
+                secret.display()
+            )),
+            "{message}"
+        );
+    }
+    // Located at the cell (its whole span), not at a line of its code (F38).
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "output-file-outside")
+            .all(|d| d
+                .span
+                .as_ref()
+                .is_some_and(|s| s.cell == Some(1) && s.start_line == 1))
+    );
 }

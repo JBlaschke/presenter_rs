@@ -22,16 +22,14 @@ use crate::error::{Diagnostic, Diagnostics, Result};
 use crate::ir::{Deck, DeckMeta, Slide};
 use crate::theme::Theme;
 
-/// `highlight_style` values that name a built-in style rather than a file.
-const BUILTIN_HIGHLIGHT_STYLES: [&str; 3] = ["monokai", "zenburn", "none"];
-
 /// Builds the §4 context for `input` (whose config is the effective one, see
 /// [`RenderInput::config`]), appending an `unknown-layout` warning to `diagnostics` for
 /// every slide whose layout the theme chain does not provide (such a slide gets
 /// `layout_template = "layouts/default.html"`).
 ///
 /// Fails when a `[scripts] entries` file of the theme is missing
-/// ([`Theme::script_entries`]).
+/// ([`Theme::script_entries`]) or the `highlight_style` file is missing or outside its theme
+/// ([`Theme::highlight_style_file`]).
 pub fn build_context(
     input: &RenderInput<'_>,
     diagnostics: &mut Diagnostics,
@@ -132,27 +130,20 @@ fn theme_json(theme: &Theme) -> Result<Value> {
     map.insert("name".into(), theme.name().into());
     map.insert("chain".into(), chain.into());
     map.insert("reveal_theme".into(), theme.reveal_theme().into());
-    map.insert("highlight_style".into(), highlight_style(theme).into());
+    map.insert("highlight_style".into(), highlight_style(theme)?.into());
     map.insert("vars".into(), Value::Object(theme.vars()));
     map.insert("scripts".into(), scripts.into());
     Ok(Value::Object(map))
 }
 
 /// `highlight_style` for templates: a built-in name as is, a path as `@<theme>/<path>`
-/// relative to the theme that set it.
-fn highlight_style(theme: &Theme) -> String {
-    let style = theme.highlight_style();
-    if BUILTIN_HIGHLIGHT_STYLES.contains(&style.as_str()) {
-        return style;
-    }
-    match theme
-        .chain
-        .iter()
-        .find(|dir| dir.manifest.styles.highlight_style.is_some())
-    {
-        Some(dir) => format!("@{}/{}", dir.name, style),
-        None => style,
-    }
+/// relative to the theme that set it. A path that is missing or leaves the theme directory
+/// is an [`crate::error::Error::Theme`] ([`Theme::highlight_style_file`]).
+fn highlight_style(theme: &Theme) -> Result<String> {
+    Ok(match theme.highlight_style_file()? {
+        Some(file) => format!("@{}/{}", file.theme, file.rel_path),
+        None => theme.highlight_style(),
+    })
 }
 
 /// `deck.slides` as JSON, every slide and child decorated with `layout_template`.
@@ -195,16 +186,12 @@ fn decorated(
     Ok(value)
 }
 
-/// The `unknown-layout` warning for `slide`.
+/// The `unknown-layout` warning for `slide` ([`Theme::unknown_layout_message`], shared with
+/// `presenter check`).
 fn unknown_layout(slide: &Slide, label: &str, deck: &Deck, theme: &Theme) -> Diagnostic {
     let mut diagnostic = Diagnostic::warning(
         "unknown-layout",
-        format!(
-            "{label}: unknown layout '{}' (theme '{}' has: {}); using the default layout",
-            slide.layout,
-            theme.name(),
-            theme.layouts().join(", ")
-        ),
+        theme.unknown_layout_message(label, &slide.layout),
     )
     .with_path(&deck.source.path);
     diagnostic.span = slide.span.clone();

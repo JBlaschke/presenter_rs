@@ -9,8 +9,14 @@
 //! | mode | URL for an asset | bytes |
 //! |---|---|---|
 //! | [`OutputMode::Standalone`] | `data:<mime>;base64,…` ([`data_uri`]) | read now, inlined |
-//! | [`OutputMode::Site`] | `url_prefix` + [`hashed_file_name`], e.g. `assets/plot-3f9a1c2b7e0d.png` | read now, one [`EmittedFile`] per id |
+//! | [`OutputMode::Site`] | `url_prefix` + [`hashed_file_name`] of the asset's file-name hint and a hash of its **bytes**, e.g. `assets/plot-5e0c7b1f9a2d.png` | read now, one [`EmittedFile`] per distinct name |
 //! | [`OutputMode::Serve`] | `/__presenter/deck-asset/<id>` | not read (the dev server reads them on request) |
+//!
+//! **Site-mode file names are content-addressed** (ir.md §3, audit F20): the hash in the name
+//! is [`content_hash`] of the bytes written, never the registry id (which, for a file asset,
+//! hashes its absolute path). The same deck built from two checkouts gives the same names, and
+//! an edited image gets a new name, so a host may cache `assets/` forever. Two assets with the
+//! same bytes and the same file-name hint share one file.
 //!
 //! **Site-mode URLs depend on where the text ends up.** [`Emitter::resolve_html`],
 //! [`Emitter::resolve_css`] and [`Emitter::url_for`] return URLs relative to the output
@@ -36,14 +42,25 @@
 //! **Placeholder scanning.** The placeholder grammar is `asset:` followed by exactly 12
 //! `[0-9a-f]`; a 13th hex digit (`[0-9a-fA-F]`) means the text is not a placeholder (so a
 //! longer hash is never cut to its first 12 chars), any other following character or the end
-//! of the text ends it. The emitter scans the *whole* text with that pattern instead of
-//! parsing HTML attributes and CSS `url()`s: the grammar is unambiguous, frontends only ever
-//! write placeholders into attribute values (`src`, `href`, `srcset`, `poster`,
-//! `data-background-*`, inline `style` `url()`) and CSS `url()`s, and text content never
-//! legitimately contains `asset:` + 12 hex digits. (A slide that *shows* such a string as
-//! text is therefore rewritten or rejected too; that is a documented limitation.) Unique ids
-//! are collected first, each is resolved once, then all occurrences are replaced. An id that
-//! is not registered is an [`Error::Other`] naming it.
+//! of the text ends it. Unique ids are collected first, each is resolved once, then all
+//! occurrences are replaced. An id that is not registered is an [`Error::Other`] naming it
+//! (and, in a document, the attribute it was found in).
+//!
+//! In an HTML document ([`Emitter::resolve_html`]) placeholders are replaced only where the
+//! frontends, the templates' helpers and the notebook attachment resolver write them (ir.md
+//! §3, audit F16): inside the **attribute values** of start tags (`src`, `href`, `srcset`,
+//! `poster`, `data-background-*`, inline `style` `url()`, `data-src`, …) except the
+//! attributes that hold text for people (`alt`, `title`, `placeholder`, `label`, `value`,
+//! `abbr`, `aria-*`; `is_text_attribute`), and inside the content of **`<style>` and
+//! `<script>` elements** (attachments resolved in a notebook cell's CSS or script, `asset()`
+//! in an inline script of a template). Text content is never rewritten: a literal `asset:` +
+//! 12 hex digits in prose, inline code, a code block, speaker notes, alt text or a link title
+//! is left alone. Inside `<style>`/`<script>` only registered ids are replaced (an unknown one
+//! there is a string the author wrote, left alone); an unknown id in an attribute value is an
+//! error. The document is tokenized like a browser does (the Markdown renderer's HTML
+//! tokenizer: comments, raw-text elements and quoted values are honoured), so `<p>asset:…</p>`
+//! and `<code>&lt;img src="asset:…"&gt;</code>` are text. In a stylesheet
+//! ([`Emitter::resolve_css`]) the whole text is scanned.
 //!
 //! **Query strings and fragments.** [`register_css_urls`] keeps a reference's `?query#frag`
 //! after the placeholder (`url(asset:<id>?#iefix)`), so site and serve URLs keep it. A
@@ -73,14 +90,16 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use base64::Engine as _;
 use regex::{Captures, Regex};
 
-use crate::assets::registry::{AssetData, AssetRegistry, unknown_id};
+use crate::assets::registry::{AssetData, AssetRegistry, content_hash, unknown_id};
 use crate::error::{Error, Result};
+use crate::markdown::render::{html_attr_values, html_start_tags};
 
 /// URL prefix under which `presenter serve` serves registered deck assets by id
 /// (`docs/spec/live-reload.md` §1).
@@ -109,7 +128,7 @@ pub enum OutputMode {
 /// A file the caller must write next to the document (site mode only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmittedFile {
-    /// `assets_dir.join(hashed_file_name(hint, id))`.
+    /// `assets_dir.join(hashed_file_name(hint, &content_hash(&bytes)))`.
     pub path: PathBuf,
     /// The asset's content.
     pub bytes: Vec<u8>,
@@ -126,14 +145,14 @@ enum Referrer {
 
 /// Rewrites placeholders for one output. Use one emitter per output (or carry its
 /// [`Emitter::files`] into the next one with [`Emitter::with_files`]) so that site mode
-/// emits each asset exactly once, however often it is referenced.
+/// writes each file once, however often it is referenced.
 #[derive(Debug)]
 pub struct Emitter<'a> {
     registry: &'a AssetRegistry,
     mode: &'a OutputMode,
-    /// Files emitted so far (site mode; always empty otherwise), one per distinct id, in
-    /// order of first use. This list is also the deduplication state: an asset whose path is
-    /// already in it is not emitted again.
+    /// Files emitted so far (site mode; always empty otherwise), one per distinct file name
+    /// (at most one per id), in order of first use. This list is also the deduplication
+    /// state: an asset whose path is already in it is not emitted again.
     pub files: Vec<EmittedFile>,
 }
 
@@ -159,39 +178,42 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Replace every `asset:<id>` in attribute values and CSS url() of an HTML document.
+    /// Replace every `asset:<id>` in the attribute values (except text attributes such as
+    /// `alt` and `title`) and the `<style>` and `<script>` elements of an HTML document; text
+    /// content is left alone (see the module docs).
     ///
-    /// The whole document is scanned (see the module docs for why that is sound). Site-mode
-    /// URLs are relative to the document. Errors: an unknown id ([`Error::Other`]), a file
-    /// asset that disappeared ([`Error::MissingAsset`], standalone and site modes only) or
-    /// another read failure.
+    /// Site-mode URLs are relative to the document. Errors: an unknown id in an attribute
+    /// value ([`Error::Other`], naming the attribute), a file asset that disappeared
+    /// ([`Error::MissingAsset`], standalone and site modes only) or another read failure.
     pub fn resolve_html(&mut self, html: &str) -> Result<String> {
-        self.resolve_placeholders(html, Referrer::Document)
+        self.resolve_placeholders(html, Referrer::Document, Scope::Html)
     }
 
     /// Replace `asset:<id>` inside a CSS text (typically the output of
     /// [`register_css_urls`]) that is inlined into the output document (`<style>`): site-mode
     /// URLs are relative to the document. For a stylesheet written as a file into
-    /// `assets_dir` use [`Emitter::resolve_css_in_assets_dir`]. Same scanning and errors as
-    /// [`Emitter::resolve_html`].
+    /// `assets_dir` use [`Emitter::resolve_css_in_assets_dir`]. The whole text is scanned;
+    /// errors as [`Emitter::resolve_html`].
     pub fn resolve_css(&mut self, css: &str) -> Result<String> {
-        self.resolve_placeholders(css, Referrer::Document)
+        self.resolve_placeholders(css, Referrer::Document, Scope::Css)
     }
 
     /// Like [`Emitter::resolve_css`], for a stylesheet that the caller writes as a file into
     /// the site-mode `assets_dir` (e.g. `assets/theme-<hash>.css`): site-mode URLs are bare
-    /// file names (`bg-<id>.png`), because a browser resolves them against the stylesheet's
-    /// own URL. Emitted files are shared with the other methods. In standalone and serve
-    /// mode this is exactly [`Emitter::resolve_css`].
+    /// file names (`bg-<hash>.png`), because a browser resolves them against the
+    /// stylesheet's own URL. Emitted files are shared with the other methods. In standalone
+    /// and serve mode this is exactly [`Emitter::resolve_css`].
     pub fn resolve_css_in_assets_dir(&mut self, css: &str) -> Result<String> {
-        self.resolve_placeholders(css, Referrer::AssetsDir)
+        self.resolve_placeholders(css, Referrer::AssetsDir, Scope::Css)
     }
 
-    /// URL for one id in the current mode (data URI / "assets/plot-3f9a1c2b7e0d.png" /
-    /// "/__presenter/deck-asset/3f9a1c2b7e0d"); site-mode URLs are relative to the document.
+    /// URL for one id in the current mode (data URI / "assets/plot-5e0c7b1f9a2d.png" /
+    /// "/__presenter/deck-asset/3f9a1c2b7e0d"); site-mode URLs are relative to the document
+    /// and name the file by a hash of its bytes ([`content_hash`]), not by the id.
     ///
-    /// Site mode pushes an [`EmittedFile`] unless [`Emitter::files`] already holds its path.
-    /// Serve mode only checks that the id is registered and reads nothing.
+    /// Site mode reads the asset and pushes an [`EmittedFile`] unless [`Emitter::files`]
+    /// already holds its path. Serve mode only checks that the id is registered and reads
+    /// nothing.
     pub fn url_for(&mut self, id: &str) -> Result<String> {
         self.url_from(id, Referrer::Document)
     }
@@ -205,12 +227,14 @@ impl<'a> Emitter<'a> {
                 assets_dir,
                 url_prefix,
             } => {
-                let name = hashed_file_name(&asset.file_name_hint, id);
+                // The name hashes the bytes (module docs), so they are read even when the
+                // file was emitted before: once per distinct id and resolve call.
+                let bytes = self.registry.read(id)?;
+                let name = hashed_file_name(&asset.file_name_hint, &content_hash(&bytes));
                 let path = assets_dir.join(&name);
-                // Linear, but outputs hold at most a few hundred files and this runs once
-                // per distinct id and resolve call.
+                // Linear, but outputs hold at most a few hundred files.
                 if !self.files.iter().any(|file| file.path == path) {
-                    let bytes = self.registry.read(id)?.into_owned();
+                    let bytes = bytes.into_owned();
                     tracing::debug!(id, file = %name, len = bytes.len(), "emitting asset file");
                     self.files.push(EmittedFile { path, bytes });
                 }
@@ -224,17 +248,35 @@ impl<'a> Emitter<'a> {
     }
 
     /// Shared implementation of the `resolve_*` methods.
-    fn resolve_placeholders(&mut self, text: &str, referrer: Referrer) -> Result<String> {
-        let found = find_placeholders(text);
+    fn resolve_placeholders(
+        &mut self,
+        text: &str,
+        referrer: Referrer,
+        scope: Scope,
+    ) -> Result<String> {
+        let mut found = find_placeholders(text);
+        if scope == Scope::Html && !found.is_empty() {
+            found = in_html_values(text, found);
+            // Inside `<style>`/`<script>` an unregistered id is the author's text (a string
+            // in a script), not a placeholder: what presenter writes there is registered.
+            found.retain(|p| !p.in_element() || self.registry.get(p.id).is_some());
+        }
         if found.is_empty() {
             return Ok(text.to_string());
         }
         let mut urls: BTreeMap<&str, String> = BTreeMap::new();
         for placeholder in &found {
-            if !urls.contains_key(placeholder.id) {
-                let url = self.url_from(placeholder.id, referrer)?;
-                urls.insert(placeholder.id, url);
+            if urls.contains_key(placeholder.id) {
+                continue;
             }
+            if self.registry.get(placeholder.id).is_none() {
+                return Err(match &placeholder.place {
+                    Some(place) => unknown_id_in(placeholder.id, place),
+                    None => unknown_id(placeholder.id),
+                });
+            }
+            let url = self.url_from(placeholder.id, referrer)?;
+            urls.insert(placeholder.id, url);
         }
         let drop_query = matches!(self.mode, OutputMode::Standalone);
         let mut out =
@@ -270,8 +312,9 @@ pub fn data_uri(mime: &str, bytes: &[u8]) -> String {
     uri
 }
 
-/// Deterministic, content-addressed site-mode file name: `"plot.png"` + id →
-/// `"plot-<id>.png"`; a name without extension → `"<name>-<id>"`.
+/// Deterministic site-mode file name: `"plot.png"` + hash → `"plot-<hash>.png"`; a name
+/// without extension → `"<name>-<hash>"`. The emitter passes [`content_hash`] of the
+/// asset's bytes, so names are content-addressed.
 ///
 /// Only the last path segment of `hint` is used (`/` and `\` separate), and every character
 /// other than ASCII letters, digits, `.`, `-` and `_` becomes `_`, so the result is a safe
@@ -427,6 +470,27 @@ struct Placeholder<'t> {
     id_end: usize,
     /// Byte offset just after a `?query` following the id (`== id_end` when there is none).
     query_end: usize,
+    /// Where it was found in an HTML document (an attribute's name, or `<style>` /
+    /// `<script>`), for error messages.
+    place: Option<String>,
+}
+
+impl Placeholder<'_> {
+    /// True if it was found in the content of a `<style>` or `<script>` element.
+    fn in_element(&self) -> bool {
+        self.place
+            .as_deref()
+            .is_some_and(|place| place.starts_with('<'))
+    }
+}
+
+/// Which parts of a text the `resolve_*` methods rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// An HTML document: attribute values and `<style>`/`<script>` contents only.
+    Html,
+    /// A stylesheet: the whole text.
+    Css,
 }
 
 /// Every placeholder of `text`, in order.
@@ -441,9 +505,74 @@ fn find_placeholders(text: &str) -> Vec<Placeholder<'_>> {
                 id: id.as_str(),
                 id_end: id.end(),
                 query_end: query_end(text, id.end()),
+                place: None,
             })
         })
         .collect()
+}
+
+/// The placeholders of `found` (all of `html`'s, in order) that lie in a region of
+/// [`html_regions`], each with its region as `place` and its query cut at the region's end.
+fn in_html_values<'t>(html: &str, found: Vec<Placeholder<'t>>) -> Vec<Placeholder<'t>> {
+    let regions = html_regions(html);
+    found
+        .into_iter()
+        .filter_map(|mut placeholder| {
+            let after = regions.partition_point(|(range, _)| range.start <= placeholder.start);
+            let (range, place) = regions.get(after.checked_sub(1)?)?;
+            if placeholder.id_end > range.end {
+                return None;
+            }
+            placeholder.query_end = placeholder.query_end.min(range.end);
+            placeholder.place = Some(place.clone());
+            Some(placeholder)
+        })
+        .collect()
+}
+
+/// The HTML attributes whose value is text for people, not a URL ([`is_text_attribute`]).
+const TEXT_ATTRS: [&str; 6] = ["alt", "title", "placeholder", "label", "value", "abbr"];
+
+/// True if the attribute `name` (lowercase) holds text for people rather than a URL: `alt`,
+/// `title`, `placeholder`, `label`, `value`, `abbr` and every `aria-*` attribute. No
+/// placeholder is ever written there: the emitter leaves their values alone (audit F16) and
+/// the notebook frontend resolves no `attachment:` URL there.
+pub(crate) fn is_text_attribute(name: &str) -> bool {
+    TEXT_ATTRS.contains(&name) || name.starts_with("aria-")
+}
+
+/// The byte ranges of `html` where placeholders are replaced (module docs), sorted and
+/// disjoint, each with where it is for messages (an attribute's name, or `<style>` /
+/// `<script>`): the value of every attribute of a start tag (outside comments and raw-text
+/// elements, quotes excluded) except the text attributes ([`is_text_attribute`]), and the
+/// content of every `<style>` and `<script>` element (up to its end tag, or the end of
+/// `html`).
+fn html_regions(html: &str) -> Vec<(Range<usize>, String)> {
+    let mut regions: Vec<(Range<usize>, String)> = html_attr_values(html)
+        .into_iter()
+        .filter(|(name, _)| !is_text_attribute(name))
+        .map(|(name, range)| (range, name))
+        .collect();
+    // ASCII lowercasing keeps every byte offset.
+    let lower = html.to_ascii_lowercase();
+    for (name, end) in html_start_tags(html) {
+        if matches!(name.as_str(), "style" | "script") {
+            let close = format!("</{name}");
+            let stop = lower[end..].find(&close).map_or(html.len(), |at| end + at);
+            regions.push((end..stop, format!("<{name}>")));
+        }
+    }
+    regions.sort_by_key(|(range, _)| range.start);
+    regions
+}
+
+/// The error for an unregistered id found in a document in the value of the attribute
+/// `attribute` (only attribute values make an unknown id an error, see the module docs).
+fn unknown_id_in(id: &str, attribute: &str) -> Error {
+    Error::Other(format!(
+        "unknown asset id '{id}': the placeholder 'asset:{id}' in the `{attribute}` attribute \
+         of an element of the document does not name a registered asset"
+    ))
 }
 
 /// End of a `?query` starting at byte `pos` (`pos` itself when there is none). The query
@@ -1312,7 +1441,7 @@ mod tests {
             )
         );
         let serve = OutputMode::Serve;
-        let out = Emitter::new(&registry, &serve).resolve_html(&text).unwrap();
+        let out = Emitter::new(&registry, &serve).resolve_css(&text).unwrap();
         assert!(
             out.contains(&format!("url(/__presenter/deck-asset/{id}?#iefix)")),
             "{out}"
@@ -1351,18 +1480,140 @@ mod tests {
         let mut registry = AssetRegistry::new();
         let a = registry.register_bytes(vec![1], "image/png", "a.png");
         let b = registry.register_bytes(vec![2], "image/png", "b.png");
-        let text = format!("x asset:{a}?next=asset:{b} y");
+        let text = format!("<a href=\"asset:{a}?next=asset:{b}\">y</a>");
         let standalone = OutputMode::Standalone;
         let out = Emitter::new(&registry, &standalone)
             .resolve_html(&text)
             .unwrap();
-        assert_eq!(out, format!("x {} y", data_uri("image/png", &[1])));
+        assert_eq!(
+            out,
+            format!("<a href=\"{}\">y</a>", data_uri("image/png", &[1]))
+        );
         let serve = OutputMode::Serve;
         let out = Emitter::new(&registry, &serve).resolve_html(&text).unwrap();
         assert_eq!(
             out,
-            format!("x /__presenter/deck-asset/{a}?next=/__presenter/deck-asset/{b} y")
+            format!(
+                "<a href=\"/__presenter/deck-asset/{a}?next=/__presenter/deck-asset/{b}\">y</a>"
+            )
         );
+    }
+
+    /// ir.md §3 (audit F16): in a document, placeholders are replaced in attribute values
+    /// (not in text attributes such as `alt` and `title`) and in `<style>`/`<script>`
+    /// elements only; the same text in prose, code, notes, alt text or titles stays.
+    #[test]
+    fn html_text_content_is_never_rewritten() {
+        let mut registry = AssetRegistry::new();
+        let id = registry.register_bytes(vec![7], "image/png", "a.png");
+        let uri = data_uri("image/png", &[7]);
+        let standalone = OutputMode::Standalone;
+        let resolve = |html: &str| {
+            Emitter::new(&registry, &standalone)
+                .resolve_html(html)
+                .unwrap()
+        };
+        for text in [
+            format!("<p>The id asset:{id} is text.</p>"),
+            format!("<p><code>asset:{id}</code></p>"),
+            format!("<pre><code>&lt;img src=&quot;asset:{id}&quot;&gt;</code></pre>"),
+            format!("<aside class=\"notes\">asset:{id}</aside>"),
+            format!("<!-- <img src=\"asset:{id}\"> -->"),
+            format!("<textarea><img src=\"asset:{id}\"></textarea>"),
+            format!("<p title='x'>asset:{id}</p>"),
+            // Text attributes hold the author's words, not URLs.
+            format!("<img src=\"x.png\" alt=\"The id asset:{id}\" title='asset:{id}'>"),
+            format!("<a href=\"https://e.org\" title=\"see asset:{id}\">x</a>"),
+            format!("<div aria-label=\"asset:{id}\" ARIA-DESCRIPTION=asset:{id}></div>"),
+            format!("<input placeholder=\"asset:{id}\" value=\"asset:{id}\">"),
+            // Unregistered ids in text, text attributes and scripts are not errors either.
+            "<p>asset:0123456789ab and `asset:3f9a1c2b7e0d`</p>".to_string(),
+            "<img alt=\"asset:0123456789ab\" src=\"x.png\">".to_string(),
+            "<a title=\"see asset:0123456789ab\" href=\"https://e.org\">x</a>".to_string(),
+            "<script>console.log(\"asset:0123456789ab\")</script>".to_string(),
+            "<style>a::after{content:\"asset:0123456789ab\"}</style>".to_string(),
+        ] {
+            assert_eq!(resolve(&text), text);
+        }
+        // Attribute values (any quoting), inline styles and <style>/<script> contents are.
+        for (html, expected) in [
+            (
+                format!("<img src=\"asset:{id}\" alt=\"asset:{id}\">"),
+                format!("<img src=\"{uri}\" alt=\"asset:{id}\">"),
+            ),
+            (
+                format!("<div data-src='asset:{id}' data-background-image=asset:{id}></div>"),
+                format!("<div data-src='{uri}' data-background-image={uri}></div>"),
+            ),
+            (
+                format!("<img src=asset:{id}><p>asset:{id}</p>"),
+                format!("<img src={uri}><p>asset:{id}</p>"),
+            ),
+            (
+                format!("<div style='background:url(asset:{id}?v=1)'>asset:{id}</div>"),
+                format!("<div style='background:url({uri})'>asset:{id}</div>"),
+            ),
+            (
+                format!("<STYLE>a{{b:url(asset:{id})}}</Style><p>asset:{id}</p>"),
+                format!("<STYLE>a{{b:url({uri})}}</Style><p>asset:{id}</p>"),
+            ),
+            (
+                format!("<script>show('asset:{id}')</script>asset:{id}"),
+                format!("<script>show('{uri}')</script>asset:{id}"),
+            ),
+        ] {
+            assert_eq!(resolve(&html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn unknown_ids_in_a_document_name_where_they_are() {
+        let registry = AssetRegistry::new();
+        let standalone = OutputMode::Standalone;
+        let mut emitter = Emitter::new(&registry, &standalone);
+        let err = emitter
+            .resolve_html("<p>asset:0123456789ab</p><img src=\"asset:0123456789ab\">")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown asset id '0123456789ab': the placeholder 'asset:0123456789ab' in the `src` \
+             attribute of an element of the document does not name a registered asset"
+        );
+        // In `<style>`/`<script>` an unknown id is the author's text and stays.
+        let style = "<style>x{y:url(asset:0123456789ab)}</style>";
+        assert_eq!(emitter.resolve_html(style).unwrap(), style);
+        // Stylesheets are scanned whole.
+        let err = emitter.resolve_css("/* asset:0123456789ab */").unwrap_err();
+        assert!(err.to_string().contains("'asset:0123456789ab'"), "{err}");
+    }
+
+    /// ir.md §3 (audit F20): a site-mode file name hashes the bytes, not the id (which for a
+    /// file asset hashes its absolute path).
+    #[test]
+    fn site_file_names_hash_the_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+        for dir in [&one, &two] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("plot.png"), b"same bytes").unwrap();
+        }
+        let mut registry = AssetRegistry::new();
+        let a = registry.register_file(&one.join("plot.png"));
+        let b = registry.register_file(&two.join("plot.png"));
+        assert_ne!(a, b, "file ids hash the path");
+        let mode = site();
+        let mut emitter = Emitter::new(&registry, &mode);
+        let hash = content_hash(b"same bytes");
+        let name = format!("plot-{hash}.png");
+        assert_eq!(emitter.url_for(&a).unwrap(), format!("assets/{name}"));
+        assert_eq!(emitter.url_for(&b).unwrap(), format!("assets/{name}"));
+        assert_eq!(emitter.files.len(), 1, "same bytes and hint: one file");
+        assert_eq!(emitter.files[0].path, Path::new("out/assets").join(&name));
+        // Changed bytes, new name.
+        std::fs::write(one.join("plot.png"), b"edited").unwrap();
+        let mut emitter = Emitter::new(&registry, &mode);
+        let edited = format!("assets/plot-{}.png", content_hash(b"edited"));
+        assert_eq!(emitter.url_for(&a).unwrap(), edited);
     }
 
     #[test]

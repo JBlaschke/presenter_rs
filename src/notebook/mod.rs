@@ -14,7 +14,9 @@
 //!
 //! Missing local files (in raw HTML cells, `text/html` outputs, Markdown images, slide
 //! backgrounds) never fail [`parse`]: they are `missing-asset` warnings, as in the Markdown
-//! frontend (ir.md §4).
+//! frontend (ir.md §4). Outputs come from executed code, so the local files they name are
+//! only embedded when they are inside the notebook's directory ([`outputs::OutputFiles`],
+//! notebook-mapping §4); files named by the author's cells resolve like in a Markdown deck.
 
 pub mod convert;
 pub mod nbformat;

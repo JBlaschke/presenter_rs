@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
-use super::{REQUIRED_TEMPLATES, Theme, ThemeDir, ThemeManifest, ThemeSource, disk_file};
+use super::manifest::REVEAL_THEMES;
+use super::{
+    LINKED_OUTSIDE, REQUIRED_TEMPLATES, Theme, ThemeDir, ThemeManifest, ThemeSource, closest_name,
+    disk_file, linked_outside,
+};
 
 /// The most themes one chain may contain (the requested theme plus seven ancestors).
 pub const MAX_CHAIN_LEN: usize = 8;
@@ -27,9 +31,10 @@ pub const MANIFEST_FILE: &str = "theme.toml";
 ///
 /// Fails with [`Error::Theme`] (`name` = `spec`, or the `extends` value for a parent that
 /// cannot be found or parsed) when the theme is not found (the message lists every
-/// directory that was tried and the built-in theme names), a manifest is invalid, the
-/// chain has a cycle or more than [`MAX_CHAIN_LEN`] themes, two themes share a name, or the
-/// root lacks required templates (the message lists the missing files).
+/// directory that was tried and the built-in theme names, and suggests a near miss), a
+/// manifest is invalid, the chain has a cycle or more than [`MAX_CHAIN_LEN`] themes, two
+/// themes share a name, or the root lacks required templates (the message lists the missing
+/// files).
 pub fn resolve(spec: &str, search_roots: &[&Path]) -> Result<Theme> {
     let source = locate(spec, search_roots).map_err(|message| theme_error(spec, message))?;
     let mut chain: Vec<ThemeDir> = Vec::new();
@@ -97,7 +102,51 @@ fn locate(spec: &str, roots: &[&Path]) -> std::result::Result<ThemeSource, Strin
             prefix: format!("themes/{spec}/"),
         });
     }
-    Err(not_found_message(&candidates, &builtins))
+    let mut message = not_found_message(&candidates, &builtins);
+    if let Some(hint) = not_found_hint(spec, &candidates, &builtins) {
+        message.push_str(&format!(" ({hint})"));
+    }
+    Err(message)
+}
+
+/// A hint for a theme `spec` that was not found (audit F40): for the name of a stock
+/// reveal.js theme, how a theme selects it; otherwise `did you mean '…'?` for the closest
+/// (edit distance 1 or 2) built-in theme name (when `spec` is a plain name) or theme
+/// directory (a directory with a `theme.toml`) next to one of the `candidates`, written like
+/// `spec`.
+fn not_found_hint(spec: &str, candidates: &[PathBuf], builtins: &[String]) -> Option<String> {
+    if REVEAL_THEMES.contains(&spec) {
+        return Some(format!(
+            "'{spec}' is a reveal.js theme, not a presenter theme: select it with \
+             `reveal_theme = \"{spec}\"` in the [styles] table of a theme's {MANIFEST_FILE}; \
+             `presenter theme new <dir>` creates a theme that extends the default one"
+        ));
+    }
+    let trimmed = spec.trim_end_matches(['/', '\\']);
+    let (prefix, last) = match trimmed.rfind(['/', '\\']) {
+        Some(at) => trimmed.split_at(at + 1),
+        None => ("", trimmed),
+    };
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    if prefix.is_empty() {
+        names.extend(builtins.iter().cloned());
+    }
+    for parent in candidates.iter().filter_map(|candidate| candidate.parent()) {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = entry.file_name().to_str()
+                && path.is_dir()
+                && disk_file(&path, MANIFEST_FILE).is_some()
+            {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    let name = closest_name(last, names.iter().map(String::as_str))?;
+    Some(format!("did you mean '{prefix}{name}'?"))
 }
 
 /// The directories `spec` may be: `spec` itself if absolute, else `spec` below each root,
@@ -120,7 +169,9 @@ fn candidate_dirs(spec: &str, roots: &[&Path]) -> Vec<PathBuf> {
     candidates
 }
 
-/// "not found" with every directory tried and the built-in names.
+/// "not found" with every directory tried and the built-in names, and for each tried
+/// directory that exists why it is no theme (no `theme.toml`, a case variant of the name,
+/// or a `theme.toml` that is a symbolic link out of the directory).
 fn not_found_message(candidates: &[PathBuf], builtins: &[String]) -> String {
     let tried = if candidates.is_empty() {
         "no search directories".to_string()
@@ -136,6 +187,14 @@ fn not_found_message(candidates: &[PathBuf], builtins: &[String]) -> String {
         builtins.join(", ")
     );
     for candidate in candidates.iter().filter(|c| c.is_dir()) {
+        if linked_outside(candidate, MANIFEST_FILE) {
+            // Audit F08: the manifest is there, but a link takes it out of the theme.
+            message.push_str(&format!(
+                " ({} has a {MANIFEST_FILE} that {LINKED_OUTSIDE})",
+                candidate.display()
+            ));
+            continue;
+        }
         message.push_str(&format!(
             " ({} exists but has no {MANIFEST_FILE}",
             candidate.display()

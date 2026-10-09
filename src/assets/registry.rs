@@ -72,7 +72,7 @@ impl AssetRegistry {
     /// rather than on the working directory.
     pub fn register_file(&mut self, abs_path: &Path) -> String {
         let path = resolve_path(abs_path);
-        let id = hash_id(path.to_string_lossy().as_bytes());
+        let id = content_hash(path.to_string_lossy().as_bytes());
         self.assets.entry(id.clone()).or_insert_with(|| Asset {
             id: id.clone(),
             mime: mime_guess::from_path(&path)
@@ -90,7 +90,7 @@ impl AssetRegistry {
 
     /// Registers in-memory bytes. id = first 12 hex chars of blake3(bytes). Returns the id.
     pub fn register_bytes(&mut self, bytes: Vec<u8>, mime: &str, file_name_hint: &str) -> String {
-        let id = hash_id(&bytes);
+        let id = content_hash(&bytes);
         self.assets.entry(id.clone()).or_insert_with(|| Asset {
             id: id.clone(),
             mime: mime.to_string(),
@@ -192,8 +192,10 @@ pub(crate) fn unknown_id(id: &str) -> Error {
     ))
 }
 
-/// First [`ID_LEN`] lowercase hex chars of the BLAKE3 hash of `bytes`.
-fn hash_id(bytes: &[u8]) -> String {
+/// First [`ID_LEN`] lowercase hex chars of the BLAKE3 hash of `bytes`: the id of an asset
+/// registered by its bytes, and the hash in a site-mode file name (`assets::emit`), which
+/// is always taken from the bytes, also for a file asset (whose id hashes its path).
+pub fn content_hash(bytes: &[u8]) -> String {
     let hex = blake3::hash(bytes).to_hex();
     hex[..ID_LEN].to_string()
 }

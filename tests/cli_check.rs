@@ -281,6 +281,8 @@ fn examples_report_no_warnings() {
     let mut decks = vec![
         "examples/basic/slides.md",
         "examples/headings-mode/slides.md",
+        // A Sass theme: `check` compiles it (audit F10).
+        "examples/custom-theme-scss/slides.md",
     ];
     // Created by T33; it must be clean once it exists.
     if root().join("examples/notebook/analysis.ipynb").exists() {
@@ -461,4 +463,485 @@ fn indented_dash_lines_rules_after_link_definitions_and_content_setext_headings_
     );
     assert_eq!(code, 1, "{stderr}");
     assert_eq!(stderr.matches(": warning: `-").count(), 5, "{stderr}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Audit fixes (A4)
+
+/// `(code, path, line)` of each JSON entry.
+fn codes_paths_and_lines(entries: &[Value]) -> Vec<(String, String, Option<u64>)> {
+    entries
+        .iter()
+        .map(|e| {
+            (
+                e["code"].as_str().unwrap().to_string(),
+                e["path"].as_str().unwrap().to_string(),
+                e["line"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+/// F10: a deck whose build fails on its theme does not pass `check`: the problems
+/// `presenter theme check` reports that a build fails on are errors, located in the theme
+/// (a template that does not compile is one when the deck uses it).
+#[test]
+fn theme_problems_that_fail_a_build_fail_the_check() {
+    let manifest = "name = \"th\"\nextends = \"default\"\n[styles]\nentries = [\"styles/nope.css\"]\n\
+                    highlight_style = \"monokia\"\n[scripts]\nentries = [\"scripts/extra.js\"]\n\
+                    [reveal]\nplugins = [\"bogus\", \"zoom\"]\n";
+    let dir = project(&[
+        ("th/theme.toml", manifest),
+        (
+            "th/templates/layouts/title.html",
+            "<section>\n{%- endiff %}\n",
+        ),
+        ("deck.md", "---\ntheme: ./th\n---\n# One {layout=title}\n"),
+        ("ok.md", "# One\n"),
+    ]);
+    let (code, entries) = check_json(dir.path(), &["deck.md"]);
+    assert_eq!(code, 1);
+    let theme = "th/theme.toml".to_string();
+    assert_eq!(
+        codes_paths_and_lines(&entries),
+        [
+            ("theme-style-entry".into(), theme.clone(), Some(4)),
+            ("theme-script-entry".into(), theme.clone(), Some(7)),
+            ("theme-highlight-style".into(), theme.clone(), Some(5)),
+            (
+                "theme-template".into(),
+                "th/templates/layouts/title.html".into(),
+                Some(2)
+            ),
+            ("theme-plugins".into(), theme, Some(9)),
+        ]
+    );
+    assert!(entries.iter().all(|e| e["level"] == "error"));
+    let (_, _, stderr) = run(dir.path(), &["check", "deck.md"]);
+    assert!(
+        stderr.starts_with(
+            "th/theme.toml:4: error: theme 'th': [styles] entry 'styles/nope.css' is not found"
+        ),
+        "{stderr}"
+    );
+    // The build fails on the same theme; a deck with a sound theme passes.
+    assert_eq!(run(dir.path(), &["build", "deck.md", "-o", "o.html"]).0, 1);
+    assert_eq!(check_json(dir.path(), &["ok.md"]), (0, Vec::new()));
+
+    // A highlight_style typo alone: build says what is wrong (not a deck.html line).
+    let dir = project(&[
+        (
+            "th/theme.toml",
+            "name = \"th\"\nextends = \"default\"\n[styles]\nhighlight_style = \"monokia\"\n",
+        ),
+        ("deck.md", "---\ntheme: ./th\n---\n# One\n"),
+    ]);
+    let (code, entries) = check_json(dir.path(), &["deck.md"]);
+    assert_eq!((code, entries.len()), (1, 1), "{entries:?}");
+    let (code, _, stderr) = run(dir.path(), &["build", "deck.md", "-o", "o.html"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.starts_with("error: theme 'th': [styles] highlight_style 'monokia'"),
+        "{stderr}"
+    );
+}
+
+/// F10 (review): a template that does not compile but that the deck does not use (a layout
+/// no slide uses, a partial nothing includes) is a warning, since the build succeeds; once a
+/// slide uses it, it is an error and the build fails.
+#[test]
+fn templates_the_deck_does_not_use_only_warn() {
+    let dir = project(&[
+        ("t/theme.toml", "name = \"u\"\nextends = \"default\"\n"),
+        (
+            "t/templates/layouts/unused.html",
+            "<section>{%- endiff %}</section>",
+        ),
+        ("t/templates/partials/draft.html", "{% if x %}"),
+        ("d.md", "---\ntheme: ./t\n---\n# A\n"),
+        ("e.md", "---\ntheme: ./t\n---\n# A {layout=unused}\n"),
+    ]);
+    assert_eq!(run(dir.path(), &["build", "d.md", "-o", "o.html"]).0, 0);
+    let (code, entries) = check_json(dir.path(), &["d.md"]);
+    assert_eq!(code, 0);
+    let found: Vec<(&str, &str, &str)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e["code"].as_str().unwrap(),
+                e["path"].as_str().unwrap(),
+                e["level"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "theme-template",
+                "t/templates/layouts/unused.html",
+                "warning"
+            ),
+            (
+                "theme-template",
+                "t/templates/partials/draft.html",
+                "warning"
+            ),
+        ]
+    );
+    assert!(
+        entries[0]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("(this deck does not use the template, so its build does not fail on it; a deck that uses it does)")
+    );
+    assert_eq!(run(dir.path(), &["check", "--deny-warnings", "d.md"]).0, 1);
+
+    let (code, entries) = check_json(dir.path(), &["e.md"]);
+    assert_eq!(code, 1);
+    assert_eq!(entries[0]["level"], "error", "{entries:?}");
+    assert_eq!(entries[0]["path"], "t/templates/layouts/unused.html");
+    assert_eq!(run(dir.path(), &["build", "e.md", "-o", "o.html"]).0, 1);
+}
+
+/// F10 (review): `check` compiles the theme's stylesheet as a build does, so a Sass error or
+/// a `url()` that finds no file fails the check too, located in the stylesheet.
+#[test]
+fn theme_stylesheets_that_do_not_compile_fail_the_check() {
+    let manifest =
+        "name = \"th\"\nextends = \"default\"\n[styles]\nentries = [\"styles/theme.scss\"]\n";
+    let dir = project(&[
+        ("th/theme.toml", manifest),
+        ("th/styles/theme.scss", ".a { color: red"),
+        ("deck.md", "---\ntheme: ./th\n---\n# One\n"),
+    ]);
+    assert_eq!(run(dir.path(), &["build", "deck.md", "-o", "o.html"]).0, 1);
+    let (code, entries) = check_json(dir.path(), &["deck.md"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        codes_paths_and_lines(&entries),
+        [(
+            "style-error".to_string(),
+            "th/styles/theme.scss".to_string(),
+            None
+        )]
+    );
+    assert!(
+        entries[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("style '@th/styles/theme.scss': "),
+        "{entries:?}"
+    );
+
+    std::fs::write(
+        dir.path().join("th/styles/theme.scss"),
+        ".a { background: url(../assets/nope.png); }",
+    )
+    .unwrap();
+    assert_eq!(run(dir.path(), &["build", "deck.md", "-o", "o.html"]).0, 1);
+    let (code, entries) = check_json(dir.path(), &["deck.md"]);
+    assert_eq!(code, 1);
+    assert!(
+        entries[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("url(../assets/nope.png) not found"),
+        "{entries:?}"
+    );
+
+    std::fs::write(
+        dir.path().join("th/styles/theme.scss"),
+        "$c: red; .a { color: $c; }",
+    )
+    .unwrap();
+    assert_eq!(check_json(dir.path(), &["deck.md"]), (0, Vec::new()));
+}
+
+/// F08 (review): a theme file that a symbolic link takes out of the theme is reported as
+/// such: `check` warns about the link and fails on the stylesheet that names it, and the
+/// failed build logs which link it ignored (once), not just "not found".
+#[cfg(unix)]
+#[test]
+fn links_out_of_a_theme_are_reported() {
+    let manifest =
+        "name = \"th\"\nextends = \"default\"\n[styles]\nentries = [\"styles/theme.css\"]\n";
+    let dir = project(&[
+        ("secret.txt", "SECRET"),
+        ("th/theme.toml", manifest),
+        (
+            "th/styles/theme.css",
+            "body { background: url(../assets/logo.png); }\n.b { background: url(../assets/logo.png?x); }\n",
+        ),
+        ("deck.md", "---\ntheme: ./th\n---\n# One\n"),
+    ]);
+    std::fs::create_dir_all(dir.path().join("th/assets")).unwrap();
+    std::os::unix::fs::symlink("../../secret.txt", dir.path().join("th/assets/logo.png")).unwrap();
+    let (code, entries) = check_json(dir.path(), &["deck.md"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        codes_paths_and_lines(&entries),
+        [
+            (
+                "theme-link-outside".to_string(),
+                "th/assets/logo.png".to_string(),
+                None
+            ),
+            (
+                "style-error".to_string(),
+                "th/styles/theme.css".to_string(),
+                None
+            ),
+        ]
+    );
+    assert_eq!(entries[0]["level"], "warning");
+    // Text mode: the findings only, the link once.
+    let (_, _, stderr) = run(dir.path(), &["check", "deck.md"]);
+    assert_eq!(
+        stderr.matches("is a symbolic link to ").count(),
+        1,
+        "{stderr}"
+    );
+
+    let (code, _, stderr) = run(dir.path(), &["build", "deck.md", "-o", "o.html"]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        stderr
+            .matches("assets/logo.png is a symbolic link to ")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("outside the theme directory: presenter ignores it, so it counts as missing"),
+        "{stderr}"
+    );
+}
+
+/// F40: a near-miss layout name gets a suggestion.
+#[test]
+fn unknown_layouts_suggest_the_near_miss() {
+    let dir = project(&[("deck.md", "# One\n\n---\n\n## Two {layout=titel}\n")]);
+    let (code, _, stderr) = run(dir.path(), &["check", "deck.md"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("unknown layout 'titel' (theme 'default' has: ")
+            && stderr.contains("; did you mean 'title'?); using the default layout"),
+        "{stderr}"
+    );
+}
+
+/// A notebook cell of `kind` with `source` and `metadata`.
+fn nb_cell(kind: &str, source: &str, metadata: Value) -> Value {
+    let mut cell = serde_json::json!({"cell_type": kind, "metadata": metadata, "source": source});
+    if kind == "code" {
+        cell["outputs"] = serde_json::json!([]);
+        cell["execution_count"] = serde_json::json!(1);
+    }
+    cell
+}
+
+/// F28: a notebook whose cells have no slide types is one slide; `check` (and `build`) say
+/// why and how to split it.
+#[test]
+fn notebooks_without_slide_types_get_a_hint() {
+    use serde_json::json;
+    let plain = [
+        nb_cell("markdown", "# Analysis", json!({})),
+        nb_cell("markdown", "Some text", json!({})),
+        nb_cell("code", "x = 1", json!({})),
+        nb_cell(
+            "markdown",
+            "Notes",
+            json!({"slideshow": {"slide_type": "notes"}}),
+        ),
+    ];
+    let mut typed = plain.clone();
+    typed[1]["metadata"] = json!({"slideshow": {"slide_type": "slide"}});
+    let dir = project(&[
+        ("plain.ipynb", &notebook(&plain)),
+        ("typed.ipynb", &notebook(&typed)),
+        ("short.ipynb", &notebook(&plain[..2])),
+    ]);
+    let (code, entries) = check_json(dir.path(), &["plain.ipynb"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        codes_and_lines(&entries),
+        [("notebook-single-slide".to_string(), None)]
+    );
+    let message = entries[0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(
+            "all 3 cells are on one slide because no cell has a slide type (as in `jupyter \
+             nbconvert --to slides`)"
+        ) && message.contains("Slide Type")
+            && message.contains("split_markdown_cells"),
+        "{message}"
+    );
+    assert_eq!(check_json(dir.path(), &["typed.ipynb"]), (0, Vec::new()));
+    assert_eq!(check_json(dir.path(), &["short.ipynb"]), (0, Vec::new()));
+    let (code, _, stderr) = run(dir.path(), &["build", "plain.ipynb", "-o", "o.html"]);
+    assert_eq!(code, 0);
+    assert!(
+        stderr.contains("warning: all 3 cells are on one slide"),
+        "{stderr}"
+    );
+}
+
+/// F38: a missing file named by an output is reported for its cell (the cell-level span,
+/// so check's JSON and the `-->` line of the failed build name the cell) and for the output
+/// (in the message), without quoting an unrelated line of the cell's code.
+#[test]
+fn missing_files_of_outputs_name_the_cell_and_the_output() {
+    use serde_json::json;
+    let title = nb_cell(
+        "markdown",
+        "# T",
+        json!({"slideshow": {"slide_type": "slide"}}),
+    );
+    let mut first = nb_cell("code", "x\ny = 2", json!({}));
+    first["outputs"] = json!([
+        {"output_type": "display_data", "metadata": {}, "data": {"text/markdown": "![m](missing.png)"}}
+    ]);
+    let mut second = nb_cell("code", "show()", json!({}));
+    second["outputs"] = json!([
+        {"output_type": "display_data", "metadata": {}, "data": {"text/html": "<img src=\"missing2.png\">"}}
+    ]);
+    let dir = project(&[("a.ipynb", &notebook(&[title, first, second]))]);
+    let (code, _, stderr) = run(dir.path(), &["check", "a.ipynb"]);
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    assert!(
+        lines[0].starts_with(
+            "a.ipynb: cell 1, line 1: warning: output 0: image `missing.png` not found"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        lines[1].starts_with(
+            "a.ipynb: cell 2, line 1: warning: output 0: file `missing2.png` not found"
+        ),
+        "{stderr}"
+    );
+    let (code, entries) = check_json(dir.path(), &["a.ipynb"]);
+    assert_eq!(code, 0);
+    let found: Vec<(Option<u64>, Option<u64>, bool)> = entries
+        .iter()
+        .map(|e| {
+            let message = e["message"].as_str().unwrap();
+            (
+                e["cell"].as_u64(),
+                e["line"].as_u64(),
+                message.starts_with("output 0: "),
+            )
+        })
+        .collect();
+    assert_eq!(found, [(Some(1), Some(1), true), (Some(2), Some(1), true)]);
+
+    let (code, _, stderr) = run(dir.path(), &["build", "a.ipynb", "-o", "o.html"]);
+    assert_eq!(code, 1);
+    let lines: Vec<&str> = stderr.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.ends_with("error: asset not found: missing.png"))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(
+        lines
+            .get(at + 1)
+            .is_some_and(|line| line.trim_start() == "--> a.ipynb: cell 1, line 1"),
+        "the failing error names the cell: {stderr}"
+    );
+    assert!(
+        stderr.contains("a.ipynb: cell 2, line 1"),
+        "the second missing file names its cell too: {stderr}"
+    );
+    assert!(
+        !stderr.contains("| x") && !stderr.contains("| y = 2") && !stderr.contains("| show()"),
+        "no line of the code is quoted for an output: {stderr}"
+    );
+}
+
+/// F08: files named by outputs (written by executed code) are only embedded from inside the
+/// notebook's directory; the author's cells resolve `..` like a Markdown deck.
+#[test]
+fn outputs_embed_no_files_from_outside_the_notebook_directory() {
+    use serde_json::json;
+    let mut cell = nb_cell("code", "show()", json!({}));
+    cell["outputs"] = json!([
+        {"output_type": "display_data", "metadata": {}, "data": {"text/html": "<img src=\"../secret.txt\"><img src=\"fig.png\">"}},
+        {"output_type": "display_data", "metadata": {}, "data": {"text/markdown": "![x](../secret.txt) ![y](fig.png)"}}
+    ]);
+    let title = nb_cell(
+        "markdown",
+        "# T\n\n![logo](../logo.png)",
+        json!({"slideshow": {"slide_type": "slide"}}),
+    );
+    let dir = project(&[
+        ("secret.txt", "SECRET-CONTENT-123\n"),
+        ("logo.png", "LOGO-BYTES"),
+        ("sub/fig.png", "FIG-BYTES"),
+        ("sub/nb.ipynb", &notebook(&[title, cell])),
+    ]);
+    let (code, entries) = check_json(dir.path(), &["sub/nb.ipynb"]);
+    assert_eq!(code, 0);
+    let found: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|e| (e["code"].as_str().unwrap(), e["message"].as_str().unwrap()))
+        .collect();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        entries.iter().all(|e| e["cell"] == 1 && e["line"] == 1),
+        "{entries:?}"
+    );
+    for (output, (code, message)) in found.iter().enumerate() {
+        assert_eq!(*code, "output-file-outside");
+        assert!(
+            message.starts_with(&format!("output {output}: `../secret.txt` names "))
+                && message.contains("secret.txt, which is outside the notebook's directory"),
+            "{message}"
+        );
+    }
+    let (code, _, stderr) = run(dir.path(), &["build", "sub/nb.ipynb", "-o", "o.html"]);
+    assert_eq!(code, 0, "{stderr}");
+    let html = std::fs::read_to_string(dir.path().join("o.html")).unwrap();
+    // base64 of the secret, the figure and the logo
+    assert!(
+        !html.contains("U0VDUkVULUNPTlRFTlQtMTIz"),
+        "the secret is not embedded"
+    );
+    assert!(
+        html.contains("src=\"../secret.txt\""),
+        "the URL stays as written"
+    );
+    assert_eq!(html.matches("RklHLUJZVEVT").count(), 2, "fig.png, twice");
+    assert!(
+        html.contains("TE9HTy1CWVRFUw=="),
+        "the author's ../logo.png is embedded"
+    );
+}
+
+/// F43: a notebook saved with a UTF-8 byte order mark is read like any other.
+#[test]
+fn notebooks_with_a_byte_order_mark_check_and_build() {
+    let text = std::fs::read_to_string(root().join("examples/notebook/analysis.ipynb")).unwrap();
+    let dir = project(&[("bom.ipynb", &format!("\u{feff}{text}"))]);
+    let (code, stdout, stderr) = run(dir.path(), &["check", "--deny-warnings", "bom.ipynb"]);
+    assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "", ""));
+    let (code, _, stderr) = run(dir.path(), &["build", "bom.ipynb", "-o", "o.html"]);
+    assert_eq!(code, 0, "{stderr}");
+    // Its errors quote the source line, as for a notebook without the mark (review).
+    let cells = [nb_cell(
+        "markdown",
+        "# T\n\n![x](nope.png)",
+        serde_json::json!({}),
+    )];
+    let dir = project(&[("bom.ipynb", &format!("\u{feff}{}", notebook(&cells)))]);
+    let (code, _, stderr) = run(dir.path(), &["build", "bom.ipynb", "-o", "o.html"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("--> bom.ipynb: cell 0, line 3\n  |\n3 | ![x](nope.png)\n"),
+        "{stderr}"
+    );
 }

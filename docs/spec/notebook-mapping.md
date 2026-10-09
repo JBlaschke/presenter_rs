@@ -44,6 +44,7 @@ pub type MimeBundle = BTreeMap<String, serde_json::Value>;
   with `SlideType::{Slide, Subslide, Fragment, Skip, Notes, Continue}`; absent or `"-"` →
   `Continue`; unknown string → `Continue` plus a warning.
 - Language: `metadata.language_info.name`, else `metadata.kernelspec.language`, else `"text"`.
+- One leading UTF-8 byte order mark is ignored, as in Markdown and TOML files (audit F43).
 
 > **Clarifications (T30, 2026-10-08):** `""` and `null` slide types are treated like `"-"`
 > (JupyterLab 4 writes `""`). `CellType` has a fourth variant `Unknown` for cell types from newer
@@ -92,6 +93,17 @@ for (index, cell) in cells.enumerate():
 - `Features.notebook = true` always for notebook sources; `code = true` if any code cell was
   emitted; `math` if any `data-math-style` or `text/latex` output; `notes` if any notes.
 
+> **Clarifications (A4, 2026-10-09):**
+> - `[slides] incremental_lists` and the slide classes `.incremental` / `.no-incremental`
+>   apply to notebook slides exactly as to Markdown slides: the top-level lists of each HTML
+>   block of the slide (one per markdown or raw HTML cell) become fragments; lists inside a
+>   `fragment` cell are nested and stay as they are. `<!-- .element: -->` comments apply too
+>   (audit F17). `slides.split` and `slide_level` do not: a notebook's structure comes from
+>   slide types (and `split_markdown_cells`, which splits by `---`/`--` rules).
+> - A notebook with at least three shown cells (notes cells not counted) and no `slide` or
+>   `subslide` cell becomes one slide, as with nbconvert; the frontend then warns
+>   `notebook-single-slide` with how to set slide types (audit F28).
+
 ## 3. Tags and metadata that change rendering
 
 | Source | Effect |
@@ -133,6 +145,25 @@ text/markdown, text/latex, application/json, text/plain
 > payload cannot be rendered (bad base64, non-text payload, no renderer) warns `output-invalid` and
 > the next MIME in priority order is tried. Image sizes fall back to top-level `metadata.width/height`.
 > `text/latex` strips `\(…\)` too. Non-SGR ANSI sequences are removed.
+
+> **Clarifications (A4, 2026-10-09, audits F08 and F38):**
+> - Local files of outputs: relative `src`/`poster` URLs of `text/html` outputs (the raw-HTML
+>   rule of markdown-dialect §6) and the images and raw HTML of `text/markdown` outputs are
+>   resolved against the notebook's directory, but **only files inside that directory**
+>   (subdirectories included, symbolic links resolved) become `asset:<id>` (ir.md invariant 4).
+>   Outputs are written by executed code, not by the author, so a file outside it
+>   (`../secret.txt`, a link pointing elsewhere) is not embedded: its URL stays as written and
+>   an `output-file-outside` warning names it. Markdown and raw cells, which the author wrote,
+>   resolve `..` like a Markdown deck.
+> - Every warning about an output, those about its files (`missing-asset`,
+>   `output-file-outside`) included, has the span of the whole cell, like every cell-level
+>   warning, so `check --format json` gives its `cell` and a build that fails on a missing
+>   file names the cell after `-->`. Its message starts with `output <i>: ` (0-based, among
+>   the cell's outputs that could be read). An output is not a line of the cell's source, so a report quotes no
+>   source line for a missing file that the line does not mention.
+> - This is an exception to ir.md §2 invariant 4 for outputs: a URL of an output that names a
+>   file outside the notebook's directory stays as written, as does one naming a missing
+>   file (ir.md itself is the coordinator's to annotate).
 
 Other outputs:
 - `Stream { name, text }` → `CellOutput::Stream { name, html }` with `html = ansi_to_html::convert(&html_escape::encode_text(text))`

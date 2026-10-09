@@ -380,6 +380,9 @@ impl Notebook {
 /// | [`codes::PRESENTER_NOT_OBJECT`] | notebook or cell `metadata.presenter` neither an object nor `null` | ignored |
 /// | [`codes::NBFORMAT_NEWER`] | `nbformat` > 4 | read as nbformat 4 |
 ///
+/// One leading UTF-8 byte order mark (U+FEFF) is ignored, as for Markdown decks, CSS and
+/// TOML files (some Windows editors write one); JSON itself does not allow it.
+///
 /// # Errors
 /// [`Error::Parse`] (with `path`) for invalid JSON (with its line), a document that is not
 /// an object, `nbformat` < 4 (message exactly `"nbformat 4 required"`, spec §1), `nbformat`
@@ -392,6 +395,7 @@ pub fn parse_notebook(path: &Path, json: &str) -> crate::error::Result<(Notebook
         line,
         message,
     };
+    let json = json.strip_prefix('\u{feff}').unwrap_or(json);
     let value: Value = serde_json::from_str(json)
         .map_err(|err| parse_error(Some(err.line()), format!("invalid notebook JSON: {err}")))?;
     let Value::Object(mut top) = value else {

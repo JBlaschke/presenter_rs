@@ -19,9 +19,11 @@
 //! captured it, which for runtime errors happens only in a debug environment (serve mode).
 //! [`crate::error::template_error`] gives explicit control over that.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, LazyLock};
 
 use minijinja::{AutoEscape, Environment, ErrorKind, UndefinedBehavior};
+use regex::Regex;
 
 use crate::error::{Error, Result};
 
@@ -80,6 +82,74 @@ fn load_detail(err: Error) -> String {
     }
 }
 
+/// A template file of the chain: the name of the theme that has it and its path below
+/// `templates/`.
+pub(crate) type TemplateFile = (String, String);
+
+/// Template comments (`{# … #}`), whose text is not code.
+static COMMENT: LazyLock<Regex> = LazyLock::new(|| {
+    // A constant pattern covered by the unit tests: compiling it cannot fail.
+    Regex::new(r"(?s)\{#.*?#\}").expect("comment regex is valid")
+});
+
+/// A tag that loads other templates (`include`, `extends`, `import`, `from … import`); the
+/// group is the rest of the tag.
+static LOADING_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    // A constant pattern covered by the unit tests: compiling it cannot fail.
+    Regex::new(r"(?s)\{%[-+]?\s*(?:include|extends|import|from)\b(.*?)[-+]?%\}")
+        .expect("tag regex is valid")
+});
+
+/// A string literal in a tag; group 1 or 2 is its text.
+static STRING: LazyLock<Regex> = LazyLock::new(|| {
+    // A constant pattern covered by the unit tests: compiling it cannot fail.
+    Regex::new(r#""((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'"#).expect("string regex is valid")
+});
+
+/// The template files a render that starts at the templates named `roots` loads, as far as
+/// the names are written as string literals (audit F10): each root and, transitively, every
+/// name in an `include`, `extends`, `import` or `from` tag of a file reached (comments are
+/// skipped; every entry of a list is followed), resolved as the loader resolves it
+/// ([`Theme::read_template`]: child first, `@<theme>/…` in that theme). Names that find
+/// nothing are skipped, and names built at render time (`include slide.layout_template`)
+/// are not followed: the caller passes the layouts the deck uses as roots.
+pub(crate) fn reached_templates(
+    theme: &Theme,
+    roots: impl IntoIterator<Item = String>,
+) -> BTreeSet<TemplateFile> {
+    let mut reached = BTreeSet::new();
+    let mut pending: Vec<String> = roots.into_iter().collect();
+    while let Some(name) = pending.pop() {
+        let Some((dir, path)) = theme.template_origin(&name) else {
+            continue;
+        };
+        if !reached.insert((dir.name.clone(), path.clone())) {
+            continue;
+        }
+        let Ok(Some(bytes)) = dir.read(&format!("templates/{path}")) else {
+            continue;
+        };
+        pending.extend(loaded_names(&String::from_utf8_lossy(&bytes)));
+    }
+    reached
+}
+
+/// The template names written as string literals in the loading tags of `source`.
+fn loaded_names(source: &str) -> Vec<String> {
+    let code = COMMENT.replace_all(source, "");
+    LOADING_TAG
+        .captures_iter(&code)
+        .filter_map(|tag| tag.get(1))
+        .flat_map(|rest| {
+            STRING
+                .captures_iter(rest.as_str())
+                .filter_map(|literal| literal.get(1).or_else(|| literal.get(2)))
+                .map(|text| text.as_str().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +173,61 @@ mod tests {
                 manifest: ThemeManifest::default(),
             }],
         }
+    }
+
+    #[test]
+    fn loaded_names_are_the_literals_of_loading_tags() {
+        let source = "{# {% include \"commented.html\" %} #}\n\
+                      {%- extends \"@p/base.html\" -%}\n\
+                      {% include 'a.html' ignore missing %}{%+ include [\"b.html\", 'c.html'] +%}\n\
+                      {% import \"macros.html\" as m %}{% from 'forms.html' import field %}\n\
+                      {% include slide.layout_template %}{% include \"x/\" ~ name ~ \".html\" %}\n\
+                      {% set include = \"not-a-tag.html\" %}{{ \"include.html\" }}\n\
+                      {%\n  include\n  \"multi-line.html\"\n%}";
+        assert_eq!(
+            loaded_names(source),
+            [
+                "@p/base.html",
+                "a.html",
+                "b.html",
+                "c.html",
+                "macros.html",
+                "forms.html",
+                "x/",
+                ".html",
+                "multi-line.html"
+            ]
+        );
+    }
+
+    #[test]
+    fn reached_templates_follow_literal_names_through_the_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theme = disk_theme(
+            tmp.path(),
+            &[
+                (
+                    "deck.html",
+                    "{% include \"slide.html\" %}{% include \"nope.html\" %}",
+                ),
+                (
+                    "slide.html",
+                    "{% include ['x/', 'part.html'] %}{% include 'slide.html' %}",
+                ),
+                ("part.html", "{% extends '@t/base.html' %}"),
+                ("base.html", ""),
+                ("unused.html", "{% include 'other.html' %}"),
+                ("other.html", ""),
+            ],
+        );
+        let reached: Vec<String> = reached_templates(&theme, ["deck.html".to_string()])
+            .into_iter()
+            .map(|(theme, path)| format!("{theme}:{path}"))
+            .collect();
+        assert_eq!(
+            reached,
+            ["t:base.html", "t:deck.html", "t:part.html", "t:slide.html"]
+        );
     }
 
     #[test]
