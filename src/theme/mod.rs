@@ -23,12 +23,18 @@
 //! work. So a downloaded theme cannot embed other local files into a deck's output, and the
 //! dev server cannot serve them. [`ThemeDir::list`] lists exactly the files
 //! [`ThemeDir::read`] accepts.
+//!
+//! **Files read.** [`recording_reads`] tells which files of disk themes some work read
+//! (a render: templates, stylesheets, the files Sass loaded, `url()` targets, helper
+//! paths), so that a build can treat each of them as one of its inputs and never write
+//! over it (cli.md `build`, audit F01).
 
 pub mod manifest;
 pub mod resolve;
 pub mod styles;
 pub mod templates;
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -116,6 +122,32 @@ pub struct ThemeFile {
     pub bytes: Vec<u8>,
 }
 
+/// A template of a disk theme that does not compile ([`Theme::broken_templates`]).
+#[derive(Debug)]
+pub(crate) struct BrokenTemplate<'t> {
+    /// The theme it is in.
+    pub(crate) dir: &'t ThemeDir,
+    /// Its path below `templates/`.
+    pub(crate) rel: String,
+    /// Its file.
+    pub(crate) path: PathBuf,
+    /// Why it does not compile: minijinja's error kind and detail.
+    pub(crate) message: String,
+    /// The line minijinja names, if any.
+    pub(crate) line: Option<usize>,
+}
+
+impl BrokenTemplate<'_> {
+    /// `diagnostic` with this template's path and line.
+    pub(crate) fn locate(&self, diagnostic: Diagnostic) -> Diagnostic {
+        let diagnostic = diagnostic.with_path(&self.path);
+        match self.line {
+            Some(line) => diagnostic.with_span(line_span(line)),
+            None => diagnostic,
+        }
+    }
+}
+
 /// A resolved theme: the inheritance chain, child first, root last.
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -144,11 +176,24 @@ impl ThemeDir {
                 let Some(path) = disk_file(dir, &rel) else {
                     return Ok(None);
                 };
+                note_read(&path);
                 std::fs::read(&path).map(Some).map_err(|e| Error::Theme {
                     name: self.name.clone(),
                     message: format!("cannot read {}: {e}", path.display()),
                 })
             }
+        }
+    }
+
+    /// Notes the file at `rel` (same path rules as [`ThemeDir::read`]) as read for
+    /// [`recording_reads`], when this is a disk theme and the file is there: for a file
+    /// read on another thread or in another process (a Sass compilation's).
+    pub(crate) fn note_read(&self, rel: &str) {
+        if let ThemeSource::Disk { dir } = &self.source
+            && let Some(rel) = normalize_rel(rel).filter(|r| !r.is_empty())
+            && let Some(path) = disk_file(dir, &rel)
+        {
+            note_read(&path);
         }
     }
 
@@ -203,6 +248,19 @@ impl ThemeDir {
         }
     }
 
+    /// Why `entry`, a path this theme's `theme.toml` names (`[styles]`/`[scripts]` entries,
+    /// a path-valued `highlight_style`), is not a file of this theme, as a clause: `must be
+    /// a relative path`, `must stay inside the theme directory`, `does not name a file`,
+    /// `is not found`, or that a symbolic link takes it out of the theme. `None` when it is
+    /// one. The rule of [`Theme::problems`] (`presenter check`) and `presenter theme check`.
+    pub(crate) fn entry_problem(&self, entry: &str) -> Option<&'static str> {
+        match entry_path_problem(entry) {
+            Some(problem) => Some(problem),
+            None if self.exists(entry) => None,
+            None => Some(self.missing_reason(entry, "is not found")),
+        }
+    }
+
     /// Why the file at `rel` cannot be read: `missing`, or that a symbolic link takes it out
     /// of the theme ([`ThemeDir::linked_outside`]).
     fn missing_reason(&self, rel: &str, missing: &'static str) -> &'static str {
@@ -243,6 +301,45 @@ fn disk_file(dir: &Path, rel: &str) -> Option<PathBuf> {
 const LINKED_OUTSIDE: &str = "is a symbolic link (or below one) to a file outside the theme \
                               directory, which presenter ignores: theme files must stay \
                               inside the theme";
+
+thread_local! {
+    /// The files of disk themes read on this thread while [`recording_reads`] runs
+    /// (`None`: nothing is recording).
+    static READS: RefCell<Option<BTreeSet<PathBuf>>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` and returns with its result every file of a disk theme that it read on this
+/// thread ([`ThemeDir::read`]), including the files a Sass compilation it started read on
+/// its own thread or in its worker process, as paths in their theme directory (module
+/// docs, "Files read"). A recording inside another one adds its files to the outer one.
+pub fn recording_reads<R>(f: impl FnOnce() -> R) -> (R, BTreeSet<PathBuf>) {
+    /// Puts back the outer recording, also when `f` panics.
+    struct Restore(Option<Option<BTreeSet<PathBuf>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(outer) = self.0.take() {
+                READS.set(outer);
+            }
+        }
+    }
+    let mut restore = Restore(Some(READS.replace(Some(BTreeSet::new()))));
+    let result = f();
+    let read = READS.take().unwrap_or_default();
+    if let Some(Some(outer)) = restore.0.as_mut() {
+        outer.extend(read.iter().cloned());
+    }
+    drop(restore);
+    (result, read)
+}
+
+/// Notes that `path`, a file of a disk theme, was read ([`recording_reads`]).
+fn note_read(path: &Path) {
+    READS.with_borrow_mut(|reads| {
+        if let Some(reads) = reads {
+            reads.insert(path.to_path_buf());
+        }
+    });
+}
 
 /// The symbolic links already reported as leading out of their theme, by
 /// [`warn_linked_outside`] or as `theme-link-outside` findings ([`link_problems`]).
@@ -604,10 +701,36 @@ impl Theme {
     /// an error when `reached` is `None` or has it, else a warning ([`Theme::deck_problems`]).
     /// Hidden files (`.gitkeep`) are skipped; built-in themes always compile.
     fn template_problems(&self, reached: Option<&BTreeSet<TemplateFile>>) -> Vec<Diagnostic> {
-        let env = match self.environment(false) {
-            Ok(env) => env,
+        let broken = match self.broken_templates() {
+            Ok(broken) => broken,
             Err(err) => return vec![Diagnostic::error(codes::THEME_TEMPLATE, err.to_string())],
         };
+        let mut found = Vec::new();
+        for template in broken {
+            let BrokenTemplate { dir, rel, .. } = &template;
+            let message = format!("theme '{}': template {rel}: {}", dir.name, template.message);
+            let used =
+                reached.is_none_or(|reached| reached.contains(&(dir.name.clone(), rel.clone())));
+            let diagnostic = if used {
+                Diagnostic::error(codes::THEME_TEMPLATE, message)
+            } else {
+                let message = format!(
+                    "{message} (this deck does not use the template, so its build does not \
+                     fail on it; a deck that uses it does)"
+                );
+                Diagnostic::warning(codes::THEME_TEMPLATE, message)
+            };
+            found.push(template.locate(diagnostic));
+        }
+        found
+    }
+
+    /// Every template of the chain's disk themes that does not compile, chain order (child
+    /// first), each theme's in path order. Hidden files (`.gitkeep`) are skipped; built-in
+    /// themes always compile. The check of [`Theme::problems`] (`presenter check`) and
+    /// `presenter theme check`. Errors: the environment cannot be built.
+    pub(crate) fn broken_templates(&self) -> Result<Vec<BrokenTemplate<'_>>> {
+        let env = self.environment(false)?;
         let mut found = Vec::new();
         for dir in &self.chain {
             let ThemeSource::Disk { dir: root } = &dir.source else {
@@ -623,48 +746,47 @@ impl Theme {
                 let Err(err) = env.get_template(&format!("@{}/{rel}", dir.name)) else {
                     continue;
                 };
-                let detail = match err.detail() {
+                let message = match err.detail() {
                     Some(detail) => format!("{}: {detail}", err.kind()),
                     None => err.kind().to_string(),
                 };
-                let message = format!("theme '{}': template {rel}: {detail}", dir.name);
-                let used = reached
-                    .is_none_or(|reached| reached.contains(&(dir.name.clone(), rel.to_string())));
-                let diagnostic = if used {
-                    Diagnostic::error(codes::THEME_TEMPLATE, message)
-                } else {
-                    let message = format!(
-                        "{message} (this deck does not use the template, so its build does not \
-                         fail on it; a deck that uses it does)"
-                    );
-                    Diagnostic::warning(codes::THEME_TEMPLATE, message)
-                };
-                let mut diagnostic = diagnostic.with_path(root.join(&path));
-                if let Some(line) = err.line() {
-                    diagnostic = diagnostic.with_span(line_span(line));
-                }
-                found.push(diagnostic);
+                found.push(BrokenTemplate {
+                    dir,
+                    rel: rel.to_string(),
+                    path: root.join(&path),
+                    message,
+                    line: err.line(),
+                });
             }
         }
-        found
+        Ok(found)
     }
 
-    /// `theme-plugins`: the chain's merged `[reveal] plugins` list is invalid (the check the
-    /// pipeline makes before rendering), reported on the theme that sets it.
-    fn plugin_problem(&self) -> Option<Diagnostic> {
+    /// Why the chain's merged `[reveal] plugins` list is invalid (the config's message),
+    /// with the theme of the chain whose `theme.toml` sets the winning value (`None` when no
+    /// theme sets one); `None` when the list is valid. The one check behind `theme-plugins`
+    /// ([`Theme::problems`]), `presenter theme check` and the build's (`pipeline`).
+    pub(crate) fn plugins_problem(&self) -> Option<(Option<&ThemeDir>, String)> {
         let probe = Config {
             reveal: self.reveal_defaults(),
             ..Config::default()
         };
-        let err = probe.validate_plugins().err()?;
-        let message = match err {
+        let message = match probe.validate_plugins().err()? {
             Error::Config(message) => message,
             other => other.to_string(),
         };
         let dir = self
             .chain
             .iter()
-            .find(|dir| dir.manifest.reveal.contains_key("plugins"))?;
+            .find(|dir| dir.manifest.reveal.contains_key("plugins"));
+        Some((dir, message))
+    }
+
+    /// `theme-plugins`: the chain's merged `[reveal] plugins` list is invalid (the check the
+    /// pipeline makes before rendering), reported on the theme that sets it.
+    fn plugin_problem(&self) -> Option<Diagnostic> {
+        let (dir, message) = self.plugins_problem()?;
+        let dir = dir?;
         let message = format!("theme '{}': theme.toml [reveal]: {message}", dir.name);
         Some(manifest_problem(
             dir,
@@ -890,10 +1012,8 @@ fn entry_problems(dir: &ThemeDir) -> Vec<Diagnostic> {
     let mut found = Vec::new();
     for (table, code, entries) in lists {
         for entry in entries {
-            let problem = match entry_path_problem(entry) {
-                Some(problem) => problem,
-                None if dir.exists(entry) => continue,
-                None => dir.missing_reason(entry, "is not found"),
+            let Some(problem) = dir.entry_problem(entry) else {
+                continue;
             };
             let message = format!(
                 "theme '{}': [{table}] entry '{entry}' {problem} (paths are relative to the \
@@ -1046,6 +1166,43 @@ mod tests {
         assert_eq!(normalize_rel("a/..").as_deref(), Some(""));
         assert_eq!(normalize_rel(".."), None);
         assert_eq!(normalize_rel("assets/../../theme.toml"), None);
+    }
+
+    #[test]
+    fn recordings_collect_the_disk_files_read_and_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("img")).unwrap();
+        std::fs::write(root.join("a.css"), "a").unwrap();
+        std::fs::write(root.join("img/x.png"), "x").unwrap();
+        let dir = ThemeDir {
+            name: "t".into(),
+            source: ThemeSource::Disk { dir: root.clone() },
+            manifest: ThemeManifest::default(),
+        };
+        // Not recording: nothing is kept.
+        dir.read("a.css").unwrap();
+        let ((), outer) = recording_reads(|| {
+            dir.read("a.css").unwrap();
+            assert_eq!(dir.read("missing.css").unwrap(), None);
+            let ((), inner) = recording_reads(|| dir.note_read("img/./x.png"));
+            assert_eq!(inner, BTreeSet::from([root.join("img/x.png")]));
+            dir.note_read("nothing/here.png");
+        });
+        assert_eq!(
+            outer,
+            BTreeSet::from([root.join("a.css"), root.join("img/x.png")])
+        );
+        // A panic inside a recording ends it.
+        let panicked = std::panic::catch_unwind(|| recording_reads(|| panic!("boom")));
+        assert!(panicked.is_err());
+        assert!(READS.with_borrow(Option::is_none));
+        // Built-in themes have no files on disk.
+        let builtin = resolve("default", &[]).unwrap();
+        let ((), none) = recording_reads(|| {
+            builtin.chain[0].read("theme.toml").unwrap();
+        });
+        assert!(none.is_empty());
     }
 
     #[test]

@@ -39,7 +39,8 @@
 //!   calls itself, whether a condition that is never met guards it or not, in one file or
 //!   several) overflows the worker's stack and ends the worker only: an [`Error::Style`]
 //!   that names the recursion when the SCSS files read show one (`recursion` module),
-//!   else says what happened.
+//!   lists the candidates (each with its file and line) when they show several that a
+//!   condition guards, else says what happened.
 //!
 //! A library user without a worker (a test binary is no presenter; [`with_worker`] names
 //! one) compiles on a thread of its own process with the same stack and time limit, which
@@ -314,7 +315,9 @@ fn style_message(error: &Error) -> String {
 
 /// The [`Error::Style`] for a stack overflow while compiling `key` (`source`) for `theme`
 /// after reading `reads`: the recursion that the SCSS files read show
-/// ([`recursion::recursion_hint`]), at its call; `None` when they show none.
+/// ([`recursion::recursion_hint`]), at its call; when they show several that a condition
+/// guards, an error of `key` that lists each with its file and line, blaming none; `None`
+/// when they show none.
 fn overflow_error(theme: &Theme, key: &str, source: &str, reads: &Reads) -> Option<Error> {
     let fs = VirtualFs::new(theme);
     let mut files: Vec<(String, String)> = Vec::new();
@@ -334,7 +337,24 @@ fn overflow_error(theme: &Theme, key: &str, source: &str, reads: &Reads) -> Opti
             files.push((file.clone(), text));
         }
     }
-    let (at, found) = recursion::recursion_hint(&files)?;
+    let (at, found) = match recursion::recursion_hint(&files)? {
+        recursion::Hint::One(at, found) => (at, found),
+        recursion::Hint::Candidates(found) => {
+            let list: Vec<String> = found
+                .iter()
+                .map(|(at, recursion)| recursion.summary(&files[*at].0))
+                .collect();
+            return Some(Error::Style {
+                file: key.to_string(),
+                message: format!(
+                    "Sass ran out of stack, most likely in a recursion whose condition meant \
+                     to end it is never met; the stylesheets have several, any of which may \
+                     be it: {}",
+                    list.join(", ")
+                ),
+            });
+        }
+    };
     let (file, text) = &files[at];
     let error = Error::Style {
         file: file.clone(),
@@ -395,6 +415,7 @@ fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -
         Ok(result) => {
             // It has sent its result: the thread is ending, and its stack is freed.
             let _ = thread.join();
+            note_reads(theme, &reads.lock().unwrap_or_else(PoisonError::into_inner));
             Outcome::Finished(result)
         }
         Err(RecvTimeoutError::Timeout) => Outcome::Abandoned {
@@ -412,6 +433,18 @@ fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -
 /// The files a compilation read through its [`VirtualFs`], by canonical key, with a hash
 /// of their contents, in the order read.
 type Reads = Vec<(String, blake3::Hash)>;
+
+/// Notes the files of disk themes among `reads` as read on this thread
+/// ([`crate::theme::recording_reads`]): the compilation read them on its own thread or in
+/// its worker process.
+fn note_reads(theme: &Theme, reads: &Reads) {
+    let fs = VirtualFs::new(theme);
+    for (key, _) in reads {
+        if let Some(Location::Theme(dir, rel)) = fs.locate(key) {
+            dir.note_read(rel);
+        }
+    }
+}
 
 /// What a compilation reports while it runs ([`Reporter`]).
 enum Report {

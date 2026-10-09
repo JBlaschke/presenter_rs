@@ -53,7 +53,11 @@ Limitations (reveal.js print mode, ?print-pdf):
   - Animations, transitions and auto-animate are not exported: every page is a static
     snapshot. Videos and iframes show whatever they display when the page is printed.
   - A slide taller than the page continues on extra pages, up to [reveal]
-    pdfMaxPagesPerSlide.
+    pdfMaxPagesPerSlide. The default theme prints the lines of code blocks and outputs
+    slightly closer than on screen, to leave room for the line Chrome moves at each page
+    break; reveal.js reserves the pages from the screen height, so such a slide that ends
+    just past a page boundary on screen can end with a page that is empty but for its
+    background (about one in ten to twenty of them). Nothing is lost.
   - Needs Chrome or Chromium (Edge and Brave work too); without one the command
     exits with code 3. Chrome gets 120 s for the whole export.
   - The PDF is not byte-for-byte reproducible, unlike `presenter build`: Chrome stamps

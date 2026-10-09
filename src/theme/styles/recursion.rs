@@ -84,6 +84,20 @@ impl Recursion {
         }
         message
     }
+
+    /// This recursion in a list of candidates ([`Hint::Candidates`]), in the file `file`:
+    /// `@function f (<file>:<line>)`, or `@mixin a (<file>:<line>, through b)`.
+    pub(super) fn summary(&self, file: &str) -> String {
+        let name = match self.kind {
+            RecursionKind::Mixin => "@mixin",
+            RecursionKind::Function => "@function",
+        };
+        let through = match self.cycle.as_slice() {
+            [_, _] => String::new(),
+            cycle => format!(", through {}", cycle[1..cycle.len() - 1].join(", ")),
+        };
+        format!("{name} {} ({file}:{}{through})", self.cycle[0], self.line)
+    }
 }
 
 /// The names a file refers to, by kind ([`always_recursion`]).
@@ -106,22 +120,50 @@ pub(super) fn always_recursion(scss: &str, elsewhere: &Refs) -> (Option<Recursio
     (found, scan.all_refs())
 }
 
+/// What [`recursion_hint`] finds in the SCSS files of a compilation that overflowed its
+/// stack, each recursion with the index of its file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Hint {
+    /// The recursion that most likely overflowed the stack: the first reached definition
+    /// that always recurses, else the only reached one that recurses at all.
+    One(usize, Recursion),
+    /// Two or more reached recursions that a condition guards, in the order of the files
+    /// (in a file: mixins, then functions, in source order), one per cycle: any of them
+    /// may be the one whose condition is never met, so none is blamed (a correct recursive
+    /// helper, such as a `str-replace` that recurses inside an `@if`, is one of them).
+    Candidates(Vec<(usize, Recursion)>),
+}
+
 /// The recursion most likely to have overflowed the stack of a compilation of `files`
-/// (its SCSS files, `(name, text)` in the order loaded): the first reached definition that
-/// always recurses (in the order of `files`), else the first reached one that recurses at
-/// all; with the index of its file.
-pub(super) fn recursion_hint(files: &[(String, String)]) -> Option<(usize, Recursion)> {
+/// (its SCSS files, `(name, text)` in the order loaded; [`Hint`]): the first reached
+/// definition that always recurses (in the order of `files`), else the reached
+/// definitions that recurse at all, named only when there is one.
+pub(super) fn recursion_hint(files: &[(String, String)]) -> Option<Hint> {
     let scans: Vec<FileScan> = files.iter().map(|(_, text)| FileScan::of(text)).collect();
     let elsewhere = |at: usize| -> Refs {
         let others = scans.iter().enumerate().filter(|(other, _)| *other != at);
         others.flat_map(|(_, scan)| scan.all_refs()).collect()
     };
-    [true, false].into_iter().find_map(|always| {
-        scans
-            .iter()
-            .enumerate()
-            .find_map(|(at, scan)| Some((at, scan.cycle(&elsewhere(at), always)?)))
-    })
+    let always = scans
+        .iter()
+        .enumerate()
+        .find_map(|(at, scan)| Some((at, scan.cycle(&elsewhere(at), true)?)));
+    if let Some((at, found)) = always {
+        return Some(Hint::One(at, found));
+    }
+    let mut found: Vec<(usize, Recursion)> = Vec::new();
+    for (at, scan) in scans.iter().enumerate() {
+        let reached = scan.reached(&elsewhere(at));
+        for kind in [RecursionKind::Mixin, RecursionKind::Function] {
+            let cycles = scan.cycles_of(kind, &reached, false, usize::MAX);
+            found.extend(cycles.into_iter().map(|cycle| (at, cycle)));
+        }
+    }
+    match found.len() {
+        0 => None,
+        1 => found.pop().map(|(at, recursion)| Hint::One(at, recursion)),
+        _ => Some(Hint::Candidates(found)),
+    }
 }
 
 /// A reference to a mixin (`@include`) or a function (a call).
@@ -224,6 +266,18 @@ impl FileScan {
 
     /// [`FileScan::cycle`] among the `reached` definitions of `kind`.
     fn cycle_of(&self, kind: RecursionKind, reached: &Refs, always: bool) -> Option<Recursion> {
+        self.cycles_of(kind, reached, always, 1).pop()
+    }
+
+    /// Up to `limit` cycles among the `reached` definitions of `kind`, in source order of
+    /// the definitions that start them; a definition on a cycle found before starts none.
+    fn cycles_of(
+        &self,
+        kind: RecursionKind,
+        reached: &Refs,
+        always: bool,
+        limit: usize,
+    ) -> Vec<Recursion> {
         let defs: Vec<&Definition> = self.definitions.iter().filter(|d| d.kind == kind).collect();
         // The first definition of a name counts.
         let edges: BTreeMap<&str, Vec<&Ref>> = defs
@@ -234,8 +288,19 @@ impl FileScan {
         let reached = defs
             .iter()
             .filter(|def| reached.contains(&(kind, def.name.clone())));
-        reached.into_iter().find_map(|def| {
-            edges.get(def.name.as_str())?.iter().find_map(|next| {
+        let mut found: Vec<Recursion> = Vec::new();
+        let mut on_a_cycle: BTreeSet<String> = BTreeSet::new();
+        for def in reached {
+            if found.len() >= limit {
+                break;
+            }
+            if !on_a_cycle.insert(def.name.clone()) {
+                continue;
+            }
+            let Some(next) = edges.get(def.name.as_str()) else {
+                continue;
+            };
+            let cycle = next.iter().find_map(|next| {
                 let mut path = vec![def.name.clone()];
                 let found = cycle_back(
                     &def.name,
@@ -250,8 +315,13 @@ impl FileScan {
                     line: next.line,
                     always,
                 })
-            })
-        })
+            });
+            if let Some(cycle) = cycle {
+                on_a_cycle.extend(cycle.cycle.iter().cloned());
+                found.push(cycle);
+            }
+        }
+        found
     }
 }
 
@@ -758,14 +828,18 @@ mod tests {
         // The audit's conditional examples: a forgotten decrement, a base case never met.
         let forgotten = "@mixin pad($n) { @if $n > 0 { padding: $n; @include pad($n); } }\n\
                          body { @include pad(3px); }\n";
-        let (at, found) = recursion_hint(&files(&[("a", forgotten)])).unwrap();
+        let Some(Hint::One(at, found)) = recursion_hint(&files(&[("a", forgotten)])) else {
+            panic!("one recursion");
+        };
         assert_eq!(
             (at, found.kind, found.always, found.line),
             (0, MIXIN, false, 1)
         );
         let spacing = "@function spacing($n) {\n  @if $n == 0 { @return 0px; }\n  \
                        @return spacing($n - 2) + 4px;\n}\n.a { margin: spacing(3); }";
-        let (_, found) = recursion_hint(&files(&[("a", spacing)])).unwrap();
+        let Some(Hint::One(_, found)) = recursion_hint(&files(&[("a", spacing)])) else {
+            panic!("one recursion");
+        };
         assert_eq!((found.kind, found.always, found.line), (FUNCTION, false, 3));
         let message = found.message(spacing);
         assert!(
@@ -783,9 +857,65 @@ mod tests {
         let entry = "@use \"p\";\n@mixin x($n) { @if $n { @include x($n); } }\n@include x(1);\n\
                      a { b: p.f(); }";
         let partial = "@function f() { @return f(); }";
-        let (at, found) = recursion_hint(&files(&[("a", entry), ("p", partial)])).unwrap();
+        let Some(Hint::One(at, found)) = recursion_hint(&files(&[("a", entry), ("p", partial)]))
+        else {
+            panic!("one recursion");
+        };
         assert_eq!((at, found.kind, found.always), (1, FUNCTION, true));
         assert_eq!(recursion_hint(&files(&[("a", "a { b: c; }")])), None);
+    }
+
+    #[test]
+    fn several_conditional_recursions_are_all_candidates() {
+        // Wave-8 review of the A2 fixes: a correct recursive helper (Bootstrap's
+        // str-replace recurses inside an @if) must not be blamed for another function's
+        // overflow, whichever comes first.
+        let files = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        let entry = "@use \"lib\";\n@use \"spacing\";\n\
+                     .a { content: lib.str-replace(\"a-b\", \"-\", \"_\"); \
+                     margin: spacing.spacing(3); }\n";
+        let lib = "@function str-replace($string, $search, $replace: \"\") {\n  \
+                   $index: str-index($string, $search);\n  @if $index {\n    \
+                   @return str-slice($string, 1, $index - 1) + $replace + \
+                   str-replace(str-slice($string, $index + str-length($search)), $search, \
+                   $replace);\n  }\n  @return $string;\n}\n";
+        let spacing = "@function spacing($n) {\n  @if $n == 0 { @return 0px; }\n  \
+                       @return spacing($n - 2) + 4px;\n}\n";
+        let hint = recursion_hint(&files(&[("e", entry), ("l", lib), ("s", spacing)]));
+        let Some(Hint::Candidates(found)) = hint else {
+            panic!("{hint:?}");
+        };
+        let summaries: Vec<String> = found
+            .iter()
+            .map(|(at, recursion)| recursion.summary(["e", "l", "s"][*at]))
+            .collect();
+        assert_eq!(
+            summaries,
+            ["@function str-replace (l:4)", "@function spacing (s:3)"]
+        );
+        // Both in one file, the correct one first.
+        let both = format!("{lib}{spacing}.a {{ x: str-replace(\"a\", \"b\"); y: spacing(3); }}");
+        let Some(Hint::Candidates(found)) = recursion_hint(&files(&[("b", &both)])) else {
+            panic!("two candidates");
+        };
+        assert_eq!(found.len(), 2);
+        // A mutual recursion is one candidate, not one per definition on it.
+        let mutual = "@mixin a($n) { @if $n { @include b($n); } }\n\
+                      @mixin b($n) { @if $n { @include a($n); } }\nx { @include a(1); }\n";
+        let Some(Hint::One(_, found)) = recursion_hint(&files(&[("m", mutual)])) else {
+            panic!("one recursion");
+        };
+        assert_eq!(found.summary("m"), "@mixin a (m:1, through b)");
+        // Unreached recursions are no candidates.
+        let unused = format!("{lib}{spacing}.a {{ y: spacing(3); }}");
+        let Some(Hint::One(_, found)) = recursion_hint(&files(&[("u", &unused)])) else {
+            panic!("one recursion");
+        };
+        assert_eq!(found.cycle, ["spacing", "spacing"]);
     }
 
     #[test]

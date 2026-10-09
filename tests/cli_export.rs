@@ -1056,3 +1056,28 @@ fn export_refuses_to_overwrite_a_theme_file_before_the_browser_starts() {
     assert!(!marker.exists(), "the browser ran");
     assert_eq!(snapshot(dir.path(), &["d.md", "t/theme.toml"]), before);
 }
+
+/// The limitations `export pdf --help` lists (T45), including the empty last page a slide
+/// that spans pages can end with (audit F15, documented rather than removed; wave 8).
+#[test]
+fn help_lists_the_limitations_of_the_pdf() {
+    let output = presenter(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .args(["export", "pdf", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = text(&output.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "Limitations (reveal.js print mode, ?print-pdf):",
+        "every fragment step is printed on its own page",
+        "continues on extra pages, up to [reveal] pdfMaxPagesPerSlide",
+        "can end with a page that is empty but for its background (about one in ten to \
+         twenty of them). Nothing is lost.",
+        "The PDF is not byte-for-byte reproducible",
+    ] {
+        assert!(help.contains(expected), "{expected:?} in {help}");
+    }
+}

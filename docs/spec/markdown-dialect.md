@@ -157,6 +157,13 @@ grammar (T11), and the two must agree (shared unit tests).
 > `unparsed-attr-block` warning. Not covered: notebook markdown cells with
 > `split_markdown_cells = true`, whose headings, links, images and inline code comrak alone
 > reads (their fences are covered).
+>
+> **Clarification (W8FIX, 2026-10-09):** no item may have a `{` or `}` outside quotes either.
+> Two blocks written without a space (`## H {.dark}{background='#222'}`, also with double
+> quotes, or a fence's `` ```python {.a}{lines='1|3'} ``) reach the frontend as one block, and a
+> stray `}` (`{k='v'}}`) ends up in an item: such a block is not read (on a heading it stays in
+> the text) and is an `unparsed-attr-block` warning, instead of becoming attributes with braces
+> in their names and values. Quoted braces are content (`{data-x='a {b}'}`).
 
 ### 3.2 Slide attributes: where they come from and how they normalize
 Sources, applied in this order (later wins for the same key; classes accumulate):

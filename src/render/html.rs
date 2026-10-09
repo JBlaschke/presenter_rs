@@ -128,6 +128,14 @@ pub fn serve_stylesheet(theme: &Theme, key: &str, css: &str) -> Result<String> {
 /// unresolvable `url()`), theme manifest entries
 /// ([`Error::Theme`]) and placeholders naming unregistered assets.
 pub fn render(input: RenderInput<'_>) -> Result<RenderedDocument> {
+    let (rendered, theme_files) = crate::theme::recording_reads(|| render_document(input));
+    let mut rendered = rendered?;
+    rendered.theme_files = theme_files.into_iter().collect();
+    Ok(rendered)
+}
+
+/// [`render`], without [`RenderedDocument::theme_files`].
+fn render_document(input: RenderInput<'_>) -> Result<RenderedDocument> {
     let mut diagnostics = Diagnostics::new();
     let ctx = context::build_context(&input, &mut diagnostics)?;
     check_background_videos(&input, &mut diagnostics);
@@ -170,6 +178,7 @@ pub fn render(input: RenderInput<'_>) -> Result<RenderedDocument> {
         files: emitter.files,
         slide_count: slide_count(input.deck),
         diagnostics,
+        theme_files: Vec::new(),
     })
 }
 

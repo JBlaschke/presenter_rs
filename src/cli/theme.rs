@@ -73,9 +73,7 @@ use crate::ir::{Deck, DeckMeta, Features, SourceInfo, SourceKind, SourceSpan};
 use crate::pipeline::{self, BuildOptions};
 use crate::theme::manifest::check_theme_name;
 use crate::theme::resolve::{MANIFEST_FILE, MAX_CHAIN_LEN};
-use crate::theme::{
-    self, Theme, ThemeDir, ThemeManifest, ThemeSource, is_layout_name, normalize_rel,
-};
+use crate::theme::{self, Theme, ThemeDir, ThemeManifest, ThemeSource, is_layout_name};
 
 /// The parent of `presenter theme new` without `--extends` (always the built-in theme).
 const DEFAULT_PARENT: &str = "default";
@@ -84,9 +82,6 @@ const DEFAULT_PARENT: &str = "default";
 /// classes; the theme's CSS and templates refer to it). `eject` and `init --full-theme`
 /// copy it as [`copied_readme`] (audit F48).
 pub(crate) const BUILTIN_THEME_README: &str = "README.md";
-
-/// `highlight_style` values that name a bundled style rather than a file.
-const BUNDLED_HIGHLIGHT_STYLES: [&str; 3] = ["monokai", "zenburn", "none"];
 
 /// Runs `presenter theme`.
 pub fn run(args: &ThemeArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
@@ -607,7 +602,7 @@ fn token_groups(theme: &Theme) -> Vec<TokenGroup> {
     }
     for dir in theme.chain.iter().rev() {
         for entry in &dir.manifest.styles.entries {
-            let bytes = match path_problem(dir, entry) {
+            let bytes = match dir.entry_problem(entry) {
                 Some(_) => None,
                 None => dir.read(entry).ok().flatten(),
             };
@@ -827,15 +822,25 @@ fn manifest_problem(dir: &Path) -> std::io::Result<Option<String>> {
     Ok(Some(why))
 }
 
-/// Every problem of a resolved theme (see the module docs), chain order.
+/// Every problem of a resolved theme (see the module docs), chain order. The rules are
+/// those of [`Theme::problems`] (`presenter check`): the same entry rule
+/// ([`ThemeDir::entry_problem`]), templates ([`Theme::broken_templates`]), plugin check
+/// ([`Theme::plugins_problem`]) and `theme.toml` line finders ([`theme::manifest`]); the
+/// messages here leave out the theme's name, which the path says.
 fn problems(theme: &Theme) -> anyhow::Result<Diagnostics> {
     let mut found = Diagnostics::new();
-    let env = theme.environment(false)?;
+    let broken = theme.broken_templates()?;
     for (index, dir) in theme.chain.iter().enumerate() {
         let manifest = ManifestFile::read(dir);
         entry_problems(&manifest, &mut found);
         layout_problems(&manifest, &theme.chain[index..], &mut found);
-        template_problems(&env, dir, &mut found);
+        for template in broken
+            .iter()
+            .filter(|template| std::ptr::eq(template.dir, dir))
+        {
+            let diagnostic = Diagnostic::error("theme-template", template.message.clone());
+            found.push(template.locate(diagnostic));
+        }
     }
     plugin_problems(theme, &mut found);
     if found.is_empty() {
@@ -886,103 +891,15 @@ impl<'a> ManifestFile<'a> {
     }
 
     /// The line where `value` is written as a quoted TOML string in the value of `key` in
-    /// `[table]` (an array may span several lines), comments ignored. When it is not
-    /// written that way (a dotted key, an inline table), the first line that has it
-    /// outside a comment.
+    /// `[table]` ([`theme::manifest::line_of_value`]).
     fn line_of_value(&self, table: &str, key: &str, value: &str) -> Option<usize> {
-        let quoted = [format!("\"{value}\""), format!("'{value}'")];
-        let has_value = |code: &str| quoted.iter().any(|q| code.contains(q.as_str()));
-        let mut current: Option<String> = None;
-        let mut in_value = false;
-        let scoped = line_where(&self.text, |line| {
-            let code = toml_code(line).trim();
-            if let Some(header) = table_header(code) {
-                current = Some(header);
-                in_value = false;
-                return false;
-            }
-            if let Some((name, rest)) = split_key(code) {
-                in_value = current.as_deref() == Some(table) && is_key(name, key);
-                return in_value && has_value(rest);
-            }
-            in_value && has_value(code)
-        });
-        scoped.or_else(|| line_where(&self.text, |line| has_value(toml_code(line))))
+        theme::manifest::line_of_value(&self.text, table, key, value)
     }
 
-    /// The line of `key = …` (bare or quoted key) in the table `[table]`.
+    /// The line of `key = …` in the table `[table]` ([`theme::manifest::line_of_key`]).
     fn line_of_key(&self, table: &str, key: &str) -> Option<usize> {
-        let mut current: Option<String> = None;
-        line_where(&self.text, |line| {
-            let code = toml_code(line).trim();
-            if let Some(header) = table_header(code) {
-                current = Some(header);
-                return false;
-            }
-            current.as_deref() == Some(table)
-                && split_key(code).is_some_and(|(name, _)| is_key(name, key))
-        })
+        theme::manifest::line_of_key(&self.text, table, key)
     }
-}
-
-/// The 1-based number of the first line of `text` for which `matches` is true.
-fn line_where(text: &str, matches: impl FnMut(&str) -> bool) -> Option<usize> {
-    text.lines().position(matches).map(|index| index + 1)
-}
-
-/// `line` without its comment: the text before the first `#` outside a TOML string.
-fn toml_code(line: &str) -> &str {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (index, c) in line.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if c == '\\' => escaped = true,
-            Some(open) if c == open => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c == '#' => return &line[..index],
-            None => {}
-        }
-    }
-    line
-}
-
-/// The table a header line (comment removed, trimmed) opens, without brackets or spaces:
-/// `[ styles ]` → `styles`. `None` for any other line.
-fn table_header(code: &str) -> Option<String> {
-    let inner = code.strip_prefix('[')?.strip_suffix(']')?;
-    let inner = inner.trim_start_matches('[').trim_end_matches(']');
-    Some(inner.chars().filter(|c| !c.is_whitespace()).collect())
-}
-
-/// A `key = value` line (comment removed) split at its first `=` outside a string: the
-/// trimmed key and the rest. `None` for a line without one (an array continuation line).
-fn split_key(code: &str) -> Option<(&str, &str)> {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (index, c) in code.char_indices() {
-        match quote {
-            Some('"') if escaped => escaped = false,
-            Some('"') if c == '\\' => escaped = true,
-            Some(open) if c == open => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c == '=' => return Some((code[..index].trim(), &code[index + 1..])),
-            None => {}
-        }
-    }
-    None
-}
-
-/// True if the written key `name` (bare, `"quoted"` or `'quoted'`) is `key`.
-fn is_key(name: &str, key: &str) -> bool {
-    name == key
-        || [('"', '"'), ('\'', '\'')].iter().any(|(open, close)| {
-            name.strip_prefix(*open)
-                .and_then(|rest| rest.strip_suffix(*close))
-                .is_some_and(|inner| inner == key)
-        })
 }
 
 /// A one-line span.
@@ -1003,41 +920,29 @@ fn entry_problems(manifest: &ManifestFile<'_>, found: &mut Diagnostics) {
     ];
     for (table, code, entries) in lists {
         for entry in entries {
-            if let Some(problem) = path_problem(manifest.dir, entry) {
-                let message = format!("[{table}] entry '{entry}' {problem}");
+            if let Some(problem) = manifest.dir.entry_problem(entry) {
+                let message =
+                    format!("[{table}] entry '{entry}' {problem} ({RELATIVE_TO_THE_THEME})");
                 let line = manifest.line_of_value(table, "entries", entry);
                 found.push(manifest.problem(code, message, line));
             }
         }
     }
     if let Some(style) = &theme.styles.highlight_style
-        && !BUNDLED_HIGHLIGHT_STYLES.contains(&style.as_str())
-        && let Some(problem) = path_problem(manifest.dir, style)
+        && !theme::BUILTIN_HIGHLIGHT_STYLES.contains(&style.as_str())
+        && let Some(problem) = manifest.dir.entry_problem(style)
     {
         let message = format!(
-            "[styles] highlight_style '{style}' (not monokai, zenburn or none, so a CSS file) {problem}"
+            "[styles] highlight_style '{style}' (not monokai, zenburn or none, so a CSS file) \
+             {problem} ({RELATIVE_TO_THE_THEME})"
         );
         let line = manifest.line_of_value("styles", "highlight_style", style);
         found.push(manifest.problem("theme-highlight-style", message, line));
     }
 }
 
-/// Why `path` (from `theme.toml`) is not a file of `dir`, if it is not, as an `is …`
-/// clause. The renderer's rules: relative, inside the theme directory, an existing file
-/// (exact name).
-fn path_problem(dir: &ThemeDir, path: &str) -> Option<&'static str> {
-    if path.starts_with(['/', '\\']) || Path::new(path).has_root() {
-        return Some("is not a relative path (paths are relative to the theme directory)");
-    }
-    match normalize_rel(path) {
-        None => Some("is outside the theme directory"),
-        Some(rel) if rel.is_empty() => Some("is not a file"),
-        Some(_) if !dir.exists(path) => {
-            Some("is not found (paths are relative to the theme directory)")
-        }
-        Some(_) => None,
-    }
-}
+/// How the paths of a `theme.toml` are read, after an entry problem.
+const RELATIVE_TO_THE_THEME: &str = "paths are relative to the theme directory";
 
 /// `[layouts]` entries of `manifest` without `templates/layouts/<name>.html` in `chain`
 /// (the manifest's theme and its parents).
@@ -1065,58 +970,10 @@ fn layout_problems(manifest: &ManifestFile<'_>, chain: &[ThemeDir], found: &mut 
     }
 }
 
-/// Templates of a disk theme that do not compile (syntax errors, unreadable files).
-/// Hidden files (`.gitkeep`) are skipped.
-fn template_problems(env: &minijinja::Environment<'_>, dir: &ThemeDir, found: &mut Diagnostics) {
-    let ThemeSource::Disk { dir: root } = &dir.source else {
-        return;
-    };
-    for path in dir.list("templates") {
-        let Some(rel) = path.strip_prefix("templates/") else {
-            continue;
-        };
-        if rel.split('/').any(|segment| segment.starts_with('.')) {
-            continue;
-        }
-        let Err(err) = env.get_template(&format!("@{}/{rel}", dir.name)) else {
-            continue;
-        };
-        let message = match err.detail() {
-            Some(detail) => format!("{}: {detail}", err.kind()),
-            None => err.kind().to_string(),
-        };
-        let mut diagnostic =
-            Diagnostic::error("theme-template", message).with_path(root.join(&path));
-        if let Some(line) = err.line() {
-            diagnostic = diagnostic.with_span(line_span(line));
-        }
-        found.push(diagnostic);
-    }
-}
-
-/// An invalid merged `[reveal] plugins` list, reported on the theme that sets it.
-///
-/// This is the check `build` makes in `pipeline::check_theme_plugins` (private to
-/// src/pipeline.rs), which returns the first failure as an error instead of a located
-/// diagnostic: keep the two in step. Follow-up: one `pub(crate)` probe in the pipeline
-/// for both (pipeline.rs is not this module's file).
+/// An invalid merged `[reveal] plugins` list ([`Theme::plugins_problem`], the check
+/// `build` makes too), reported on the theme that sets it.
 fn plugin_problems(theme: &Theme, found: &mut Diagnostics) {
-    let probe = Config {
-        reveal: theme.reveal_defaults(),
-        ..Config::default()
-    };
-    let Err(err) = probe.validate_plugins() else {
-        return;
-    };
-    let message = match err {
-        Error::Config(message) => message,
-        other => other.to_string(),
-    };
-    let Some(dir) = theme
-        .chain
-        .iter()
-        .find(|dir| dir.manifest.reveal.contains_key("plugins"))
-    else {
+    let Some((Some(dir), message)) = theme.plugins_problem() else {
         return;
     };
     let manifest = ManifestFile::read(dir);
@@ -1561,13 +1418,6 @@ mod tests {
         assert_eq!(manifest.line_of_value("reveal", "plugins", "x.js"), Some(4));
         assert_eq!(manifest.line_of_key("scripts", "other"), Some(7));
         assert_eq!(manifest.line_of_key("vars", "a#b"), Some(13));
-        assert_eq!(toml_code("a = \"#\" # c"), "a = \"#\" ");
-        assert_eq!(toml_code("a = 'x\\' # c"), "a = 'x\\' ");
-        assert_eq!(toml_code("a = \"x\\\"#\" # c"), "a = \"x\\\"#\" ");
-        assert_eq!(table_header("[[ a.b ]]").as_deref(), Some("a.b"));
-        assert_eq!(table_header("\"x\","), None);
-        assert_eq!(split_key("\"a = b\","), None);
-        assert_eq!(split_key("'k' = 1"), Some(("'k'", " 1")));
     }
 
     #[test]

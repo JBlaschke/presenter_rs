@@ -182,7 +182,8 @@ Also observed:
   `assets/`). The img src stayed `/__presenter/asset/logo.svg`, and the page kept showing
   the 100 px image (`naturalWidth` 100), with no reload. A fresh `GET` of the same URL
   returned the 300 px file. This is a known limitation now (below). The stylesheet `url()`
-  case named in the first run is still untested.
+  case named in the first run is still untested. (Both were fixed later by A2, audit F03,
+  and are covered by a browser test; see Known limitations.)
 - When files are written within a moment of `presenter serve` starting (here: the setup
   edits, immediately before the start), the watcher may report them as a change, and one
   extra `content` rebuild follows the first build. This is harmless: the build is
@@ -242,7 +243,7 @@ This run did not cover items 2, 5, 6, 11–18, 20, 21, 23–25, 27 and 28; the s
 above covers all of them except 24. An edited image referenced from a theme stylesheet
 (`url()` of a theme asset) was not tested. Its URL does not change either, so after a `css`
 build it may also show stale; the second run confirmed this for a template's `asset()`
-image (see Known limitations).
+image (see Known limitations, where both cases are now recorded as fixed by A2, audit F03).
 
 ### 2026-10-08: mock server, fifth run (W3FIX: whole served page compared)
 
@@ -449,16 +450,16 @@ Still to do: repeat this checklist against `presenter serve` once T23 has landed
 - Editing a theme script file (`theme.toml [scripts]`) does not run the new code: its URL is
   unchanged, so the client swaps the slides only. Reload by hand. A serve-mode `script()`
   URL that carried a content hash would make this a full reload automatically.
-- Editing an image of a theme (a file under a theme's `assets/` that a template references
-  with `asset()`, such as the default theme's title-slide logo) does not show the new
-  image: the change is a `css` build (§2), its URL `/__presenter/asset/<path>` is
-  unchanged, and the client re-requests only stylesheets. Reload by hand. An image that a
-  theme stylesheet references with `url()` keeps its URL too and is probably affected as
-  well (not tested). Deck images (`/__presenter/deck-asset/<id>`) are not
-  affected: `presenter serve` adds `?v=<version>` to their URLs, which changes when the
-  file does (T23). Possible follow-up to the protocol: classify a theme `assets/` file
-  that is not a stylesheet as `content`, and version `/__presenter/asset/` URLs of images
-  the same way.
+- Resolved (A2, audit F03; this entry was a known limitation until then): an edited image
+  of a theme, whether a template references it with `asset()` (the default theme's
+  title-slide logo) or a theme stylesheet with `url()`, now shows without a reload. In
+  serve mode their `/__presenter/asset/<path>` URLs carry `?v=<content version>`, which
+  changes with the file's bytes (live-reload.md §4), like the `?v=<version>` of deck images
+  (`/__presenter/deck-asset/<id>`, T23). A stylesheet's `url()` changes with the swapped
+  stylesheet; a `css` build that changes an `asset()` URL of the document is reported as
+  `content`, so the slides are swapped and the client copies the new URLs of theme files
+  outside them. `tests/browser.rs` `serve_shows_edited_theme_images_without_a_reload`
+  covers both cases (opt-in browser tests).
 - Elements that scripts add to the page are never compared, so they never cause a reload;
   they stay as they are across swaps (only the children of `.slides` are replaced).
 - `<meta>` elements are not compared, so a changed `<meta name="description">` (front

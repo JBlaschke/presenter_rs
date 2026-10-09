@@ -163,7 +163,8 @@ text/markdown, text/latex, application/json, text/plain
 >   source line for a missing file that the line does not mention.
 > - This is an exception to ir.md §2 invariant 4 for outputs: a URL of an output that names a
 >   file outside the notebook's directory stays as written, as does one naming a missing
->   file (ir.md itself is the coordinator's to annotate).
+>   file (ir.md itself is the coordinator's to annotate; W8FIX added the note there, after
+>   ir.md §2).
 
 Other outputs:
 - `Stream { name, text }` → `CellOutput::Stream { name, html }` with `html = ansi_to_html::convert(&html_escape::encode_text(text))`

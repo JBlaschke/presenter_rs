@@ -26,6 +26,8 @@ mod paths;
 pub mod reveal;
 mod styles;
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
 use crate::assets::emit::{EmittedFile, OutputMode};
@@ -137,4 +139,10 @@ pub struct RenderedDocument {
     /// Fonts) and the `markdown` filter's Markdown warnings (e.g. `missing-asset`; message
     /// prefixed `markdown filter: `, no span).
     pub diagnostics: Diagnostics,
+    /// Every file of a disk theme of the chain that the render read
+    /// ([`crate::theme::recording_reads`]): templates, stylesheets and the files Sass
+    /// loaded, the theme stylesheet's `url()` targets and imports, and what `style()`,
+    /// `script()` and `asset()` named, sorted. A build counts them among its inputs
+    /// ([`crate::pipeline::input_files`]).
+    pub theme_files: Vec<PathBuf>,
 }

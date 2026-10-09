@@ -293,6 +293,14 @@ mod tests {
         assert_eq!(line_of_value(text, "reveal", "plugins", "a.css"), Some(3));
         assert_eq!(line_of_key(text, "reveal", "plugins"), Some(11));
         assert_eq!(line_of_key(text, "styles", "plugins"), None);
+        // The pieces (moved here from `presenter theme check`'s own copy, wave 8).
+        assert_eq!(toml_code("a = \"#\" # c"), "a = \"#\" ");
+        assert_eq!(toml_code("a = 'x\\' # c"), "a = 'x\\' ");
+        assert_eq!(toml_code("a = \"x\\\"#\" # c"), "a = \"x\\\"#\" ");
+        assert_eq!(table_header("[[ a.b ]]").as_deref(), Some("a.b"));
+        assert_eq!(table_header("\"x\","), None);
+        assert_eq!(split_key("\"a = b\","), None);
+        assert_eq!(split_key("'k' = 1"), Some(("'k'", " 1")));
     }
 
     fn parse(text: &str) -> Result<ThemeManifest> {

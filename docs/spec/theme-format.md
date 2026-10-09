@@ -105,6 +105,13 @@ Asset lookup (`asset("fonts/x.woff2")`, CSS `url(fonts/x.woff2)`): same walk ove
 > string literals in `include`/`extends`/`import`/`from` tags). A template that does not
 > compile but that the deck does not use is a warning (a deck that uses it fails to build),
 > and so is every symbolic link whose target is outside its theme (`theme-link-outside`).
+>
+> **Clarification (W8FIX, 2026-10-09):** "when the build loads it" is decided statically, from
+> the tags as written: a tag inside an `{% if %}` counts, although minijinja loads its
+> template only when the condition holds. So a deck whose build skips the include can build
+> while `check` reports the broken template as an error: the built-in `layouts/title.html`
+> includes `partials/logo.html` only when the deck sets a logo, and a theme whose
+> `partials/logo.html` does not compile fails `check` for every deck with a title slide.
 
 ## 4. Template context
 
@@ -143,6 +150,14 @@ Helper functions (registered on the environment by T15; all return HTML marked s
 `path` resolution for `style`/`script`/`asset`: `vendor/…` → embedded vendor tree
 (`docs/spec/vendored-assets.md`); `presenter/…` → `assets/presenter/` (our JS);
 anything else → theme chain `assets/` directories (child first). Unknown path → `Error::Template`.
+
+> **Clarification (W8FIX, 2026-10-09, records audit F03 as built by A2):** in serve mode,
+> `asset(path)` of a file of the theme chain (the `@<theme>/…` form or the chain's `assets/`)
+> returns `/__presenter/asset/<path>?v=<content version>`, and so does a relative `url()` of
+> the theme stylesheet that names such a file (live-reload.md §4): the version is a number
+> that changes with the file's bytes, so a browser that swaps the page in place fetches an
+> edited image. `vendor/…` and `presenter/…` files, and the URLs of `style()` and `script()`,
+> carry no version.
 
 > **Contract change (coordinator, 2026-10-08, from T02/T13):** §2 lets themes name files
 > relative to the theme directory (`scripts.entries = ["scripts/extra.js"]`, a path-valued

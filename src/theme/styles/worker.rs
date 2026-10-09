@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Isolation, Outcome, Report, Reporter, SASS_STACK_SIZE, VirtualFs, compile_sass, overflow_error,
-    style_message, timeout_error, timeout_message,
+    Isolation, Outcome, Report, Reporter, SASS_STACK_SIZE, VirtualFs, compile_sass, note_reads,
+    overflow_error, style_message, timeout_error, timeout_message,
 };
 use crate::error::Error;
 use crate::theme::{Theme, ThemeDir, ThemeManifest, ThemeSource};
@@ -283,6 +283,7 @@ pub(super) fn compile(
     // The worker has answered or closed its stdout: it is ending.
     let status = child.wait();
     let stderr = pipes.close();
+    note_reads(theme, &reads);
     Ok(match (result, status) {
         (Some(result), _) => Outcome::Finished(result),
         (None, Ok(status)) => crashed(theme, key, source, reads, status, &stderr),
