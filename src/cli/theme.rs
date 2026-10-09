@@ -8,12 +8,12 @@
 //!   file's directory, then the current directory. It prints the chain child → root and
 //!   where each theme lives.
 //! - `eject NAME DIR` copies every embedded file of the built-in theme `NAME` into `DIR`,
-//!   which must not exist, except its top-level `README.md` (it documents the built-in theme
-//!   in the repository, with links that break in a copy). The copy is named after the
-//!   directory: `name` in `theme.toml` (with a comment line on top saying where it came
-//!   from) and the `@NAME/` template names in its templates change; everything else,
-//!   `extends` included, is copied as is, so ejecting `default` gives a root theme that
-//!   builds exactly like the built-in one.
+//!   which must not exist. The copy is named after the directory: `name` in `theme.toml`
+//!   (with a comment line on top saying where it came from) and the `@NAME/` template names
+//!   in its templates change, and its top-level `README.md` gets a note on top saying that
+//!   it documents the built-in theme, with its links into presenter's repository unlinked
+//!   (audit F48); everything else, `extends` included, is copied as is, so ejecting
+//!   `default` gives a root theme that builds exactly like the built-in one.
 //! - `new DIR [--extends NAME]` writes a minimal child theme into `DIR` (which must be
 //!   empty or not exist): `theme.toml` (`name` from the directory, `extends`, `[styles]
 //!   entries`), `styles/theme.css` listing the parent's tokens (the CSS custom properties
@@ -57,8 +57,10 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use anyhow::{Context, anyhow};
+use regex::Regex;
 
 use super::{
     EXIT_BUILD_ERROR, GlobalArgs, ThemeArgs, ThemeCheckArgs, ThemeCommand, ThemeEjectArgs,
@@ -78,9 +80,9 @@ use crate::theme::{
 /// The parent of `presenter theme new` without `--extends` (always the built-in theme).
 const DEFAULT_PARENT: &str = "default";
 
-/// The top-level file of a built-in theme that `eject` and `init --full-theme` leave out:
-/// it documents the built-in theme in the repository, and its relative links break in a
-/// copy (audit F48).
+/// The top-level file of a built-in theme that documents it (its tokens, layouts and
+/// classes; the theme's CSS and templates refer to it). `eject` and `init --full-theme`
+/// copy it as [`copied_readme`] (audit F48).
 pub(crate) const BUILTIN_THEME_README: &str = "README.md";
 
 /// `highlight_style` values that name a bundled style rather than a file.
@@ -249,15 +251,13 @@ pub(crate) fn eject_builtin(name: &str, dir: &Path) -> anyhow::Result<Theme> {
     Ok(ejected)
 }
 
-/// Every file of the built-in theme `builtin` but its [`BUILTIN_THEME_README`] as the
-/// files of its copy named `name`: `theme.toml` renamed ([`renamed_manifest`]) under a
-/// provenance comment, templates retargeted ([`retarget_template`]), everything else as is.
+/// Every file of the built-in theme `builtin` as the files of its copy named `name`:
+/// `theme.toml` renamed ([`renamed_manifest`]) under a provenance comment, templates
+/// retargeted ([`retarget_template`]), the [`BUILTIN_THEME_README`] as [`copied_readme`],
+/// everything else as is.
 fn ejected_files(builtin: &ThemeDir, name: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let mut files = Vec::new();
     for rel in builtin.list("") {
-        if rel == BUILTIN_THEME_README {
-            continue;
-        }
         let bytes = builtin
             .read(&rel)?
             .ok_or_else(|| anyhow!("built-in theme '{}': cannot read {rel}", builtin.name))?;
@@ -270,12 +270,43 @@ fn ejected_files(builtin: &ThemeDir, name: &str) -> anyhow::Result<Vec<(String, 
             .into_bytes()
         } else if rel.starts_with("templates/") {
             retarget_template(bytes, &builtin.name, name)
+        } else if rel == BUILTIN_THEME_README {
+            copied_readme(bytes, &builtin.name, name, "presenter theme eject")
         } else {
             bytes
         };
         files.push((rel, bytes));
     }
     Ok(files)
+}
+
+/// The [`BUILTIN_THEME_README`] of the built-in theme `builtin` for its copy, the theme
+/// `name` that the command `made_by` wrote (audit F48). A note on top says that the copy
+/// is the theme `name` and that the text documents the built-in theme, whose tokens,
+/// layouts and classes the copy keeps until it is changed. Links that leave the theme
+/// directory (`[text](../../../docs/spec/theme-format.md)`: files of presenter's
+/// repository, which a copy does not have) keep their text and lose the link; the note
+/// says where those paths are. Non-UTF-8 bytes are copied unchanged.
+pub(crate) fn copied_readme(bytes: Vec<u8>, builtin: &str, name: &str, made_by: &str) -> Vec<u8> {
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => return err.into_bytes(),
+    };
+    // A Markdown link `[text](target)` whose target starts with `../`.
+    static OUTSIDE_LINK: LazyLock<Regex> = LazyLock::new(|| {
+        // A constant pattern covered by the unit tests: compiling it cannot fail.
+        Regex::new(r"\[([^\[\]\n]*)\]\(\.\./[^()\s]*\)").expect("link regex is valid")
+    });
+    let body = OUTSIDE_LINK.replace_all(&text, "${1}");
+    format!(
+        "> **A copy.** `{made_by}` copied presenter's built-in theme `{builtin}` here as the \
+         theme `{name}`.\n> The text below documents the built-in theme: its tokens, layouts \
+         and classes are this copy's too, until you change them. Paths outside this \
+         directory, such as `docs/spec/theme-format.md`, are in presenter's source \
+         repository.\n\n\
+         {body}"
+    )
+    .into_bytes()
 }
 
 /// `manifest` (the text of a `theme.toml`) with its top-level `name = …` line replaced by
@@ -1315,14 +1346,54 @@ mod tests {
         assert_eq!(ejected.name(), "copy");
         assert!(matches!(ejected.chain[0].source, ThemeSource::Disk { .. }));
         let builtin = theme::resolve("default", &[]).unwrap();
-        let mut expected = builtin.chain[0].list("");
+        let expected = builtin.chain[0].list("");
         assert!(expected.iter().any(|rel| rel == BUILTIN_THEME_README));
-        expected.retain(|rel| rel != BUILTIN_THEME_README);
-        assert_eq!(ejected.chain[0].list(""), expected, "all but the README");
+        assert_eq!(ejected.chain[0].list(""), expected, "every file");
+        let readme = fs::read_to_string(dir.join(BUILTIN_THEME_README)).unwrap();
+        assert!(
+            readme.starts_with(
+                "> **A copy.** `presenter theme eject` copied presenter's built-in theme \
+                 `default` here as the theme `copy`.\n"
+            ),
+            "{readme}"
+        );
         let err = eject_builtin("default", &dir).unwrap_err();
         assert!(err.is::<UsageError>(), "{err:#}");
         let err = eject_builtin("nope", &tmp.path().join("other")).unwrap_err();
         assert!(err.is::<UsageError>(), "{err:#}");
+    }
+
+    #[test]
+    fn copied_readmes_say_what_they_document_and_unlink_repository_paths() {
+        let original = "# The `default` theme\n\nThe root ([`docs/spec/theme-format.md`](../../../docs/spec/theme-format.md)).\n\
+                        See [Tokens](#tokens), [grass](https://crates.io/crates/grass), \
+                        [`styles/theme.css`](styles/theme.css) and [`examples/notebook/`](../../../examples/notebook/).\n";
+        let copied = copied_readme(original.as_bytes().to_vec(), "default", "mine", "cmd");
+        let copied = String::from_utf8(copied).unwrap();
+        let (note, body) = copied.split_once("\n\n").unwrap();
+        assert_eq!(
+            note,
+            "> **A copy.** `cmd` copied presenter's built-in theme `default` here as the theme \
+             `mine`.\n> The text below documents the built-in theme: its tokens, layouts and \
+             classes are this copy's too, until you change them. Paths outside this directory, \
+             such as `docs/spec/theme-format.md`, are in presenter's source repository."
+        );
+        assert_eq!(
+            body,
+            "# The `default` theme\n\nThe root (`docs/spec/theme-format.md`).\n\
+             See [Tokens](#tokens), [grass](https://crates.io/crates/grass), \
+             [`styles/theme.css`](styles/theme.css) and `examples/notebook/`.\n"
+        );
+        // The real README: no link leaves the copy.
+        let builtin = theme::resolve("default", &[]).unwrap();
+        let readme = builtin.chain[0]
+            .read(BUILTIN_THEME_README)
+            .unwrap()
+            .unwrap();
+        let copied = String::from_utf8(copied_readme(readme, "default", "x", "cmd")).unwrap();
+        assert!(!copied.contains("](../"), "{copied}");
+        // Bytes that are not UTF-8 are copied as they are.
+        assert_eq!(copied_readme(vec![0xff, b'x'], "a", "b", "c"), [0xff, b'x']);
     }
 
     #[test]

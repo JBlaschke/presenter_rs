@@ -44,7 +44,9 @@
 //! shares more than the root with it and the relative form is no longer than the absolute
 //! one; else as given. A path that is not below the current directory as spelled is also
 //! compared in its canonical form, so a symbolic link in its prefix (such as `/tmp` →
-//! `/private/tmp` on macOS) does not keep it absolute.
+//! `/private/tmp` on macOS) does not keep it absolute. A `..` is resolved as the file
+//! system resolves it, so after a symbolic link it leaves the directory the link points to
+//! and the message names the file that is really read or written.
 //!
 //! # Global behaviour
 //!
@@ -490,14 +492,23 @@ pub fn display_path(path: &Path) -> PathBuf {
 }
 
 /// [`display_path`] with the current directory `cwd` (`None`: unknown; `path` is returned
-/// as given). A relative `path` is taken from `cwd`. A path below `cwd` as spelled is shown
-/// relative to it; otherwise the canonical forms ([`canonical_form`]) are compared too and
-/// the shorter relative form wins (a symbolic link in the prefix of either), else `path`.
+/// as given). A relative `path` is taken from `cwd`. A path with a `..` is first resolved
+/// as the file system resolves it ([`pipeline::path_after_creating_dirs`]): after a
+/// symbolic link, `..` leaves the directory the link points to, so `link/../x` is not
+/// `x`. A path below `cwd` as spelled is shown relative to it; otherwise the canonical
+/// forms ([`canonical_form`]) are compared too and the shorter relative form wins (a
+/// symbolic link in the prefix of either), else `path`.
 fn relative_to(path: &Path, cwd: Option<&Path>) -> PathBuf {
     let Some(cwd) = cwd else {
         return path.to_path_buf();
     };
-    let absolute = normalize_lexically(&cwd.join(path));
+    let joined = cwd.join(path);
+    let absolute = if path.components().any(|c| c == Component::ParentDir) {
+        // `joined` is absolute (`cwd` is), so it always resolves.
+        pipeline::path_after_creating_dirs(&joined).unwrap_or_else(|| normalize_lexically(&joined))
+    } else {
+        normalize_lexically(&joined)
+    };
     let spelled = relative_path(&absolute, cwd);
     if let Some(below) = spelled
         .as_ref()
@@ -576,12 +587,18 @@ pub fn clash_error(clash: &pipeline::Clash, explicit: bool) -> anyhow::Error {
 }
 
 /// A [`UsageError`] when the output file argument `out` (`-o` of a command that writes one
-/// file) names a directory: it ends with a path separator or is an existing directory
+/// file) names a directory: it ends with a path separator, its last component is `.` or
+/// `..` (`out/.`, `out/..`, whether `out` exists or not), or it is an existing directory
 /// (audit F41). `hint` says what to give instead.
 pub fn reject_directory(out: &Path, hint: &str) -> anyhow::Result<()> {
     let text = out.as_os_str().to_string_lossy();
-    let separator = text.ends_with('/') || text.ends_with(std::path::MAIN_SEPARATOR);
-    if separator || out.is_dir() {
+    // The last component as typed: `Path::components` drops a trailing `.`.
+    let last = text
+        .rsplit(['/', std::path::MAIN_SEPARATOR])
+        .next()
+        .unwrap_or_default();
+    let spelled_as_directory = !text.is_empty() && matches!(last, "" | "." | "..");
+    if spelled_as_directory || out.is_dir() {
         return Err(UsageError(format!("-o {} names a directory; {hint}", out.display())).into());
     }
     Ok(())
@@ -1091,6 +1108,29 @@ mod tests {
                 relative_to(&link.join("talk/out.html"), Some(&real)),
                 PathBuf::from("talk/out.html")
             );
+            // A `..` after a symbolic link leaves the directory the link points to, as the
+            // file system resolves it (review of A1: `up/../out.html` was shown as
+            // `out.html`, but the file was written to `../out.html`).
+            let work = real.join("talk/work");
+            std::fs::create_dir_all(work.join("sub")).unwrap();
+            std::os::unix::fs::symlink(real.join("talk"), work.join("up")).unwrap();
+            assert_eq!(
+                relative_to(Path::new("up/../out.html"), Some(&work)),
+                PathBuf::from("../../out.html")
+            );
+            assert_eq!(
+                relative_to(Path::new("new/../up/../s.md"), Some(&work)),
+                PathBuf::from("../../s.md")
+            );
+            // A `..` after a plain directory, existing or not, is lexical.
+            assert_eq!(
+                relative_to(Path::new("sub/../out.html"), Some(&work)),
+                PathBuf::from("out.html")
+            );
+            assert_eq!(
+                relative_to(Path::new("new/../out.html"), Some(&work)),
+                PathBuf::from("out.html")
+            );
         }
         assert_eq!(
             relative_to(&real.join("talk/s.md"), Some(&real)),
@@ -1106,6 +1146,12 @@ mod tests {
             PathBuf::from("out/"),
             tmp.path().to_path_buf(),
             tmp.path().join("."),
+            // Spelled as a directory whether or not it exists (review of A1).
+            PathBuf::from("missing/."),
+            PathBuf::from("missing/.."),
+            PathBuf::from("."),
+            PathBuf::from(".."),
+            tmp.path().join("new/.."),
         ] {
             let err = reject_directory(&out, hint).unwrap_err();
             assert_eq!(exit_code_for(&err), EXIT_USAGE, "{out:?}");
@@ -1116,6 +1162,8 @@ mod tests {
         }
         assert!(reject_directory(Path::new("out/a.html"), hint).is_ok());
         assert!(reject_directory(&tmp.path().join("new.html"), hint).is_ok());
+        assert!(reject_directory(Path::new("out/..html"), hint).is_ok());
+        assert!(reject_directory(Path::new("out/.hidden"), hint).is_ok());
     }
 
     #[test]

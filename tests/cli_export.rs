@@ -841,11 +841,11 @@ fn assert_refused(dir: &Path, args: &[&str], protected: &[&str]) -> String {
 #[test]
 fn export_refuses_to_overwrite_its_input() {
     let dir = project(&[("d.md", "# keep\n"), ("presenter.toml", "")]);
+    // No `does not end in .pdf` warning for a file that is not going to be written.
     let stderr = assert_refused(dir.path(), &["d.md", "-o", "d.md"], &["d.md"]);
     assert_eq!(
         stderr,
-        "warning: -o d.md does not end in .pdf; the file will hold a PDF\n\
-         error: refusing to write d.md: it is the input file d.md; choose another output \
+        "error: refusing to write d.md: it is the input file d.md; choose another output \
          path with -o\n"
     );
     let stderr = assert_refused(
@@ -887,6 +887,24 @@ fn export_refuses_links_to_its_input() {
     if upper.exists() {
         assert_refused(dir.path(), &["d.md", "-o", "D.MD"], &["d.md"]);
     }
+    // A link reached after a `..` out of a directory that does not exist yet: work/link
+    // points to sub/, so `work/nonexist/../link/../d.md` is d.md.
+    std::fs::create_dir_all(dir.path().join("work")).unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink("../sub", dir.path().join("work/link")).unwrap();
+    let stderr = assert_refused(
+        dir.path(),
+        &["d.md", "-o", "work/nonexist/../link/../d.md"],
+        &["d.md"],
+    );
+    assert!(
+        stderr.ends_with(
+            "error: refusing to write d.md: it is the input file d.md; choose another output \
+             path with -o\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("work/nonexist").exists());
 }
 
 #[cfg(unix)]
@@ -928,7 +946,7 @@ fn export_refuses_to_overwrite_an_asset_before_the_browser_starts() {
 fn export_output_arguments_are_checked() {
     let dir = project(&[("d.md", "# Slide\n")]);
     std::fs::create_dir(dir.path().join("existing")).unwrap();
-    for out in ["out/", "existing"] {
+    for out in ["out/", "existing", "pdfs/.", "pdfs/..", "existing/."] {
         presenter(dir.path())
             .args(["export", "pdf", "d.md", "-o", out])
             .args(["--chrome", "/nonexistent/chrome"])
@@ -938,7 +956,9 @@ fn export_output_arguments_are_checked() {
                 "error: -o {out} names a directory; give the PDF file to write\n"
             ));
     }
-    // A name without .pdf is allowed, with a warning (then: no browser, exit 3).
+    assert!(!dir.path().join("pdfs").exists());
+    // A name without .pdf is allowed; its warning comes once the PDF is going to be
+    // written, so not when no browser is found (exit 3).
     let output = presenter(dir.path())
         .args(["export", "pdf", "d.md", "-o", "slides.html"])
         .args(["--chrome", "/nonexistent/chrome"])
@@ -947,18 +967,92 @@ fn export_output_arguments_are_checked() {
         .get_output()
         .clone();
     let stderr = text(&output.stderr);
+    assert!(stderr.starts_with("error: --chrome "), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pdf_name_without_pdf_is_warned_about_just_before_the_browser_starts() {
+    let dir = project(&[("d.md", "# Slide\n")]);
+    let fake = fake_chrome(
+        dir.path(),
+        "fake-chrome",
+        "echo 'fake chrome: no display' >&2\nexit 4",
+    );
+    let private_tmp = tempfile::tempdir().unwrap();
+    let export = |args: &[&str]| {
+        run_settled(|| {
+            let mut cmd = presenter(dir.path());
+            cmd.env("TMPDIR", private_tmp.path())
+                .args(args)
+                .arg("--chrome")
+                .arg(&fake);
+            cmd
+        })
+    };
+    let output = export(&["export", "pdf", "d.md", "-o", "slides.html"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = text(&output.stderr);
     assert!(
         stderr.starts_with(
-            "warning: -o slides.html does not end in .pdf; the file will hold a PDF\nerror: "
+            "warning: -o slides.html does not end in .pdf; the file will hold a PDF\n\
+             error: Chrome failed to print the deck: "
         ),
         "{stderr}"
     );
-    let output = presenter(dir.path())
-        .args(["-q", "export", "pdf", "d.md", "-o", "slides.PDF"])
-        .args(["--chrome", "/nonexistent/chrome"])
-        .assert()
-        .code(3)
-        .get_output()
-        .clone();
+    // -q hides the warning, not the error.
+    let output = export(&["-q", "export", "pdf", "d.md", "-o", "slides.html"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("error: Chrome failed to print the deck: "),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("warning"), "{stderr}");
+    // A .pdf name in any case gets no warning.
+    let output = export(&["export", "pdf", "d.md", "-o", "slides.PDF"]);
     assert!(text(&output.stderr).starts_with("error: "), "{output:?}");
+    assert_cleaned_up(private_tmp.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn export_refuses_to_overwrite_a_theme_file_before_the_browser_starts() {
+    let dir = project(&[
+        ("d.md", "# Themed\n"),
+        ("t/theme.toml", "name = \"t\"\nextends = \"default\"\n"),
+    ]);
+    let marker = dir.path().join("chrome-ran");
+    let fake = fake_chrome(
+        dir.path(),
+        "fake-chrome",
+        &format!("touch '{}'\nexit 1", marker.display()),
+    );
+    let before = snapshot(dir.path(), &["d.md", "t/theme.toml"]);
+    let output = run_settled(|| {
+        let mut cmd = presenter(dir.path());
+        cmd.args([
+            "export",
+            "pdf",
+            "d.md",
+            "--theme",
+            "./t",
+            "-o",
+            "t/theme.toml",
+        ])
+        .arg("--chrome")
+        .arg(&fake);
+        cmd
+    });
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let shown = Path::new("t/theme.toml").display().to_string();
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "error: refusing to write {shown}: it is the theme file {shown}; choose another \
+             output path with -o\n"
+        )
+    );
+    assert!(!marker.exists(), "the browser ran");
+    assert_eq!(snapshot(dir.path(), &["d.md", "t/theme.toml"]), before);
 }

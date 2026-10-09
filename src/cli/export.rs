@@ -14,9 +14,10 @@
 //!   (nothing with `-q`).
 //! - The PDF never overwrites an input (audit F01): before Chrome is looked for, the output
 //!   is compared by file identity with the input and the `presenter.toml` in use, and after
-//!   the build, before Chrome starts, with the deck's local assets too
-//!   ([`crate::pipeline::find_clash`]). A clash is a usage error (exit 2), and so is a `-o`
-//!   that names a directory. A `-o` that does not end in `.pdf` gets a warning.
+//!   the build, before Chrome starts, with the deck's local assets and the theme's files
+//!   too ([`crate::pipeline::input_files`]). A clash is a usage error
+//!   (exit 2), and so is a `-o` that names a directory. A `-o` that does not end in `.pdf`
+//!   gets a warning once every check has passed, just before Chrome starts.
 //! - A Chrome failure (it exits, times out after [`crate::pdf::DEFAULT_TIMEOUT`], or the
 //!   page fails) is an error that includes Chrome's stderr: exit 1.
 //!
@@ -89,7 +90,7 @@ fn export_pdf(args: &ExportPdfArgs, global: &GlobalArgs) -> anyhow::Result<ExitC
         standalone: Some(true),
         ..CliOverrides::default()
     };
-    let out = pdf_output(args, &opts, global)?;
+    let out = pdf_output(args, &opts)?;
     let Some(chrome) = pdf::find_chrome(args.chrome.as_deref()) else {
         report_error(&anyhow::anyhow!(no_chrome_message(args.chrome.as_deref())));
         return Ok(ExitCode::from(EXIT_NO_CHROME));
@@ -103,6 +104,7 @@ fn export_pdf(args: &ExportPdfArgs, global: &GlobalArgs) -> anyhow::Result<ExitC
     if let Some(clash) = pipeline::find_clash([out.as_path()], &pipeline::input_files(&build)) {
         return Err(clash_error(&clash, args.out.is_some()));
     }
+    warn_unless_pdf_extension(args.out.as_deref(), global);
     let bytes = pdf::html_to_pdf(&chrome, &build.document.html, pdf::DEFAULT_TIMEOUT)?;
     write_pdf(&out, &bytes)?;
     if !global.quiet {
@@ -135,30 +137,12 @@ fn no_chrome_message(explicit: Option<&Path>) -> String {
 
 /// Where the PDF goes: `-o`, else [`default_pdf_path`] for the project config of `opts`.
 /// Checked before Chrome is looked for: a `-o` that names a directory, and an output that
-/// is the input or the `presenter.toml` in use, are usage errors; a `-o` without the
-/// `.pdf` extension gets a warning (printed at once, not with `-q`).
-fn pdf_output(
-    args: &ExportPdfArgs,
-    opts: &BuildOptions,
-    global: &GlobalArgs,
-) -> anyhow::Result<PathBuf> {
+/// is the input or the `presenter.toml` in use, are usage errors.
+fn pdf_output(args: &ExportPdfArgs, opts: &BuildOptions) -> anyhow::Result<PathBuf> {
     let (config, config_path) = pipeline::load_config(opts)?;
     let out = match &args.out {
         Some(out) => {
             reject_directory(out, "give the PDF file to write")?;
-            let pdf = out
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
-            if !pdf {
-                let warning = Diagnostic::warning(
-                    "pdf-extension",
-                    format!(
-                        "-o {} does not end in .pdf; the file will hold a PDF",
-                        display_path(out).display()
-                    ),
-                );
-                report_diagnostics(&Diagnostics::from(vec![warning]), global);
-            }
             out.clone()
         }
         None => default_pdf_path(&args.input, &config),
@@ -169,6 +153,29 @@ fn pdf_output(
         return Err(clash_error(&clash, args.out.is_some()));
     }
     Ok(out)
+}
+
+/// The `pdf-extension` warning (not with `-q`) when the `-o` file does not end in `.pdf`.
+/// Printed once every check has passed, just before Chrome starts, so it never precedes
+/// a refusal to write that file.
+fn warn_unless_pdf_extension(out: Option<&Path>, global: &GlobalArgs) {
+    let Some(out) = out else {
+        return;
+    };
+    if out
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        return;
+    }
+    let warning = Diagnostic::warning(
+        "pdf-extension",
+        format!(
+            "-o {} does not end in .pdf; the file will hold a PDF",
+            display_path(out).display()
+        ),
+    );
+    report_diagnostics(&Diagnostics::from(vec![warning]), global);
 }
 
 /// Where the PDF goes without `-o`: the standalone HTML output path with `.pdf`.

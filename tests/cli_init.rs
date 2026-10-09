@@ -528,17 +528,11 @@ fn full_theme_copies_the_default_theme() {
 
     let builtin = presenter::vendor::list("themes/default/");
     assert!(!builtin.is_empty());
-    // Every file but the built-in theme's README, which documents it in the repository
-    // and whose links break in a copy (audit F48).
-    let builtin: Vec<String> = builtin
-        .into_iter()
-        .filter(|key| key != "themes/default/README.md")
-        .collect();
     let expected: BTreeSet<String> = builtin
         .iter()
         .map(|key| format!("theme/{}", &key["themes/default/".len()..]))
         .collect();
-    assert!(!project.join("theme/README.md").exists());
+    assert!(expected.contains("theme/README.md"));
     let theme_files: BTreeSet<String> = files(&project)
         .into_iter()
         .filter(|f| f.starts_with("theme/"))
@@ -546,7 +540,7 @@ fn full_theme_copies_the_default_theme() {
     assert_eq!(theme_files, expected);
     for key in &builtin {
         let rel = &key["themes/default/".len()..];
-        if rel == "theme.toml" {
+        if rel == "theme.toml" || rel == "README.md" {
             continue;
         }
         let copied = std::fs::read(project.join("theme").join(rel)).unwrap();
@@ -578,6 +572,25 @@ fn full_theme_copies_the_default_theme() {
     original.insert("name".into(), "full".into());
     original.insert("description".into(), description.into());
     assert_eq!(manifest, original);
+
+    // The README says that it documents the built-in theme, and none of its links leaves
+    // the copy; the copied CSS and templates that point to it find it (audit F48).
+    let readme = read(project.join("theme/README.md"));
+    assert!(
+        readme.starts_with(
+            "> **A copy.** `presenter init --full-theme` copied presenter's built-in theme \
+             `default` here as the theme `full`.\n"
+        ),
+        "{readme}"
+    );
+    assert!(!readme.contains("](../"), "{readme}");
+    assert!(read(project.join("theme/templates/cell.html")).contains("(README.md, "));
+    for rel in ["styles/theme.css", "styles/notebook.css"] {
+        assert!(
+            read(project.join("theme").join(rel)).contains("../README.md"),
+            "{rel}"
+        );
+    }
 
     let html = build(&project, "slides.md", 6);
     let context = dump(&project, "slides.md", true);

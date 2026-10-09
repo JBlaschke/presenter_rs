@@ -14,9 +14,10 @@
 //! The output never overwrites an input (audit F01): before building, the document's path
 //! (`-o`, the default path, or `<out>/index.html` for a site) is compared by file identity
 //! with the input and the `presenter.toml` in use, and after building, everything to be
-//! written with the deck's local assets too ([`pipeline::output_clash`]). A clash is a
-//! usage error (exit 2) and nothing is written. A standalone `-o` that names a directory
-//! (a trailing `/` or an existing directory) is a usage error too.
+//! written with the deck's local assets and the theme's files too
+//! ([`pipeline::output_clash`], [`pipeline::input_files`]). A clash is a usage error
+//! (exit 2) and nothing is written. A standalone `-o` that names a directory (a trailing
+//! `/`, a last component `.` or `..`, or an existing directory) is a usage error too.
 //!
 //! `--watch` ([`watch`], T20) builds once, then rebuilds on every change of the deck's
 //! inputs ([`crate::serve::watch`]) until interrupted: each build prints exactly what a
@@ -25,8 +26,10 @@
 //! <paths>` before every rebuild (neither with `-q`). A `presenter.toml` that cannot be
 //! loaded at startup is reported the same way and watched until it can (the output path
 //! and mode depend on it); then the first build runs. An output that would overwrite the
-//! input or the `presenter.toml` ends the command before watching starts (exit 2); one
-//! that would overwrite an asset the deck starts to use later fails that rebuild.
+//! input or the `presenter.toml` ends the command before watching starts, and so does a
+//! first build whose output would overwrite one of its other inputs (an asset, a theme
+//! file): exit 2 with the message of a single build. A rebuild that would overwrite an
+//! input the deck starts to use later fails with that message and watching goes on.
 
 use std::io::Write as _;
 use std::ops::ControlFlow;
@@ -61,7 +64,9 @@ pub fn run(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
 /// ([`watcher::run_build_watch_with`]); runs until interrupted. An input whose format
 /// cannot be told ends the command like a single build's; a `presenter.toml` that cannot be
 /// loaded is reported and watched until it can be, then the first build runs; build
-/// errors are printed and watching goes on.
+/// errors are printed and watching goes on. A first build whose output would overwrite
+/// one of its inputs ends the command like a single build (its diagnostics, then the
+/// usage error, exit 2): `-o` cannot change while watching.
 pub fn watch(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let (opts, out, announced) = match build_options(args, global) {
         Ok((opts, out)) => (opts, out, false),
@@ -71,14 +76,29 @@ pub fn watch(args: &BuildArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> 
         }
         Err(err) => return Err(err),
     };
+    let explicit = args.out.is_some();
+    let mut first = true;
+    let mut refused = None;
     watcher::run_build_watch_with(&opts, &out, |status| {
+        // The first status is the first build's (`Built` or `Failed`).
+        if std::mem::take(&mut first)
+            && let WatchStatus::Failed(failure) = &status
+            && let Some(clash) = pipeline::refused_clash(&failure.error)
+        {
+            report_diagnostics(&failure.diagnostics, global);
+            refused = Some(clash_error(clash, explicit));
+            return ControlFlow::Break(());
+        }
         // `Watching …` was printed while waiting for the config.
         if !(announced && matches!(status, WatchStatus::Watching(_))) {
-            print_watch_status(status, &opts, &out, global);
+            print_watch_status(status, &opts, explicit, global);
         }
         ControlFlow::Continue(())
     })?;
-    Ok(ExitCode::SUCCESS)
+    match refused {
+        Some(err) => Err(err),
+        None => Ok(ExitCode::SUCCESS),
+    }
 }
 
 /// `build --watch` with a `presenter.toml` that cannot be loaded before the first build:
@@ -114,26 +134,33 @@ fn is_config_error(err: &anyhow::Error) -> bool {
         .any(|cause| matches!(cause.downcast_ref::<Error>(), Some(Error::Config(_))))
 }
 
-/// Prints one [`WatchStatus`] of `build --watch` (module docs).
+/// Prints one [`WatchStatus`] of `build --watch` (module docs). A rebuild whose output
+/// would overwrite one of its inputs is reported like a single build's refusal
+/// ([`clash_error`]; `explicit`: the output came from `-o`).
 fn print_watch_status(
     status: WatchStatus<'_>,
     opts: &BuildOptions,
-    out: &Path,
+    explicit: bool,
     global: &GlobalArgs,
 ) {
     match status {
         WatchStatus::Built { build, written } => {
             report_diagnostics(&build.diagnostics, global);
-            if !global.quiet {
-                let document = written.first().map_or(out, PathBuf::as_path);
+            if let Some(document) = written.first().filter(|_| !global.quiet) {
                 // stdout is gone (closed pipe ignored); nothing sensible is left to do.
                 let _ = print_stdout(&wrote_line(build, document));
             }
         }
-        WatchStatus::Failed(failure) => {
-            let error = report::report_build_failure(failure, &opts.input, global);
-            report::report_error(&error);
-        }
+        WatchStatus::Failed(failure) => match pipeline::refused_clash(&failure.error) {
+            Some(clash) => {
+                report_diagnostics(&failure.diagnostics, global);
+                report::report_error(&clash_error(clash, explicit));
+            }
+            None => {
+                let error = report::report_build_failure(failure, &opts.input, global);
+                report::report_error(&error);
+            }
+        },
         WatchStatus::Watching(_) => status_line(WATCHING, global),
         WatchStatus::Changed(batch) => status_line(&rebuilding_line(batch), global),
     }

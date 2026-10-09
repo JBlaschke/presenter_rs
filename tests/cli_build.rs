@@ -1084,10 +1084,245 @@ fn build_refuses_to_overwrite_the_config_or_an_asset() {
 }
 
 #[test]
+fn build_watch_refuses_an_asset_as_its_output_before_watching() {
+    // The first build finds the clash: the command ends like a single build (exit 2,
+    // display paths and the hint), instead of watching with an error it cannot recover
+    // from (-o cannot change while watching).
+    let tmp = project(&[("a.md", "# A\n\n![plot](figures/plot.png)\n")]);
+    std::fs::create_dir(tmp.path().join("figures")).unwrap();
+    std::fs::copy(
+        root().join("tests/fixtures/md/images/ok.png"),
+        tmp.path().join("figures/plot.png"),
+    )
+    .unwrap();
+    let stderr = assert_refused(
+        tmp.path(),
+        &["build", "a.md", "-o", "figures/plot.png", "--watch"],
+        &["a.md", "figures/plot.png"],
+    );
+    let plot = Path::new("figures/plot.png").display().to_string();
+    assert_eq!(
+        stderr,
+        format!(
+            "error: refusing to write {plot}: it is the deck's asset {plot}; choose another \
+             output path with -o\n"
+        )
+    );
+}
+
+/// A `presenter build --watch` process in `dir` whose stdout and stderr go to files in
+/// `logs` (outside the watched directory); killed when dropped.
+struct Watching {
+    child: std::process::Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl Watching {
+    fn spawn(dir: &Path, logs: &Path, args: &[&str]) -> Watching {
+        let stdout = logs.join("stdout");
+        let stderr = logs.join("stderr");
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+            .current_dir(dir)
+            .args(args)
+            .env_remove("RUST_LOG")
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        Watching {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr).unwrap_or_default()
+    }
+
+    /// Waits (at most 30 s) until `done` holds for stderr; the process must keep running.
+    fn wait_for(&mut self, what: &str, done: impl Fn(&str) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if done(&self.stderr()) {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "presenter exited ({status}) before {what}:\n{}",
+                    self.stderr()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}:\n{}", self.stderr());
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn build_watch_reports_a_rebuild_that_would_overwrite_an_input_like_a_build() {
+    // The deck starts to use its own output as an image: that rebuild is refused with the
+    // message of a single build (display paths, hint), and watching goes on.
+    let tmp = project(&[("w.md", "# Watched\n")]);
+    let logs = tempfile::tempdir().unwrap();
+    let mut watching = Watching::spawn(
+        tmp.path(),
+        logs.path(),
+        &["build", "w.md", "-o", "out/w.png", "--watch"],
+    );
+    watching.wait_for("the first build", |stderr| {
+        stderr.contains("Watching for changes")
+    });
+    let first = std::fs::read(tmp.path().join("out/w.png")).unwrap();
+    // Replaced in one step, so no rebuild sees a half-written deck.
+    let edited = logs.path().join("w.md");
+    std::fs::write(&edited, "# Watched\n\n![me](out/w.png)\n").unwrap();
+    std::fs::rename(&edited, tmp.path().join("w.md")).unwrap();
+    let out = Path::new("out/w.png").display().to_string();
+    let refusal = format!(
+        "\nerror: refusing to write {out}: it is the deck's asset {out}; choose another output \
+         path with -o\n"
+    );
+    // The message may be written in several pieces: wait for all of it.
+    watching.wait_for("the refused rebuild", |stderr| stderr.contains(&refusal));
+    assert!(
+        watching.child.try_wait().unwrap().is_none(),
+        "still watching"
+    );
+    assert_eq!(std::fs::read(tmp.path().join("out/w.png")).unwrap(), first);
+    let stdout = std::fs::read_to_string(&watching.stdout).unwrap();
+    assert!(
+        stdout.starts_with(&format!("Wrote {out} (1 slide, ")),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn build_refuses_its_input_reached_through_a_link_after_dot_dot() {
+    // work/link -> ../other/sub: from work/, `nonexist/../link/../deck.md` is
+    // other/deck.md once `nonexist` is created, the input itself.
+    let tmp = project(&[("other/deck.md", "# Precious\n"), ("work/keep", "")]);
+    std::fs::create_dir(tmp.path().join("other/sub")).unwrap();
+    let work = tmp.path().join("work");
+    std::os::unix::fs::symlink("../other/sub", work.join("link")).unwrap();
+    let stderr = assert_refused(
+        &work,
+        &[
+            "build",
+            "../other/deck.md",
+            "-o",
+            "nonexist/../link/../deck.md",
+        ],
+        &["../other/deck.md"],
+    );
+    assert_eq!(
+        stderr,
+        "error: refusing to write ../other/deck.md: it is the input file ../other/deck.md; \
+         choose another output path with -o\n"
+    );
+    assert!(!work.join("nonexist").exists());
+    // `Wrote` names the file a `..` after the link reaches.
+    std::fs::write(work.join("x.md"), "# X\n").unwrap();
+    let stdout =
+        stdout_of(
+            presenter()
+                .current_dir(&work)
+                .args(["build", "x.md", "-o", "link/../out.html"]),
+        );
+    assert!(
+        stdout.starts_with("Wrote ../other/out.html (1 slide, "),
+        "{stdout}"
+    );
+    assert!(tmp.path().join("other/out.html").is_file());
+    assert!(!work.join("out.html").exists());
+}
+
+#[test]
+fn build_refuses_to_overwrite_the_files_of_its_theme() {
+    // In a `presenter init` project: the theme's manifest, stylesheet and templates, and a
+    // file its stylesheet uses with url(), are inputs like presenter.toml.
+    let tmp = tempfile::tempdir().unwrap();
+    presenter()
+        .current_dir(tmp.path())
+        .args(["-q", "init", "."])
+        .assert()
+        .success();
+    std::fs::copy(
+        root().join("tests/fixtures/md/images/ok.png"),
+        tmp.path().join("theme/bg.png"),
+    )
+    .unwrap();
+    let css = tmp.path().join("theme/styles/theme.css");
+    let mut text = std::fs::read_to_string(&css).unwrap();
+    text.push_str("\n.reveal .slides { background-image: url(\"../bg.png\"); }\n");
+    std::fs::write(&css, text).unwrap();
+    let protected = [
+        "slides.md",
+        "presenter.toml",
+        "theme/theme.toml",
+        "theme/styles/theme.css",
+        "theme/templates/layouts/title.html",
+        "theme/bg.png",
+    ];
+    for out in &protected[2..] {
+        let stderr = assert_refused(tmp.path(), &["build", "slides.md", "-o", out], &protected);
+        let shown = Path::new(out).display().to_string();
+        assert_eq!(
+            stderr,
+            format!(
+                "error: refusing to write {shown}: it is the theme file {shown}; choose \
+                 another output path with -o\n"
+            )
+        );
+    }
+    // The first build of --watch finds it too.
+    assert_refused(
+        tmp.path(),
+        &["build", "slides.md", "-o", "theme/theme.toml", "--watch"],
+        &protected,
+    );
+    // An output kept in the theme directory (HTML at its top level, or anywhere below a
+    // directory that is not one of the theme's) can be built again.
+    for out in ["theme/preview.html", "theme/dist/slides.html"] {
+        for _ in 0..2 {
+            presenter()
+                .current_dir(tmp.path())
+                .args(["-q", "build", "slides.md", "-o", out])
+                .assert()
+                .success();
+        }
+    }
+    presenter()
+        .current_dir(tmp.path())
+        .args(["-q", "build", "slides.md"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn a_standalone_output_that_names_a_directory_is_a_usage_error() {
     let tmp = project(&[("slides.md", "# One\n")]);
     std::fs::create_dir(tmp.path().join("existing")).unwrap();
-    for out in ["../outdir/", "existing"] {
+    // A last component `.` or `..` names a directory too, whether it exists or not.
+    for out in [
+        "../outdir/",
+        "existing",
+        "out/.",
+        "out/..",
+        "existing/.",
+        ".",
+    ] {
         presenter()
             .current_dir(tmp.path())
             .args(["build", "slides.md", "-o", out])
@@ -1100,6 +1335,7 @@ fn a_standalone_output_that_names_a_directory_is_a_usage_error() {
             ));
     }
     assert!(!tmp.path().join("../outdir").exists());
+    assert!(!tmp.path().join("out").exists(), "no directory is created");
     // A directory is what --site writes.
     presenter()
         .current_dir(tmp.path())

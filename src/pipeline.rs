@@ -44,13 +44,15 @@
 //! Output safety (audit F01): an output file must never be one of the build's inputs.
 //! [`find_clash`] compares files by identity ([`same_file`]: device and inode on Unix), so
 //! a symbolic or hard link to the input and another spelling of its name on a
-//! case-insensitive file system are caught too. [`output_clash`] checks everything
-//! [`write_output`] would write against [`input_files`] (the source, the `presenter.toml`,
-//! the deck's local assets); `write_output` refuses with [`Error::Other`] when there is a
-//! clash, and the CLI checks first to exit 2 with a usage error.
+//! case-insensitive file system are caught too; an output that does not exist yet is taken
+//! where the write will reach it ([`path_after_creating_dirs`]). [`output_clash`] checks
+//! everything [`write_output`] would write against [`input_files`] (the source, the
+//! `presenter.toml`, the deck's local assets, the files of the theme directories in use);
+//! `write_output` refuses with an error that carries the [`Clash`] ([`refused_clash`]),
+//! and the CLI checks first to exit 2 with a usage error.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::assets::emit::OutputMode;
 use crate::assets::registry::{AssetData, AssetRegistry, normalize_lexically};
@@ -59,7 +61,7 @@ use crate::error::{Diagnostic, Diagnostics, Error, Level, Result};
 use crate::ir::{Deck, Parsed, SourceInfo, SourceKind};
 use crate::markdown::render::missing_asset_path;
 use crate::render::{self, BuildInfo, RenderInput, RenderedDocument};
-use crate::theme::{self, Theme};
+use crate::theme::{self, Theme, ThemeDir, ThemeSource};
 
 /// File name of the document in site mode (`<out>/index.html`).
 pub const SITE_INDEX: &str = "index.html";
@@ -517,23 +519,27 @@ pub enum InputRole {
     Config,
     /// A local file the deck references (an image, a video, an embedded page, …).
     Asset,
+    /// A file of a theme directory the build uses ([`input_files`] says which).
+    Theme,
 }
 
 impl fmt::Display for InputRole {
-    /// `the input file`, `the config file` or `the deck's asset`.
+    /// `the input file`, `the config file`, `the deck's asset` or `the theme file`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             InputRole::Source => "the input file",
             InputRole::Config => "the config file",
             InputRole::Asset => "the deck's asset",
+            InputRole::Theme => "the theme file",
         })
     }
 }
 
 /// An output file that is one of the build's inputs, so that writing it would destroy that
 /// input (audit F01). Found by [`find_clash`] and [`output_clash`]; [`write_output`]
-/// refuses to write when there is one. Displayed as
-/// `refusing to write <output>: it is the input file <input>` (paths as stored).
+/// refuses to write when there is one (its error carries the clash: [`refused_clash`]).
+/// Displayed as `refusing to write <output>: it is the input file <input>` (paths as
+/// stored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clash {
     /// The output file, as it would be written.
@@ -557,9 +563,25 @@ impl fmt::Display for Clash {
     }
 }
 
-/// The files `build` read that its output must never overwrite, each with its role: the
-/// source, the `presenter.toml` that was used and every local file asset of the deck.
-/// (Theme files are not listed: an output inside a theme directory is allowed.)
+impl std::error::Error for Clash {}
+
+/// The directories of a theme whose files a build reads (theme-format.md §1); every file
+/// in them is a theme input ([`input_files`]).
+const THEME_INPUT_DIRS: [&str; 4] = ["templates", "styles", "assets", "scripts"];
+
+/// Extensions (ASCII case-insensitive) of the top-level files of a theme directory that are
+/// not theme inputs: what `build` and `export pdf` write, so that an output kept in a theme
+/// directory can be rebuilt ([`input_files`]).
+const OUTPUT_EXTENSIONS: [&str; 3] = ["html", "htm", "pdf"];
+
+/// The files `build` read, or may read, that its output must never overwrite, each with
+/// its role: the source, the `presenter.toml` that was used, every local file asset of the
+/// deck and the files of each theme directory of the chain ([`InputRole::Theme`]): its
+/// top-level files (`theme.toml` among them) except `.html`, `.htm` and `.pdf` files,
+/// which may be earlier outputs; every file in its `templates/`, `styles/`, `assets/` and
+/// `scripts/` directories; and the files its `theme.toml` names (`[styles] entries`,
+/// `[scripts] entries`, a `highlight_style` file). Other files below a theme directory (a
+/// `dist/` there, say) are not inputs. Built-in themes have no files on disk.
 pub fn input_files(build: &Build) -> Vec<(PathBuf, InputRole)> {
     let mut inputs = vec![(build.deck.source.path.clone(), InputRole::Source)];
     inputs.extend(
@@ -572,14 +594,64 @@ pub fn input_files(build: &Build) -> Vec<(PathBuf, InputRole)> {
         AssetData::File(path) => Some((path.clone(), InputRole::Asset)),
         AssetData::Bytes(_) => None,
     }));
+    for theme_dir in &build.theme.chain {
+        inputs.extend(
+            theme_files(theme_dir)
+                .into_iter()
+                .map(|path| (path, InputRole::Theme)),
+        );
+    }
     inputs
+}
+
+/// The theme input files of `theme_dir` on disk ([`input_files`]); none for a built-in
+/// theme. Listed files exist; named ones may not (they are then no input).
+fn theme_files(theme_dir: &ThemeDir) -> Vec<PathBuf> {
+    let ThemeSource::Disk { dir } = &theme_dir.source else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.is_file() && !has_output_extension(path))
+        .collect();
+    files.sort();
+    for sub in THEME_INPUT_DIRS {
+        files.extend(theme_dir.list(sub).into_iter().map(|rel| dir.join(rel)));
+    }
+    let manifest = &theme_dir.manifest;
+    let named = manifest
+        .styles
+        .entries
+        .iter()
+        .chain(&manifest.scripts.entries)
+        .chain(&manifest.styles.highlight_style);
+    files.extend(
+        named
+            .filter_map(|rel| theme::normalize_rel(rel))
+            .filter(|rel| !rel.is_empty())
+            .map(|rel| dir.join(rel)),
+    );
+    files
+}
+
+/// Whether `path` ends in one of [`OUTPUT_EXTENSIONS`].
+fn has_output_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            OUTPUT_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
 }
 
 /// The first of `outputs` that is one of `inputs` (the same file, by [`same_file`]'s
 /// identity; the first matching input names it), if any. An output path that does not
 /// resolve yet is taken as the file it reaches once [`write_output`] has created its
-/// missing directories (`sub/../slides.md` is `slides.md`). Relative paths are taken from
-/// the current directory.
+/// missing directories ([`path_after_creating_dirs`]: `sub/../slides.md` is `slides.md`).
+/// Relative paths are taken from the current directory.
 pub fn find_clash<'a>(
     outputs: impl IntoIterator<Item = &'a Path>,
     inputs: &[(PathBuf, InputRole)],
@@ -630,23 +702,50 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// The path a write to `path` reaches once its missing directories are created (as
-/// [`write_output`] does): the longest prefix of `path` that exists, canonical, joined with
-/// the rest normalized lexically. The rest starts at a component that does not exist, so it
-/// will be a plain new directory and a `..` after it returns to its parent. `None` when not
-/// even the current directory resolves.
-fn path_after_creating_dirs(path: &Path) -> Option<PathBuf> {
-    let components: Vec<std::path::Component<'_>> = path.components().collect();
-    (0..components.len()).rev().find_map(|existing| {
-        let prefix: PathBuf = components[..existing].iter().collect();
-        let prefix = if prefix.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            prefix
-        };
-        let base = std::fs::canonicalize(prefix).ok()?;
-        let rest: PathBuf = components[existing..].iter().collect();
-        Some(normalize_lexically(&base.join(rest)))
-    })
+/// [`write_output`] does), with every symbolic link that the write follows resolved.
+///
+/// The components are followed one at a time, as the operating system follows them. While
+/// every directory so far exists, the next name is looked up on disk: an existing file,
+/// directory or symbolic link is replaced by its canonical path, so a later `..` leaves
+/// the directory a link points to, not the link's own directory. A name that does not
+/// exist starts the directories the write creates; a `..` after it returns to the
+/// directory it was created in (where lookups on disk resume) and `.` is skipped. So
+/// `new/../link/../x.md` is `x.md` next to the directory that `link` points to.
+///
+/// A relative `path` is taken from the current directory; `None` when that cannot be
+/// resolved. The result is absolute, and canonical as far as it exists.
+pub fn path_after_creating_dirs(path: &Path) -> Option<PathBuf> {
+    let mut base = if path.has_root() {
+        PathBuf::new()
+    } else {
+        std::fs::canonicalize(".").ok()?
+    };
+    // Names below `base` that do not exist yet: the directories the write creates.
+    let mut created: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => base.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if created.pop().is_none()
+                    && let Some(parent) = base.parent()
+                {
+                    base = parent.to_path_buf();
+                }
+            }
+            Component::Normal(name) => {
+                let existing = created
+                    .is_empty()
+                    .then(|| std::fs::canonicalize(base.join(name)).ok())
+                    .flatten();
+                match existing {
+                    Some(real) => base = real,
+                    None => created.push(name),
+                }
+            }
+        }
+    }
+    Some(created.iter().fold(base, |dir, name| dir.join(name)))
 }
 
 /// The identity of an existing file ([`same_file`]).
@@ -681,11 +780,15 @@ fn file_id(path: &Path) -> Option<FileId> {
 ///
 /// Parent directories are created. Existing output files are overwritten, but never one of
 /// the build's inputs: when [`output_clash`] finds one, nothing is written and the error is
-/// an [`Error::Other`] with the [`Clash`] message. Stale files of an earlier site build are
-/// left alone. I/O errors are [`Error::Io`] naming the path.
+/// an [`Error::Io`] of kind [`std::io::ErrorKind::InvalidInput`] that displays the
+/// [`Clash`] message and carries the clash ([`refused_clash`] gets it back). Stale files of
+/// an earlier site build are left alone. I/O errors are [`Error::Io`] naming the path.
 pub fn write_output(build: &Build, out: &Path, mode: &OutputMode) -> Result<Vec<PathBuf>> {
     if let Some(clash) = output_clash(build, out, mode) {
-        return Err(Error::Other(clash.to_string()));
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            clash,
+        )));
     }
     match mode {
         OutputMode::Standalone => {
@@ -705,6 +808,16 @@ pub fn write_output(build: &Build, out: &Path, mode: &OutputMode) -> Result<Vec<
         OutputMode::Serve => Err(Error::Other(
             "serve output is held in memory and cannot be written to disk".into(),
         )),
+    }
+}
+
+/// The [`Clash`] that made [`write_output`] refuse to write, when `error` is that refusal
+/// (for a caller that reports it in its own words, like `build --watch`); `None` for every
+/// other error.
+pub fn refused_clash(error: &Error) -> Option<&Clash> {
+    match error {
+        Error::Io(err) => err.get_ref()?.downcast_ref::<Clash>(),
+        _ => None,
     }
 }
 
@@ -1079,6 +1192,15 @@ mod tests {
             path_after_creating_dirs(&dir.path().join("n1/n2/../../a/x.md")),
             Some(base.join("a/x.md"))
         );
+        assert_eq!(
+            path_after_creating_dirs(&dir.path().join("./a/./n/m/../../x.md")),
+            Some(base.join("a/x.md"))
+        );
+        assert_eq!(
+            path_after_creating_dirs(&dir.path().join("n/../n/x.md")),
+            Some(base.join("n/x.md")),
+            "a directory created on the way is new and empty"
+        );
         #[cfg(unix)]
         {
             // An existing link in the prefix is followed, as the OS follows it.
@@ -1087,7 +1209,117 @@ mod tests {
                 path_after_creating_dirs(&dir.path().join("link/new/../x.md")),
                 Some(base.join("a/x.md"))
             );
+            // A link reached after a `..` out of a new directory is followed too, and a
+            // `..` after it leaves the directory it points to (review of A1: the lexical
+            // rest went to `<dir>/x.md`, while the OS wrote `a/../x.md`).
+            std::fs::create_dir_all(base.join("other/sub")).unwrap();
+            std::os::unix::fs::symlink(base.join("other/sub"), base.join("a/up")).unwrap();
+            assert_eq!(
+                path_after_creating_dirs(&dir.path().join("a/new/../up/../deck.md")),
+                Some(base.join("other/deck.md"))
+            );
+            assert_eq!(
+                path_after_creating_dirs(&dir.path().join("link/up/../../x.md")),
+                Some(base.join("x.md")),
+                "link/up is other/sub: .. twice is the temporary directory"
+            );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_clash_follows_a_link_after_a_dot_dot_out_of_a_new_directory() {
+        // work/link -> ../other/sub; `nonexist/../link/../deck.md` from work/ is
+        // other/deck.md, the input.
+        let dir = project(&[("other/deck.md", "# Precious\n"), ("work/x.md", "")]);
+        std::fs::create_dir(dir.path().join("other/sub")).unwrap();
+        std::os::unix::fs::symlink("../other/sub", dir.path().join("work/link")).unwrap();
+        let deck = dir.path().join("other/deck.md");
+        let inputs = [(deck.clone(), InputRole::Source)];
+        let out = dir.path().join("work/nonexist/../link/../deck.md");
+        let clash = find_clash([out.as_path()], &inputs).unwrap();
+        assert_eq!((clash.output, clash.input), (out, deck));
+        let elsewhere = dir.path().join("work/nonexist/../deck.md");
+        assert_eq!(find_clash([elsewhere.as_path()], &inputs), None);
+    }
+
+    #[test]
+    fn the_files_of_a_theme_directory_are_inputs() {
+        let dir = project(&[
+            ("slides.md", "# One\n"),
+            (
+                "t/theme.toml",
+                "name = \"t\"\nextends = \"default\"\n[styles]\nentries = [\"main.css\", \
+                 \"css/extra.css\"]\nhighlight_style = \"hl/code.css\"\n",
+            ),
+            ("t/main.css", "body { background: url(\"bg.png\"); }\n"),
+            ("t/css/extra.css", "p { color: red; }\n"),
+            ("t/hl/code.css", ".hljs { color: blue; }\n"),
+            ("t/bg.png", "png"),
+            ("t/templates/partials/extra.html", "<p>extra</p>\n"),
+            ("t/assets/logo.svg", "<svg/>"),
+            ("t/preview.html", "an earlier output"),
+            ("t/talk.PDF", "an earlier export"),
+            ("t/dist/slides.html", "an earlier output"),
+            ("t/dist/notes.txt", "not read by the theme"),
+        ]);
+        let input = dir.path().join("slides.md");
+        let opts = BuildOptions {
+            cli: CliOverrides {
+                theme: Some(dir.path().join("t").display().to_string()),
+                ..CliOverrides::default()
+            },
+            ..BuildOptions::new(&input)
+        };
+        let build = build_deck(&opts).unwrap();
+        let theme_dir = std::fs::canonicalize(dir.path().join("t")).unwrap();
+        let mut theme_inputs: Vec<String> = input_files(&build)
+            .into_iter()
+            .filter(|(_, role)| *role == InputRole::Theme)
+            .map(|(path, _)| {
+                let rel = path.strip_prefix(&theme_dir).unwrap();
+                rel.to_string_lossy().replace('\\', "/")
+            })
+            .collect();
+        theme_inputs.sort();
+        theme_inputs.dedup();
+        assert_eq!(
+            theme_inputs,
+            [
+                "assets/logo.svg",
+                "bg.png",
+                "css/extra.css",
+                "hl/code.css",
+                "main.css",
+                "templates/partials/extra.html",
+                "theme.toml"
+            ]
+        );
+        let out = dir.path().join("t/theme.toml");
+        let clash = output_clash(&build, &out, &OutputMode::Standalone).unwrap();
+        assert_eq!(clash.role, InputRole::Theme);
+        assert!(
+            clash.to_string().contains(": it is the theme file "),
+            "{clash}"
+        );
+        assert!(write_output(&build, &out, &OutputMode::Standalone).is_err());
+        assert!(
+            std::fs::read_to_string(&out)
+                .unwrap()
+                .starts_with("name = ")
+        );
+        // An output kept in the theme directory can be rebuilt.
+        for kept in ["t/preview.html", "t/talk.PDF", "t/dist/slides.html"] {
+            let out = dir.path().join(kept);
+            assert_eq!(output_clash(&build, &out, &OutputMode::Standalone), None);
+        }
+        // Built-in themes have no files on disk.
+        let plain = build_deck(&BuildOptions::new(&input)).unwrap();
+        assert!(
+            input_files(&plain)
+                .iter()
+                .all(|(_, role)| *role != InputRole::Theme)
+        );
     }
 
     #[test]
@@ -1103,8 +1335,12 @@ mod tests {
             let clash = output_clash(&build, &out, &OutputMode::Standalone).unwrap();
             assert_eq!(clash.output, out);
             let err = write_output(&build, &out, &OutputMode::Standalone).unwrap_err();
-            assert!(matches!(&err, Error::Other(message) if *message == clash.to_string()));
+            assert_eq!(err.to_string(), clash.to_string());
+            assert_eq!(refused_clash(&err), Some(&clash));
         }
+        assert_eq!(refused_clash(&Error::Other("x".into())), None);
+        let plain_io = Error::Io(std::io::Error::other("disk full"));
+        assert_eq!(refused_clash(&plain_io), None);
         assert_eq!(std::fs::read(&input).unwrap(), before);
         assert_eq!(
             std::fs::read(dir.path().join("plot.png")).unwrap(),

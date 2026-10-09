@@ -29,12 +29,19 @@ presenter build <INPUT> [-o/--out PATH] [--theme NAME|PATH] [--standalone|--site
 - Stdout: nothing except `Wrote <path> (<n> slides, <size>)` on success. Diagnostics on stderr.
 - The output never overwrites one of the build's inputs (audit F01). Every file to be written
   (`-o`, the default path, a site's `<out>/index.html` and `assets/`) is compared by file identity
-  with the input, the `presenter.toml` in use and the deck's local assets, so a symbolic or hard
-  link and another spelling of the name on a case-insensitive file system count too. A clash exits 2
-  with `error: refusing to write <out>: it is the input file <input>; choose another output path
-  with -o` (for the default path: `…; it is the default output path ([build] out_dir); choose
-  another one with -o`) and writes nothing. `--watch` checks the input and `presenter.toml` before
-  it starts watching. A standalone `-o` that names a directory (a trailing `/` or an existing
+  with the input, the `presenter.toml` in use, the deck's local assets and the files of a theme
+  directory in use (its `theme.toml` and its other top-level files except `.html`, `.htm` and
+  `.pdf` files, which may be earlier outputs; everything in its `templates/`, `styles/`, `assets/`
+  and `scripts/`; the files its `theme.toml` names), so a symbolic or hard link and another
+  spelling of the name on a case-insensitive file system count too, and so does a path that
+  reaches the file once its missing directories are created (`new/../link/../x.md`). A clash
+  exits 2 with `error: refusing to write <out>: it is the input file <input>; choose another
+  output path with -o` (`the config file`, `the deck's asset`, `the theme file`; for the default
+  path: `…; it is the default output path ([build] out_dir); choose another one with -o`) and
+  writes nothing. `--watch` checks the input and `presenter.toml` before it starts watching, and
+  ends the same way when its first build finds a clash; a later rebuild that would overwrite an
+  input (an image the deck starts to use) prints that error and watching goes on. A standalone
+  `-o` that names a directory (a trailing `/`, a last component `.` or `..`, or an existing
   directory) exits 2 as well (audit F41).
 - A build that fails on missing assets reports each of them as a located error with its source
   line, in source order (audit F37).
@@ -71,8 +78,10 @@ presenter theme check <DIR>                # validate theme.toml, chain, require
   NAME or DIR argument that names nothing usable: not a built-in theme (`eject`), an `--extends`
   that is neither a theme directory nor a built-in theme (`new`), a `check` DIR that does not
   exist, is not a directory or has no `theme.toml`, an existing `eject` DIR, a non-empty `new` DIR.
-- `eject` (and `init --full-theme`) leave out the built-in theme's own `README.md`, which
-  documents it in the repository (audit F48).
+- `eject` (and `init --full-theme`) copy the built-in theme's `README.md` (its CSS and templates
+  refer to it) with a note on top: the copy is the theme `<name>`, and the text documents the
+  built-in theme. Its links into presenter's repository keep their text but lose the link, which
+  would break in the copy (audit F48).
 
 ## dump
 ```
@@ -101,8 +110,9 @@ presenter export pdf <INPUT> [-o FILE] [--chrome PATH] [--theme …]
   (`--chrome`, `$CHROME_PATH`, or well-known locations on macOS/Linux), writes the PDF.
   Exit 3 when no Chrome is found, with install hints.
 - The PDF never overwrites an input either (as for `build`, audit F01): exit 2, checked before
-  Chrome is looked for (the input, `presenter.toml`) and before it starts (the deck's assets). A
-  `-o` that names a directory exits 2; a `-o` that does not end in `.pdf` gets a warning.
+  Chrome is looked for (the input, `presenter.toml`) and before it starts (the deck's assets, the
+  theme's files). A `-o` that names a directory exits 2; a `-o` that does not end in `.pdf` gets a
+  warning once every check has passed, just before Chrome starts.
 - The PDF is not byte-for-byte reproducible: Chrome stamps the export time and its version into
   it (the PLAN goal 7 exception, audit F21). `export pdf --help` lists this under Limitations.
 
@@ -113,4 +123,6 @@ presenter export pdf <INPUT> [-o FILE] [--chrome PATH] [--theme …]
 - Every command accepts `--theme` where a deck is involved.
 - Paths in messages (`Wrote …`, `path:line:` diagnostics, error reports, `check --format json`)
   are relative to the current directory, with `..` for a path outside it when that is no longer
-  than the absolute path; a symbolic link in a path's prefix does not keep it absolute (audit F39).
+  than the absolute path; a symbolic link in a path's prefix does not keep it absolute, and a `..`
+  in a path is resolved as the file system resolves it (after a link it leaves the directory the
+  link points to), so the message names the file really read or written (audit F39).

@@ -193,14 +193,11 @@ fn eject_default_copies_every_file_and_renames_the_theme() {
     assert!(copy.join("templates/deck.html").is_file());
 
     let builtin = resolve("default", &[]).unwrap().chain.remove(0);
-    let mut files = builtin.list("");
+    let files = builtin.list("");
     assert!(files.len() >= 6, "{files:?}");
-    // Every file but the README, which documents the built-in theme in the repository
-    // with links that break in a copy (audit F48).
     assert!(files.iter().any(|rel| rel == "README.md"), "{files:?}");
-    files.retain(|rel| rel != "README.md");
-    assert!(!copy.join("README.md").exists());
-    // Byte for byte, except that templates name their own files `@my-copy/…`.
+    // Byte for byte, except that templates name their own files `@my-copy/…` and the
+    // README says what it documents (audit F48).
     for rel in &files {
         let copied = fs::read(copy.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
         let original = builtin.read(rel).unwrap().unwrap();
@@ -208,10 +205,11 @@ fn eject_default_copies_every_file_and_renames_the_theme() {
             let original = String::from_utf8(original).unwrap();
             let expected = original.replace("@default/", "@my-copy/");
             assert_eq!(String::from_utf8(copied).unwrap(), expected, "{rel}");
-        } else if rel != "theme.toml" {
+        } else if rel != "theme.toml" && rel != "README.md" {
             assert_eq!(copied, original, "{rel}");
         }
     }
+    assert_readme_is_the_copys(&copy, "presenter theme eject", "my-copy");
     let deck = fs::read_to_string(copy.join("templates/deck.html")).unwrap();
     assert!(!deck.contains("@default/"), "{deck}");
     let copied_files = walk(&copy);
@@ -228,6 +226,36 @@ fn eject_default_copies_every_file_and_renames_the_theme() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(stdout.contains("  chain: my-copy\n"), "{stdout}");
     assert!(stdout.ends_with("No problems found.\n"), "{stdout}");
+}
+
+/// The README of a copy of the built-in theme in `copy` (audit F48): every copied file
+/// that points readers to `README.md` (the CSS as `../README.md`) finds it, it says what it
+/// documents, and none of its links leaves the copy.
+fn assert_readme_is_the_copys(copy: &Path, made_by: &str, name: &str) {
+    let readme = fs::read_to_string(copy.join("README.md")).expect("the README is copied");
+    assert!(
+        readme.starts_with(&format!(
+            "> **A copy.** `{made_by}` copied presenter's built-in theme `default` here as \
+             the theme `{name}`.\n"
+        )),
+        "{readme}"
+    );
+    assert!(readme.contains("\n\n# The `default` theme\n"), "{readme}");
+    assert!(!readme.contains("](../"), "{readme}");
+    let mut pointers = 0;
+    for rel in walk(copy) {
+        let Ok(text) = fs::read_to_string(copy.join(&rel)) else {
+            continue;
+        };
+        if text.contains("../README.md") {
+            let dir = Path::new(&rel).parent().unwrap();
+            assert!(copy.join(dir).join("../README.md").is_file(), "{rel}");
+            pointers += 1;
+        } else if text.contains("README.md") && rel != "README.md" {
+            pointers += 1;
+        }
+    }
+    assert!(pointers >= 3, "the theme's files point to its README");
 }
 
 /// Files below `dir`, relative and `/`-separated, sorted.
