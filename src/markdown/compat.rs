@@ -7,10 +7,11 @@
 //!
 //! - **`<!-- .slide: … -->`** (slide attributes): a top-level HTML block that is exactly one
 //!   comment whose text starts with `.slide:` ([`slide_comment`]). The splitter
-//!   ([`split`]) reads it among the comments that start the slide, or among those right after
-//!   the slide's first visible node when that is a heading (the heading is the boundary in
-//!   headings mode, and reveal decks often put the comment under the title); other comments
-//!   ([`is_blank`]) may come before or between. The text goes through
+//!   ([`split`]) reads it among the invisible nodes that start the slide, or among those
+//!   right after the slide's first visible node when that is a heading (the heading is the
+//!   boundary in headings mode, and reveal decks often put the comment under the title);
+//!   other comments and `:::notes` blocks ([`is_invisible`]) may come before or between (A3).
+//!   The text goes through
 //!   [`parse_attr_block`](crate::markdown::attrs::parse_attr_block) and
 //!   [`SlideAttrs::from_parsed`](crate::markdown::attrs::SlideAttrs::from_parsed), so it takes
 //!   `k="v"`, `k=v`, `k='v'`, bare keys, `.class` and `#id`, and keys are normalized like every
@@ -40,7 +41,7 @@ use comrak::Options;
 use comrak::nodes::{AstNode, NodeValue};
 
 use crate::error::Result;
-use crate::markdown::render::{RenderCtx, RenderMode, Rendered, render_nodes};
+use crate::markdown::render::{self, RenderCtx, RenderMode, Rendered, render_nodes};
 use crate::markdown::split;
 
 /// The text after `.slide:` when `literal` (an HTML block's literal) is exactly one HTML
@@ -82,14 +83,25 @@ pub fn element_comment(content: &str) -> Option<&str> {
     }
 }
 
-/// Whether a top-level node renders nothing visible: an `HtmlBlock` made only of HTML
-/// comments and whitespace (a licence header, a `<!-- .slide: -->` comment). The headings
-/// mode of the splitter does not start a slide for such nodes alone (dialect §2.3 "only if it
-/// is non-blank").
+/// Whether a top-level node is an `HtmlBlock` made only of HTML comments and whitespace (a
+/// licence header, a `<!-- .slide: -->` comment), which renders nothing. This is the HTML
+/// half of [`is_invisible`], which the splitter uses (comments and `:::notes` blocks, A3).
 pub fn is_blank<'a>(node: &'a AstNode<'a>) -> bool {
     match &node.data().value {
         NodeValue::HtmlBlock(block) => is_comment_only(&block.literal),
         _ => false,
+    }
+}
+
+/// Whether a top-level node shows nothing on the slide: a comment-only HTML block
+/// ([`is_blank`]) or a `:::notes` directive (also pandoc's `::: {.notes}`), whose content
+/// goes to the speaker notes (dialect §4, §7). Such nodes do not count when the splitter
+/// looks for a slide's first visible node, nor when headings mode asks whether a slide has
+/// visible content yet (A3).
+pub fn is_invisible<'a>(node: &'a AstNode<'a>) -> bool {
+    match &node.data().value {
+        NodeValue::BlockDirective(directive) => render::is_notes_info(&directive.info),
+        _ => is_blank(node),
     }
 }
 

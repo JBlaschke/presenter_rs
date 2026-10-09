@@ -54,8 +54,8 @@ use serde::de::{
 };
 use serde_json::{Map, Value};
 
-use crate::error::{Error, Result};
-use crate::ir::DeckMeta;
+use crate::error::{Diagnostic, Diagnostics, Error, Result};
+use crate::ir::{DeckMeta, SourceSpan};
 
 /// The front matter delimiter line (dialect §1: `front_matter_delimiter = "---"`).
 const DELIMITER: &str = "---";
@@ -175,12 +175,25 @@ pub fn strip_delimiters(literal: &str) -> &str {
 /// in messages are those of the source the block came from: the YAML is taken to start on
 /// line 2, right after the opening `---` on line 1 (always the case for a Markdown file
 /// and for a notebook cell), so `title: a: b` as the first YAML line is reported on line 2.
+/// Two common mistakes get a hint after the position (A3):
+/// `title: Rust: the good parts` → `… at line 2 column 12 (put the value in quotes:
+/// `title: "Rust: the good parts"`)`, and a line indented with a tab → `(indent with spaces,
+/// not tabs)`.
 pub fn parse_front_matter(yaml: &str) -> Result<DeckMeta> {
     // One leading line break shifts serde_norway's line numbers to source lines.
     let source = format!("\n{yaml}");
     let root = serde_norway::Deserializer::from_str(&source)
         .deserialize_any(RootVisitor)
-        .map_err(|err| Error::FrontMatter(err.to_string()))?;
+        .map_err(|err| {
+            let mut message = err.to_string();
+            let hint = err
+                .location()
+                .and_then(|at| yaml_hint(yaml, &message, at.line()));
+            if let Some(hint) = hint {
+                message.push_str(&format!(" ({hint})"));
+            }
+            Error::FrontMatter(message)
+        })?;
     let meta = root.ok_or_else(|| Error::FrontMatter(NOT_A_MAPPING.to_string()))?;
     tracing::debug!(
         vars = meta.vars.len(),
@@ -188,6 +201,186 @@ pub fn parse_front_matter(yaml: &str) -> Result<DeckMeta> {
         "parsed front matter"
     );
     Ok(meta)
+}
+
+/// A hint for the YAML error `message` located on source `line` (the YAML's first line is
+/// line 2), for the two mistakes YAML's own messages do not explain: a line indented with a
+/// tab (`indent with spaces, not tabs`), and a `mapping values are not allowed` error on a
+/// `key: value` line (also a `- key: value` item) whose plain value contains `: ` or ends
+/// with `:`, as talk titles do (`put the value in quotes: `title: "Rust: the good parts"``,
+/// built from the line with `\` and `"` escaped).
+fn yaml_hint(yaml: &str, message: &str, line: usize) -> Option<String> {
+    let text = yaml.lines().nth(line.checked_sub(2)?)?;
+    let entry = text.trim_start();
+    if text[..text.len() - entry.len()].contains('\t') {
+        return Some("indent with spaces, not tabs".to_string());
+    }
+    if !message.starts_with("mapping values are not allowed") {
+        return None;
+    }
+    let entry = entry.strip_prefix("- ").unwrap_or(entry);
+    let (key, value) = entry.split_once(": ")?;
+    let value = value.trim();
+    let plain = !value.starts_with(['"', '\'', '[', '{', '|', '>', '&', '*', '!', '#']);
+    if key.is_empty() || !plain || !(value.contains(": ") || value.ends_with(':')) {
+        return None;
+    }
+    let quoted = value.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!("put the value in quotes: `{key}: \"{quoted}\"`"))
+}
+
+/// [`parse_front_matter`] for the front matter of a Markdown deck, whose closing `---` is on
+/// line `closing`, with what it means for a deck (A3): front matter that swallowed slide
+/// content because a deck started with a `---` rule or the closing `---` is missing.
+/// Markdown headings are YAML comments, so such content vanishes without an error.
+///
+/// - YAML without any key (only comments and blank lines) with a comment that is a Markdown
+///   heading (`# Title`; not a commented-out key such as `# title: Draft`, nor a label
+///   ending with `:`): a [`FRONT_MATTER_EMPTY`] warning (lines 1 to `closing`), as for a
+///   notebook's first cell. YAML with keys whose values are all commented out
+///   (`reveal:` over `#   transition: fade`) is fine;
+/// - otherwise a Markdown heading after a blank line, with only blank lines and comments
+///   after it, one of them blank (a slide's heading is followed by a blank line before the
+///   separator; a closing remark sits right on the `---`), as [`swallowed_heading`] finds
+///   it: a [`FRONT_MATTER_UNCLOSED`] warning on its line;
+/// - a root that is not a mapping: `expected a mapping at line L column C (…)` with the
+///   position of the root value and the front matter's extent, asking whether line 1 was
+///   meant as a slide separator or the closing `---` is missing; any other error gets that
+///   extent and question too when the YAML has a heading after a blank line.
+///
+/// Errors: as [`parse_front_matter`].
+pub fn parse_deck_front_matter(
+    yaml: &str,
+    closing: usize,
+    diagnostics: &mut Diagnostics,
+) -> Result<DeckMeta> {
+    let extent = format!("the front matter runs from line 1 to the `---` on line {closing}");
+    let meta = parse_front_matter(yaml).map_err(|err| match err {
+        Error::FrontMatter(message) if message == NOT_A_MAPPING => {
+            let (line, column) = root_position(yaml);
+            Error::FrontMatter(format!(
+                "{NOT_A_MAPPING} at line {line} column {column} ({extent}; is its closing `---` \
+                 missing, or was line 1 meant as a slide separator?)"
+            ))
+        }
+        Error::FrontMatter(message) if !headings_after_blank(yaml).is_empty() => {
+            Error::FrontMatter(format!(
+                "{message} ({extent}; is its closing `---` missing?)"
+            ))
+        }
+        other => other,
+    })?;
+    let span = |start_line| SourceSpan {
+        start_line,
+        end_line: closing,
+        cell: None,
+    };
+    let keyless = yaml.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with('#')
+    });
+    if keyless {
+        if yaml.lines().any(is_markdown_heading) {
+            let message = format!(
+                "{extent} and sets nothing: its `# …` lines are YAML comments and are not shown. \
+                 Was line 1 meant as a slide separator? The first slide needs none"
+            );
+            diagnostics.push(Diagnostic::warning(FRONT_MATTER_EMPTY, message).with_span(span(1)));
+        }
+    } else if let Some((line, text)) = swallowed_heading(yaml) {
+        let message = format!(
+            "`{text}` on line {line} is a YAML comment, not a slide: {extent}. Is its closing \
+             `---` missing (before line {line})?"
+        );
+        diagnostics.push(Diagnostic::warning(FRONT_MATTER_UNCLOSED, message).with_span(span(line)));
+    }
+    Ok(meta)
+}
+
+/// Diagnostic code of front matter that sets nothing but has YAML comments (warning; the same
+/// code as the notebook frontend's).
+pub const FRONT_MATTER_EMPTY: &str = "front-matter-empty";
+
+/// Diagnostic code of front matter that ends with a Markdown heading, so its closing `---` is
+/// probably missing (warning, A3).
+pub const FRONT_MATTER_UNCLOSED: &str = "front-matter-unclosed";
+
+/// The source line and column (1-based; the YAML starts on line 2) of the first character
+/// that is not whitespace or part of a comment: where a root value starts.
+fn root_position(yaml: &str) -> (usize, usize) {
+    (2..)
+        .zip(yaml.lines())
+        .find_map(|(number, line)| {
+            let trimmed = line.trim_start();
+            (!trimmed.is_empty() && !trimmed.starts_with('#')).then(|| {
+                (
+                    number,
+                    line[..line.len() - trimmed.len()].chars().count() + 1,
+                )
+            })
+        })
+        .unwrap_or((2, 1))
+}
+
+/// The YAML comment lines that look like Markdown headings ([`is_markdown_heading`]) and
+/// follow a blank line, as `(source line, text)` (the YAML's first line is line 2).
+fn headings_after_blank(yaml: &str) -> Vec<(usize, &str)> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    (1..lines.len())
+        .filter(|&i| lines[i - 1].trim().is_empty() && is_markdown_heading(lines[i]))
+        .map(|i| (i + 2, lines[i]))
+        .collect()
+}
+
+/// A Markdown heading as a YAML comment: `#` to `######` at the start of the line, a space or
+/// tab and text, not ending with `:` (a comment that labels what follows) and not a
+/// commented-out key ([`is_commented_key`]).
+fn is_markdown_heading(line: &str) -> bool {
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    let text = &line[hashes..];
+    if !(1..=6).contains(&hashes) || !text.starts_with([' ', '\t']) {
+        return false;
+    }
+    let text = text.trim();
+    !text.is_empty() && !text.ends_with(':') && !is_commented_key(line)
+}
+
+/// A comment holding a `key: value` line (`# date: 2026-01-31`, `#theme: dark`): the key is
+/// letters, digits, `_` and `-`, and the colon ends the line or is followed by whitespace.
+fn is_commented_key(line: &str) -> bool {
+    let Some(comment) = line.trim_start().strip_prefix('#') else {
+        return false;
+    };
+    let comment = comment.trim_start_matches('#').trim();
+    comment.split_once(':').is_some_and(|(key, value)| {
+        !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'))
+            && (value.is_empty() || value.starts_with([' ', '\t']))
+    })
+}
+
+/// A Markdown heading that front matter swallowed (`# Title`, after a blank line; not a
+/// label ending with `:` or a commented-out key such as `# date: …`), after the last YAML line
+/// (not blank, not a comment), with only blank lines and comments after it, none of them a
+/// commented-out key and one of them blank (counting the blank line before the closing
+/// `---`, which [`strip_delimiters`] leaves as a final line break); `(source line, text)`,
+/// the YAML's first line being line 2. See [`parse_deck_front_matter`].
+pub fn swallowed_heading(yaml: &str) -> Option<(usize, &str)> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let is_yaml = |line: &&str| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#')
+    };
+    let last_yaml = lines.iter().rposition(is_yaml).map_or(1, |i| i + 2);
+    let (line, text) = headings_after_blank(yaml)
+        .into_iter()
+        .find(|&(line, _)| line > last_yaml)?;
+    let after = &lines[line - 1..];
+    let keys_after = after.iter().any(|later| is_commented_key(later));
+    let blank_after = after.iter().any(|later| later.trim().is_empty()) || yaml.ends_with('\n');
+    (!keys_after && blank_after).then_some((line, text))
 }
 
 /// Deck metadata from a JSON value, with the key rules of [`parse_front_matter`]: for a
@@ -712,7 +905,8 @@ alpha: [1, 2]
         // Line numbers are source lines: the YAML starts on line 2, after the opening `---`.
         assert_eq!(
             front_matter_error("title: Rust: the good parts\nauthor: Me\n"),
-            "mapping values are not allowed in this context at line 2 column 12"
+            "mapping values are not allowed in this context at line 2 column 12 (put the value \
+             in quotes: `title: \"Rust: the good parts\"`)"
         );
         assert_eq!(
             front_matter_error("a: 1\n  b: 2\n"),
@@ -729,13 +923,159 @@ alpha: [1, 2]
         // CRLF line breaks count once.
         assert_eq!(
             front_matter_error("title: T\r\nkey: a: b\r\n"),
-            "mapping values are not allowed in this context at line 3 column 7"
+            "mapping values are not allowed in this context at line 3 column 7 (put the value \
+             in quotes: `key: \"a: b\"`)"
         );
         // A type error is reported at the value's own line too.
         assert_eq!(
             front_matter_error("lang: de\ntitle: [a, b]\n"),
             "title: invalid type: sequence, expected a string at line 3 column 8"
         );
+    }
+
+    /// A3 (F29): hints for a colon in a plain value and for tab indentation, after the
+    /// position, which still locates the error.
+    #[test]
+    fn yaml_errors_get_hints_for_colons_and_tabs() {
+        let quote =
+            |key: &str, value: &str| format!(" (put the value in quotes: `{key}: \"{value}\"`)");
+        for (yaml, key, value) in [
+            ("subtitle: Part 2: more\n", "subtitle", "Part 2: more"),
+            ("title: Part 1:\n", "title", "Part 1:"),
+            (
+                "authors:\n  - name: Ada: the first\n",
+                "name",
+                "Ada: the first",
+            ),
+            (
+                "title: C:\\dir \"x\": y\n",
+                "title",
+                "C:\\\\dir \\\"x\\\": y",
+            ),
+        ] {
+            let message = front_matter_error(yaml);
+            assert!(message.ends_with(&quote(key, value)), "{yaml:?}: {message}");
+        }
+        let err = parse_front_matter("title: Rust: the good parts\n").unwrap_err();
+        assert_eq!(err.span().map(|span| span.start_line), Some(2));
+        assert_eq!(err.column(), Some(12));
+        // no hint where quoting is not the fix
+        for yaml in ["a: 1\n  b: 2\n", "title: \"a\": b\n", "title: [a: b\n"] {
+            let message = front_matter_error(yaml);
+            assert!(
+                !message.contains("put the value in quotes"),
+                "{yaml:?}: {message}"
+            );
+        }
+        for yaml in [
+            "title: X\n\tsubtitle: y\n",
+            "title: T\nlist:\n\t- a\n",
+            "a:\n  b: 1\n\tc: 2\n",
+        ] {
+            let message = front_matter_error(yaml);
+            assert!(
+                message.ends_with(" (indent with spaces, not tabs)"),
+                "{yaml:?}: {message}"
+            );
+            let err = Error::FrontMatter(message);
+            assert!(err.span().is_some() && err.column().is_some(), "{err}");
+        }
+    }
+
+    fn deck_front_matter(
+        yaml: &str,
+        closing: usize,
+    ) -> (Result<DeckMeta>, Vec<(&'static str, usize, usize)>) {
+        let mut diagnostics = Diagnostics::new();
+        let meta = parse_deck_front_matter(yaml, closing, &mut diagnostics);
+        let found = diagnostics
+            .iter()
+            .map(|d| {
+                let span = d.span.as_ref().unwrap();
+                (d.code, span.start_line, span.end_line)
+            })
+            .collect();
+        (meta, found)
+    }
+
+    /// A3 (F05): front matter that swallowed slide content.
+    #[test]
+    fn deck_front_matter_reports_swallowed_slides() {
+        // comments only: the deck started with a `---` rule
+        let (meta, found) = deck_front_matter("\n# Real\n", 4);
+        assert_eq!(meta.unwrap(), DeckMeta::default());
+        assert_eq!(found, [(FRONT_MATTER_EMPTY, 1, 4)]);
+        for yaml in ["", "\n", "~\n", "null\n"] {
+            assert_eq!(deck_front_matter(yaml, 3).1, [], "{yaml:?}");
+        }
+        // a heading after the last key and a blank line: the closing `---` is missing
+        let (meta, found) = deck_front_matter("title: T\n\n# Slide {layout=title}\n\n", 7);
+        assert_eq!(meta.unwrap().title.as_deref(), Some("T"));
+        assert_eq!(found, [(FRONT_MATTER_UNCLOSED, 4, 7)]);
+        // comments that are not slides: labels, commented-out keys, no blank line before,
+        // or YAML after them
+        for yaml in [
+            "# Front matter: settings for this deck.\ntitle: T\n# date: 2026-01-31\n",
+            "title: T\n\n# Theme options:\n# theme: dark\n",
+            "title: T\n\n# Theme options\n# theme: dark\n",
+            "title: T\n# Comment right under a key\n",
+            "title: T\n\n# Section\nauthor: A\n",
+            "title: T\n\n#hashtag\n",
+            "title: T\n\n  # indented comment\n",
+            "title: T\n\n# date: 2026\n",
+        ] {
+            assert_eq!(deck_front_matter(yaml, 9).1, [], "{yaml:?}");
+        }
+        assert_eq!(
+            swallowed_heading("a: 1\n\n## Agenda\n\n"),
+            Some((4, "## Agenda"))
+        );
+        // A3 fix round: valid front matter is no false alarm: options all commented out
+        // (keys or values), and a closing remark right on the closing `---` (as
+        // `strip_delimiters` returns it: no final line break)
+        for yaml in [
+            "reveal:\n  # transition: fade\n  # controls: false",
+            "# title: My talk\n# author: Me",
+            "# title: Draft\n\n# author: Me\n",
+            "title: X\nauthor: Y\n\n# More options live in presenter.toml",
+            "title: Talk\n\n# Remember to update the abstract\n# before the conference",
+        ] {
+            assert_eq!(deck_front_matter(yaml, 9).1, [], "{yaml:?}");
+        }
+        // the same remark followed by a blank line before the `---` is a swallowed slide
+        let (_, found) = deck_front_matter("title: X\n\n# Slide two\n", 6);
+        assert_eq!(found, [(FRONT_MATTER_UNCLOSED, 4, 6)]);
+        let (_, found) = deck_front_matter("title: X\n\n# Slide two\n\n# (more to say here)", 8);
+        assert_eq!(found, [(FRONT_MATTER_UNCLOSED, 4, 8)]);
+        // a heading among commented-out keys still says the deck lost its first slide
+        let (_, found) = deck_front_matter("# date: 2026\n\n# Welcome\n", 6);
+        assert_eq!(found, [(FRONT_MATTER_EMPTY, 1, 6)]);
+        // not a mapping: located at the root value, with the question
+        let (meta, _) = deck_front_matter("\n# Real\n\nSome paragraph\n", 6);
+        let Err(Error::FrontMatter(message)) = meta else {
+            panic!("expected an error");
+        };
+        assert_eq!(
+            message,
+            "expected a mapping at line 5 column 1 (the front matter runs from line 1 to the \
+             `---` on line 6; is its closing `---` missing, or was line 1 meant as a slide \
+             separator?)"
+        );
+        // a YAML error in front matter with a heading after a blank line gets the question
+        let (meta, _) = deck_front_matter("title: T\n\n# Title\n\nSome text\n", 7);
+        let Err(Error::FrontMatter(message)) = meta else {
+            panic!("expected an error");
+        };
+        assert!(
+            message.ends_with(
+                "(the front matter runs from line 1 to the `---` on line 7; is its closing `---` \
+                 missing?)"
+            ),
+            "{message}"
+        );
+        // other errors are unchanged
+        let (meta, _) = deck_front_matter("reveal: fade\n", 3);
+        assert!(matches!(meta, Err(Error::FrontMatter(m)) if m.ends_with("at line 2 column 9")));
     }
 
     #[test]

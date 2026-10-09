@@ -4,6 +4,8 @@
 //! group of top-level comrak nodes) and [`render_fragment`] parses and renders a standalone
 //! Markdown string (notebook cells, `text/markdown` outputs, the `markdown` template filter);
 //! [`render_fragment_with_lift`] also lifts a leading heading's attributes (notebook cells).
+//! A fragment is parsed like a deck: attribute blocks comrak rejects are read again
+//! ([`recover_attr_blocks`], A3).
 //!
 //! The nodes are moved under a synthetic `Document` node, so lists and footnotes render as a
 //! unit (the footnote list of a slide is closed at the end of that slide). Then:
@@ -13,9 +15,10 @@
 //!    detached; its children (and the footnote definitions written inside it, which comrak
 //!    moved to the end of the document) are rendered through a second synthetic document with
 //!    the same passes and appended to [`Rendered::notes`] in document order;
-//! 3. **checks**: a paragraph that starts like a directive (`:::name …`) but is not one is an
-//!    `invalid-directive` warning: comrak does not open a directive whose line has a `:`
-//!    after the fence (`title="a:b"`, a URL); `&#58;` is the way to write that colon;
+//! 3. **checks**: a paragraph that starts like a directive (`:::name …`, `::: {.name …}`) but
+//!    is not one is an `invalid-directive` warning: comrak does not open a directive whose
+//!    line has a `:` after the fence (`title="a:b"`, a URL, pandoc's closing `:::`); `&#58;`
+//!    is the way to write that colon;
 //! 4. **assets** (§6): relative image URLs and relative `src` / `poster` attributes of raw
 //!    HTML start tags ([`rewrite_html_assets`]) are resolved against [`RenderCtx::base_dir`]:
 //!    an existing file is registered ([`AssetRegistry::register_file`]) and the URL becomes
@@ -24,7 +27,9 @@
 //!    file back from it) or [`Error::MissingAsset`] when [`RenderCtx::missing_asset_is_error`].
 //!    Raw HTML is tokenized like a browser does: comments, the content of raw-text elements
 //!    (`<script>`, `<style>`, …) and text inside other attributes' quoted values never count,
-//!    also when a `<script>` opens in one raw HTML node and closes in a later one;
+//!    also when a `<script>` opens in one raw HTML node and closes in a later one. A file
+//!    found only by letter case (`plain.PNG` for `plain.png`, which a case-insensitive file
+//!    system accepts) is registered and reported as `asset-case-mismatch` (A3);
 //! 5. **footnotes**: every slide (and every notes block) has its own footnote list.
 //!    References are numbered per slide in order of first use (comrak numbers them across the
 //!    whole document) and link to the definition *on the same slide*, so a label such as
@@ -40,17 +45,26 @@
 //! 6. **HTML**: comrak's formatter with a small override (`format_node`) for the nodes the
 //!    dialect renders differently from comrak:
 //!    - `BlockDirective` (§4): `<div class="name classes…" …>` from a quote-aware split of the
-//!      info string: `:::fragment … index=N` adds `data-fragment-index="N"`,
-//!      `::::columns widths="1fr 2fr"` adds `style="grid-template-columns: 1fr 2fr"`,
+//!      info string, or from pandoc's attribute block (`::: {.fragment .fade-up}`,
+//!      `::: {#id .note}`, `::: {.notes}`; A3): `:::fragment … index=N` adds
+//!      `data-fragment-index="N"` (N a non-negative integer, else an `invalid-directive-arg`
+//!      warning), `::::columns widths="1fr 2fr"` adds `style="grid-template-columns: 1fr 2fr"`,
 //!      `:::column width=…` renders `<div class="column">` (the width is consumed), and every
-//!      other `key=value` arg becomes `data-<key>="value"`;
+//!      other `key=value` arg becomes `data-<key>="value"`. A directive without a name (a
+//!      bare `:::` line, mostly a nested closing fence as long as the outer one's) is an
+//!      `invalid-directive` warning;
 //!    - `CodeBlock` (§5): [`render_code_block`](crate::markdown::code::render_code_block);
-//!      a ```` ```math ```` fence becomes `<div data-math-style="display">TeX</div>`;
+//!      a ```` ```math ```` fence becomes `<div data-math-style="display">TeX</div>`. A `{…}`
+//!      block comrak left in the info string is read with
+//!      [`fence_attrs`] (A3);
 //!    - `Math` (§8): `<span data-math-style="inline|display">TeX</span>` (also for code math);
 //!    - headings, links, images and inline code with `{…}` attributes (§3.3): comrak's own
 //!      tag with `id`, `class` and `key="value"` appended (comrak's formatter never writes
-//!      node attributes). Doing this in the formatter rather than by rewriting nodes to raw
-//!      HTML keeps the inline children (emphasis, alt text, …) rendered by comrak;
+//!      node attributes; a `title=` attribute on a link or image only when it has no
+//!      Markdown title). Doing this in the formatter rather than by rewriting nodes to raw
+//!      HTML keeps the inline children (emphasis, alt text, …) rendered by comrak. Slide
+//!      attributes (`layout=`, `background=`, …) still on a heading were not lifted: an
+//!      `unlifted-slide-attr` warning (A3);
 //!    - footnote references and definitions (pass 5).
 //!
 //! Every attribute value written here is escaped with `encode_double_quoted_attribute`.
@@ -58,12 +72,16 @@
 //! (an element with a `data-math-style` attribute in the HTML or notes, see
 //! [`has_math_markup`]; the text `data-math-style` in inline code does not count) and `notes`.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
 use std::collections::btree_map::Entry;
+use std::collections::hash_map::Entry as HashEntry;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
+use std::ffi::OsString;
 use std::fmt::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use comrak::html::{
     ChildRendering, Context, dangerous_url, format_document_with_formatter, format_node_default,
@@ -80,10 +98,14 @@ use html_escape::{decode_html_entities, encode_quoted_attribute};
 use crate::assets::registry::{AssetRegistry, normalize_lexically};
 use crate::error::{Diagnostic, Diagnostics, Error, Result};
 use crate::ir::{Features, SourceSpan};
-use crate::markdown::attrs::{ParsedAttrs, is_valid_attr_name};
+use crate::markdown::attrs::{
+    ElementAttrs, ParsedAttrs, is_valid_attr_name, normalize_key, parse_attr_block,
+};
 use crate::markdown::code::{
     code_attrs, push_attr, render_code_block_with, strip_trailing_newline,
 };
+use crate::markdown::compat::is_invisible;
+use crate::markdown::recover::{fence_attrs, recover_attr_blocks, unparsed};
 use crate::markdown::split::{first_heading_text, lift_heading_attrs};
 
 /// The attribute every math element carries (`Features.math` is derived from it).
@@ -91,6 +113,9 @@ const MATH_ATTR: &str = "data-math-style";
 
 /// Diagnostic code of a missing local file.
 const MISSING_ASSET: &str = "missing-asset";
+
+/// Diagnostic code of a local file found only by letter case (A3).
+const ASSET_CASE_MISMATCH: &str = "asset-case-mismatch";
 
 /// Separates the URL as written from the resolved path in a `missing-asset` message.
 const LOOKED_FOR: &str = " (looked for ";
@@ -116,10 +141,11 @@ pub struct RenderCtx<'r> {
     pub base_dir: &'r Path,
     /// Deck or notebook rendering.
     pub mode: RenderMode,
-    /// Receives `missing-asset`, `invalid-directive`, `invalid-directive-arg`,
-    /// `duplicate-footnote` and `footnote-elsewhere` warnings. Spans are lines of the rendered
-    /// text (`cell: None`) and the path is not set: the caller adds both. The missing file of
-    /// a `missing-asset` warning is in its message only: see [`missing_asset_path`].
+    /// Receives `missing-asset`, `asset-case-mismatch`, `invalid-directive`,
+    /// `invalid-directive-arg`, `duplicate-footnote`, `footnote-elsewhere`,
+    /// `unparsed-attr-block` and `unlifted-slide-attr` warnings. Spans are lines of the
+    /// rendered text (`cell: None`) and the path is not set: the caller adds both. The missing
+    /// file of a `missing-asset` warning is in its message only: see [`missing_asset_path`].
     pub diagnostics: &'r mut Diagnostics,
     /// Return [`Error::MissingAsset`] for a missing local file instead of a warning.
     pub missing_asset_is_error: bool,
@@ -183,11 +209,13 @@ pub fn render_fragment(text: &str, opts: &Options, ctx: &mut RenderCtx) -> Resul
 /// `# Title {layout=title}` while the current slide is still empty gives them to the slide).
 ///
 /// With `lift_heading`, [`lift_heading_attrs`] runs on the fragment's top-level nodes (front
-/// matter excluded) before rendering: when the first node is a heading with `{…}` attributes,
-/// they are removed from it (the heading renders clean) and returned for the caller to apply
-/// (`SlideAttrs::from_parsed(attrs).apply_to(slide)`). Otherwise, and always without
-/// `lift_heading`, the second value is `None` and the attributes stay on the `<hN>` element.
-/// Errors as [`render_nodes`].
+/// matter excluded) before rendering: when the first visible node (HTML comments and
+/// `:::notes` blocks before it do not count, [`is_invisible`]) is a heading with `{…}`
+/// attributes, they are removed from it (the heading renders clean) and returned for the
+/// caller to apply (`SlideAttrs::from_parsed(attrs).apply_to(slide)`). Otherwise, and always
+/// without `lift_heading`, the second value is `None` and the attributes stay on the `<hN>`
+/// element. Attribute blocks comrak rejects are read as in a deck
+/// ([`recover_attr_blocks`]). Errors as [`render_nodes`].
 pub fn render_fragment_with_lift(
     text: &str,
     opts: &Options,
@@ -195,20 +223,19 @@ pub fn render_fragment_with_lift(
     lift_heading: bool,
 ) -> Result<(Rendered, Option<ParsedAttrs>)> {
     let arena = Arena::new();
-    let root = match ctx.mode {
-        RenderMode::Deck => parse_document(&arena, text, opts),
-        RenderMode::Notebook => {
-            let mut notebook_opts = opts.clone();
-            notebook_opts.extension.front_matter_delimiter = None;
-            parse_document(&arena, text, &notebook_opts)
-        }
-    };
+    let mut parse_opts = opts.clone();
+    if ctx.mode == RenderMode::Notebook {
+        parse_opts.extension.front_matter_delimiter = None;
+    }
+    let root = parse_document(&arena, text, &parse_opts);
+    let (root, _) = recover_attr_blocks(&arena, root, text, &parse_opts, ctx.diagnostics);
     let nodes: Vec<_> = root
         .children()
         .filter(|node| !matches!(node.data().value, NodeValue::FrontMatter(_)))
         .collect();
     let lifted = if lift_heading {
-        lift_heading_attrs(&nodes)
+        let visible = nodes.iter().take_while(|node| is_invisible(node)).count();
+        lift_heading_attrs(&nodes[visible..])
     } else {
         None
     };
@@ -567,6 +594,7 @@ fn render_document<'a>(
 ) -> Result<Rendered> {
     let (notes, mut features) = extract_notes(arena, doc, opts, ctx)?;
     check_unopened_directives(doc, ctx);
+    let _listings = DirListings::enter();
     rewrite_assets(doc, ctx)?;
     let footnotes = prepare_footnotes(doc, ctx);
     features.code |= doc.descendants().any(|node| {
@@ -631,48 +659,97 @@ fn extract_notes<'a>(
 
 fn is_notes(node: &AstNode<'_>) -> bool {
     matches!(&node.data().value,
-        NodeValue::BlockDirective(directive) if directive.info.split_whitespace().next() == Some("notes"))
+        NodeValue::BlockDirective(directive) if is_notes_info(&directive.info))
 }
 
-/// Pass 3: a paragraph whose text starts with `:::name` is a directive comrak did not open
-/// (module docs): an `invalid-directive` warning on its first line.
+/// Pass 3: a paragraph whose text starts with `:::name` (or pandoc's `::: {.name …}`) is a
+/// directive comrak did not open (module docs): an `invalid-directive` warning on its first
+/// line, which names the fix (`&#58;` for a colon; no closing `:::` after a pandoc block)
+/// and, for `:::notes`, says that the speaker notes show on the slide.
 fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
     for node in doc.descendants() {
-        if !matches!(node.data().value, NodeValue::Paragraph) {
-            continue;
-        }
-        let Some(first) = node.first_child() else {
+        let Some(unopened) = unopened_directive(node) else {
             continue;
         };
-        let name = match &first.data().value {
-            NodeValue::Text(text) => {
-                let line = text.lines().next().unwrap_or_default();
-                let rest = line.trim_start_matches(':');
-                if line.len() - rest.len() < 3 {
-                    continue;
-                }
-                let name: String = rest
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
-                    .collect();
-                name
-            }
-            _ => continue,
+        let name = &unopened.name;
+        let shown = if unopened.pandoc {
+            format!("::: {{.{name} …}}")
+        } else {
+            format!(":::{name} …")
         };
-        if !name.starts_with(char::is_alphabetic) {
-            continue;
-        }
-        let message = format!(
-            "`:::{name} …` is not a directive: comrak does not open one when the line has a \
-             `:` after the fence (a URL, `title=\"a:b\"`); write the colon as `&#58;`"
+        let fix = if unopened.closing_colons {
+            "remove the `:::` after the attribute block (pandoc allows it, comrak does not)"
+        } else {
+            "write the colon as `&#58;`"
+        };
+        let mut message = format!(
+            "`{shown}` is not a directive: comrak does not open one when the line has a `:` \
+             after the fence (a URL, `title=\"a:b\"`); {fix}"
         );
+        if name == "notes" {
+            message.push_str(". Until then the speaker notes in it are shown on the slide");
+        }
         let span = node_span(node).map(|span| SourceSpan {
             end_line: span.start_line,
             ..span
         });
         ctx.diagnostics.warn("invalid-directive", message).span = span;
     }
+}
+
+/// A paragraph that starts like a directive comrak did not open (see [`unopened_directive`]).
+struct Unopened {
+    /// The directive's name: the word after the fence, or the first class of a pandoc block.
+    name: String,
+    /// Written as pandoc's `::: {.name …}`.
+    pandoc: bool,
+    /// A pandoc block followed by closing colons (`::: {.notes} :::`).
+    closing_colons: bool,
+}
+
+/// The directive a paragraph starts like (`:::name …` or `::: {.name …}` on its first line,
+/// the name starting with a letter) but is not, for pass 3; `None` for any other node.
+fn unopened_directive<'a>(node: &'a AstNode<'a>) -> Option<Unopened> {
+    if !matches!(node.data().value, NodeValue::Paragraph) {
+        return None;
+    }
+    let first = node.first_child()?;
+    let data = first.data();
+    let NodeValue::Text(text) = &data.value else {
+        return None;
+    };
+    let line = text.lines().next().unwrap_or_default();
+    let rest = line.trim_start_matches(':');
+    if line.len() - rest.len() < 3 {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let word = |text: &str| -> String {
+        text.chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+            .collect()
+    };
+    let unopened = match rest.strip_prefix('{') {
+        // the first `.class`; the text may stop early (an autolink or HTML in the block)
+        Some(block) => Unopened {
+            name: block
+                .split_whitespace()
+                .find_map(|token| token.strip_prefix('.'))
+                .map(word)
+                .unwrap_or_default(),
+            pandoc: true,
+            closing_colons: rest.trim_end().ends_with(':'),
+        },
+        None => Unopened {
+            name: word(rest),
+            pandoc: false,
+            closing_colons: false,
+        },
+    };
+    unopened
+        .name
+        .starts_with(char::is_alphabetic)
+        .then_some(unopened)
 }
 
 /// Pass 4: images and raw HTML `src`/`poster` (module docs).
@@ -711,8 +788,16 @@ fn local_asset(
         return Ok(None);
     }
     let (path, suffix) = url.split_at(url.find(['?', '#']).unwrap_or(url.len()));
-    let file = ctx.base_dir.join(percent_decode(path));
+    let decoded = percent_decode(path);
+    let file = ctx.base_dir.join(&decoded);
     if file.is_file() {
+        if let Some(on_disk) = case_mismatch(ctx.base_dir, &decoded) {
+            let message = format!(
+                "{what} `{url}` matches `{on_disk}` only by letter case: it is found on this \
+                 file system, but not on a case-sensitive one (Linux); write `{on_disk}`"
+            );
+            ctx.diagnostics.warn(ASSET_CASE_MISMATCH, message).span = span.cloned();
+        }
         let id = ctx.assets.register_file(&file);
         return Ok(Some(format!("{}{suffix}", AssetRegistry::placeholder(&id))));
     }
@@ -730,6 +815,125 @@ fn local_asset(
     );
     ctx.diagnostics.warn(MISSING_ASSET, message).span = span.cloned();
     Ok(None)
+}
+
+/// The spelling on disk of `relative` (a path under `base` that exists) when some segment
+/// of it matches the file system's entry only by letter case, which a case-insensitive file
+/// system (macOS, Windows) accepts and a case-sensitive one (Linux) does not: each segment
+/// is compared exactly with the names `read_dir` lists, as theme files are (A3). `.` is
+/// skipped and `..` goes up unchecked. `None` when every segment matches exactly (or a
+/// directory cannot be listed). Listings are cached while a [`DirListings`] guard is open.
+fn case_mismatch(base: &Path, relative: &str) -> Option<String> {
+    let mut dir = base.to_path_buf();
+    let mut on_disk: Vec<String> = Vec::new();
+    let mut mismatch = false;
+    for component in Path::new(relative).components() {
+        let name = match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => OsString::from(".."),
+            std::path::Component::Normal(name) => {
+                let listing = DirListings::get(&dir)?;
+                if listing.exact.contains(name) {
+                    name.to_os_string()
+                } else {
+                    mismatch = true;
+                    listing
+                        .folded
+                        .get(&name.to_string_lossy().to_lowercase())?
+                        .clone()
+                }
+            }
+            _ => return None,
+        };
+        on_disk.push(name.to_string_lossy().into_owned());
+        dir.push(name);
+    }
+    mismatch.then(|| on_disk.join("/"))
+}
+
+/// The entry names of a directory, for [`case_mismatch`].
+struct Listing {
+    /// Every name as listed.
+    exact: HashSet<OsString>,
+    /// Lowercased name → the smallest listed name with that lowercase form.
+    folded: HashMap<String, OsString>,
+}
+
+impl Listing {
+    fn read(dir: &Path) -> Option<Listing> {
+        let mut listing = Listing {
+            exact: HashSet::new(),
+            folded: HashMap::new(),
+        };
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let name = entry.file_name();
+            let folded = name.to_string_lossy().to_lowercase();
+            match listing.folded.entry(folded) {
+                HashEntry::Occupied(mut kept) if name < *kept.get() => {
+                    kept.insert(name.clone());
+                }
+                HashEntry::Occupied(_) => {}
+                HashEntry::Vacant(slot) => {
+                    slot.insert(name.clone());
+                }
+            }
+            listing.exact.insert(name);
+        }
+        Some(listing)
+    }
+}
+
+/// The open [`DirListings`] guards on a thread and the listings read meanwhile (`None`: the
+/// directory cannot be listed).
+type ListingCache = (usize, HashMap<PathBuf, Option<Rc<Listing>>>);
+
+thread_local! {
+    /// This thread's [`ListingCache`].
+    static LISTINGS: RefCell<ListingCache> = RefCell::new((0, HashMap::new()));
+}
+
+/// While a guard is alive, [`case_mismatch`] lists each directory once on this thread
+/// instead of once per reference and path segment (a deck next to a large `figures/`
+/// folder would otherwise list it for every image). The outermost guard forgets the
+/// listings when dropped, so a rebuild sees the files as they are then. A deck parse holds
+/// one for the whole deck, and each rendered slide or fragment one of its own.
+pub(crate) struct DirListings(());
+
+impl DirListings {
+    /// Opens a guard (nested guards share the outermost one's listings).
+    pub(crate) fn enter() -> DirListings {
+        LISTINGS.with_borrow_mut(|(open, _)| *open += 1);
+        DirListings(())
+    }
+
+    /// The listing of `dir`: cached while a guard is open, else read now. `None` when the
+    /// directory cannot be listed.
+    fn get(dir: &Path) -> Option<Rc<Listing>> {
+        let cached = LISTINGS.with_borrow(|(open, listings)| {
+            (*open > 0).then(|| listings.get(dir).cloned()).flatten()
+        });
+        if let Some(listing) = cached {
+            return listing;
+        }
+        let listing = Listing::read(dir).map(Rc::new);
+        LISTINGS.with_borrow_mut(|(open, listings)| {
+            if *open > 0 {
+                listings.insert(dir.to_path_buf(), listing.clone());
+            }
+        });
+        listing
+    }
+}
+
+impl Drop for DirListings {
+    fn drop(&mut self) {
+        LISTINGS.with_borrow_mut(|(open, listings)| {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                listings.clear();
+            }
+        });
+    }
 }
 
 /// A local reference: not empty, no URL scheme (`https:`, `data:`, `asset:`, …), not
@@ -1079,7 +1283,11 @@ fn write_backrefs(
     Ok(true)
 }
 
-/// `<div class="name classes…" data-…>` … `</div>` (dialect §4).
+/// `<div class="name classes…" data-…>` … `</div>` (dialect §4). A directive without a
+/// name (a bare `:::` line opened it) is an `invalid-directive` warning: it is nearly always
+/// the closing fence of a nested directive written as long as the outer one's (A3), unless
+/// a `:::name` paragraph that pass 3 reports comes before it among its siblings, after any
+/// other directive (then it is that one's closing fence).
 fn write_directive<'a>(
     context: &mut Context<'_, '_, FormatState>,
     node: &'a AstNode<'a>,
@@ -1099,6 +1307,22 @@ fn write_directive<'a>(
         diagnostic.span = span.clone();
         context.user.diagnostics.push(diagnostic);
     }
+    // after a `:::name` line comrak did not open (since the last directive), this is that
+    // one's closing fence and the line's own warning says it all
+    let after_unopened = || {
+        node.preceding_siblings()
+            .skip(1)
+            .take_while(|sibling| !matches!(sibling.data().value, NodeValue::BlockDirective(_)))
+            .any(|sibling| unopened_directive(sibling).is_some())
+    };
+    if info.trim().is_empty() && !after_unopened() {
+        let mut diagnostic = Diagnostic::warning("invalid-directive", UNNAMED_DIRECTIVE);
+        diagnostic.span = span.map(|span| SourceSpan {
+            end_line: span.start_line,
+            ..span
+        });
+        context.user.diagnostics.push(diagnostic);
+    }
     context.cr()?;
     context.write_str("<div")?;
     context.write_str(&attrs)?;
@@ -1107,31 +1331,116 @@ fn write_directive<'a>(
     Ok(ChildRendering::HTML)
 }
 
-/// The attributes of a directive's `<div>` (leading space included) and the problems found
-/// in its info string (dialect §4).
-fn directive_attrs(info: &str) -> (String, Vec<String>) {
+/// The warning for a directive opened by a bare `:::` line (see [`write_directive`]).
+const UNNAMED_DIRECTIVE: &str = "a bare `:::` line here opens an unnamed directive: an empty \
+     `<div>` that runs to the next `:::` line or, without one, to the end of the document (or \
+     notebook cell), and `---` lines inside it start no slides. An earlier `:::` probably \
+     closed the directive this line was meant to close. Nested directives need a longer outer \
+     fence, e.g. `::::columns` … `:::column` … `:::` … `::::`";
+
+/// A directive's info string, read as dialect §4 writes it (`name class… key=value…`) or as
+/// pandoc does (`{.name .class #id key=value}`, A3 contract note).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirectiveInfo {
+    /// The name: the first token, or the first class of a pandoc block; empty for a bare
+    /// `:::` (or a pandoc block without a class).
+    pub(crate) name: String,
+    /// The other classes, in order.
+    pub(crate) classes: Vec<String>,
+    /// The `#id` of a pandoc block.
+    pub(crate) id: Option<String>,
+    /// `key=value` args in order (a pandoc block's bare keys have an empty value).
+    pub(crate) args: Vec<(String, String)>,
+    /// Problems found while reading it (an unbalanced quote), for warnings.
+    pub(crate) problems: Vec<String>,
+}
+
+/// Reads a directive's info string (see [`DirectiveInfo`]). It is a pandoc attribute block
+/// when it starts with `{` and ends with `}` (after trimming): `::: {.fragment .fade-up}` is
+/// `:::fragment fade-up`, `:::: {.columns}` is `::::columns`, `::: {.column width="40%"}` is
+/// `:::column width=40%`, `::: {#intro .note}` is `:::note` with `id="intro"` and
+/// `::: {.notes}` is `:::notes`. Otherwise it is split on whitespace outside quotes: the
+/// first token is the name, tokens with `=` are args, the others classes.
+pub(crate) fn directive_info(info: &str) -> DirectiveInfo {
+    let trimmed = info.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return match parse_attr_block(trimmed) {
+            Ok(parsed) => {
+                let mut classes = parsed.classes;
+                let mut id = parsed.id;
+                let mut args = Vec::new();
+                for (key, value) in parsed.pairs {
+                    match key.to_ascii_lowercase().as_str() {
+                        "class" => classes.extend(value.split_whitespace().map(str::to_string)),
+                        "id" => id = Some(value),
+                        _ => args.push((key, value)),
+                    }
+                }
+                let mut classes = classes.into_iter().filter(|c| !c.is_empty());
+                DirectiveInfo {
+                    name: classes.next().unwrap_or_default(),
+                    classes: classes.collect(),
+                    id: id.filter(|id| !id.is_empty()),
+                    args,
+                    problems: Vec::new(),
+                }
+            }
+            Err(err) => DirectiveInfo {
+                problems: vec![format!("{err} in directive `:::{info}`")],
+                ..DirectiveInfo::default()
+            },
+        };
+    }
     let (tokens, unbalanced) = split_info(info);
-    let mut problems = Vec::new();
+    let mut out = DirectiveInfo::default();
     if let Some(quote) = unbalanced {
-        problems.push(format!(
+        out.problems.push(format!(
             "unbalanced {quote} quote in directive `:::{info}` (read to the end of the line)"
         ));
     }
     let mut tokens = tokens.into_iter();
-    let name = tokens.next().map(|token| token.text).unwrap_or_default();
-    let mut classes = vec![name.clone()];
-    let mut attrs: BTreeMap<String, String> = BTreeMap::new();
+    out.name = tokens.next().map(|token| token.text).unwrap_or_default();
     for token in tokens {
-        let Some(eq) = token.eq else {
-            classes.push(token.text);
-            continue;
-        };
-        let (key, value) = (&token.text[..eq], &token.text[eq + 1..]);
+        match token.eq {
+            Some(eq) => {
+                let (key, value) = (&token.text[..eq], &token.text[eq + 1..]);
+                out.args.push((key.to_string(), value.to_string()));
+            }
+            None => out.classes.push(token.text),
+        }
+    }
+    out
+}
+
+/// Whether a directive's info string names `:::notes` (also pandoc's `::: {.notes}`).
+pub(crate) fn is_notes_info(info: &str) -> bool {
+    directive_info(info).name == "notes"
+}
+
+/// The attributes of a directive's `<div>` (leading space included) and the problems found
+/// in its info string (dialect §4): `id` (pandoc form), `class` (the name, then the other
+/// classes, deduplicated), then the other attributes by name. `:::fragment index=N` needs a
+/// non-negative integer N (anything else would hide the fragment for good in reveal.js): it
+/// is written normalized, and any other value is dropped with a problem (A3).
+fn directive_attrs(info: &str) -> (String, Vec<String>) {
+    let directive = directive_info(info);
+    let mut problems = directive.problems;
+    let name = directive.name;
+    let mut classes = vec![name.clone()];
+    classes.extend(directive.classes);
+    let mut attrs: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in directive.args {
         let lower = key.to_ascii_lowercase();
         match (name.as_str(), lower.as_str()) {
-            ("fragment", "index") => {
-                attrs.insert("data-fragment-index".into(), value.into());
-            }
+            ("fragment", "index") => match value.trim().parse::<u32>() {
+                Ok(index) => {
+                    attrs.insert("data-fragment-index".into(), index.to_string());
+                }
+                Err(_) => problems.push(format!(
+                    "`index={value}` in directive `:::{info}` is not a non-negative integer \
+                     (dropped; reveal.js would never show the fragment)"
+                )),
+            },
             ("columns", "widths") => {
                 attrs.insert("style".into(), format!("grid-template-columns: {value}"));
             }
@@ -1141,10 +1450,10 @@ fn directive_attrs(info: &str) -> (String, Vec<String>) {
                 "`{key}` in directive `:::{info}` is not a valid attribute name (dropped)"
             )),
             _ if lower.starts_with("data-") => {
-                attrs.insert(lower, value.into());
+                attrs.insert(lower, value);
             }
             _ => {
-                attrs.insert(format!("data-{lower}"), value.into());
+                attrs.insert(format!("data-{lower}"), value);
             }
         }
     }
@@ -1154,10 +1463,12 @@ fn directive_attrs(info: &str) -> (String, Vec<String>) {
             unique.push(class);
         }
     }
-    let classes = unique;
     let mut html = String::new();
-    if !classes.is_empty() {
-        push_attr(&mut html, "class", &classes.join(" "));
+    if let Some(id) = &directive.id {
+        push_attr(&mut html, "id", id);
+    }
+    if !unique.is_empty() {
+        push_attr(&mut html, "class", &unique.join(" "));
     }
     for (key, value) in &attrs {
         push_attr(&mut html, key, value);
@@ -1225,20 +1536,25 @@ fn write_code_block<'a>(
         .render
         .sourcepos
         .then(|| node.data().sourcepos.to_string());
+    let (info, parsed) = fence_info(context, node, &block.info, attrs);
     context.cr()?;
-    if is_math_fence(&block.info) {
+    if is_math_fence(info) {
         context.write_str("<div")?;
         render_sourcepos(context, node)?;
         context.write_str(" data-math-style=\"display\"")?;
-        if let Some(attrs) = attrs {
-            context.write_str(&element_attrs(attrs, &[MATH_ATTR]))?;
+        if let Some(parsed) = &parsed {
+            let attrs = Attributes {
+                id: parsed.id.clone(),
+                classes: parsed.classes.clone(),
+                pairs: parsed.pairs.clone(),
+            };
+            context.write_str(&element_attrs(&attrs, &[MATH_ATTR]))?;
         }
         context.write_str(">")?;
         context.escape(strip_trailing_newline(&block.literal))?;
         context.write_str("</div>")?;
     } else {
-        let parsed = attrs.map(ParsedAttrs::from);
-        let code = code_attrs(&block.info, parsed.as_ref());
+        let code = code_attrs(info, parsed.as_ref());
         context.write_str(&render_code_block_with(
             &block.literal,
             &code,
@@ -1247,6 +1563,34 @@ fn write_code_block<'a>(
     }
     context.lf()?;
     Ok(ChildRendering::HTML)
+}
+
+/// A fence's info string and attributes: comrak's, or, when comrak left a `{…}` block it
+/// rejected at the end of the info string, the info without it and the block read by
+/// [`fence_attrs`] (dialect §3.1, A3). A block meant as attributes that is not valid stays in
+/// the info string and is an `unparsed-attr-block` warning.
+fn fence_info<'i, 'a>(
+    context: &mut Context<'_, '_, FormatState>,
+    node: &'a AstNode<'a>,
+    info: &'i str,
+    attrs: Option<&Attributes>,
+) -> (&'i str, Option<ParsedAttrs>) {
+    if let Some(attrs) = attrs {
+        return (info, Some(ParsedAttrs::from(attrs)));
+    }
+    match fence_attrs(info) {
+        Some((rest, _, ElementAttrs::Attrs(parsed))) => (rest, Some(parsed)),
+        Some((_, block, ElementAttrs::Invalid(reason))) => {
+            let mut diagnostic = unparsed("code fence's language", block, &reason);
+            diagnostic.span = node_span(node).map(|span| SourceSpan {
+                end_line: span.start_line,
+                ..span
+            });
+            context.user.diagnostics.push(diagnostic);
+            (info, None)
+        }
+        _ => (info, None),
+    }
 }
 
 /// Whether a fence's info string names the `math` language (comrak's `math_code` rule).
@@ -1276,7 +1620,9 @@ fn write_math<'a>(
     Ok(ChildRendering::HTML)
 }
 
-/// A heading with `{…}` attributes (§3.3): comrak's `<hN>` plus the attributes.
+/// A heading with `{…}` attributes (§3.3): comrak's `<hN>` plus the attributes. Slide
+/// attributes still on it ([`slide_only_keys`]) were not lifted onto the slide: an
+/// `unlifted-slide-attr` warning (A3).
 fn write_heading<'a>(
     context: &mut Context<'_, '_, FormatState>,
     node: &'a AstNode<'a>,
@@ -1285,6 +1631,21 @@ fn write_heading<'a>(
     entering: bool,
 ) -> FormatResult {
     if entering {
+        let keys = slide_only_keys(attrs);
+        if !keys.is_empty() {
+            let message = format!(
+                "{keys} on this heading {does} not apply to the slide and {is} written on the \
+                 `<h{level}>`: slide attributes on a heading are lifted only when the heading \
+                 is the slide's first visible element (only HTML comments and `:::notes` \
+                 blocks may come before it)",
+                keys = keys.join(", "),
+                does = if keys.len() == 1 { "does" } else { "do" },
+                is = if keys.len() == 1 { "is" } else { "are" },
+            );
+            let mut diagnostic = Diagnostic::warning("unlifted-slide-attr", message);
+            diagnostic.span = node_span(node);
+            context.user.diagnostics.push(diagnostic);
+        }
         context.cr()?;
         write!(context, "<h{level}")?;
         render_sourcepos(context, node)?;
@@ -1297,7 +1658,24 @@ fn write_heading<'a>(
     Ok(ChildRendering::HTML)
 }
 
-/// A link with `{…}` attributes (§3.3): comrak's `<a href title>` plus the attributes.
+/// The `key=value` pairs of a heading's attributes that only mean something on a slide
+/// (`layout`, `background` and the other dialect §3.2 shorthands; not `data-`/`aria-`
+/// keys, which elements use too), as `` `key=value` ``, in order.
+fn slide_only_keys(attrs: &Attributes) -> Vec<String> {
+    attrs
+        .pairs
+        .iter()
+        .filter(|(key, _)| {
+            let lower = key.to_ascii_lowercase();
+            let verbatim = lower.starts_with("data-") || lower.starts_with("aria-");
+            lower == "layout" || (!verbatim && normalize_key(&lower, "").1)
+        })
+        .map(|(key, value)| format!("`{key}={value}`"))
+        .collect()
+}
+
+/// A link with `{…}` attributes (§3.3): comrak's `<a href title>` plus the attributes; a
+/// `title=` attribute is written when the link has no Markdown title (A3).
 fn write_link<'a>(
     context: &mut Context<'_, '_, FormatState>,
     node: &'a AstNode<'a>,
@@ -1321,13 +1699,19 @@ fn write_link<'a>(
         context.escape(&link.title)?;
         context.write_str("\"")?;
     }
-    context.write_str(&element_attrs(attrs, &["href", "title"]))?;
+    let reserved: &[&str] = if link.title.is_empty() {
+        &["href"]
+    } else {
+        &["href", "title"]
+    };
+    context.write_str(&element_attrs(attrs, reserved))?;
     context.write_str(">")?;
     Ok(ChildRendering::HTML)
 }
 
 /// An image with `{…}` attributes (§3.3): comrak's `<img src alt title />` plus the
-/// attributes. The alt text is the image's children rendered as plain text.
+/// attributes; a `title=` attribute is written when the image has no Markdown title (A3).
+/// The alt text is the image's children rendered as plain text.
 fn write_image<'a>(
     context: &mut Context<'_, '_, FormatState>,
     node: &'a AstNode<'a>,
@@ -1350,7 +1734,12 @@ fn write_image<'a>(
         context.escape(&link.title)?;
     }
     context.write_str("\"")?;
-    context.write_str(&element_attrs(attrs, &["src", "alt", "title"]))?;
+    let reserved: &[&str] = if link.title.is_empty() {
+        &["src", "alt"]
+    } else {
+        &["src", "alt", "title"]
+    };
+    context.write_str(&element_attrs(attrs, reserved))?;
     context.write_str(" />")?;
     Ok(ChildRendering::HTML)
 }
@@ -1549,6 +1938,223 @@ After inner.
              <div class=\"fragment fade-in\" data-fragment-index=\"3\">\n<p>y</p>\n</div>\n\
              <div class=\"column grow\">\n<p>z</p>\n</div>\n"
         );
+    }
+
+    /// A3 (F26): pandoc's attribute block as a directive's info string.
+    #[test]
+    fn pandoc_directive_info() {
+        let info =
+            |name: &str, classes: &[&str], id: Option<&str>, args: &[(&str, &str)]| DirectiveInfo {
+                name: name.to_string(),
+                classes: classes.iter().map(|c| c.to_string()).collect(),
+                id: id.map(str::to_string),
+                args: args
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                problems: Vec::new(),
+            };
+        let cases = [
+            ("{.fragment}", info("fragment", &[], None, &[])),
+            (
+                " {.fragment .fade-up} ",
+                info("fragment", &["fade-up"], None, &[]),
+            ),
+            (
+                "{.column width=\"40%\"}",
+                info("column", &[], None, &[("width", "40%")]),
+            ),
+            ("{#intro .note}", info("note", &[], Some("intro"), &[])),
+            (
+                "{.a class=\"b c\" id=x k='v w'}",
+                info("a", &["b", "c"], Some("x"), &[("k", "v w")]),
+            ),
+            ("{#only}", info("", &[], Some("only"), &[])),
+            (
+                "columns widths=\"1fr 2fr\" big",
+                info("columns", &["big"], None, &[("widths", "1fr 2fr")]),
+            ),
+            ("", info("", &[], None, &[])),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(directive_info(text), expected, "{text:?}");
+        }
+        assert!(is_notes_info("{.notes}") && is_notes_info("notes") && is_notes_info(" notes x"));
+        assert!(!is_notes_info("{.fragment .notes}") && !is_notes_info("note"));
+        let problems = directive_info("{.a k='v}").problems;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let html = render(
+            "::: {.fragment index=1}\nx\n:::\n\n:::: {.columns widths=\"1fr 2fr\"}\n::: {#c .column width=1}\ny\n:::\n::::\n\n::: {.notes}\nn\n:::\n",
+        );
+        assert_eq!(
+            html.html,
+            "<div class=\"fragment\" data-fragment-index=\"1\">\n<p>x</p>\n</div>\n\
+             <div class=\"columns\" style=\"grid-template-columns: 1fr 2fr\">\n\
+             <div id=\"c\" class=\"column\">\n<p>y</p>\n</div>\n</div>\n"
+        );
+        assert_eq!(html.notes.as_deref(), Some("<p>n</p>\n"));
+    }
+
+    /// A3 fix round: directory listings for `asset-case-mismatch` are read once while a
+    /// guard is open, and read again after the outermost guard is dropped (a rebuild).
+    #[test]
+    fn case_listings_are_cached_while_a_guard_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Figs")).unwrap();
+        std::fs::write(dir.path().join("Figs/a.png"), b"x").unwrap();
+        assert_eq!(
+            case_mismatch(dir.path(), "figs/./a.png").as_deref(),
+            Some("Figs/a.png")
+        );
+        {
+            let _deck = DirListings::enter();
+            assert_eq!(case_mismatch(dir.path(), "Figs/a.png"), None);
+            std::fs::write(dir.path().join("Figs/B.png"), b"x").unwrap();
+            // the listing read above is reused, and it has no `B.png`
+            assert_eq!(case_mismatch(dir.path(), "Figs/b.png"), None);
+            drop(DirListings::enter());
+            assert_eq!(case_mismatch(dir.path(), "Figs/b.png"), None);
+        }
+        assert_eq!(
+            case_mismatch(dir.path(), "Figs/b.png").as_deref(),
+            Some("Figs/B.png")
+        );
+        assert_eq!(case_mismatch(dir.path(), "Figs/../Figs/B.png"), None);
+    }
+
+    /// A3 (F14): only a non-negative integer is a fragment index.
+    #[test]
+    fn fragment_indices_must_be_integers() {
+        for (index, expected) in [
+            ("3", Some("3")),
+            ("\" 2 \"", Some("2")),
+            ("+4", Some("4")),
+            ("007", Some("7")),
+        ] {
+            let (rendered, _, codes) = render_with(
+                &format!(":::fragment index={index}\nx\n:::\n"),
+                RenderMode::Deck,
+                false,
+            );
+            assert_eq!(codes, [], "{index}");
+            let attr = expected.map(|n| format!(" data-fragment-index=\"{n}\""));
+            assert!(
+                rendered.html.starts_with(&format!(
+                    "<div class=\"fragment\"{}>",
+                    attr.unwrap_or_default()
+                )),
+                "{index}: {}",
+                rendered.html
+            );
+        }
+        for index in ["first", "", "-1", "1.5", "99999999999"] {
+            let (rendered, _, codes) = render_with(
+                &format!("Text\n\n:::fragment index={index}\nx\n:::\n"),
+                RenderMode::Deck,
+                false,
+            );
+            assert_eq!(codes, [("invalid-directive-arg", 3)], "{index}");
+            assert!(
+                rendered.html.contains("<div class=\"fragment\">\n"),
+                "{index}: {}",
+                rendered.html
+            );
+        }
+        // other directives keep `index=` as data
+        assert!(
+            render(":::box index=a\nx\n:::\n")
+                .html
+                .contains("data-index=\"a\"")
+        );
+    }
+
+    /// A3 (F13): a directive opened by a bare `:::` line is reported, once per mistake.
+    #[test]
+    fn unnamed_directives_are_reported() {
+        let (rendered, _, codes) = render_with(
+            ":::fragment\nA\n:::notes\nN\n:::\nB\n:::\n\nC\n",
+            RenderMode::Deck,
+            false,
+        );
+        assert_eq!(codes, [("invalid-directive", 7)]);
+        assert!(
+            rendered.html.ends_with("<div>\n<p>C</p>\n</div>\n"),
+            "{}",
+            rendered.html
+        );
+        // nested with a longer outer fence: nothing to report
+        let (_, _, codes) = render_with(
+            "::::fragment\nA\n:::notes\nN\n:::\nB\n::::\n",
+            RenderMode::Deck,
+            false,
+        );
+        assert_eq!(codes, []);
+        // a `{#id}`-only pandoc block has no name but is no mistake
+        let (rendered, _, codes) = render_with("::: {#x}\ny\n:::\n", RenderMode::Deck, false);
+        assert_eq!(codes, []);
+        assert_eq!(rendered.html, "<div id=\"x\">\n<p>y</p>\n</div>\n");
+    }
+
+    /// A3 (F35): a `title=` attribute is written when there is no Markdown title.
+    #[test]
+    fn title_attributes_on_links_and_images() {
+        let html = render(
+            "[a](https://x.y){title=\"T1\"} [b](https://x.y \"Md\"){title=\"T2\"} \
+             ![c](https://x.y/c.png){title=\"T3\"} ![d](https://x.y/d.png \"Md\"){title=\"T4\"}\n",
+        )
+        .html;
+        assert_eq!(
+            html,
+            "<p><a href=\"https://x.y\" title=\"T1\">a</a> <a href=\"https://x.y\" title=\"Md\">b</a> \
+             <img src=\"https://x.y/c.png\" alt=\"c\" title=\"T3\" /> \
+             <img src=\"https://x.y/d.png\" alt=\"d\" title=\"Md\" /></p>\n"
+        );
+    }
+
+    /// A3 (F04): a fence's `{…}` block that comrak rejects; one meant as attributes but not
+    /// valid is reported on the fence's line.
+    #[test]
+    fn fence_attribute_blocks_comrak_rejects() {
+        let html =
+            render("```python {lines=1|3 .numbered}\na\n```\n\n```math {data-x='a b'}\nx\n```\n")
+                .html;
+        assert_eq!(
+            html,
+            "<pre><code class=\"language-python\" data-trim data-line-numbers=\"1|3\">a</code></pre>\n\
+             <div data-math-style=\"display\" data-x=\"a b\">x</div>\n"
+        );
+        let (rendered, _, codes) = render_with(
+            "Text\n\n```python {numbered lines=1|3}\na\n```\n\n```{r}\nb\n```\n",
+            RenderMode::Deck,
+            false,
+        );
+        assert_eq!(codes, [("unparsed-attr-block", 3)]);
+        assert!(
+            rendered
+                .html
+                .contains("<pre><code class=\"language-python\" data-trim>a")
+        );
+        assert!(
+            rendered
+                .html
+                .contains("<code class=\"language-{r}\" data-trim>b")
+        );
+    }
+
+    /// A3 (F12): slide attributes left on a heading are reported; element attributes not.
+    #[test]
+    fn slide_attributes_left_on_a_heading_are_reported() {
+        let (rendered, _, codes) = render_with(
+            "Intro\n\n## A {layout=section}\n\n## B {.x data-id=b aria-label=l title=t}\n\n\
+             ## C {background=red transition=zoom}\n",
+            RenderMode::Deck,
+            false,
+        );
+        assert_eq!(
+            codes,
+            [("unlifted-slide-attr", 3), ("unlifted-slide-attr", 7)]
+        );
+        assert!(rendered.html.contains("<h2 layout=\"section\">A</h2>"));
     }
 
     #[test]
@@ -1805,6 +2411,7 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
             RenderMode::Deck,
             false,
         );
+        // the `:::` meant to close it opens an unnamed directive, reported only once (A3)
         assert_eq!(codes, [("invalid-directive", 3)]);
         assert_eq!(
             rendered.html,
@@ -1867,6 +2474,7 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
         let lifted = lifted.unwrap();
         assert_eq!(lifted.id.as_deref(), Some("a"));
         assert_eq!(lifted.classes, ["wide"]);
+        assert!(ctx.diagnostics.is_empty());
         let (rendered, lifted) = render_fragment_with_lift(text, &opts, &mut ctx, false).unwrap();
         assert!(lifted.is_none());
         assert!(
@@ -1874,6 +2482,10 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
                 .html
                 .starts_with("<h1 id=\"a\" class=\"wide\" layout=\"title\">")
         );
+        // a slide attribute left on the element is reported (A3)
+        let codes: Vec<_> = ctx.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, ["unlifted-slide-attr"]);
+        *ctx.diagnostics = Diagnostics::new();
         // only a leading heading is lifted
         let (_, lifted) =
             render_fragment_with_lift("x\n\n# H {.c}\n", &opts, &mut ctx, true).unwrap();

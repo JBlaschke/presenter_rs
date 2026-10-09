@@ -923,17 +923,17 @@ impl<'a> Converter<'a> {
         let Some(first) = root.first_child() else {
             return Ok(());
         };
-        // The splitter lifts a leading heading's attributes; keep them on the heading
-        // unless the current slide is still empty (§2).
-        let kept = if self.cur_is_empty() {
-            None
-        } else {
-            first.data_mut().attrs.take()
+        // The splitter lifts a leading heading's attributes (also after comments and
+        // `:::notes`); keep them on the heading unless the current slide is still empty (§2).
+        let heading = crate::markdown::split::lifted_heading(root);
+        let kept = match heading {
+            Some(heading) if !self.cur_is_empty() => heading.data_mut().attrs.take(),
+            _ => None,
         };
         let raw = split_with_source(root, text, SplitMode::Rules)
             .map_err(|err| cell_error(err, &self.source.path, index, offset));
-        if kept.is_some() {
-            first.data_mut().attrs = kept;
+        if let (Some(heading), Some(kept)) = (heading, kept) {
+            heading.data_mut().attrs = Some(kept);
         }
         let raw = raw?;
         let leading = !raw.slides.iter().any(|(slide, children)| {

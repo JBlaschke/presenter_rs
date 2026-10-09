@@ -177,7 +177,8 @@ fn serve_overlays_locate_front_matter_errors_in_the_deck() {
     assert_eq!(
         serde_json::to_value(&payload).unwrap(),
         json!({"message": "slides.md:2: front matter: mapping values are not allowed in this \
-                           context at line 2 column 9",
+                           context at line 2 column 9 (put the value in quotes: \
+                           `title: \"a: b\"`)",
                "file": "slides.md", "line": 2, "kind": "front-matter",
                "excerpt": "title: a: b"})
     );

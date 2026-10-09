@@ -4,10 +4,16 @@
 //! [`Parsed`] deck:
 //!
 //! 1. comrak parses the text with [`comrak_options`] (dialect §1);
-//! 2. the `FrontMatter` node goes through [`frontmatter::parse_front_matter`] into
-//!    `Deck.meta`, and is merged into a clone of the config (`Config::merge_front_matter`), so
-//!    front matter can switch `slides.split` or `markdown.*`; when it changes
-//!    `markdown.smart_punctuation` the text is parsed again with the new options;
+//! 2. the `FrontMatter` node goes through [`frontmatter::parse_deck_front_matter`] into
+//!    `Deck.meta` (with warnings for front matter that swallowed slide content, A3), and is
+//!    merged into a clone of the config (`Config::merge_front_matter`), so front matter can
+//!    switch `slides.split` or `markdown.*`; when it changes `markdown.smart_punctuation` the
+//!    text is parsed again with the new options. `---` on line 1 directly followed by `---`
+//!    on line 2 is empty front matter (A3): the text is then parsed without comrak's front
+//!    matter extension, so the opening `---` is not paired with a later separator, and the
+//!    two rules become an empty `FrontMatter` node. Attribute blocks comrak rejected are
+//!    then read again ([`recover::recover_attr_blocks`], which may parse the text once more
+//!    with those blocks rewritten in comrak's own syntax; that text is used from then on);
 //! 3. [`split::split_with_source`] splits the document into slides;
 //! 4. each slide is rendered by [`render::render_nodes`] (through [`compat::render_slide`],
 //!    which splits off a `Note:` paragraph and what follows as notes); its attributes
@@ -31,6 +37,7 @@ pub mod code;
 pub mod compat;
 pub mod frontmatter;
 pub mod postprocess;
+pub mod recover;
 pub mod render;
 pub mod split;
 
@@ -43,7 +50,8 @@ use crate::assets::registry::AssetRegistry;
 use crate::config::{Config, MarkdownConfig, SlideSplit, SlidesConfig};
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{Block, Deck, DeckMeta, Features, Parsed, Slide, SourceInfo};
-use crate::markdown::render::{RenderCtx, RenderMode, rewrite_slide_assets};
+use crate::markdown::recover::recover_attr_blocks;
+use crate::markdown::render::{DirListings, RenderCtx, RenderMode, rewrite_slide_assets};
 use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
 
 /// Parses a Markdown deck into the IR (see the module docs for the steps).
@@ -71,9 +79,22 @@ pub(crate) fn parse_deferring_config(
 /// [`parse`]; with `defer`, [`parse_deferring_config`].
 fn parse_with(source: &SourceInfo, text: &str, config: &Config, defer: bool) -> Result<Parsed> {
     let arena = Arena::new();
+    let empty_front_matter = starts_with_empty_front_matter(text);
+    let parse_options = |opts: &Options<'static>| {
+        let mut opts = opts.clone();
+        if empty_front_matter {
+            opts.extension.front_matter_delimiter = None;
+        }
+        opts
+    };
     let first_opts = comrak_options(&config.markdown);
-    let mut root = parse_document(&arena, text, &first_opts);
-    let meta = deck_meta(root)?;
+    let mut root = parse_document(&arena, text, &parse_options(&first_opts));
+    let mut diagnostics = Diagnostics::new();
+    let meta = if empty_front_matter {
+        DeckMeta::default()
+    } else {
+        deck_meta(root, &mut diagnostics)?
+    };
     let mut deck_config = config.clone();
     if defer {
         let mut parse_meta = meta.clone();
@@ -87,13 +108,20 @@ fn parse_with(source: &SourceInfo, text: &str, config: &Config, defer: bool) -> 
     }
     let opts = comrak_options(&deck_config.markdown);
     if opts.parse.smart != first_opts.parse.smart {
-        root = parse_document(&arena, text, &opts);
+        root = parse_document(&arena, text, &parse_options(&opts));
     }
-    let raw = split_with_source(root, text, split_mode(&deck_config.slides))
+    let (root, text) =
+        recover_attr_blocks(&arena, root, text, &parse_options(&opts), &mut diagnostics);
+    if empty_front_matter {
+        mark_empty_front_matter(root);
+    }
+    let raw = split_with_source(root, &text, split_mode(&deck_config.slides))
         .map_err(|err| with_source_path(err, &source.path))?;
 
+    // every slide's file references list each directory once (asset-case-mismatch)
+    let _listings = DirListings::enter();
     let mut assets = AssetRegistry::new();
-    let mut diagnostics = raw.diagnostics;
+    diagnostics.extend(raw.diagnostics);
     let mut features = Features::default();
     let mut slides = Vec::with_capacity(raw.slides.len());
     let mut ctx = RenderCtx {
@@ -104,7 +132,7 @@ fn parse_with(source: &SourceInfo, text: &str, config: &Config, defer: bool) -> 
         missing_asset_is_error: false,
     };
     let incremental = deck_config.slides.incremental_lists;
-    let lines = split::source_lines(text);
+    let lines = split::source_lines(&text);
     for (raw_slide, raw_children) in raw.slides {
         let mut slide = build_slide(&arena, raw_slide, &lines, &opts, &mut ctx, &mut features)?;
         postprocess_slide(&mut slide, incremental, ctx.diagnostics)?;
@@ -164,16 +192,56 @@ pub fn comrak_options(config: &MarkdownConfig) -> Options<'static> {
 }
 
 /// `Deck.meta` from the document's `FrontMatter` node (always its first child), or the
-/// default when there is none.
-fn deck_meta<'a>(root: &'a AstNode<'a>) -> Result<DeckMeta> {
+/// default when there is none. Front matter that swallowed slide content is reported in
+/// `diagnostics` ([`frontmatter::parse_deck_front_matter`]).
+fn deck_meta<'a>(root: &'a AstNode<'a>, diagnostics: &mut Diagnostics) -> Result<DeckMeta> {
     let Some(first) = root.first_child() else {
         return Ok(DeckMeta::default());
     };
-    match &first.data().value {
+    let data = first.data();
+    match &data.value {
         NodeValue::FrontMatter(literal) => {
-            frontmatter::parse_front_matter(frontmatter::strip_delimiters(literal))
+            let yaml = frontmatter::strip_delimiters(literal);
+            // comrak's node ends on the closing `---` line
+            let closing = data.sourcepos.end.line;
+            frontmatter::parse_deck_front_matter(yaml, closing, diagnostics)
         }
         _ => Ok(DeckMeta::default()),
+    }
+}
+
+/// Whether the source's first two lines are exactly `---` (a byte-order mark before the
+/// first is ignored, as comrak does): empty front matter, as in Jekyll and pandoc (A3).
+/// comrak would pair the opening `---` with the first *later* `---` line, which in a deck is
+/// a slide separator, and take everything up to it for YAML (the line right after the
+/// opening `---` never closes the block). Such a text is parsed without the front matter
+/// extension and [`mark_empty_front_matter`] turns its two leading rules into front matter.
+fn starts_with_empty_front_matter(text: &str) -> bool {
+    let lines = split::source_lines(text);
+    lines.len() >= 2 && lines[0] == "---" && lines[1] == "---"
+}
+
+/// For a text that [`starts_with_empty_front_matter`], parsed without the front matter
+/// extension: its first thematic break becomes an empty `FrontMatter` node spanning lines 1
+/// and 2 (as comrak makes for `---`, blank line, `---`) and the second one is detached, so
+/// neither makes a slide.
+fn mark_empty_front_matter<'a>(root: &'a AstNode<'a>) {
+    let breaks: Vec<_> = root
+        .children()
+        .take(2)
+        .filter(|node| {
+            let data = node.data();
+            matches!(data.value, NodeValue::ThematicBreak)
+                && data.sourcepos.start.line == data.sourcepos.end.line
+                && data.sourcepos.start.line <= 2
+        })
+        .collect();
+    if let [first, second] = breaks.as_slice() {
+        tracing::debug!("`---` / `---` at the start: empty front matter");
+        let mut data = first.data_mut();
+        data.value = NodeValue::FrontMatter("---\n---\n".to_string());
+        data.sourcepos.end = second.data().sourcepos.end;
+        second.detach();
     }
 }
 
@@ -544,6 +612,48 @@ y
         }
         let parsed = parse_text("---\ntitle: Only front matter\n---\n");
         assert_eq!(parsed.deck.meta.title.as_deref(), Some("Only front matter"));
+    }
+
+    /// A3 (F04): dialect §3.1 "the two must agree" also for blocks comrak rejects: the
+    /// separator form and the heading form give the same slide.
+    #[test]
+    fn separator_and_heading_forms_agree_beyond_comrak() {
+        for block in [
+            "{.dark background=#222}",
+            "{background=images/ok.png}",
+            "{background=https://example.org/a.png}",
+            "{#q .x data-note='two words' transition=zoom}",
+            "{layout=section data-x=a/b?c=1&d=2|3}",
+        ] {
+            let separator = parse_text(&format!("# A\n\n--- {block}\n\n## T\n"));
+            let heading = parse_text(&format!("# A\n\n---\n\n## T {block}\n"));
+            let (from_separator, from_heading) =
+                (&separator.deck.slides[1], &heading.deck.slides[1]);
+            assert_eq!(
+                from_heading,
+                &Slide {
+                    span: from_separator.span.clone(),
+                    ..from_separator.clone()
+                },
+                "{block}"
+            );
+            assert_eq!(html(from_heading), "<h2>T</h2>\n", "{block}");
+            assert_eq!(from_heading.title.as_deref(), Some("T"), "{block}");
+            assert!(
+                heading.diagnostics.is_empty(),
+                "{block}: {:?}",
+                heading.diagnostics
+            );
+        }
+        // the text after a recovered block keeps its place and lines keep their numbers
+        let parsed = parse_text("![a](images/ok.png){width='5'} after\n\n![b](gone.png)\n");
+        let found: Vec<_> = parsed
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.span.as_ref().map(|s| s.start_line)))
+            .collect();
+        assert_eq!(found, [("missing-asset", Some(3))]);
+        assert!(html(&parsed.deck.slides[0]).contains("width=\"5\" /> after</p>"));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Code fence rendering (`lines=`, language classes) for reveal's highlight plugin. Implemented by T12.
 //!
 //! Contract: `docs/spec/markdown-dialect.md` §5. comrak parses the `{…}` block after the
-//! language into node attributes (the info string is then just the language), and
-//! [`code_attrs`] applies the §5 table to both:
+//! language into node attributes (the info string is then just the language); a block comrak
+//! rejects (`{lines=1|3}`, single quotes) is read by the renderer with
+//! [`fence_attrs`](crate::markdown::recover::fence_attrs) (A3). [`code_attrs`] applies the
+//! §5 table to both:
 //!
 //! | info / attribute | effect |
 //! |---|---|

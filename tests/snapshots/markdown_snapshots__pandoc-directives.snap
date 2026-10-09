@@ -1,0 +1,71 @@
+---
+source: tests/markdown_snapshots.rs
+expression: json
+---
+{
+  "meta": {
+    "title": "Pandoc directives",
+    "subtitle": null,
+    "author": null,
+    "date": null,
+    "description": null,
+    "lang": null,
+    "theme": null,
+    "reveal": {},
+    "vars": {}
+  },
+  "slides": [
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Pandoc fenced divs",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Pandoc fenced divs</h2>\n<div class=\"fragment fade-up\">\n<p>Fades up.</p>\n</div>\n<div class=\"columns\" style=\"grid-template-columns: 1fr 2fr\">\n<div class=\"column\">\n<p>Left.</p>\n</div>\n<div id=\"intro\" class=\"note\">\n<p>Right.</p>\n</div>\n</div>\n"
+        }
+      ],
+      "notes": "<p>Speaker notes in pandoc syntax.</p>\n",
+      "children": [],
+      "span": {
+        "start_line": 15,
+        "end_line": 32,
+        "cell": null
+      }
+    },
+    {
+      "id": null,
+      "layout": "default",
+      "classes": [],
+      "attrs": {},
+      "title": "Fragment indices",
+      "blocks": [
+        {
+          "type": "html",
+          "html": "<h2>Fragment indices</h2>\n<div class=\"fragment\">\n<p>Not a number: the index is dropped.</p>\n</div>\n<div class=\"fragment\" data-fragment-index=\"2\">\n<p>Second.</p>\n</div>\n"
+        }
+      ],
+      "notes": null,
+      "children": [],
+      "span": {
+        "start_line": 34,
+        "end_line": 44,
+        "cell": null
+      }
+    }
+  ],
+  "features": {
+    "math": false,
+    "code": false,
+    "notes": true,
+    "notebook": false
+  },
+  "source": {
+    "path": "[path]",
+    "kind": "markdown",
+    "base_dir": "[path]"
+  },
+  "assets": []
+}
