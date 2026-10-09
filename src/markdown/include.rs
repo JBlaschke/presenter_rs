@@ -3,14 +3,16 @@
 //! The Markdown frontend ([`super::parse`]) splits a deck into slides first; then:
 //!
 //! 1. `find_includes` looks at every `:::include` directive of the split deck. One that is
-//!    the only visible content (HTML comments and `:::notes` blocks do not count,
-//!    [`compat::is_invisible`]) of a horizontal slide without vertical slides, closed by a
+//!    the only visible content (HTML comments, `:::notes` blocks and a `Note:` paragraph with
+//!    what follows it do not count, [`compat::is_invisible`]) of a horizontal slide without
+//!    vertical slides, closed by a
 //!    `:::` line right after it, is an *include slide*; any other `:::include` is an
 //!    [`Error::Parse`] at its line, with the including file's path: in a vertical slide
 //!    (after `--`), inside a list, quote or another directive, next to other content, with a
 //!    body, not closed, without a path, or a `:::include` line comrak did not open (a `:`
-//!    after the fence). Slide attributes (`--- {…}`, `<!-- .slide: -->`) and `:::notes` of
-//!    an include slide are ignored with an [`codes::INCLUDE_ATTRS_IGNORED`] warning.
+//!    after the fence). Slide attributes (`--- {…}`, `<!-- .slide: -->`), `:::notes` and a
+//!    `Note:` paragraph (dialect §7) of an include slide are ignored with an
+//!    [`codes::INCLUDE_ATTRS_IGNORED`] warning.
 //! 2. `expand` replaces an include slide by every top-level slide of the included file,
 //!    with their vertical children. The path (quoted when it has spaces) is resolved against
 //!    the including file's directory (absolute paths work; URLs do not); the extension picks
@@ -19,19 +21,22 @@
 //!    a [`SourceInfo`] of its own (its images resolve against its directory, its diagnostics
 //!    and errors carry its path) and with the including deck's config (front matter merged).
 //!    Its own front matter or notebook metadata config tables still apply to its parsing; its
-//!    deck metadata is discarded, with an [`codes::INCLUDE_META_IGNORED`] warning naming the
-//!    keys it sets that differ from the top-level deck's. A missing, unreadable or non-UTF-8
+//!    deck metadata (and its `math:` table, which is deck-wide render config) is discarded,
+//!    with an [`codes::INCLUDE_META_IGNORED`] warning naming the keys it sets that differ from
+//!    the including file's. A missing, unreadable or non-UTF-8
 //!    file, an unknown extension, a cycle (by canonical path) and nesting deeper than
 //!    [`MAX_DEPTH`] are [`Error::Parse`] at the directive's line. Errors inside the included
 //!    file keep its own path and line (a front matter error becomes an [`Error::Parse`] with
 //!    its path, so that it is not located in the top-level deck).
 //! 3. Every slide (and child) of an included file records the file in `SourceSpan.file`, as
 //!    do the spans of its diagnostics; its assets, features and diagnostics are merged into the
-//!    deck, and `Deck.includes` lists every included file, transitively, in first-use order.
+//!    deck (a file included twice reports its diagnostics once), and `Deck.includes` lists
+//!    every included file, transitively, in first-use order.
 //!
 //! [`scan_includes`] finds the files a Markdown deck includes without parsing it as a deck,
 //! for the watcher of a deck that does not parse. In a notebook (markdown cells, `text/markdown`
-//! outputs), the renderer removes a `:::include` with an [`codes::INCLUDE_IN_NOTEBOOK`] warning.
+//! outputs), the renderer removes a `:::include` with an [`codes::INCLUDE_IN_NOTEBOOK`] warning
+//! (what comrak put inside it, such as the rest of the cell after an unclosed one, stays).
 
 use std::path::{Path, PathBuf};
 
@@ -53,18 +58,20 @@ pub const MAX_DEPTH: usize = 8;
 
 /// The diagnostic codes of includes (all `Level::Warning`).
 pub mod codes {
-    /// Slide attributes or `:::notes` on an include slide; ignored.
+    /// Slide attributes, `:::notes` or a `Note:` paragraph on an include slide; ignored.
     pub const INCLUDE_ATTRS_IGNORED: &str = "include-attrs-ignored";
-    /// Deck metadata of an included file that differs from the top-level deck's; ignored.
+    /// Deck metadata of an included file that differs from the including file's; ignored.
     pub const INCLUDE_META_IGNORED: &str = "include-meta-ignored";
     /// `:::include` in a notebook (a markdown cell or output); nothing is included and the
     /// directive renders nothing.
     pub const INCLUDE_IN_NOTEBOOK: &str = "include-in-notebook";
 }
 
-/// The config tables of front matter (config.md §3), which an included file applies to its
-/// own parsing; they are not deck metadata for [`codes::INCLUDE_META_IGNORED`].
-const CONFIG_TABLES: [&str; 4] = ["slides", "markdown", "math", "notebook"];
+/// The config tables of front matter (config.md §3) that an included file applies to its own
+/// parsing; they are not deck metadata for [`codes::INCLUDE_META_IGNORED`]. `math:` is not
+/// among them: it configures KaTeX for the whole rendered deck, so only the top-level deck's
+/// applies, and an included file's that differs is reported.
+const CONFIG_TABLES: [&str; 3] = ["slides", "markdown", "notebook"];
 
 /// An include slide found by [`find_includes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,16 +96,16 @@ pub(crate) struct IncludedSource {
 }
 
 /// The files being parsed, from the top-level deck down to the current one (for cycles and
-/// the depth limit), and the top-level deck's metadata (what an included file's metadata is
-/// compared with).
+/// the depth limit), and the current file's metadata (what the metadata of a file it includes
+/// is compared with, dialect §4.1).
 #[derive(Debug, Clone)]
 pub(crate) struct Context {
     /// `(canonical path, path as shown in messages)` of each file, the top-level deck first.
     files: Vec<(PathBuf, String)>,
     /// The top-level deck's directory; paths below it are shown relative to it.
     root_dir: PathBuf,
-    /// The top-level deck's metadata.
-    root_meta: DeckMeta,
+    /// The current file's metadata (its front matter).
+    meta: DeckMeta,
 }
 
 impl Context {
@@ -110,7 +117,16 @@ impl Context {
                 shown(&source.path, &source.base_dir),
             )],
             root_dir: source.base_dir.clone(),
-            root_meta: meta.clone(),
+            meta: meta.clone(),
+        }
+    }
+
+    /// This context for the current file, whose front matter is `meta` (an included file's
+    /// context comes from [`expand`] before its front matter is read).
+    pub(crate) fn with_meta(&self, meta: &DeckMeta) -> Context {
+        Context {
+            meta: meta.clone(),
+            ..self.clone()
         }
     }
 
@@ -153,7 +169,9 @@ pub(crate) struct Expanded {
 /// the including file (for errors), `headings` whether it is split in headings mode (for the
 /// hint of an include next to other content). Ignored slide attributes and notes are
 /// reported in `diagnostics` (no path). Errors: [`Error::Parse`] at the line of the first
-/// `:::include` that is not an include slide, or whose path cannot be read from its line.
+/// `:::include` that is not an include slide, or whose path cannot be read from its line;
+/// one in a vertical slide names what opened that slide (a `--` line or, in headings mode,
+/// a heading).
 pub(crate) fn find_includes<'a>(
     slides: &[(RawSlide<'a>, Vec<RawSlide<'a>>)],
     lines: &[&str],
@@ -174,10 +192,10 @@ pub(crate) fn find_includes<'a>(
         for child in children {
             if let Some(node) = child.nodes.iter().find(|node| is_include(node)) {
                 let message = format!(
-                    "`:::include` cannot be in a vertical slide (the `--` on line {} opened \
-                     it): an included file's slides are horizontal slides; put `---` before \
-                     the directive instead",
-                    child.start_line
+                    "`:::include` cannot be in a vertical slide ({} opened it): an included \
+                     file's slides are horizontal slides; put `---` before the directive \
+                     instead",
+                    opener(child, lines)
                 );
                 return Err(error(start_line(node), message));
             }
@@ -185,7 +203,7 @@ pub(crate) fn find_includes<'a>(
         let include = include_slide(slide, children, lines, headings)
             .map_err(|(line, message)| error(line, message))?;
         if let Some(include) = &include {
-            report_ignored(slide, include.line, diagnostics);
+            report_ignored(slide, include.line, lines, diagnostics);
         }
         found.push(include);
     }
@@ -218,20 +236,57 @@ fn check_nested<'a>(nodes: &[&'a AstNode<'a>]) -> std::result::Result<(), Misuse
     Ok(())
 }
 
+/// What opened the vertical slide `child`, for messages: ``the `--` on line 8`` or, in
+/// headings mode, ``the `## B` heading on line 8``.
+fn opener(child: &RawSlide<'_>, lines: &[&str]) -> String {
+    let line = child.start_line;
+    let text = lines.get(line - 1).map_or("", |text| text.trim());
+    if text.starts_with("--") && !text.starts_with("---") {
+        return format!("the `--` on line {line}");
+    }
+    let heading = child
+        .nodes
+        .iter()
+        .find(|node| matches!(node.data().value, NodeValue::Heading(_)));
+    match heading {
+        Some(heading) => {
+            let at = start_line(heading);
+            match lines.get(at - 1).map(|text| text.trim()) {
+                Some(text) if text.starts_with('#') => {
+                    format!("the `{text}` heading on line {at}")
+                }
+                _ => format!("the heading on line {at}"),
+            }
+        }
+        None => format!("line {line}"),
+    }
+}
+
+/// The index in `nodes` (a slide's) of the first `Note:` paragraph (dialect §7), from which on
+/// everything is speaker notes; `nodes.len()` without one.
+fn notes_start<'a>(nodes: &[&'a AstNode<'a>], lines: &[&str]) -> usize {
+    nodes
+        .iter()
+        .position(|node| compat::note_marker(node, Some(lines)).is_some())
+        .unwrap_or(nodes.len())
+}
+
 /// The include `slide` (a horizontal slide with `children`) consists of, if any; an error
-/// when it has an `:::include` but is not an include slide.
+/// when it has an `:::include` but is not an include slide. A `Note:` paragraph after the
+/// directive and what follows it are notes, not content ([`report_ignored`] reports them).
 fn include_slide<'a>(
     slide: &RawSlide<'a>,
     children: &[RawSlide<'a>],
     lines: &[&str],
     headings: bool,
 ) -> std::result::Result<Option<Include>, Misuse> {
-    let Some(&directive) = slide.nodes.iter().find(|node| is_include(node)) else {
+    let Some(at) = slide.nodes.iter().position(is_include) else {
         return Ok(None);
     };
+    let directive = slide.nodes[at];
     let line = start_line(directive);
-    let other = slide
-        .nodes
+    let notes = notes_start(&slide.nodes, lines).max(at + 1);
+    let other = slide.nodes[..notes]
         .iter()
         .find(|node| !std::ptr::eq(**node, directive) && !compat::is_invisible(node));
     if let Some(other) = other {
@@ -250,9 +305,9 @@ fn include_slide<'a>(
     }
     if let Some(child) = children.first() {
         let message = format!(
-            "the slide of `:::include` cannot have vertical slides (the `--` on line {}): the \
+            "the slide of `:::include` cannot have vertical slides ({} opened one): the \
              included file's slides replace it; use `---` instead",
-            child.start_line
+            opener(child, lines)
         );
         return Err((line, message));
     }
@@ -297,9 +352,14 @@ fn check_closed<'a>(directive: &'a AstNode<'a>, lines: &[&str]) -> std::result::
     Ok(())
 }
 
-/// [`codes::INCLUDE_ATTRS_IGNORED`] warnings for slide attributes and `:::notes` on an
-/// include slide (the directive is on `line`).
-fn report_ignored<'a>(slide: &RawSlide<'a>, line: usize, diagnostics: &mut Diagnostics) {
+/// [`codes::INCLUDE_ATTRS_IGNORED`] warnings for slide attributes and notes (`:::notes`, a
+/// `Note:` paragraph) on an include slide (the directive is on `line`).
+fn report_ignored<'a>(
+    slide: &RawSlide<'a>,
+    line: usize,
+    lines: &[&str],
+    diagnostics: &mut Diagnostics,
+) {
     let span = SourceSpan {
         start_line: line,
         end_line: line,
@@ -314,7 +374,7 @@ fn report_ignored<'a>(slide: &RawSlide<'a>, line: usize, diagnostics: &mut Diagn
     }
     let notes = slide.nodes.iter().any(
         |node| matches!(&node.data().value, NodeValue::BlockDirective(d) if is_notes_info(&d.info)),
-    );
+    ) || notes_start(&slide.nodes, lines) < slide.nodes.len();
     if notes {
         let message = "speaker notes on the slide of `:::include` are ignored: write them on a \
                        slide of the included file";
@@ -424,8 +484,9 @@ fn start_line(node: &AstNode<'_>) -> usize {
 
 /// Parses the file `include` names and returns its slides and the rest (module docs, steps 2
 /// and 3). `source` is the including file, `config` the config it was parsed with, `context`
-/// its place in the chain of includes. An [`codes::INCLUDE_META_IGNORED`] warning goes to
-/// `warnings` (at the directive's line, no path).
+/// its place in the chain of includes (with its metadata, which the included file's is
+/// compared with). An [`codes::INCLUDE_META_IGNORED`] warning goes to `warnings` (at the
+/// directive's line, no path).
 pub(crate) fn expand(
     include: &Include,
     source: &SourceInfo,
@@ -468,7 +529,7 @@ pub(crate) fn expand(
     let inner = context.enter(canonical, &path);
     let (parsed, effective, nested) = parse_included(&included, &text, config, &inner)
         .map_err(|err| in_included_file(err, &path))?;
-    let keys = differing_meta(&parsed.deck.meta, &context.root_meta);
+    let keys = differing_meta(&parsed.deck.meta, &context.meta);
     if !keys.is_empty() {
         let message = format!(
             "`{written}` sets {}; an included file's deck metadata is ignored (the top-level \
@@ -584,13 +645,15 @@ fn included_kind(path: &Path) -> Option<SourceKind> {
     crate::pipeline::detect_kind(path).ok()
 }
 
-/// The text of the included file (UTF-8), or why it cannot be read.
+/// The text of the included file (UTF-8), or why it cannot be read. The messages leave the
+/// resolved path out (an error report names paths relative to the current directory, which
+/// the library does not know; the directive's location and line say which file is meant).
 fn read_included(path: &Path) -> std::result::Result<String, String> {
     let bytes = std::fs::read(path).map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => {
-            format!("file not found (looked for {})", path.display())
-        }
-        _ => format!("cannot read {}: {err}", path.display()),
+        std::io::ErrorKind::NotFound => "file not found (a relative path starts at the \
+                                         directory of the file with the directive)"
+            .to_string(),
+        _ => format!("cannot read it: {err}"),
     })?;
     String::from_utf8(bytes).map_err(|err| format!("not valid UTF-8 ({err})"))
 }
@@ -630,9 +693,9 @@ fn in_included_file(err: Error, path: &Path) -> Error {
     }
 }
 
-/// The deck metadata keys `included` sets that differ from `root`'s (`title`, …,
-/// `reveal.<key>`, other front matter keys), each in backticks; the config tables are not
-/// deck metadata.
+/// The deck metadata keys `included` sets that differ from `root`'s, the including file's
+/// (`title`, …, `reveal.<key>`, `math` and other front matter keys), each in backticks; the
+/// config tables that apply to the included file ([`CONFIG_TABLES`]) are not deck metadata.
 fn differing_meta(included: &DeckMeta, root: &DeckMeta) -> Vec<String> {
     let fields = [
         ("title", &included.title, &root.title),
@@ -692,7 +755,8 @@ fn canonical(path: &Path) -> PathBuf {
 /// turn the includes of each included Markdown file that can be read (to [`MAX_DEPTH`],
 /// each file once). Files that do not exist are listed too. Best effort and without errors:
 /// for the watcher of a deck that does not parse (`serve::watch`), so that fixing an included
-/// file rebuilds. Nothing for a path that is not a Markdown file.
+/// file rebuilds. `path` is read as Markdown whatever its extension (the caller knows it is
+/// one, also for `--format md`).
 pub fn scan_includes(path: &Path) -> Vec<PathBuf> {
     let Ok(path) = std::path::absolute(path).map(|path| normalize_lexically(&path)) else {
         return Vec::new();
@@ -702,9 +766,11 @@ pub fn scan_includes(path: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// [`scan_includes`] of one file at `depth`; `seen` holds every file listed or scanned.
+/// [`scan_includes`] of one file at `depth`; `seen` holds every file listed or scanned. The
+/// top-level deck (depth 1) is scanned whatever its extension (`--format md`); an included
+/// file only when its extension makes it Markdown, as [`expand`] reads it.
 fn scan_file(path: &Path, depth: usize, seen: &mut Vec<PathBuf>, found: &mut Vec<PathBuf>) {
-    if depth > MAX_DEPTH || included_kind(path) != Some(SourceKind::Markdown) {
+    if depth > MAX_DEPTH || (depth > 1 && included_kind(path) != Some(SourceKind::Markdown)) {
         return;
     }
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -817,11 +883,18 @@ mod tests {
         let (found, codes) = find(text, false);
         assert_eq!(found.unwrap(), [None, include(7, "b.md")]);
         assert_eq!(codes, [codes::INCLUDE_ATTRS_IGNORED]);
+        // reveal's `Note:` form (dialect §7): the paragraph and what follows are notes
+        for headings in [false, true] {
+            let text = "# A\n\n---\n\n:::include b.md\n:::\nNote: hello\n\nmore notes\n";
+            let (found, codes) = find(text, headings);
+            assert_eq!(found.unwrap(), [None, include(5, "b.md")], "{headings}");
+            assert_eq!(codes, [codes::INCLUDE_ATTRS_IGNORED], "{headings}");
+        }
     }
 
     #[test]
     fn every_misuse_is_an_error_at_the_directive() {
-        let cases: [(&str, bool, usize, &str); 12] = [
+        let cases: [(&str, bool, usize, &str); 15] = [
             (
                 "# A\n\n:::include b.md\n:::\n",
                 false,
@@ -844,7 +917,27 @@ mod tests {
                 "# A\n\n---\n\n:::include b.md\n:::\n\n--\n\nC\n",
                 false,
                 5,
-                "(the `--` on line 8)",
+                "(the `--` on line 8 opened one)",
+            ),
+            // headings mode: a heading opens the vertical slide, or a `--`
+            (
+                "# A\n\ntext\n\n## B {#b}\n\n:::include b.md\n:::\n",
+                true,
+                7,
+                "vertical slide (the `## B {#b}` heading on line 5 opened it)",
+            ),
+            (
+                "# A\n\ntext\n\n--\n\n:::include b.md\n:::\n",
+                true,
+                7,
+                "vertical slide (the `--` on line 5 opened it)",
+            ),
+            // a `Note:` paragraph before the directive is content (the include is in notes)
+            (
+                "# A\n\n---\n\nNote: n\n\n:::include b.md\n:::\n",
+                false,
+                7,
+                "line 5 has other content",
             ),
             (
                 "- item\n\n  :::include b.md\n  :::\n",
@@ -937,9 +1030,18 @@ mod tests {
         included
             .vars
             .insert("slides".into(), serde_json::json!({"split": "headings"}));
+        // `math:` configures KaTeX for the whole deck: only the top-level deck's applies
+        let macros = serde_json::json!({"katex_options": {"macros": {"\\RR": "\\mathbb{R}"}}});
+        included.vars.insert("math".into(), macros);
         assert_eq!(
             differing_meta(&included, &root),
-            ["`author`", "`theme`", "`reveal.controls`", "`venue`"]
+            [
+                "`author`",
+                "`theme`",
+                "`reveal.controls`",
+                "`venue`",
+                "`math`"
+            ]
         );
         assert!(differing_meta(&root, &root).is_empty());
         assert!(differing_meta(&DeckMeta::default(), &root).is_empty());

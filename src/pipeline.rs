@@ -11,8 +11,8 @@
 //!    [`BuildOptions::format`] or the extension ([`detect_kind`]) and parses it into a
 //!    [`Parsed`] deck. The returned config also has the deck's front matter merged.
 //! 3. [`prepare`]: escalates the first `missing-asset` warning to [`Error::MissingAsset`]
-//!    when [`BuildOptions::missing_asset_is_error`] (ir.md §4 contract change; one of an
-//!    included file is an [`Error::Parse`] in that file, [`missing_asset_as_error`]), resolves the
+//!    when [`BuildOptions::missing_asset_is_error`] (ir.md §4 contract change; the span of
+//!    one in an included file names that file, [`missing_asset_as_error`]), resolves the
 //!    theme (`cli.theme` → front matter `theme` → `[deck] theme`, searched in the config
 //!    file's directory, the input's directory and the current directory), checks the
 //!    theme's `[reveal] plugins` (an [`Error::Theme`] naming the theme) and builds the
@@ -355,6 +355,35 @@ pub fn parse_only(opts: &BuildOptions) -> Result<(Parsed, Config, Option<PathBuf
 pub fn try_parse_only(
     opts: &BuildOptions,
 ) -> std::result::Result<(Parsed, Config, Option<PathBuf>), BuildFailure> {
+    let parsed = try_parse_with_includes(opts)?;
+    Ok((parsed.parsed, parsed.config, parsed.config_path))
+}
+
+/// What [`parse_with_includes`] returns.
+#[derive(Debug)]
+pub(crate) struct ParsedWithIncludes {
+    /// The deck, as [`parse_only`] returns it.
+    pub(crate) parsed: Parsed,
+    /// The config, as [`parse_only`] returns it.
+    pub(crate) config: Config,
+    /// The `presenter.toml` that was used, as [`parse_only`] returns it.
+    pub(crate) config_path: Option<PathBuf>,
+    /// Every file a Markdown deck includes (transitively, each once, in first-use order),
+    /// with the config the frontend parsed it with (dialect §4.1, T48); empty for a notebook.
+    pub(crate) includes: Vec<crate::markdown::include::IncludedSource>,
+}
+
+/// [`parse_only`], with the files the deck includes and the config each was parsed with, from
+/// the same parse: for `check`, which lints the source of every included file as the frontend
+/// read it.
+pub(crate) fn parse_with_includes(opts: &BuildOptions) -> Result<ParsedWithIncludes> {
+    try_parse_with_includes(opts).map_err(|failure| failure.error)
+}
+
+/// [`try_parse_only`] with the included files ([`parse_with_includes`]).
+fn try_parse_with_includes(
+    opts: &BuildOptions,
+) -> std::result::Result<ParsedWithIncludes, BuildFailure> {
     let kind = match opts.format {
         Some(kind) => kind,
         None => detect_kind(&opts.input)?,
@@ -362,12 +391,16 @@ pub fn try_parse_only(
     let text = read_source(&opts.input)?;
     let source = source_info(&opts.input, kind)?;
     let (mut config, config_path) = load_config(opts)?;
-    let (parsed, deferred) = match kind {
-        SourceKind::Markdown => (
-            crate::markdown::parse_deferring_config(&source, &text, &config)?,
-            None,
-        ),
-        SourceKind::Notebook => crate::notebook::parse_deferring_config(&source, &text, &config)?,
+    let (parsed, deferred, includes) = match kind {
+        SourceKind::Markdown => {
+            let (parsed, includes) = crate::markdown::parse_with_includes(&source, &text, &config)?;
+            (parsed, None, includes)
+        }
+        SourceKind::Notebook => {
+            let (parsed, deferred) =
+                crate::notebook::parse_deferring_config(&source, &text, &config)?;
+            (parsed, deferred, Vec::new())
+        }
     };
     tracing::debug!(
         diagnostics = parsed.diagnostics.len(),
@@ -385,7 +418,12 @@ pub fn try_parse_only(
         });
     }
     config.apply_cli(&opts.cli);
-    Ok((parsed, config, config_path))
+    Ok(ParsedWithIncludes {
+        parsed,
+        config,
+        config_path,
+        includes,
+    })
 }
 
 /// Stage 1 of the module docs: the project config (`opts.config_path`, else the first
@@ -954,32 +992,11 @@ fn missing_asset_error(diagnostics: &Diagnostics) -> Option<Error> {
 /// diagnostic. `None` for any other diagnostic. The CLI uses it to report every missing
 /// asset of a failed build the same way (audit F37).
 ///
-/// A missing asset of an included file (its span names the file, `SourceSpan.file`, T48) is
-/// an [`Error::Parse`] in that file instead, at the span's line (`cell N, line M: ` for a
-/// notebook cell), with the diagnostic's message: [`Error::MissingAsset`] cannot say which
-/// file its span is in, and its readers locate it in the deck's source.
+/// For a missing asset of an included file the span's `file` names that file
+/// (`SourceSpan.file`, T48): the CLI's report and the serve overlay locate and quote it there.
 pub fn missing_asset_as_error(diagnostic: &Diagnostic) -> Option<Error> {
     if diagnostic.code != MISSING_ASSET {
         return None;
-    }
-    if let Some(span) = &diagnostic.span
-        && let Some(file) = &span.file
-    {
-        let (line, message) = match span.cell {
-            Some(cell) => (
-                None,
-                format!(
-                    "cell {cell}, line {}: {}",
-                    span.start_line, diagnostic.message
-                ),
-            ),
-            None => (Some(span.start_line), diagnostic.message.clone()),
-        };
-        return Some(Error::Parse {
-            path: file.clone(),
-            line,
-            message,
-        });
     }
     let path = missing_asset_path(diagnostic)
         .or_else(|| diagnostic.path.clone())

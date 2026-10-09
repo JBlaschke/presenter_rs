@@ -12,7 +12,8 @@
 //!
 //! 0. **includes** (§4.1, T48), in [`RenderMode::Notebook`] only: an `:::include` directive
 //!    is removed with an `include-in-notebook` warning (only a Markdown deck includes files;
-//!    the Markdown frontend handles every `:::include` of a deck before rendering);
+//!    the Markdown frontend handles every `:::include` of a deck before rendering); what
+//!    comrak put inside it (the rest of the cell, when it is not closed) stays in its place;
 //! 1. **title**: [`first_heading_text`] of the nodes, before anything is changed;
 //! 2. **notes** (§4, §7): every outermost `:::notes` directive, wherever it is nested, is
 //!    detached; its children (and the footnote definitions written inside it, which comrak
@@ -1553,22 +1554,25 @@ pub(crate) fn is_include_info(info: &str) -> bool {
 }
 
 /// Pass 0, in [`RenderMode::Notebook`] only (notebook markdown cells and outputs, the
-/// `markdown` template filter): every outermost `:::include` directive under `doc` is
-/// detached with an `include-in-notebook` warning on its line, so it renders nothing. Only a
-/// Markdown deck includes files (dialect §4.1); the Markdown frontend consumes or rejects
-/// every `:::include` before rendering, so in [`RenderMode::Deck`] there is none.
+/// `markdown` template filter): every `:::include` directive under `doc` is replaced by its
+/// children (none for a closed one; the rest of the cell, which comrak puts inside one that
+/// is not closed) with an `include-in-notebook` warning on its line, so the directive itself
+/// renders nothing and no content is lost. Only a Markdown deck includes files (dialect
+/// §4.1); the Markdown frontend consumes or rejects every `:::include` before rendering, so
+/// in [`RenderMode::Deck`] there is none.
 fn drop_notebook_includes<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
     if ctx.mode != RenderMode::Notebook {
         return;
     }
-    let is_include = |node: &'a AstNode<'a>| {
-        matches!(&node.data().value,
-            NodeValue::BlockDirective(directive) if is_include_info(&directive.info))
-    };
     let found: Vec<_> = doc
         .descendants()
-        .filter(|node| is_include(node) && !node.ancestors().skip(1).any(is_include))
+        .filter(|node| {
+            matches!(&node.data().value,
+                NodeValue::BlockDirective(directive) if is_include_info(&directive.info))
+        })
         .collect();
+    // Document order: an include inside another one is moved out with the other's children
+    // first, then replaced in turn.
     for node in found {
         let message = "`:::include` works only in a Markdown deck, not in a notebook: nothing is \
                        included and the directive is not shown (include the notebook from a \
@@ -1578,6 +1582,9 @@ fn drop_notebook_includes<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
             ..span
         });
         ctx.diagnostics.warn(INCLUDE_IN_NOTEBOOK, message).span = span;
+        while let Some(child) = node.first_child() {
+            node.insert_before(child);
+        }
         node.detach();
     }
 }

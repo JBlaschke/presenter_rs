@@ -467,22 +467,26 @@ title: Smoothing a noisy signal
   put `---` before and after it (in headings mode, the `---` after it can be left out when
   the next slide starts with a heading). The slide is replaced by every slide of the
   included file, each with its vertical slides, in place. Included slides are never merged
-  with yours: an include next to other content, in a vertical slide (after `--`), with a
-  `--` after it, or inside a list, a quote or another directive is an error that names the
-  line. HTML comments next to it are fine.
+  with yours: an include next to other content, in a vertical slide (after `--`, or under
+  a `##` heading in headings mode), with a `--` after it, or inside a list, a quote or
+  another directive is an error that names the line. HTML comments next to it are fine.
 - The included file is read as if you built it on its own, with this deck's settings
   (`presenter.toml` and the deck's front matter, such as `notebook:` tag lists for an
   included notebook). Its own `slides:`, `markdown:` and `notebook:` settings still apply
   to it, and its images are found next to it. Its deck metadata (`title`, `subtitle`,
   `author`, `date`, `description`, `lang`, `theme`, `reveal` options and other keys) is
-  ignored; presenter warns about each value that differs from the deck's, so repeat a
-  notebook's title in the deck or remove it from the notebook.
-- Slide attributes (`--- {…}`, `<!-- .slide: -->`) and `:::notes` on the include slide are
-  ignored, with a warning: put them on the included file's slides.
+  ignored, and so is its `math:` table (KaTeX is set up once for the whole deck: put
+  macros in the deck's front matter or `presenter.toml`). presenter warns about each value
+  that differs from the file that includes it, so repeat a notebook's title in the deck or
+  remove it from the notebook.
+- Slide attributes (`--- {…}`, `<!-- .slide: -->`) and speaker notes (`:::notes`, or a
+  `Note:` paragraph and what follows it) on the include slide are ignored, with a warning:
+  put them on the included file's slides.
 - An included Markdown file can include further files, up to 8 levels deep. A file that ends
   up including itself is an error that names the chain. A notebook cannot include: a
   `:::include` in a markdown cell shows nothing, with a warning.
-- A missing or unreadable file is an error, also in `presenter serve`.
+- A missing or unreadable file is an error, also in `presenter serve`. Including the same
+  file twice is fine (it is not a cycle); its warnings are reported once.
 - Warnings and errors name the file they are in, so a mistake in `part2.md` shows as
   `part2.md:12`, also in the browser overlay of `presenter serve`.
 - `presenter serve` and `presenter build --watch` watch the included files and rebuild when

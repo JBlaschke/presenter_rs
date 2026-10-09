@@ -129,7 +129,9 @@ impl ErrorPayload {
     /// two is spelled through a symlink), the template of [`Error::Template`] and the
     /// stylesheet of [`Error::Style`]. A [`Error::MissingAsset`] or [`Error::FrontMatter`]
     /// is located in `input` (relative to `base` likewise); without `input` it has no
-    /// `file` (a missing asset's path is the missing file, named in the message). `line` is
+    /// `file` (a missing asset's path is the missing file, named in the message). A missing
+    /// asset of a file the deck includes is located in that file, which its span names
+    /// (`SourceSpan.file`, T48), with or without `input`. `line` is
     /// left out for a line of a notebook cell (it is not a line of the `.ipynb` file).
     ///
     /// `message` of a parse error is `file:line: message` (`file: message` without a line),
@@ -166,11 +168,18 @@ impl ErrorPayload {
             }
             (Error::Style { file, .. }, _) => (Some(file.clone()), None, err.to_string()),
             (Error::MissingAsset { .. } | Error::FrontMatter(_), Some(input)) => {
-                let file = display_relative(input, base);
+                let file = display_relative(&in_file(err, input), base);
                 let message = format!("{}: {}", in_input(&file, err), deck_message(err, base));
                 (Some(file), file_line(err), message)
             }
-            (Error::MissingAsset { .. }, None) => (None, file_line(err), deck_message(err, base)),
+            (Error::MissingAsset { .. }, None) => match included_file(err) {
+                Some(file) => {
+                    let file = display_relative(file, base);
+                    let message = format!("{}: {}", in_input(&file, err), deck_message(err, base));
+                    (Some(file), file_line(err), message)
+                }
+                None => (None, file_line(err), deck_message(err, base)),
+            },
             (Error::Config(message), _) => match config_location(message, base) {
                 Some((file, line, message)) => (Some(file), line, message),
                 None => (None, None, err.to_string()),
@@ -237,6 +246,23 @@ fn file_line(err: &Error) -> Option<usize> {
         .map(|span| span.start_line)
 }
 
+/// The file a missing asset of a file the deck includes is located in: its span's `file`
+/// (`SourceSpan.file`, T48). `None` for any other error.
+fn included_file(err: &Error) -> Option<&Path> {
+    match err {
+        Error::MissingAsset {
+            span: Some(span), ..
+        } => span.file.as_deref(),
+        _ => None,
+    }
+}
+
+/// The file a missing asset or front matter error of a build of `input` is located in: the
+/// included file a missing asset's span names ([`included_file`]), else `input`.
+fn in_file(err: &Error, input: &Path) -> PathBuf {
+    included_file(err).unwrap_or(input).to_path_buf()
+}
+
 /// The location of `err` in the deck source shown as `file`: `file:line`,
 /// `file: cell C, line L`, or `file` without a span.
 fn in_input(file: &str, err: &Error) -> String {
@@ -255,10 +281,12 @@ fn in_input(file: &str, err: &Error) -> String {
 fn excerpt(err: &Error, input: Option<&Path>) -> Option<String> {
     let read = |path: &Path| std::fs::read_to_string(path).ok();
     let file = match err {
-        Error::MissingAsset { .. } | Error::FrontMatter(_) => input,
-        _ => err.path(),
+        Error::MissingAsset { .. } | Error::FrontMatter(_) => included_file(err)
+            .map(Path::to_path_buf)
+            .or_else(|| input.map(Path::to_path_buf)),
+        _ => err.path().map(Path::to_path_buf),
     };
-    file.and_then(|file| err.excerpt(file, &read))
+    file.and_then(|file| err.excerpt(&file, &read))
         .map(|excerpt| excerpt.text)
         .filter(|text| !text.trim().is_empty())
         .or_else(|| err.quoted_line().map(|line| line.trim_end().to_string()))
@@ -573,6 +601,31 @@ mod tests {
         let bare = ErrorPayload::relative_to(&missing, base);
         assert_eq!(bare.message, "asset not found: img/x.png");
         assert_eq!((bare.file, bare.line), (None, Some(5)));
+        // A missing asset of an included file (T48): located and quoted in that file.
+        let part = tmp.path().join("parts/p.md");
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, "# P\n\n![y](y.png)\n").unwrap();
+        let included = Error::MissingAsset {
+            path: tmp.path().join("parts/y.png"),
+            span: Some(SourceSpan {
+                start_line: 3,
+                end_line: 3,
+                cell: None,
+                file: Some(part.clone()),
+            }),
+        };
+        for input in [Some(deck.as_path()), None] {
+            let payload = ErrorPayload::new(&included, base, input);
+            assert_eq!(
+                payload.message,
+                "parts/p.md:3: asset not found: parts/y.png"
+            );
+            assert_eq!(
+                (payload.file.as_deref(), payload.line),
+                (Some("parts/p.md"), Some(3))
+            );
+            assert_eq!(payload.excerpt.as_deref(), Some("![y](y.png)"));
+        }
         // An error without a position names the file.
         let unplaced = Error::FrontMatter("math: unknown field `enable`".into());
         let payload = ErrorPayload::new(&unplaced, base, Some(&deck));

@@ -338,7 +338,7 @@ fn every_misuse_is_an_error_at_the_directive() {
         (
             "children.md",
             1,
-            "cannot have vertical slides (the `--` on line 4)",
+            "cannot have vertical slides (the `--` on line 4 opened one)",
         ),
         ("list.md", 7, "not inside a list"),
         ("quote.md", 1, "not inside a block quote"),
@@ -348,7 +348,8 @@ fn every_misuse_is_an_error_at_the_directive() {
         (
             "missing.md",
             5,
-            "cannot include `nothere.md`: file not found (looked for ",
+            "cannot include `nothere.md`: file not found (a relative path starts at the \
+             directory of the file with the directive)",
         ),
         (
             "extension.md",
@@ -361,6 +362,9 @@ fn every_misuse_is_an_error_at_the_directive() {
         assert_eq!(path, at(deck), "{deck}: {message}");
         assert_eq!(found, Some(line), "{deck}: {message}");
         assert!(message.contains(part), "{deck}: {message}");
+        // Paths in messages are the CLI's to show (relative to the current directory).
+        let root = dir.path().to_string_lossy();
+        assert!(!message.contains(root.as_ref()), "{deck}: {message}");
     }
     // A cycle is reported in the file that closes it, naming the chain.
     let (path, line, message) = parse_error(dir.path(), "cycle-a.md");
@@ -408,18 +412,17 @@ fn a_missing_image_in_an_included_file_is_reported_there() {
         ("sub/part.md", "# P\n\n![gone](gone.png)\n"),
     ]);
     let deck = dir.path().join("deck.md");
-    // `build`: an error located in the included file.
+    // `build`: a missing asset (ir.md §4) whose span names the included file.
     match pipeline::build_deck(&BuildOptions::new(&deck)) {
-        Err(Error::Parse {
+        Err(Error::MissingAsset {
             path,
-            line,
-            message,
+            span: Some(span),
         }) => {
-            assert_eq!((path, line), (dir.path().join("sub/part.md"), Some(3)));
-            assert!(message.contains("`gone.png` not found"), "{message}");
-            assert!(message.contains("sub/gone.png"), "{message}");
+            assert_eq!(path, dir.path().join("sub/gone.png"));
+            assert_eq!(span.start_line, 3);
+            assert_eq!(span.file, Some(dir.path().join("sub/part.md")));
         }
-        other => panic!("expected a parse error, got {other:?}"),
+        other => panic!("expected a missing asset, got {other:?}"),
     }
     // `serve`: a warning with the included file's path and span.
     let parsed = parse(&deck).unwrap();
@@ -495,9 +498,10 @@ fn slide_warnings_name_the_included_file() {
             ("unknown-layout", Some(part), Some(3)),
         ]
     );
+    // The warning is in part.md; the first use is in the deck, which it names.
     let message = &checked.iter().next().unwrap().message;
     assert!(
-        message.starts_with("slide 3: id `same` is already the id of slide 1 (line 1)"),
+        message.starts_with("slide 3: id `same` is already the id of slide 1 (deck.md, line 1)"),
         "{message}"
     );
 }
@@ -607,6 +611,10 @@ fn a_notebook_cannot_include() {
             "cell_type": "markdown",
             "metadata": {},
             "source": "# Notebook\n\n:::include part.md\n:::\n\nAfter.\n"
+        }, {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": ":::include part.md\n\nImportant paragraph after.\n\n- list item\n"
         }]
     });
     let dir = project(&[("nb.ipynb", &notebook.to_string()), ("part.md", "# P\n")]);
@@ -619,10 +627,21 @@ fn a_notebook_cannot_include() {
             (d.code, span.cell, span.start_line)
         })
         .collect();
-    assert_eq!(found, [("include-in-notebook", Some(0), 3)]);
+    assert_eq!(
+        found,
+        [
+            ("include-in-notebook", Some(0), 3),
+            ("include-in-notebook", Some(1), 1),
+        ]
+    );
     assert!(parsed.deck.includes.is_empty());
     let body = html(&parsed.deck.slides[0]);
-    assert_eq!(body, "<h1>Notebook</h1>\n<p>After.</p>\n");
+    // Not closed, the directive takes the rest of the cell, which is still shown.
+    assert_eq!(
+        body,
+        "<h1>Notebook</h1>\n<p>After.</p>\n<p>Important paragraph after.</p>\n<ul>\n\
+         <li>list item</li>\n</ul>\n"
+    );
 }
 
 #[test]
@@ -665,4 +684,233 @@ fn the_mixed_example_builds_and_checks_clean() {
     );
     assert_eq!(build.document.slide_count, 11);
     assert!(build.deck.features.math && build.deck.features.code && build.deck.features.notebook);
+}
+
+/// `presenter <args>` run in `dir` without colors: the exit code and stderr.
+fn presenter_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+        .current_dir(dir)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .args(args)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output.status.code(), stderr)
+}
+
+/// cli.md (audit F37): a build that fails on missing assets reports each as a located error
+/// with its source line, in source order: the deck's, then each included file's.
+#[test]
+fn every_missing_asset_of_an_included_file_is_a_located_error_in_source_order() {
+    let notebook = serde_json::json!({
+        "nbformat": 4, "nbformat_minor": 5, "metadata": {},
+        "cells": [
+            {"cell_type": "markdown", "metadata": {}, "source": "# N\n\n![a](a.png)\n"},
+            {"cell_type": "markdown", "metadata": {}, "source": "![b](b.png)\n"},
+        ]
+    });
+    let dir = project(&[
+        (
+            "deck.md",
+            "# A\n\n![zero](zero.png)\n\n---\n\n:::include sub/part.md\n:::\n\n---\n\n\
+             # Z\n\n![last](last.png)\n",
+        ),
+        ("only.md", "# A\n\n---\n\n:::include sub/part.md\n:::\n"),
+        (
+            "sub/part.md",
+            "# P\n\n![one](one.png)\n\ntext\n\n---\n\n![two](two.png)\n",
+        ),
+        ("nb.md", "# A\n\n---\n\n:::include nb.ipynb\n:::\n"),
+        ("nb.ipynb", &notebook.to_string()),
+    ]);
+    let (code, stderr) = presenter_in(dir.path(), &["build", "deck.md", "-o", "deck.html"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let part = [
+        "error: asset not found: sub/one.png",
+        " --> sub/part.md:3",
+        "  |",
+        "3 | ![one](one.png)",
+        "  |        ^^^^^^^",
+        "error: asset not found: sub/two.png",
+        " --> sub/part.md:9",
+        "  |",
+        "9 | ![two](two.png)",
+        "  |        ^^^^^^^",
+    ];
+    let mut expected = vec![
+        "error: asset not found: zero.png",
+        " --> deck.md:3",
+        "  |",
+        "3 | ![zero](zero.png)",
+        "  |         ^^^^^^^^",
+        "error: asset not found: last.png",
+        "  --> deck.md:14",
+        "   |",
+        "14 | ![last](last.png)",
+        "   |         ^^^^^^^^",
+    ];
+    expected.extend(part);
+    assert_eq!(stderr.lines().collect::<Vec<_>>(), expected, "{stderr}");
+    // Only the included file has missing images: the same form, not one bare line.
+    let (code, stderr) = presenter_in(dir.path(), &["build", "only.md", "-o", "only.html"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().collect::<Vec<_>>(), part, "{stderr}");
+    // An included notebook: by cell.
+    let (code, stderr) = presenter_in(dir.path(), &["build", "nb.md", "-o", "nb.html"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    let errors: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("error") || line.contains("-->"))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "error: asset not found: a.png",
+            " --> nb.ipynb: cell 0, line 3",
+            "error: asset not found: b.png",
+            " --> nb.ipynb: cell 1, line 1",
+        ],
+        "{stderr}"
+    );
+}
+
+/// cli.md `check`: the notebook lints run on every included notebook too.
+#[test]
+fn check_reports_an_included_notebook_without_outputs() {
+    let cell = serde_json::json!({
+        "cell_type": "code", "execution_count": null, "metadata": {},
+        "outputs": [], "source": "x = 1"
+    });
+    let notebook = serde_json::json!({
+        "nbformat": 4, "nbformat_minor": 5, "metadata": {},
+        "cells": [
+            {"cell_type": "markdown", "metadata": {"slideshow": {"slide_type": "slide"}},
+             "source": "# Analysis"},
+            cell.clone(),
+            cell,
+        ]
+    });
+    let dir = project(&[
+        (
+            "deck.md",
+            "# A\n\n---\n\n:::include \"parts/my nb.ipynb\"\n:::\n",
+        ),
+        ("parts/my nb.ipynb", &notebook.to_string()),
+    ]);
+    let diagnostics =
+        presenter::check::run(&BuildOptions::new(dir.path().join("deck.md"))).unwrap();
+    let found: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == "notebook-no-outputs")
+        .collect();
+    assert_eq!(found.len(), 1, "{diagnostics:#?}");
+    let notebook_path = dir.path().join("parts/my nb.ipynb");
+    assert_eq!(found[0].path.as_deref(), Some(notebook_path.as_path()));
+    let message = &found[0].message;
+    assert!(
+        message.starts_with("none of the notebook's 2 code cells has outputs;"),
+        "{message}"
+    );
+    assert!(message.contains("--inplace 'my nb.ipynb'"), "{message}");
+}
+
+/// A file included twice is parsed twice, but its diagnostics are reported once.
+#[test]
+fn a_file_included_twice_reports_its_diagnostics_once() {
+    let dir = project(&[
+        (
+            "deck.md",
+            "# A\n\n---\n\n:::include part.md\n:::\n\n---\n\n:::include part.md\n:::\n",
+        ),
+        ("part.md", "# P\n\n![gone](gone.png)\n"),
+    ]);
+    let deck = dir.path().join("deck.md");
+    let parsed = parse(&deck).unwrap();
+    assert_eq!(parsed.deck.slides.len(), 3);
+    let codes: Vec<_> = parsed.diagnostics.iter().map(|d| d.code).collect();
+    assert_eq!(codes, ["missing-asset"]);
+    let checked = presenter::check::run(&BuildOptions::new(&deck)).unwrap();
+    let missing = checked.iter().filter(|d| d.code == "missing-asset").count();
+    assert_eq!(missing, 1, "{checked:#?}");
+}
+
+/// dialect §4.1 and §7: reveal's `Note:` form on the include slide is ignored like
+/// `:::notes`, with a warning, in both split modes.
+#[test]
+fn a_note_paragraph_on_an_include_slide_is_ignored() {
+    for front in ["", "---\nslides: {split: headings}\n---\n\n"] {
+        let dir = project(&[
+            (
+                "deck.md",
+                &format!("{front}# A\n\n---\n\n:::include part.md\n:::\nNote: hello\n"),
+            ),
+            ("part.md", "# P\n"),
+        ]);
+        let parsed = parse(&dir.path().join("deck.md")).unwrap();
+        assert_eq!(titles(&parsed.deck)[1].0, "P", "{front}");
+        assert!(parsed.deck.slides[1].notes.is_none(), "{front}");
+        let codes: Vec<_> = parsed.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, ["include-attrs-ignored"], "{front}");
+    }
+}
+
+/// dialect §4.1: `include-meta-ignored` names the keys that differ from the including
+/// file's metadata; an included file's `math:` table (deck-wide KaTeX config) is reported.
+#[test]
+fn included_metadata_is_compared_with_the_including_file() {
+    let dir = project(&[
+        (
+            "deck.md",
+            "---\ntitle: M\n---\n\n# A\n\n---\n\n:::include a.md\n:::\n",
+        ),
+        (
+            "a.md",
+            "---\ntitle: X\n---\n\n# From a\n\n---\n\n:::include b.md\n:::\n",
+        ),
+        ("b.md", "---\ntitle: X\n---\n\n# From b\n"),
+        ("math.md", "# A\n\n---\n\n:::include m.md\n:::\n"),
+        (
+            "m.md",
+            "---\nmath:\n  katex_options: {macros: {\"\\\\RR\": \"\\\\mathbb{R}\"}}\n---\n\n\
+             # M\n\n$x \\in \\RR$\n",
+        ),
+    ]);
+    let parsed = parse(&dir.path().join("deck.md")).unwrap();
+    let found: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.path.clone(), d.message.clone()))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(found[0].1, Some(dir.path().join("deck.md")));
+    assert!(found[0].2.starts_with("`a.md` sets `title`;"), "{found:#?}");
+    let parsed = parse(&dir.path().join("math.md")).unwrap();
+    let messages: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "include-meta-ignored")
+        .map(|d| d.message.clone())
+        .collect();
+    assert_eq!(messages.len(), 1, "{:#?}", parsed.diagnostics);
+    assert!(
+        messages[0].starts_with("`m.md` sets `math`;"),
+        "{messages:?}"
+    );
+}
+
+/// The watcher of a deck that does not parse finds its includes also when the deck is read
+/// as Markdown whatever its extension (`build --watch --format md talk.txt`).
+#[test]
+fn includes_are_scanned_in_a_markdown_deck_of_any_extension() {
+    let dir = project(&[
+        ("talk.txt", "# A\n\n---\n\n:::include part.md\n:::\n"),
+        ("part.md", "# P\n\n---\n\n:::include more.txt\n:::\n"),
+        ("more.txt", ":::include not-scanned.md\n:::\n"),
+    ]);
+    let found = presenter::markdown::include::scan_includes(&dir.path().join("talk.txt"));
+    assert_eq!(
+        found,
+        [dir.path().join("part.md"), dir.path().join("more.txt")]
+    );
 }

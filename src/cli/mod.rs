@@ -484,15 +484,19 @@ pub fn input_kind(path: &Path) -> anyhow::Result<SourceKind> {
 /// Adds the input's location to an error that does not name it itself: a missing asset
 /// (`slides.md:12: asset not found: …`, or `talk.ipynb: cell 5, line 2: …` for a notebook,
 /// like [`crate::error::Diagnostic`]'s Display) and front matter errors (`slides.md: front matter: …`).
-/// Other errors are passed through.
+/// A missing asset of a file the deck includes is located in that file, which its span names
+/// (`SourceSpan.file`, T48). Other errors are passed through.
 pub fn locate(err: Error, input: &Path) -> anyhow::Error {
     let location = match &err {
         Error::MissingAsset {
             span: Some(span), ..
-        } => match span.cell {
-            Some(cell) => format!("{}: cell {cell}, line {}", input.display(), span.start_line),
-            None => format!("{}:{}", input.display(), span.start_line),
-        },
+        } => {
+            let file = span.file.as_deref().unwrap_or(input);
+            match span.cell {
+                Some(cell) => format!("{}: cell {cell}, line {}", file.display(), span.start_line),
+                None => format!("{}:{}", file.display(), span.start_line),
+            }
+        }
         Error::MissingAsset { .. } | Error::FrontMatter(_) => input.display().to_string(),
         _ => return err.into(),
     };
@@ -1329,6 +1333,19 @@ mod tests {
         assert_eq!(
             format!("{:#}", locate(in_cell, Path::new("talk.ipynb"))),
             "talk.ipynb: cell 5, line 2: asset not found: /abs/fig.png"
+        );
+        let included = Error::MissingAsset {
+            path: PathBuf::from("/abs/talk/parts/y.png"),
+            span: Some(SourceSpan {
+                start_line: 4,
+                end_line: 4,
+                cell: None,
+                file: Some(PathBuf::from("/abs/talk/parts/p.md")),
+            }),
+        };
+        assert_eq!(
+            format!("{:#}", locate(included, input)),
+            "/abs/talk/parts/p.md:4: asset not found: /abs/talk/parts/y.png"
         );
         let no_span = Error::MissingAsset {
             path: PathBuf::from("/abs/logo.png"),

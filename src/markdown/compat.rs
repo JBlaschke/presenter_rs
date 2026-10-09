@@ -147,7 +147,10 @@ const NOTE_MARKERS: [&str; 2] = ["Notes:", "Note:"];
 /// (after spaces and tabs). So `Note\:` and `Note&#58;` (escape and entity, resolved in the
 /// `Text`) are content, like `**Note:**`. Without the source (or when the paragraph lies
 /// outside it) only the `Text` is read.
-fn note_marker<'a>(node: &'a AstNode<'a>, lines: Option<&[&str]>) -> Option<&'static str> {
+pub(crate) fn note_marker<'a>(
+    node: &'a AstNode<'a>,
+    lines: Option<&[&str]>,
+) -> Option<&'static str> {
     if !matches!(node.data().value, NodeValue::Paragraph) {
         return None;
     }

@@ -79,17 +79,9 @@ pub fn parse(source: &SourceInfo, text: &str, config: &Config) -> Result<Parsed>
 /// that change how the deck is split and rendered, are merged into the config clone, so a
 /// `reveal`, `math` or `notebook` value the config rejects does not fail the parse. The
 /// caller's merge reports it, together with the deck's diagnostics. Otherwise as [`parse`].
-pub(crate) fn parse_deferring_config(
-    source: &SourceInfo,
-    text: &str,
-    config: &Config,
-) -> Result<Parsed> {
-    parse_with(source, text, config, true, None).map(|outcome| outcome.parsed)
-}
-
-/// [`parse_deferring_config`], with every file the deck includes (transitively, in
-/// first-use order, each once) and the config it was parsed with, for `check`'s source
-/// lints of the included files.
+///
+/// Also returns every file the deck includes (transitively, in first-use order, each once)
+/// with the config it was parsed with, for `check`'s source lints of the included files.
 pub(crate) fn parse_with_includes(
     source: &SourceInfo,
     text: &str,
@@ -98,7 +90,7 @@ pub(crate) fn parse_with_includes(
     parse_with(source, text, config, true, None).map(|outcome| (outcome.parsed, outcome.sources))
 }
 
-/// An included Markdown file (`source`), parsed as [`parse_deferring_config`] parses a deck
+/// An included Markdown file (`source`), parsed as [`parse_with_includes`] parses a deck
 /// (its deck metadata is discarded, so nothing of it but its `slides` and `markdown` tables
 /// may fail the parse), in the include chain `context` ([`include::expand`]).
 pub(crate) fn parse_included(
@@ -122,7 +114,7 @@ pub(crate) struct Outcome {
     pub(crate) sources: Vec<IncludedSource>,
 }
 
-/// [`parse`]; with `defer`, [`parse_deferring_config`]. `context` is the chain of includes
+/// [`parse`]; with `defer`, [`parse_with_includes`]. `context` is the chain of includes
 /// that led to this file (`None` for the top-level deck).
 fn parse_with(
     source: &SourceInfo,
@@ -153,9 +145,10 @@ fn parse_with(
         headings,
         &mut diagnostics,
     )?;
-    let context = context
-        .cloned()
-        .unwrap_or_else(|| Context::root(source, &meta));
+    let context = match context {
+        Some(context) => context.with_meta(&meta),
+        None => Context::root(source, &meta),
+    };
     let include_config = match found.iter().any(Option::is_some) {
         true => include_config(&deck_config, &meta, defer),
         false => deck_config.clone(),
@@ -297,12 +290,23 @@ struct DeckParts {
 }
 
 impl DeckParts {
-    /// Adds the slides and the rest of an included file.
+    /// Adds the slides and the rest of an included file. A diagnostic that an earlier
+    /// include already reported (the same file included again) is left out.
     fn add_included(&mut self, expanded: include::Expanded) {
         self.slides.extend(expanded.slides);
         self.assets.merge(expanded.assets);
         self.features.merge(expanded.features);
-        self.included_diagnostics.extend(expanded.diagnostics);
+        let known = self.included_diagnostics.len();
+        for diagnostic in expanded.diagnostics {
+            let reported = self
+                .included_diagnostics
+                .iter()
+                .take(known)
+                .any(|earlier| *earlier == diagnostic);
+            if !reported {
+                self.included_diagnostics.push(diagnostic);
+            }
+        }
         for path in expanded.includes {
             if !self.includes.contains(&path) {
                 self.includes.push(path);

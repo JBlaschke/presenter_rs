@@ -29,10 +29,13 @@
 //! Included files (dialect §4.1, §10; T48): the frontend's diagnostics of every file a
 //! Markdown deck includes come with that file's path, and this module's source lints
 //! (`separator-not-recognized`, below) run on each included Markdown file and each included
-//! notebook too, with the config the frontend parsed it with, reported with its path. The
-//! slide lints (`duplicate-slide-id`, `unknown-layout`) of a slide from an included file name
-//! that file (`SourceSpan.file`). A misplaced `:::include` or a file that cannot be included
-//! is the frontend's [`Error::Parse`], which [`run`] returns.
+//! notebook too, with the config the frontend parsed it with (from the same parse,
+//! `pipeline::parse_with_includes`), reported with its path; `notebook-no-outputs` runs on
+//! each included notebook (its slides, `SourceSpan.file`). The slide lints
+//! (`duplicate-slide-id`, `unknown-layout`) of a slide from an included file name that file
+//! (`SourceSpan.file`), and a message that points at a slide of another file names that
+//! file. A misplaced `:::include` or a file that cannot be included is the frontend's
+//! [`Error::Parse`], which [`run`] returns.
 //!
 //! Added here ([`codes`]):
 //!
@@ -55,8 +58,9 @@
 //! - `duplicate-slide-id`: a slide `id` used by an earlier slide.
 //! - `unknown-layout` (theme-format §2 `[layouts]`): a slide's `layout` is not a
 //!   `templates/layouts/<name>.html` file of the theme chain ([`Theme::has_layout`]).
-//! - `notebook-no-outputs` (notebook-mapping §4 notes): a notebook whose code cells were never
-//!   executed (no outputs, no execution count), with a hint to execute it.
+//! - `notebook-no-outputs` (notebook-mapping §4 notes): a notebook (the input or an included
+//!   one) whose code cells were never executed (no outputs, no execution count), with a hint
+//!   to execute it.
 //! - `theme-error` (level error): the deck's theme cannot be resolved; `unknown-layout` and the
 //!   theme problems below are then skipped.
 //! - Theme problems ([`Theme::deck_problems`], located in the theme's `theme.toml`, template
@@ -96,6 +100,7 @@ use crate::error::{Diagnostic, Diagnostics, Error, Level, Result};
 use crate::ir::{Block, Deck, Slide, SourceKind, SourceSpan};
 use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::split_front_matter;
+use crate::markdown::include::IncludedSource;
 use crate::markdown::split::{SplitMode, source_lines, split_with_source};
 use crate::notebook::convert::codes::FRONT_MATTER_IGNORED;
 use crate::notebook::nbformat::{self, Cell, CellType, SlideType};
@@ -143,11 +148,17 @@ pub mod codes {
 /// errors). A theme that cannot be resolved is not an error here but a `theme-error`
 /// diagnostic.
 pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
-    let (parsed, config, config_path) = pipeline::parse_only(opts)?;
+    let pipeline::ParsedWithIncludes {
+        parsed,
+        config,
+        config_path,
+        includes,
+    } = pipeline::parse_with_includes(opts)?;
     let deck = parsed.deck;
     let mut found = source_lints(opts, &deck, &config, &parsed.diagnostics);
+    found.extend(included_lints(&includes, &parsed.diagnostics));
     found.extend(duplicate_slide_ids(&deck));
-    found.extend(notebook_without_outputs(&deck));
+    found.extend(notebooks_without_outputs(&deck, &includes));
     let mut theme_problems = Vec::new();
     match pipeline::resolve_theme(opts, &deck, &config, config_path.as_deref()) {
         Ok(theme) => {
@@ -200,8 +211,9 @@ fn sort_by_position(diagnostics: &mut [Diagnostic], deck: &Path, includes: &[Pat
 
 /// `err` (a failure of [`run`] for `input`) as an error-level diagnostic for `input`: the
 /// code names the kind of failure ([`codes`]), the span is the error's line when it has one.
-/// The path is `input` made absolute, like the frontends' diagnostic paths, or for a parse
-/// error the file it names (an included file, T48).
+/// The path is `input` made absolute, like the frontends' diagnostic paths, or the file the
+/// error is in when it names one: a parse error's file, a missing asset's `SourceSpan.file`
+/// (an included file, T48).
 pub fn error_diagnostic(err: &Error, input: &Path) -> Diagnostic {
     let (code, message, span) = match err {
         Error::Parse { line, message, .. } => (
@@ -219,6 +231,9 @@ pub fn error_diagnostic(err: &Error, input: &Path) -> Diagnostic {
     };
     let path = match err {
         Error::Parse { .. } => err.path().unwrap_or(input),
+        Error::MissingAsset {
+            span: Some(span), ..
+        } => span.file.as_deref().unwrap_or(input),
         _ => input,
     };
     let mut diagnostic = Diagnostic::error(code, message).with_path(absolute(path));
@@ -270,18 +285,22 @@ fn slide_warning(code: &'static str, message: String, slide: &Slide) -> Diagnost
     diagnostic
 }
 
-/// Where `span` starts, for messages: `line 12`, or `cell 3, line 2` in a notebook; with
-/// the file's name in front for a slide from an included file (`part2.md, line 4`).
-fn position(span: Option<&SourceSpan>) -> Option<String> {
+/// Where `span` starts, for a message reported in the file `here` (`None`: the deck's
+/// source, `deck`): `line 12`, or `cell 3, line 2` in a notebook; with the file's name in
+/// front when the span is in another file (a slide of an included file, or of the deck in a
+/// message about an included file: `part2.md, line 4`).
+fn position(span: Option<&SourceSpan>, deck: &Path, here: Option<&Path>) -> Option<String> {
     let span = span?;
     let at = match span.cell {
         Some(cell) => format!("cell {cell}, line {}", span.start_line),
         None => format!("line {}", span.start_line),
     };
-    Some(match span.file.as_deref().and_then(Path::file_name) {
-        Some(name) => format!("{}, {at}", name.to_string_lossy()),
-        None => at,
-    })
+    let file = span.file.as_deref();
+    if file == here {
+        return Some(at);
+    }
+    let name = file.unwrap_or(deck).file_name().unwrap_or_default();
+    Some(format!("{}, {at}", name.to_string_lossy()))
 }
 
 /// `duplicate-slide-id`: every slide whose id an earlier slide already has.
@@ -297,7 +316,9 @@ fn duplicate_slide_ids(deck: &Deck) -> Vec<Diagnostic> {
                 first.insert(id, (label, slide.span.as_ref()));
             }
             Some((earlier, span)) => {
-                let at = position(*span).map_or(String::new(), |at| format!(" ({at})"));
+                let here = slide.span.as_ref().and_then(|span| span.file.as_deref());
+                let at = position(*span, &deck.source.path, here)
+                    .map_or(String::new(), |at| format!(" ({at})"));
                 let message = format!(
                     "{label}: id `{id}` is already the id of {earlier}{at}; links to `#/{id}` \
                      go to the first one"
@@ -371,15 +392,40 @@ fn theme_file_path(theme: &Theme, key: &str) -> Option<PathBuf> {
     }
 }
 
-/// `notebook-no-outputs`: a notebook deck with code cells that were never executed: none
-/// has an output or an execution count (executed cells that print nothing are fine).
-fn notebook_without_outputs(deck: &Deck) -> Option<Diagnostic> {
-    if deck.source.kind != SourceKind::Notebook {
-        return None;
+/// `notebook-no-outputs` for a notebook deck and for every notebook a Markdown deck includes
+/// (`includes`; the cells of the slides whose `SourceSpan.file` is that notebook, reported
+/// with its path).
+fn notebooks_without_outputs(deck: &Deck, includes: &[IncludedSource]) -> Vec<Diagnostic> {
+    let slides = labelled_slides(deck);
+    let mut found = Vec::new();
+    if deck.source.kind == SourceKind::Notebook {
+        let all = slides.iter().map(|(_, slide)| *slide);
+        found.extend(notebook_without_outputs(all, &deck.source.path));
     }
-    let cells: Vec<_> = labelled_slides(deck)
-        .into_iter()
-        .flat_map(|(_, slide)| &slide.blocks)
+    for include in includes {
+        if include.kind != SourceKind::Notebook {
+            continue;
+        }
+        let from_it = slides.iter().map(|(_, slide)| *slide).filter(|slide| {
+            slide.span.as_ref().and_then(|span| span.file.as_deref())
+                == Some(include.path.as_path())
+        });
+        if let Some(diagnostic) = notebook_without_outputs(from_it, &include.path) {
+            found.push(diagnostic.with_path(&include.path));
+        }
+    }
+    found
+}
+
+/// `notebook-no-outputs`: the notebook `path` (its `slides`) has code cells that were never
+/// executed: none has an output or an execution count (executed cells that print nothing are
+/// fine).
+fn notebook_without_outputs<'s>(
+    slides: impl Iterator<Item = &'s Slide>,
+    path: &Path,
+) -> Option<Diagnostic> {
+    let cells: Vec<_> = slides
+        .flat_map(|slide| &slide.blocks)
         .filter_map(|block| match block {
             Block::Cell(cell) => Some(cell),
             Block::Html { .. } => None,
@@ -392,9 +438,7 @@ fn notebook_without_outputs(deck: &Deck) -> Option<Diagnostic> {
     {
         return None;
     }
-    let file = deck
-        .source
-        .path
+    let file = path
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let finding = match cells.len() {
@@ -422,8 +466,8 @@ fn shell_quoted(word: &str) -> Cow<'_, str> {
     }
 }
 
-/// The lints that need the source text: `separator-not-recognized`, for the deck and for
-/// every file it includes ([`included_lints`]).
+/// The lints that need the source text: `separator-not-recognized`, for the deck (for the
+/// files it includes, [`included_lints`]).
 ///
 /// The text is read again from `opts.input`, the path [`pipeline::parse_only`] read (not
 /// `deck.source.path`: that is normalized lexically and names another file when the input
@@ -446,7 +490,7 @@ fn source_lints(
         }
     };
     let path = &deck.source.path;
-    let mut found = match deck.source.kind {
+    match deck.source.kind {
         SourceKind::Markdown => markdown_lints(&text, path, config, frontend),
         SourceKind::Notebook => {
             notebook_lints(&text, path, config, frontend).unwrap_or_else(|err| {
@@ -455,34 +499,15 @@ fn source_lints(
                 vec![Diagnostic::error(codes::PARSE_ERROR, message)]
             })
         }
-    };
-    found.extend(included_lints(deck, &text, config, frontend));
-    found
+    }
 }
 
-/// The source lints of every file the Markdown deck (`text`) includes (dialect §4.1, §10),
+/// The source lints of every file a Markdown deck includes (`sources`, dialect §4.1, §10),
 /// each with the config the frontend parsed it with, with its path (also in the span,
-/// `SourceSpan.file`, as the frontend's diagnostics of an included file have it). The deck is
-/// parsed again to learn those configs ([`crate::markdown::parse_with_includes`]); when that
-/// or reading an included file fails (it changed in between), that is an error diagnostic.
-fn included_lints(
-    deck: &Deck,
-    text: &str,
-    config: &Config,
-    frontend: &Diagnostics,
-) -> Vec<Diagnostic> {
-    if deck.includes.is_empty() || deck.source.kind != SourceKind::Markdown {
-        return Vec::new();
-    }
-    let sources = match crate::markdown::parse_with_includes(&deck.source, text, config) {
-        Ok((_, sources)) => sources,
-        Err(err) => {
-            let message = format!(
-                "cannot parse the deck again for the source lints of the files it includes: {err}"
-            );
-            return vec![Diagnostic::error(codes::PARSE_ERROR, message)];
-        }
-    };
+/// `SourceSpan.file`, as the frontend's diagnostics of an included file have it). When an
+/// included file can no longer be read or parsed (it changed since the frontend read it),
+/// that is an error diagnostic.
+fn included_lints(sources: &[IncludedSource], frontend: &Diagnostics) -> Vec<Diagnostic> {
     let mut found = Vec::new();
     for source in sources {
         let path = &source.path;
@@ -1600,8 +1625,10 @@ mod tests {
             messages[1].starts_with("slide 4: id `same` is already the id of slide 1 (line 1)"),
             "{messages:?}"
         );
+        // In a message about an included file, a slide of the deck names the deck.
         assert!(
-            messages[2].starts_with("slide 2: id `same` is already the id of slide 1 (line 1)"),
+            messages[2]
+                .starts_with("slide 2: id `same` is already the id of slide 1 (deck.md, line 1)"),
             "{messages:?}"
         );
         // A misplaced include is the frontend's error, located at the directive.
@@ -1852,6 +1879,22 @@ mod tests {
         assert_eq!(config.code, codes::CONFIG_ERROR);
         let other = error_diagnostic(&Error::Other("x".into()), Path::new("/x/a.txt"));
         assert_eq!(other.code, codes::ERROR);
+        // A missing asset of an included file is in that file (T48).
+        let span = SourceSpan {
+            start_line: 3,
+            end_line: 3,
+            cell: None,
+            file: Some(PathBuf::from("/x/parts/p.md")),
+        };
+        let missing = Error::MissingAsset {
+            path: PathBuf::from("/x/parts/y.png"),
+            span: Some(span),
+        };
+        let diagnostic = error_diagnostic(&missing, Path::new("/x/deck.md"));
+        assert_eq!(
+            diagnostic.to_string(),
+            "/x/parts/p.md:3: error: asset not found: /x/parts/y.png"
+        );
     }
 
     #[test]
