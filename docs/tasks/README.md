@@ -71,6 +71,12 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
   in `docs/spec/ir.md` and `docs/spec/config.md`, and listed under "Amendments" at the end of the
   affected task files (T00, T01, T12, T14, T15, T16, T20, T21).
 
+## Final audit (2026-10-09)
+After all implementation tasks merged, a read-only multi-lens audit (user walkthrough, three spec
+conformance sweeps, robustness/security, CI/determinism, code health) produced 51 confirmed
+findings (4 major). They were fixed in five parallel fix tasks (A1 CLI safety, A2 serve robustness,
+A3 Markdown, A4 notebooks/assets/check, A5 theme/release) and merged before T46.
+
 ## PR description template
 
 ```
