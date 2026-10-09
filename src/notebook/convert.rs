@@ -56,15 +56,20 @@
 //!   `content="0; url=attachment:a.png"`), or a `data-background`/`-image`/`-video`/`-iframe`
 //!   slide attribute is registered as an inline asset and becomes `asset:<id>`. Inside a
 //!   script or another value, a URL starts after a quote, `(` or `=` (also written as a
-//!   character reference), and one that names an attachment of the cell also at the start
-//!   or after white space; script code that only uses the word (`{attachment:true}`,
-//!   `// see attachment:notes`, `` `attachment:${name}` ``, `'attachment:' + name`) is
-//!   left alone. HTML shown in code is text, not a tag, and
-//!   stays as written. The name is matched as written, then with HTML entities and percent
-//!   escapes decoded (`attachment:a%2Bb.png` names `a+b.png`), then without a `?query` or
-//!   `#fragment`, which is kept after the placeholder. A URL whose attachment was skipped
-//!   stays as written (`notebook-attachment-skipped`, reported once per name); any other
-//!   unresolved one warns [`codes::MISSING_ATTACHMENT`].
+//!   character reference; not in another URL's query or fragment, `?q=attachment:x`,
+//!   `?ids=1,2&u=attachment:x`), and one that names an attachment of the cell also at the
+//!   start or after white space; script code that only uses the word (`{attachment:true}`,
+//!   `// see attachment:notes`, `` `attachment:${name}` ``, `'attachment:' + name`) is left
+//!   alone. An attribute whose value is one URL (`src`, `href`, `data-preview-image`, …) is
+//!   only resolved as a whole: `href="https://example.org/?q=attachment:x"` stays as
+//!   written, without a warning; a `javascript:` or `data:` URL there is a script or a
+//!   document and is scanned like one (`href="javascript:show('attachment:a.png')"`). HTML
+//!   shown in code is text, not a tag, and stays as written. The name is matched as written,
+//!   then with HTML entities and percent escapes decoded (`attachment:a%2Bb.png` names
+//!   `a+b.png`), then without a `?query` or `#fragment`, which is kept after the
+//!   placeholder. A URL whose attachment was skipped stays as written
+//!   (`notebook-attachment-skipped`, reported once per name); any other unresolved one warns
+//!   [`codes::MISSING_ATTACHMENT`].
 //! - **Code cells**: [`Block::Cell`] with the outputs of [`render_outputs`] (T32); relative
 //!   `src`/`poster` URLs in `text/html` outputs go through T12's raw-HTML asset rewriting.
 //!   `hide_input` / `hide_output` come from the configured tag lists and
@@ -174,6 +179,26 @@ const ATTACHMENT_SCHEME: &str = "attachment:";
 /// other attribute's value is resolved when it is an `attachment:` URL
 /// ([`attachment_url_candidates`]).
 const TEXT_ATTRS: [&str; 6] = ["alt", "title", "placeholder", "label", "value", "abbr"];
+
+/// The HTML attributes whose value is one URL, as are `data-background` and every
+/// `data-background-*` attribute ([`is_url_attr`]): only the whole value (white space
+/// trimmed) can be an `attachment:` URL. An `attachment:` elsewhere in it is part of another
+/// URL (`href="https://example.org/?q=attachment:x"`) and left as written.
+const URL_ATTRS: [&str; 13] = [
+    "src",
+    "href",
+    "poster",
+    "data-src",
+    "data",
+    "xlink:href",
+    "action",
+    "formaction",
+    "cite",
+    "background",
+    "data-preview-image",
+    "data-preview-video",
+    "data-preview-link",
+];
 
 /// The slide attributes whose `attachment:` URLs are resolved (`data-background-video` is a
 /// comma-separated list), as [`rewrite_slide_assets`] resolves files.
@@ -1534,7 +1559,11 @@ fn attachment_name(cell: &Cell, written: &str) -> Option<String> {
 ///   count ([`Converter::attachment_url`] then resolves or reports it);
 /// - the `attachment:` URLs written inside another value of such an attribute (an
 ///   `<iframe srcdoc>`, a `<meta>` refresh's `content="0; url=attachment:a.png"`, JSON in a
-///   `data-*` attribute; [`embedded_urls`]);
+///   `data-*` attribute; [`embedded_urls`]), unless the attribute is one whose value is a
+///   URL ([`is_url_attr`]: `src`, `href`, …), where an `attachment:` inside the value is
+///   part of that URL (`href="https://example.org/?q=attachment:x"`), but for a
+///   `javascript:` or `data:` URL ([`is_code_url`]), whose content is a script or a
+///   document;
 /// - each `srcset` candidate ([`srcset_urls`]), and each CSS `url(…)` ([`css_urls`]) of a
 ///   `style` attribute or a `<style>` element;
 /// - the `attachment:` URLs written inside scripts, `<script>` elements and `on…`
@@ -1554,10 +1583,13 @@ fn attachment_url_candidates(html: &str, names: &[&str]) -> Vec<Range<usize>> {
             "style" => css_urls(text),
             name if TEXT_ATTRS.contains(&name) || name.starts_with("aria-") => continue,
             name if name.starts_with("on") => embedded_urls(text, names, Written::Attribute),
-            _ => {
+            name => {
                 let url = trimmed(text);
-                if is_attachment_url(&text[url.clone()]) {
+                let whole = &text[url.clone()];
+                if is_attachment_url(whole) {
                     vec![url]
+                } else if is_url_attr(name) && !is_code_url(whole) {
+                    Vec::new()
                 } else {
                     embedded_urls(text, names, Written::Attribute)
                 }
@@ -1575,6 +1607,22 @@ fn attachment_url_candidates(html: &str, names: &[&str]) -> Vec<Range<usize>> {
     }
     urls.sort_by_key(|url| url.start);
     urls
+}
+
+/// Whether the attribute `name` (lowercase) holds one URL: one of [`URL_ATTRS`],
+/// `data-background` or a `data-background-*` attribute.
+fn is_url_attr(name: &str) -> bool {
+    URL_ATTRS.contains(&name) || name.starts_with("data-background")
+}
+
+/// Whether `url` is a `javascript:` or `data:` URL (any ASCII case): its content is a script
+/// or a document (`javascript:show('attachment:a.png')`, `data:text/html,<img src=…>`), not
+/// the rest of one URL, so [`embedded_urls`] scans it.
+fn is_code_url(url: &str) -> bool {
+    ["javascript:", "data:"].iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    })
 }
 
 /// Whether `url` starts with the `attachment:` scheme (any ASCII case).
@@ -1612,8 +1660,10 @@ enum Written {
 /// a `<meta>` refresh's `content`, JSON in a `data-*` attribute). Such a text has no URL
 /// syntax, so an `attachment:` (any ASCII case) counts only where a URL can start: at the
 /// start of the text, or after white space or one of `` ' " ` ( = `` ([`url_may_start`];
-/// not inside a word or another URL, `/x/attachment:a.png`, nor as an object key or a
-/// label, `{attachment:x}`, `f(a,attachment:x)`). Then:
+/// not inside a word or another URL, `/x/attachment:a.png`, `/x?q=attachment:a.png`,
+/// `/x?ids=1,2&u=attachment:a.png` (a query reaches back to white space, a quote, `<`,
+/// `>` or one of `[ ] { }`, [`in_query_or_fragment`]), nor as an object key or a label,
+/// `{attachment:x}`, `f(a,attachment:x)`). Then:
 ///
 /// - the longest of the cell's attachment `names` written there (in an attribute value
 ///   also with character references, `a&amp;b.png`) is the URL when it ends after the
@@ -1657,25 +1707,71 @@ fn embedded_urls(text: &str, names: &[&str], written: Written) -> Vec<Range<usiz
 
 /// Whether a URL can start at the end of `before` ([`embedded_urls`]): `None` if not;
 /// `Some(true)` after a quote, `(` or `=` (a string, a CSS `url(`, an HTML attribute
-/// written in a string); `Some(false)` at the start of the text and after white space.
-/// With `entities`, the character before may be written as a character reference
-/// (`&quot;`).
+/// written in a string), but not after a `(` or `=` in another URL's query or fragment
+/// ([`in_query_or_fragment`]: `?q=attachment:x`); `Some(false)` at the start of the text
+/// and after white space. With `entities`, the characters before may be written as
+/// character references (`&quot;`, `&amp;`).
 fn url_may_start(before: &str, entities: bool) -> Option<bool> {
-    let Some(mut last) = before.chars().next_back() else {
+    let Some((at, last)) = char_before(before, before.len(), entities) else {
         return Some(false);
     };
-    if entities && last == ';' {
-        let reference = before.rfind('&').and_then(|amp| {
-            let (len, c) = char_reference(&before[amp..])?;
-            (amp + len == before.len()).then_some(c)
-        });
-        last = reference.unwrap_or(last);
-    }
     match last {
-        '\'' | '"' | '`' | '(' | '=' => Some(true),
+        '\'' | '"' | '`' => Some(true),
+        '(' | '=' => (!in_query_or_fragment(&before[..at], entities)).then_some(true),
         c if c.is_whitespace() => Some(false),
         _ => None,
     }
+}
+
+/// Whether the end of `text` is inside a URL's query or fragment: a `?` or `#` follows the
+/// last character that cannot be part of a URL ([`outside_url`]; `,` `;` `(` `)` can,
+/// `https://example.org/?ids=1,2&amp;q` before `=attachment:x`). With `entities`, character
+/// references count as the character they encode, also when written twice in HTML written
+/// in an attribute (`&amp;amp;` in a `srcdoc` is the `&amp;` of the inner HTML, an `&`).
+fn in_query_or_fragment(text: &str, entities: bool) -> bool {
+    let mut end = text.len();
+    while let Some((start, c)) = char_before(text, end, entities) {
+        if matches!(c, '?' | '#') {
+            return true;
+        }
+        if outside_url(c) {
+            return false;
+        }
+        end = start;
+    }
+    false
+}
+
+/// Whether `c` cannot be part of a URL written in a script or an attribute value (character
+/// references already decoded): white space, quotes, `<` and `>`, `\`, and the brackets
+/// `[ ] { }` (which a URL percent-encodes). Unlike [`ends_embedded_url`], `,` `;` `(` `)`
+/// can be, in a path or a query.
+fn outside_url(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | '`' | '<' | '>' | '[' | ']' | '{' | '}' | '\\'
+        )
+}
+
+/// The last character of `text[..end]` and its byte offset; with `entities`, a character
+/// reference that ends there (`&quot;`) is the one character it encodes
+/// ([`char_reference`]). `None` when `end` is 0.
+fn char_before(text: &str, end: usize, entities: bool) -> Option<(usize, char)> {
+    let head = &text[..end];
+    let last = head.chars().next_back()?;
+    if entities && last == ';' {
+        // `char_reference` reads at most 40 bytes, so its `&` is among the last 40.
+        let amp = head.bytes().rev().take(40).position(|b| b == b'&');
+        let reference = amp.map(|back| end - 1 - back).and_then(|amp| {
+            let (len, c) = char_reference(&head[amp..])?;
+            (amp + len == end).then_some((amp, c))
+        });
+        if reference.is_some() {
+            return reference;
+        }
+    }
+    Some((end - last.len_utf8(), last))
 }
 
 /// The length in `text` of the attachment `name` written at its start (as is, or with
@@ -2064,6 +2160,100 @@ mod tests {
         let html = "<a href=\"https://example.org/attachment:a.png\" \
                     data-note=\"see attachment:notes, [attachment:x] {attachment:y}\">a</a>";
         assert!(texts(html).is_empty(), "{:?}", texts(html));
+    }
+
+    /// An attribute whose value is one URL (`href`, `src`, `data-preview-image`, …) is a
+    /// candidate only as a whole: an `attachment:` in its query or fragment, or after white
+    /// space, is part of that URL. Inside other values, so is an `attachment:` after a `=` or
+    /// `(` in a URL's query or fragment, also after `,` `;` `(` `)` in the query and after
+    /// an `&` written twice escaped in a `srcdoc`. None of these is resolved or reported. A
+    /// `javascript:` or `data:` URL holds a script or a document, scanned like one.
+    #[test]
+    fn attachment_inside_another_url_is_no_candidate() {
+        let texts = |html: &str| -> Vec<String> {
+            let names = ["a&b.png", "a.png"];
+            let ranges = attachment_url_candidates(html, &names);
+            ranges.into_iter().map(|r| html[r].to_owned()).collect()
+        };
+        let html = "<a href=\"https://example.org/search?q=attachment:foo\">q</a>\
+                    <a href=\"https://example.org/?u=attachment:a.png\">u</a>\
+                    <a href='https://example.org/#k=attachment:a.png'>k</a>\
+                    <img src=\"x.png?v=(attachment:a.png)\" poster=\"see attachment:a.png\" \
+                    data-preview-image=\"x.png#attachment:a.png\" \
+                    data-background-image=\"x.png?u=attachment:a.png\">\
+                    <div data-url=\"https://example.org/?a=1&amp;u=attachment:a.png#f(attachment:a.png)\" \
+                    data-cfg='{\"u\":\"https://example.org/?q=attachment:nope.png\"}'></div>\
+                    <iframe srcdoc=\"<a href='https://example.org/?u=attachment:a&amp;b.png'>u</a>\
+                    <a href=https://example.org/?x&#61;attachment:a.png>v</a>\"></iframe>\
+                    <div data-url=\"https://example.org/?ids=1,2&amp;u=attachment:a.png\" \
+                    data-a=\"https://example.org/?a=1;u=attachment:nope.png\" \
+                    data-b=\"https://example.org/?q=(x)&amp;u=attachment:a.png\"></div>\
+                    <iframe srcdoc=\"<a href='https://x/?a=1&amp;amp;u=attachment:nope.png'>\"></iframe>\
+                    <a href=\"javascript:go('https://example.org/?q=attachment:a.png')\">go</a>";
+        assert!(texts(html).is_empty(), "{:?}", texts(html));
+        // The whole value still is one, and so is a URL after a query in another value.
+        let html = "<a href=\" attachment:a.png?x=attachment:a.png \" \
+                    data-preview-video=attachment:a&amp;b.png>v</a>\
+                    <div data-cfg='{\"u\":\"https://example.org/?q=1\",\"v\":\"attachment:a.png\"}' \
+                    data-x=\"https://example.org/?q=1 u=attachment:no.png\"></div>\
+                    <a href=\"javascript:show('attachment:a.png')\" \
+                    data-preview-link=\" JavaScript:show(&quot;attachment:gone.png&quot;)\">js</a>\
+                    <iframe src=\"DATA:text/html,<img src='attachment:a&amp;b.png'>\"></iframe>";
+        assert_eq!(
+            texts(html),
+            [
+                "attachment:a.png?x=attachment:a.png",
+                "attachment:a&amp;b.png",
+                "attachment:a.png",
+                "attachment:no.png",
+                "attachment:a.png",
+                "attachment:gone.png",
+                "attachment:a&amp;b.png",
+            ]
+        );
+        assert!(is_code_url("javascript:x()") && is_code_url("Data:,x"));
+        assert!(!is_code_url("https://example.org/data:x") && !is_code_url("java"));
+    }
+
+    #[test]
+    fn urls_may_start_after_quotes_and_white_space_but_not_in_a_query() {
+        for (before, entities, expected) in [
+            ("", false, Some(false)),
+            ("x = ", false, Some(false)),
+            ("f(", false, Some(true)),
+            ("show(&quot;", true, Some(true)),
+            ("show(&quot;", false, None),
+            ("0; url=", true, Some(true)),
+            ("https://x/attachment", false, None),
+            ("https://x/?q=", true, None),
+            ("https://x/?a=1&amp;u=", true, None),
+            ("https://x/?a=f(", false, None),
+            ("https://x/#k=", false, None),
+            ("x&#63;q=", true, None),
+            ("x&quest;q=", true, None),
+            ("x&quest;q=", false, Some(true)),
+            ("https://x/?q=1 u=", false, Some(true)),
+            ("'https://x/?q=1', u=", false, Some(true)),
+            // A query goes on past `,` `;` `(` `)`, and `&amp;amp;` (twice escaped).
+            ("https://x/?ids=1,2&amp;u=", true, None),
+            ("https://x/?a=1;u=", false, None),
+            ("https://x/?q=(x)&u=", false, None),
+            ("https://x/?a=1&amp;amp;u=", true, None),
+            // It ends at `<`, `>`, `[ ] { }`, and quotes.
+            ("x?y>z=", false, Some(true)),
+            ("x?y}z=", false, Some(true)),
+            ("x?y&quot;z=", true, Some(true)),
+        ] {
+            assert_eq!(
+                url_may_start(before, entities),
+                expected,
+                "{before:?} {entities}"
+            );
+        }
+        assert_eq!(char_before("a&quot;", 7, true), Some((1, '"')));
+        assert_eq!(char_before("a&quot;", 7, false), Some((6, ';')));
+        assert_eq!(char_before("aé", 3, false), Some((1, 'é')));
+        assert_eq!(char_before("a", 0, true), None);
     }
 
     /// Scripts that use the word `attachment:` without writing an attachment URL: object

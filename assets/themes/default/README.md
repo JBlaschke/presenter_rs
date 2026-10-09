@@ -199,12 +199,28 @@ the input is a highlighted code block, and the outputs sit in a frame under it.
   `display: none`, so a theme can show them faintly instead.
 - **`fragment`** (slide type or tag): the whole cell is one reveal fragment.
 - **ANSI colours** in streams and tracebacks (text and background, SGR 30–37, 40–47, 90–97
-  and 100–107) are spans that read one of 16 variables, the converter's names rather than
-  `--p-` tokens: `--black`, `--red`, `--green`, `--yellow`, `--blue`, `--magenta`, `--cyan`,
-  `--white`, and `--bright-black` … `--bright-white`. `.cell-outputs` sets all 16: the six
-  colours mixed with the text colour, so they stay readable as text on light and dark slides;
-  each bright colour equal to the normal one; black, white and their bright variants as shades
-  of the text colour. Set them on `.reveal .cell-outputs` to change them.
+  and 100–107, and reverse video, SGR 7) are spans that read one of 16 variables, the
+  converter's names rather than `--p-` tokens: `--black`, `--red`, `--green`, `--yellow`,
+  `--blue`, `--magenta`, `--cyan`, `--white`, and `--bright-black` … `--bright-white`. So are
+  8-bit colours 0–15 (`38;5;n`, `48;5;n`); the other 8-bit colours and RGB colours
+  (`38;2;r;g;b`, `48;2;r;g;b`) are written as hex values.
+  - *Text on the slide*: `.cell-outputs` sets all 16: the six colours mixed with the text
+    colour, so they stay readable as text on light and dark slides; each bright colour equal
+    to the normal one; black, white and their bright variants as shades of the text colour.
+    Set them on `.reveal .cell-outputs` to change them. These mixes are meant for text only.
+  - *Text on an ANSI background*, and reverse video, sits on a fixed colour instead. There
+    the 16 variables are a terminal palette, for the background and for the text: red,
+    green, blue, magenta, cyan and bright black are mid-tones on which black, white and
+    `--white` (all but white) text all read, and which read on black and white; yellow and
+    the other bright colours are light, for black text. Text in an ANSI colour keeps that
+    colour: from this palette, or its 8-bit or RGB value. Other text is black or white,
+    whichever reads on the background: SGR 47 is black on white, 41 white on red, 7 black
+    on white, 31;7 white on red. An 8-bit or RGB background is a hex value CSS cannot read,
+    so there the converter writes that black or white itself (`48;5;236` and `38;5;241;7`
+    are white on grey, `38;5;100;7` black on olive). Text in an ANSI colour on another one
+    (`31;43`, `31;48;5;250`, `38;5;100` on any background) is not adjusted and may not read,
+    as in a terminal. The palette is set by the rules after `.output-error` in
+    `styles/notebook.css`.
 
 | token | default | purpose |
 |---|---|---|

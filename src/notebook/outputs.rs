@@ -618,11 +618,16 @@ const ESC: u8 = 0x1b;
 /// sets, two-byte escapes such as `ESC 7`) and every stray `ESC` is dropped, as nbconvert
 /// drops them. The result never contains an `ESC` byte.
 ///
+/// Text without an ANSI colour of its own on an 8-bit or RGB background (`48;5;n` with
+/// n > 15, `48;2;r;g;b`, which the converter writes as hex values that CSS cannot read) is
+/// given `color:#000` or `color:#fff`, whichever has the higher contrast with it; the 16
+/// four-bit colours are `var(--red,#a00)` spans the theme styles.
+///
 /// Never fails: should the converter still return an error, the text is rendered without
 /// styling, escaped the same way (`& < > " '`).
 pub fn ansi_to_html(text: &str) -> String {
     let html = match ::ansi_to_html::convert(&sanitize_ansi(text, true)) {
-        Ok(html) => html,
+        Ok(html) => readable_text_on_hex_backgrounds(html),
         Err(err) => {
             tracing::debug!(%err, "ANSI conversion failed; rendering the text without colors");
             ::ansi_to_html::Esc(sanitize_ansi(text, false)).to_string()
@@ -633,6 +638,116 @@ pub fn ansi_to_html(text: &str) -> String {
         html.replace('\u{1b}', "")
     } else {
         html
+    }
+}
+
+/// The converter's HTML with a black or white text colour for text without an ANSI colour
+/// on an 8-bit or RGB background.
+///
+/// The converter writes the 16 four-bit colours as `var(--red,#a00)`, which a theme sets for
+/// text and backgrounds, but 8-bit and RGB colours (`48;5;n` with n > 15, `48;2;r;g;b`) as
+/// hex values (`background:#eee`), which CSS cannot read. On such a background, text without
+/// an ANSI colour would keep the slide's text colour, which may not read there (white text on
+/// `48;5;231`), so it gets `#000` or `#fff`, whichever has the higher contrast (WCAG): a
+/// `background:#…` span gets `;color:…` appended, and reverse video, which writes its default
+/// text as `color:var(--black,#000)` in the span of its background (`38;5;100;7`), gets the
+/// colour in its place. Text in an ANSI colour, of the span or an enclosing one, keeps it.
+///
+/// The converter's tags nest (text is escaped, so every `<` starts a tag), so a stack of the
+/// open tags tells whether the text has an ANSI colour.
+fn readable_text_on_hex_backgrounds(html: String) -> String {
+    if !html.contains("background:#") {
+        return html;
+    }
+    let mut out = String::with_capacity(html.len() + 32);
+    // For each open tag: whether its text has an ANSI colour.
+    let mut coloured: Vec<bool> = Vec::new();
+    let mut rest = html.as_str();
+    while let Some(lt) = rest.find('<') {
+        let gt = rest[lt..].find('>').map_or(rest.len(), |at| lt + at + 1);
+        out.push_str(&rest[..lt]);
+        let tag = &rest[lt..gt];
+        rest = &rest[gt..];
+        if tag.starts_with("</") {
+            coloured.pop();
+            out.push_str(tag);
+            continue;
+        }
+        let parent = coloured.last().copied().unwrap_or(false);
+        let (tag, has_colour) = with_readable_text(tag, parent);
+        out.push_str(&tag);
+        coloured.push(has_colour);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One start tag of the converter for [`readable_text_on_hex_backgrounds`], given whether the
+/// enclosing text has an ANSI colour: the tag, with a text colour when it needs one, and
+/// whether its own text has an ANSI colour. The reversed default text
+/// (`color:var(--black,#000)` in a span that also sets the background) has none.
+fn with_readable_text(tag: &str, parent: bool) -> (Cow<'_, str>, bool) {
+    let Some(style) = tag
+        .strip_prefix("<span style='")
+        .and_then(|rest| rest.strip_suffix("'>"))
+    else {
+        return (Cow::Borrowed(tag), parent);
+    };
+    let value = |property: &str| {
+        style
+            .split(';')
+            .find_map(|declaration| declaration.strip_prefix(property)?.strip_prefix(':'))
+    };
+    let (colour, background) = (value("color"), value("background"));
+    let reverse = colour.is_some() && background.is_some();
+    let coloured = match colour {
+        Some(colour) => !(reverse && colour.starts_with("var(--black,")),
+        None => parent,
+    };
+    let Some(rgb) = background.and_then(hex_rgb).filter(|_| !coloured) else {
+        return (Cow::Borrowed(tag), coloured);
+    };
+    let text = readable_on(rgb);
+    let background = background.unwrap_or_default();
+    let tag = if reverse {
+        format!("<span style='color:{text};background:{background}'>")
+    } else {
+        format!("<span style='{style};color:{text}'>")
+    };
+    (Cow::Owned(tag), coloured)
+}
+
+/// The channels of a `#rgb` or `#rrggbb` colour; `None` for any other value.
+fn hex_rgb(value: &str) -> Option<[u8; 3]> {
+    let digits = value.strip_prefix('#')?;
+    let channel = |at: usize, len: usize| {
+        let byte = u8::from_str_radix(digits.get(at..at + len)?, 16).ok()?;
+        Some(if len == 1 { byte * 17 } else { byte })
+    };
+    match digits.len() {
+        3 => Some([channel(0, 1)?, channel(1, 1)?, channel(2, 1)?]),
+        6 => Some([channel(0, 2)?, channel(2, 2)?, channel(4, 2)?]),
+        _ => None,
+    }
+}
+
+/// `#000` or `#fff`, whichever has the higher WCAG contrast ratio with `rgb`.
+fn readable_on(rgb: [u8; 3]) -> &'static str {
+    let linear = |channel: u8| {
+        let c = f64::from(channel) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [r, g, b] = rgb.map(linear);
+    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    // Contrast with black, (L + 0.05) / 0.05, against contrast with white, 1.05 / (L + 0.05).
+    if (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) {
+        "#000"
+    } else {
+        "#fff"
     }
 }
 
@@ -1011,5 +1126,106 @@ mod tests {
             sanitize_ansi("plain", true),
             Cow::Borrowed("plain")
         ));
+    }
+
+    /// Text without an ANSI colour on an 8-bit or RGB background, also reverse video's
+    /// default text, is black or white by the background's luminance; text in an ANSI colour
+    /// keeps it, and four-bit backgrounds are left to the theme (notebook.css).
+    #[test]
+    fn default_text_on_hex_backgrounds_is_black_or_white() {
+        let html = |sgr: &str| ansi_to_html(&format!("\u{1b}[{sgr}mx"));
+        let cases = [
+            (
+                "48;5;255",
+                "<span style='background:#eee;color:#000'>x</span>",
+            ),
+            (
+                "48;5;17",
+                "<span style='background:#00005f;color:#fff'>x</span>",
+            ),
+            (
+                "48;5;22",
+                "<span style='background:#005f00;color:#fff'>x</span>",
+            ),
+            // Monokai's background, as rich writes it.
+            (
+                "48;2;39;40;34",
+                "<span style='background:#272822;color:#fff'>x</span>",
+            ),
+            (
+                "48;2;255;255;200",
+                "<span style='background:#ffffc8;color:#000'>x</span>",
+            ),
+            // Reverse video of an 8-bit or RGB text colour: the default text on it.
+            (
+                "38;5;100;7",
+                "<span style='color:#878700'><span style='color:#000;background:#878700'>x\
+                 </span></span>",
+            ),
+            (
+                "38;5;241;7",
+                "<span style='color:#626262'><span style='color:#fff;background:#626262'>x\
+                 </span></span>",
+            ),
+            (
+                "38;2;200;100;0;7",
+                "<span style='color:#c86400'><span style='color:#000;background:#c86400'>x\
+                 </span></span>",
+            ),
+            // Reverse video, then an 8-bit text colour (written as the background).
+            (
+                "7;38;5;17",
+                "<span style='color:var(--black,#000);background:var(--bright-white,#fff)'>\
+                 <span style='background:#00005f;color:#fff'>x</span></span>",
+            ),
+            // Text in an ANSI colour, of the span or an enclosing one, keeps it.
+            (
+                "31;48;5;255",
+                "<span style='color:var(--red,#a00)'><span style='background:#eee'>x</span>\
+                 </span>",
+            ),
+            (
+                "38;5;100;48;2;0;0;0",
+                "<span style='color:#878700'><span style='background:#000000'>x</span></span>",
+            ),
+            (
+                "48;5;17;30",
+                "<span style='background:#00005f;color:#fff'><span style='color:var(--black,\
+                 #000)'>x</span></span>",
+            ),
+            (
+                "41;38;5;100;7",
+                "<span style='background:var(--red,#a00)'><span style='color:#878700'><span \
+                 style='color:var(--red,#a00);background:#878700'>x</span></span></span>",
+            ),
+            // Four-bit backgrounds, also `48;5;n` with n < 16, are the theme's.
+            ("41", "<span style='background:var(--red,#a00)'>x</span>"),
+            (
+                "48;5;1",
+                "<span style='background:var(--red,#a00)'>x</span>",
+            ),
+            (
+                "7",
+                "<span style='color:var(--black,#000);background:var(--bright-white,#fff)'>x\
+                 </span>",
+            ),
+        ];
+        for (sgr, expected) in cases {
+            assert_eq!(html(sgr), expected, "SGR {sgr}");
+        }
+        // A colour that ends gives the text back to the background.
+        assert_eq!(
+            ansi_to_html("\u{1b}[31;48;5;17mx\u{1b}[39my"),
+            "<span style='color:var(--red,#a00)'><span style='background:#00005f'>x</span>\
+             </span><span style='background:#00005f;color:#fff'>y</span>"
+        );
+        assert_eq!(hex_rgb("#c8f"), Some([0xcc, 0x88, 0xff]));
+        assert_eq!(hex_rgb("#c86400"), Some([0xc8, 0x64, 0x00]));
+        assert_eq!(hex_rgb("var(--red,#a00)"), None);
+        assert_eq!(hex_rgb("#c8"), None);
+        assert_eq!(hex_rgb("#gg0"), None);
+        // Black and white change at a luminance of about 0.18 (#767676 is 0.181).
+        assert_eq!(readable_on([0x76; 3]), "#000");
+        assert_eq!(readable_on([0x75; 3]), "#fff");
     }
 }

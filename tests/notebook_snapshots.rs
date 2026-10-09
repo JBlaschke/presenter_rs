@@ -1581,7 +1581,9 @@ fn attachment_urls_resolve_in_css_urls() {
 /// reveal.js' lightbox reads `data-preview-image` / `-video`, and a script may write an
 /// attachment URL: these resolved when attachments were rewritten in the cell source, and
 /// must not be left silently broken now that they are resolved in the rendered HTML. Text
-/// attributes and code stay as written.
+/// attributes and code stay as written, and so does an `attachment:` inside another URL
+/// (its path, query or fragment), without a warning. A `javascript:` or `data:` URL holds a
+/// script or a document: its attachment URLs resolve, or warn.
 #[test]
 fn attachment_urls_resolve_in_other_attributes_and_scripts() {
     let source = "<img src=\"attachment:a+b.png\" data-preview-image=\"attachment:a+b.png\" \
@@ -1592,10 +1594,18 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
                   <span data-preview-image=\"attachment:nope.png\">nope</span>\n\
                   <button onclick=\"show('attachment:a+b.png')\">show</button>\n\
                   <button onclick=\"show('attachment:a&amp;b.gif')\">amp</button>\n\
+                  <a href=\"javascript:show('attachment:a+b.png')\">js</a>\n\
+                  <a href=\"JavaScript:show(&quot;attachment:lost.png&quot;)\">lost</a>\n\
+                  <iframe src=\"data:text/html,<img src='attachment:a+b.png'>\"></iframe>\n\
                   <iframe srcdoc=\"<img src='attachment:a+b.png'><p>attachment:a+b.png</p>\"></iframe>\n\
                   <meta http-equiv=\"refresh\" content=\"30; url=attachment:page.html\">\n\
                   <div data-cfg='{\"img\":\"attachment:a+b.png\"}'>cfg</div>\n\
-                  <a href=\"https://example.org/attachment:a+b.png\">elsewhere</a>\n\n\
+                  <a href=\"https://example.org/attachment:a+b.png\">elsewhere</a>\n\
+                  <a href=\"https://example.org/search?q=attachment:foo\">search</a>\n\
+                  <a href=\"https://example.org/?u=attachment:a+b.png#attachment:a+b.png\">query</a>\n\
+                  <div data-url=\"https://example.org/?x=1&amp;u=attachment:a+b.png\">url</div>\n\
+                  <div data-url=\"https://example.org/?ids=1,2&amp;u=attachment:foo\">ids</div>\n\
+                  <iframe srcdoc=\"<a href='https://example.org/?a=1&amp;amp;u=attachment:bar'>x</a>\"></iframe>\n\n\
                   <script>document.write('<img src=\"attachment:a+b.png\">');\n\
                   var plot = \"attachment:my plot.png?v=2\", other = 'attachment:a%2Bb.png';\n\
                   var gone = 'attachment:gone.png', built = 'attachment:' + name;\n\
@@ -1635,11 +1645,21 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
         "data-preview-image=\"attachment:nope.png\"".to_owned(),
         format!("onclick=\"show('{png}')\""),
         format!("onclick=\"show('{gif}')\""),
+        // A `javascript:` or `data:` URL holds a script or a document.
+        format!("href=\"javascript:show('{png}')\""),
+        "href=\"JavaScript:show(&quot;attachment:lost.png&quot;)\"".to_owned(),
+        format!("src=\"data:text/html,<img src='{png}'>\""),
         // Inside other values: HTML in `srcdoc` (its text stays), a refresh, JSON.
         format!("srcdoc=\"<img src='{png}'><p>attachment:a+b.png</p>\""),
         format!("content=\"30; url={page}\""),
         format!("data-cfg='{{\"img\":\"{png}\"}}'"),
         "href=\"https://example.org/attachment:a+b.png\"".to_owned(),
+        // In another URL's query or fragment: part of that URL, no warning.
+        "href=\"https://example.org/search?q=attachment:foo\"".to_owned(),
+        "href=\"https://example.org/?u=attachment:a+b.png#attachment:a+b.png\"".to_owned(),
+        "data-url=\"https://example.org/?x=1&amp;u=attachment:a+b.png\"".to_owned(),
+        "data-url=\"https://example.org/?ids=1,2&amp;u=attachment:foo\"".to_owned(),
+        "srcdoc=\"<a href='https://example.org/?a=1&amp;amp;u=attachment:bar'>".to_owned(),
         format!("document.write('<img src=\"{png}\">');"),
         format!("var plot = \"{svg}?v=2\", other = '{png}';"),
         "var gone = 'attachment:gone.png', built = 'attachment:' + name;".to_owned(),
@@ -1667,6 +1687,10 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
             ),
             (
                 "missing-attachment",
+                "`attachment:lost.png`: the cell has no attachment `lost.png`"
+            ),
+            (
+                "missing-attachment",
                 "`attachment:gone.png`: the cell has no attachment `gone.png`"
             ),
         ]
@@ -1691,6 +1715,10 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
         format!("srcdoc=\"<img src='{png}'>"),
         format!("data-cfg='{{\"img\":\"{png}\"}}'"),
         "show('data:image/gif;base64,".to_owned(),
+        format!("href=\"javascript:show('{png}')\""),
+        format!("src=\"data:text/html,<img src='{png}'>\""),
+        "href=\"https://example.org/?u=attachment:a+b.png#attachment:a+b.png\"".to_owned(),
+        "data-url=\"https://example.org/?x=1&amp;u=attachment:a+b.png\"".to_owned(),
     ] {
         assert!(built.contains(&inlined), "{inlined}");
     }
