@@ -1,0 +1,9 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, Some(\"slides.md\"), \"slides.md\", deck)"
+---
+error: asset not found: figures/plot.png
+ --> slides.md:3
+  |
+3 | ![The plot](figures/plot.png){width=80%}
+  |             ^^^^^^^^^^^^^^^^

@@ -48,7 +48,13 @@ function showOverlay(err, id) {
     'font:13px monospace;white-space:pre-wrap;cursor:pointer';
   el.onclick = () => { el.style.display = 'none'; };
   el.textContent = ['build error' + (err.kind ? ' (' + err.kind + ')' : ''), err.message || 'unknown error',
-    err.file && err.file + (err.line ? ':' + err.line : ''), '(click to dismiss)'].filter(Boolean).join('\n');
+    err.file && err.file + (err.line ? ':' + err.line : '')].filter(Boolean).join('\n');
+  const pre = err.excerpt && el.appendChild(document.createElement('pre'));
+  if (pre) {
+    pre.textContent = err.excerpt;
+    pre.style.cssText = 'margin:.5em 0;color:#fc6';
+  }
+  el.append((pre ? '' : '\n') + '(click to dismiss)');
   state.errorId = id; // a reconnect leaves this one alone
 }
 function hideOverlay() {

@@ -159,7 +159,13 @@ pub fn apply_build(state: &Shared, build: &Build) -> u64 {
 /// Stores a failed attempt: sets the error (the last good document stays) and bumps
 /// `build_id`. Returns the new `build_id`.
 pub fn apply_error(state: &Shared, err: &Error) -> u64 {
-    let payload = ErrorPayload::from(err);
+    apply_error_payload(state, ErrorPayload::from(err))
+}
+
+/// [`apply_error`] with the overlay payload made by the caller: the rebuild loop passes
+/// `ErrorPayload::for_input(&err, input)`, which locates a missing asset or front matter
+/// error in the deck source and quotes its line (T44).
+pub fn apply_error_payload(state: &Shared, payload: ErrorPayload) -> u64 {
     let mut state = write(state);
     state.build_id += 1;
     state.last_error = Some(payload);
@@ -506,7 +512,7 @@ fn fallback_page(error: Option<&ErrorPayload>) -> String {
             format!(
                 "<div id=\"presenter-overlay\" style=\"{OVERLAY_STYLE}\" \
 onclick=\"this.style.display='none'\">{}</div>\n",
-                html_escape::encode_text(&overlay_text(err))
+                overlay_html(err)
             ),
         ),
         None => (
@@ -547,6 +553,25 @@ fn overlay_text(err: &ErrorPayload) -> String {
     }
     lines.push("(click to dismiss)".to_string());
     lines.join("\n")
+}
+
+/// The inline style of the overlay's excerpt `<pre>`, as the client script sets it.
+const EXCERPT_STYLE: &str = "margin:.5em 0;color:#fc6";
+
+/// The overlay's content as HTML, as the client's `showOverlay` builds it: the
+/// [`overlay_text`], with the error's excerpt (T44), when it has one, in a `<pre>` before
+/// `(click to dismiss)`.
+fn overlay_html(err: &ErrorPayload) -> String {
+    let text = overlay_text(err);
+    let excerpt = err.excerpt.as_deref().filter(|excerpt| !excerpt.is_empty());
+    let (Some(excerpt), Some(head)) = (excerpt, text.strip_suffix("\n(click to dismiss)")) else {
+        return html_escape::encode_text(&text).into_owned();
+    };
+    format!(
+        "{}<pre style=\"{EXCERPT_STYLE}\">{}</pre>(click to dismiss)",
+        html_escape::encode_text(head),
+        html_escape::encode_text(excerpt)
+    )
 }
 
 /// Read access to the state. A poisoned lock is used as is: writers only assign fields.
@@ -620,6 +645,12 @@ mod tests {
         assert_eq!(next_build_id(&state), 3);
         assert_eq!(apply_build(&state, &build), 3);
         assert_eq!(read(&state).last_error, None);
+        // A payload made by the caller is stored as given.
+        let mut payload = ErrorPayload::from(&Error::FrontMatter("bad".into()));
+        payload.file = Some("slides.md".into());
+        assert_eq!(apply_error_payload(&state, payload.clone()), 4);
+        assert_eq!(read(&state).hello().error, Some(payload));
+        assert_eq!(read(&state).build_id, 4);
     }
 
     /// A parse error in `slides.md` at line 3, as an overlay payload.
@@ -651,6 +682,20 @@ mod tests {
             "{page}"
         );
         assert!(!page.contains("class=\"slides\""));
+
+        // The excerpt (T44) in a `<pre>`, as the client shows it.
+        let mut err = err;
+        err.excerpt = Some("--- {title=\"<ab}".into());
+        let page = fallback_page(Some(&err));
+        assert!(
+            page.contains(&format!(
+                "\nslides.md:3<pre style=\"{EXCERPT_STYLE}\">--- {{title=\"&lt;ab}}</pre>\
+                 (click to dismiss)</div>"
+            )),
+            "{page}"
+        );
+        err.excerpt = Some(String::new());
+        assert!(fallback_page(Some(&err)).contains("\nslides.md:3\n(click to dismiss)</div>"));
 
         let waiting = fallback_page(None);
         assert!(waiting.contains(r#"<script src="/__presenter/live-reload.js"></script>"#));

@@ -1,0 +1,9 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, None, \"talk.ipynb\", NOTEBOOK)"
+---
+error: unbalanced " quote in attribute block {title="ab}
+ --> talk.ipynb: cell 2, line 3
+  |
+3 | --- {title="ab}
+  | ^^^^^^^^^^^^^^^

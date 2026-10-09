@@ -1,0 +1,9 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, None, \"slides.md\", DECK)"
+---
+error: unbalanced " quote in attribute block {class="dark}
+ --> slides.md:7
+  |
+7 | --- {class="dark}
+  | ^^^^^^^^^^^^^^^^^

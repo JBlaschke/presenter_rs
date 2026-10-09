@@ -3,9 +3,17 @@
 //! Contract: `docs/spec/ir.md` §4–§5. [`Error`] is for failures that stop an operation;
 //! [`Diagnostic`]s are warnings (and non-fatal errors) that frontends collect in
 //! [`Diagnostics`] and hand to the pipeline and `check` through `ir::Parsed`.
+//!
+//! Where an error is located (T44): [`Error::path`], [`Error::span`] and [`Error::column`]
+//! read the location an error carries, in its fields or in the message conventions of the
+//! frontends (a notebook cell's `cell N, line M: …`, YAML's `at line L column C`);
+//! [`Error::excerpt`] cuts the offending source line out of the file for display, and
+//! [`Error::quoted_line`] finds it in a message that a library already rendered with an
+//! excerpt (minijinja's debug info, `toml`, `grass`).
 
+use std::borrow::Cow;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
@@ -77,6 +85,337 @@ pub enum Error {
 
 /// Result alias used throughout the library.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Where an error is located and what it says apart from that (T44: terminal reports in
+/// `cli::report`, the browser overlay's payload in `serve::events`).
+impl Error {
+    /// The file this error's [`span`](Self::span) is in, when the error names it: the source
+    /// file of [`Error::Parse`] (as the frontend was given it; `None` when empty). Every
+    /// other variant gives `None`: the path of [`Error::MissingAsset`] is the missing file,
+    /// while its span is in the deck source, which only the caller knows (the CLI adds it
+    /// as context, `cli::locate`); a template's name is not a file path.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Error::Parse { path, .. } if !path.as_os_str().is_empty() => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Where the error is located, as far as it says (one line; `cell` set for a line of a
+    /// notebook cell's source):
+    ///
+    /// | variant | span |
+    /// |---|---|
+    /// | `Parse` with `line` | that line of [`path`](Self::path) |
+    /// | `Parse` whose message starts `cell N, line M: ` (a notebook cell) | line M of cell N |
+    /// | `MissingAsset` | its `span` (in the deck source) |
+    /// | `FrontMatter` with `at line L column C` | line L of the deck source; of cell N for a notebook (`cell N: …`) |
+    /// | `Template` with `line` | that line of the template |
+    ///
+    /// Every other error gives `None`.
+    pub fn span(&self) -> Option<SourceSpan> {
+        let at = |line: usize, cell: Option<usize>| SourceSpan {
+            start_line: line,
+            end_line: line,
+            cell,
+        };
+        match self {
+            Error::Parse {
+                line: Some(line), ..
+            } => Some(at(*line, None)),
+            Error::Parse { message, .. } => {
+                let (cell, line, _) = cell_location(message)?;
+                Some(at(line?, Some(cell)))
+            }
+            Error::MissingAsset { span, .. } => span.clone(),
+            Error::FrontMatter(message) => {
+                let (line, _) = line_column(message)?;
+                Some(at(line, cell_location(message).map(|(cell, ..)| cell)))
+            }
+            Error::Template { line, .. } => line.map(|line| at(line, None)),
+            _ => None,
+        }
+    }
+
+    /// The 1-based column on the [`span`](Self::span)'s line, when the message gives one:
+    /// `at line L column C` of a front matter (YAML) or notebook JSON parse error, counted
+    /// as the parser counts it: in characters for YAML, in bytes for JSON (`serde_json`;
+    /// [`Error::excerpt`] converts it to a character). A message with two positions (YAML's
+    /// `… at line 4 column 7, while parsing a flow sequence at line 3 column 7`) is located
+    /// at the first, the problem; the second is its context.
+    pub fn column(&self) -> Option<usize> {
+        let message = match self {
+            Error::Parse { message, .. } | Error::FrontMatter(message) => message,
+            _ => return None,
+        };
+        let (line, column) = line_column(message)?;
+        (self.span()?.start_line == line).then_some(column.max(1))
+    }
+
+    /// What went wrong without the location that [`path`](Self::path) and
+    /// [`span`](Self::span) give: a parse error's message without its file, line or
+    /// `cell N, line M: ` prefix; a front matter error located in a notebook cell without
+    /// its `cell N: ` prefix (`front matter: …`). Every other error's `Display` form (a
+    /// template error keeps its name and line, a missing asset names the missing file).
+    pub fn message(&self) -> Cow<'_, str> {
+        match self {
+            Error::Parse { message, .. } => match cell_location(message) {
+                Some((_, Some(_), rest)) => Cow::Borrowed(rest),
+                _ => Cow::Borrowed(message),
+            },
+            Error::FrontMatter(message) => match (cell_location(message), self.span()) {
+                (Some((_, None, rest)), Some(SourceSpan { cell: Some(_), .. })) => {
+                    Cow::Owned(format!("front matter: {rest}"))
+                }
+                _ => Cow::Owned(self.to_string()),
+            },
+            other => Cow::Owned(other.to_string()),
+        }
+    }
+
+    /// The offending line of the source `file`, cut for display: the line of
+    /// [`span`](Self::span) (of the cell's source when the span names a cell: `file` is
+    /// then the notebook), read through `source_cache`, with the part to underline: the
+    /// character at the [`column`](Self::column) (a notebook JSON error's byte column is
+    /// converted), the reference to the missing file of a [`Error::MissingAsset`] when the
+    /// line contains it, else the line's text.
+    ///
+    /// `file` is the file the span is in: [`path`](Self::path), or the deck source for a
+    /// missing asset or front matter error, which the caller knows (`cli::locate`,
+    /// `serve::events::ErrorPayload::for_input`). A template error's span is a line of the
+    /// template, whose file only a caller that resolves the theme chain can name; the CLI's
+    /// report and the overlay payload do not, and use [`quoted_line`](Self::quoted_line).
+    /// `None` without a span, when `source_cache` has no text for `file`, or when the line
+    /// does not exist (the file changed).
+    pub fn excerpt(
+        &self,
+        file: &Path,
+        source_cache: &dyn Fn(&Path) -> Option<String>,
+    ) -> Option<Excerpt> {
+        let span = self.span()?;
+        let line = source_line(&source_cache(file)?, &span)?;
+        let target = match (self, self.column()) {
+            // serde_json counts bytes (notebook JSON); YAML counts characters.
+            (Error::Parse { .. }, Some(column)) => {
+                let start = char_index(&line, column - 1);
+                Some((start, start + 1))
+            }
+            (_, Some(column)) => Some((column - 1, column)),
+            (Error::MissingAsset { path, .. }, None) => {
+                reference_range(path, &line).or_else(|| text_range(&line))
+            }
+            _ => text_range(&line),
+        };
+        Some(Excerpt::cut(span.start_line, &line, target))
+    }
+
+    /// The offending source line as a library already quoted it in the message (no file is
+    /// read): the `  12 > …` line of minijinja's debug info (template errors in serve mode,
+    /// syntax errors converted with `?`), else the only numbered line of a `toml` excerpt
+    /// (`3 | …`: `theme.toml`, `presenter.toml`) or a `grass` one (`3 │ …`). `None` when
+    /// the message quotes no line, or a blank one.
+    pub fn quoted_line(&self) -> Option<&str> {
+        match self {
+            Error::Parse { message, .. }
+            | Error::Template { message, .. }
+            | Error::Theme { message, .. }
+            | Error::Style { message, .. }
+            | Error::FrontMatter(message)
+            | Error::Config(message)
+            | Error::Other(message) => quoted_line_in(message),
+            Error::MissingAsset { .. } | Error::Io(_) | Error::Json(_) => None,
+        }
+    }
+}
+
+/// The widest [`Excerpt`] line, in characters: a longer line (minified HTML, a notebook's
+/// JSON on one line) is cut around the error.
+pub const EXCERPT_WIDTH: usize = 120;
+
+/// The source line an error points at, as shown under the error ([`Error::excerpt`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Excerpt {
+    /// The line's 1-based number: in the file, or in the cell's source for a notebook.
+    pub line: usize,
+    /// The line as shown: tabs expanded to four spaces, trailing whitespace removed, cut to
+    /// [`EXCERPT_WIDTH`] characters around the error with `…` marking a cut end.
+    pub text: String,
+    /// The part of `text` to underline: its start column (0-based, in characters) and its
+    /// width (at least 1). `None` for a blank line.
+    pub marker: Option<(usize, usize)>,
+}
+
+/// The display width of a tab in an [`Excerpt`].
+const TAB_WIDTH: usize = 4;
+
+impl Excerpt {
+    /// Line `number` (`line`) with the characters `target` (`start..end`, character indices
+    /// into `line`) to underline, cut and expanded as [`Excerpt::text`] says.
+    fn cut(number: usize, line: &str, target: Option<(usize, usize)>) -> Excerpt {
+        let chars: Vec<char> = line.trim_end().chars().collect();
+        let len = chars.len();
+        let (from, to) = if len <= EXCERPT_WIDTH {
+            (0, len)
+        } else {
+            // Keep the start of the target in the first third of the window.
+            let focus = target.map_or(0, |(start, _)| start.min(len));
+            let from = focus
+                .saturating_sub(EXCERPT_WIDTH / 3)
+                .min(len - EXCERPT_WIDTH);
+            (from, from + EXCERPT_WIDTH)
+        };
+        let width = |part: &[char]| -> usize {
+            part.iter()
+                .map(|&c| if c == '\t' { TAB_WIDTH } else { 1 })
+                .sum()
+        };
+        let lead = usize::from(from > 0);
+        let mut text = String::from(if from > 0 { "…" } else { "" });
+        for &c in &chars[from..to] {
+            match c {
+                '\t' => text.push_str(&" ".repeat(TAB_WIDTH)),
+                c => text.push(c),
+            }
+        }
+        if to < len {
+            text.push('…');
+        }
+        let marker = target.map(|(start, end)| {
+            let start = start.clamp(from, to);
+            let end = end.clamp(start, to);
+            let column = lead + width(&chars[from..start]);
+            (column, width(&chars[start..end]).max(1))
+        });
+        Excerpt {
+            line: number,
+            text,
+            marker,
+        }
+    }
+}
+
+/// Line `span.start_line` (1-based) of the source `text`, without its line break: of the
+/// file, or, when `span.cell` is set, of that cell's `source` in the notebook JSON `text`
+/// (cell indices count every cell of the notebook, as in [`SourceSpan`]). `None` when the
+/// line (or the cell) does not exist.
+pub fn source_line(text: &str, span: &SourceSpan) -> Option<String> {
+    let index = span.start_line.checked_sub(1)?;
+    let Some(cell) = span.cell else {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        return text.lines().nth(index).map(str::to_string);
+    };
+    let notebook: serde_json::Value = serde_json::from_str(text).ok()?;
+    let source: String = match notebook.get("cells")?.get(cell)?.get("source")? {
+        serde_json::Value::String(source) => source.clone(),
+        serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p.as_str()).collect(),
+        _ => return None,
+    };
+    source.lines().nth(index).map(str::to_string)
+}
+
+/// `cell N, line M: rest` or `cell N: rest` at the start of `message` (the notebook
+/// frontend's location prefix): `(N, Some(M) | None, rest)`.
+fn cell_location(message: &str) -> Option<(usize, Option<usize>, &str)> {
+    let (cell, rest) = leading_number(message.strip_prefix("cell ")?)?;
+    match rest.strip_prefix(", line ") {
+        Some(rest) => {
+            let (line, rest) = leading_number(rest)?;
+            Some((cell, Some(line), rest.strip_prefix(": ")?))
+        }
+        None => Some((cell, None, rest.strip_prefix(": ")?)),
+    }
+}
+
+/// The position of the problem in `message`, as serde_norway and serde_json locate their
+/// errors (`at line L column C`, both counting from 1): the first such position that ends
+/// the message or a clause (followed by `,`, as libyaml's problem position is by
+/// `, while parsing … at line …`, its context; by ` (` and a frontend's hint; or by a line
+/// break), else the first one. (A quoted value that reads `at line 1 column 1` is followed
+/// by its closing quote and skipped.)
+fn line_column(message: &str) -> Option<(usize, usize)> {
+    const AT: &str = "at line ";
+    let mut first = None;
+    for (at, _) in message.match_indices(AT) {
+        let Some((line, rest)) = leading_number(&message[at + AT.len()..]) else {
+            continue;
+        };
+        let Some((column, rest)) = rest.strip_prefix(" column ").and_then(leading_number) else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with([',', '\n']) || rest.starts_with(" (") {
+            return Some((line, column));
+        }
+        first.get_or_insert((line, column));
+    }
+    first
+}
+
+/// The index of the character of `line` that contains byte `offset`; the number of
+/// characters when `offset` is past the end.
+fn char_index(line: &str, offset: usize) -> usize {
+    if offset >= line.len() {
+        return line.chars().count();
+    }
+    line.char_indices()
+        .take_while(|&(at, _)| at <= offset)
+        .count()
+        .saturating_sub(1)
+}
+
+/// The decimal number at the start of `text`, and the rest of `text`.
+fn leading_number(text: &str) -> Option<(usize, &str)> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    Some((text[..digits].parse().ok()?, &text[digits..]))
+}
+
+/// See [`Error::quoted_line`].
+fn quoted_line_in(message: &str) -> Option<&str> {
+    let mut numbered = Vec::new();
+    for line in message.lines() {
+        let Some((_, rest)) = leading_number(line.trim_start()) else {
+            continue;
+        };
+        if let Some(text) = rest.strip_prefix(" > ") {
+            return Some(text).filter(|text| !text.trim().is_empty());
+        }
+        if let Some(text) = rest
+            .strip_prefix(" | ")
+            .or_else(|| rest.strip_prefix(" │ "))
+        {
+            numbered.push(text);
+        }
+    }
+    match numbered.as_slice() {
+        [only] if !only.trim().is_empty() => Some(only),
+        _ => None,
+    }
+}
+
+/// The characters of `line` (as `start..end` character indices) that refer to the missing
+/// file `path`: the last occurrence of the longest trailing part of `path` (`plot.png`,
+/// `figures/plot.png`, …) that `line` contains.
+fn reference_range(path: &Path, line: &str) -> Option<(usize, usize)> {
+    let names: Vec<&str> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect();
+    (1..=names.len()).rev().find_map(|count| {
+        let needle = names[names.len() - count..].join("/");
+        let at = line.rfind(&needle)?;
+        let start = line[..at].chars().count();
+        Some((start, start + needle.chars().count()))
+    })
+}
+
+/// The characters of `line` from its first to its last non-blank one; `None` when blank.
+fn text_range(line: &str) -> Option<(usize, usize)> {
+    let start = line.chars().position(|c| !c.is_whitespace())?;
+    let len = line.trim_end().chars().count();
+    Some((start, len))
+}
 
 /// TOML errors become [`Error::Config`]. The message is the full `toml` rendering (which
 /// includes `line N, column M` and the offending line when the input is known), followed
@@ -642,5 +981,267 @@ mod tests {
             panic!("expected Error::Template");
         };
         assert_eq!(template, "<unknown>");
+    }
+
+    fn parse_error(path: &str, line: Option<usize>, message: &str) -> Error {
+        Error::Parse {
+            path: PathBuf::from(path),
+            line,
+            message: message.into(),
+        }
+    }
+
+    fn cell_span(line: usize, cell: usize) -> SourceSpan {
+        SourceSpan {
+            cell: Some(cell),
+            ..span(line)
+        }
+    }
+
+    #[test]
+    fn errors_say_where_they_are() {
+        let markdown = parse_error("deck.md", Some(12), "bad");
+        assert_eq!(markdown.path(), Some(Path::new("deck.md")));
+        assert_eq!(markdown.span(), Some(span(12)));
+        assert_eq!(
+            (markdown.column(), markdown.message()),
+            (None, "bad".into())
+        );
+        // The notebook frontend puts a cell's location in front of the message.
+        let cell = parse_error("talk.ipynb", None, "cell 4, line 5: unbalanced");
+        assert_eq!(cell.span(), Some(cell_span(5, 4)));
+        assert_eq!(cell.message(), "unbalanced");
+        let whole_cell = parse_error("talk.ipynb", None, "cell 4: missing source");
+        assert_eq!(whole_cell.span(), None);
+        assert_eq!(whole_cell.message(), "cell 4: missing source");
+        // Notebook JSON: the line and column of the file.
+        let json = parse_error("talk.ipynb", Some(2), "invalid: key at line 2 column 28");
+        assert_eq!((json.span(), json.column()), (Some(span(2)), Some(28)));
+        assert_eq!(parse_error("", Some(3), "x").path(), None);
+
+        let missing = Error::MissingAsset {
+            path: PathBuf::from("/deck/x.png"),
+            span: Some(cell_span(2, 7)),
+        };
+        assert_eq!(
+            (missing.path(), missing.span()),
+            (None, Some(cell_span(2, 7)))
+        );
+        assert_eq!(missing.message(), "asset not found: /deck/x.png");
+
+        let front = Error::FrontMatter("mapping values are not allowed at line 2 column 9".into());
+        assert_eq!((front.span(), front.column()), (Some(span(2)), Some(9)));
+        assert_eq!(front.path(), None);
+        let in_cell = Error::FrontMatter(
+            "cell 0: bad at line 3 column 1 (a `---` block at the start of …)".into(),
+        );
+        assert_eq!(
+            (in_cell.span(), in_cell.column()),
+            (Some(cell_span(3, 0)), Some(1))
+        );
+        // The cell is in the span: the message does not repeat it.
+        assert_eq!(
+            in_cell.message(),
+            "front matter: bad at line 3 column 1 (a `---` block at the start of …)"
+        );
+        let no_position = Error::FrontMatter("math: unknown field `enable`".into());
+        assert_eq!((no_position.span(), no_position.column()), (None, None));
+        // Without a line the cell prefix is the only location: it stays.
+        let cell_only = Error::FrontMatter("cell 2: math: unknown field `enable`".into());
+        assert_eq!(cell_only.span(), None);
+        assert_eq!(
+            cell_only.message(),
+            "front matter: cell 2: math: unknown field `enable`"
+        );
+
+        let template = Error::Template {
+            template: "layouts/title.html".into(),
+            line: Some(4),
+            message: "oops".into(),
+        };
+        assert_eq!((template.path(), template.span()), (None, Some(span(4))));
+        assert_eq!(
+            template.message(),
+            "template 'layouts/title.html' line 4: oops"
+        );
+        for other in [
+            Error::Config("at line 1 column 2".into()),
+            Error::Other("cell 1, line 2: x".into()),
+        ] {
+            assert_eq!(
+                (other.path(), other.span(), other.column()),
+                (None, None, None)
+            );
+        }
+    }
+
+    #[test]
+    fn errors_with_two_positions_are_located_at_the_problem() {
+        // libyaml: the problem's position, then its context's.
+        let front = |message: &str| Error::FrontMatter(message.into());
+        let two = front(
+            "did not find expected key at line 2 column 16, while parsing a block mapping at \
+             line 2 column 1",
+        );
+        assert_eq!((two.span(), two.column()), (Some(span(2)), Some(16)));
+        let flow = front(
+            "did not find expected ',' or ']' at line 4 column 7, while parsing a flow \
+             sequence at line 3 column 7",
+        );
+        assert_eq!((flow.span(), flow.column()), (Some(span(4)), Some(7)));
+        // A quoted value that reads like a position is not one.
+        let quoted = front(
+            "title: invalid type: string \"at line 9 column 9\", expected a mapping at line 3 \
+             column 8",
+        );
+        assert_eq!((quoted.span(), quoted.column()), (Some(span(3)), Some(8)));
+        // A notebook's hint follows the position.
+        let hinted = front("cell 0: bad at line 3 column 2 (a `---` block …)");
+        assert_eq!(hinted.column(), Some(2));
+        // Nothing ends a clause: the first position.
+        let odd = front("x at line 5 column 1 y at line 6 column 2 z");
+        assert_eq!(odd.span(), Some(span(5)));
+        assert_eq!(front("at line x column 1").span(), None);
+    }
+
+    #[test]
+    fn json_byte_columns_mark_the_character() {
+        // serde_json counts bytes: `é` is two, `世` three.
+        let line = "  {\"source\": \"Grüße, 世界\", , }";
+        let byte = line.rfind(", }").unwrap() + 1;
+        let json = parse_error(
+            "talk.ipynb",
+            Some(1),
+            &format!("invalid notebook JSON: expected value at line 1 column {byte}"),
+        );
+        let excerpt = excerpt_of(&json, line).unwrap();
+        let (column, width) = excerpt.marker.unwrap();
+        assert_eq!(
+            (excerpt.text.chars().nth(column), width),
+            (Some(','), 1),
+            "{excerpt:?}"
+        );
+        assert_eq!(column, line.chars().count() - 3);
+        // YAML counts characters: no conversion.
+        let yaml = "title: \"éééééé\": b";
+        let front = Error::FrontMatter("mapping values are not allowed at line 1 column 16".into());
+        let (column, _) = excerpt_of(&front, yaml).unwrap().marker.unwrap();
+        assert_eq!(yaml.chars().nth(column), Some(':'));
+        // A byte inside a character marks that character; past the end, the end.
+        assert_eq!(char_index("aéb", 2), 1);
+        assert_eq!(char_index("aéb", 3), 2);
+        assert_eq!(char_index("aéb", 9), 3);
+        assert_eq!(char_index("", 0), 0);
+    }
+
+    #[test]
+    fn source_lines_of_files_and_notebook_cells() {
+        let text = "\u{feff}one\r\ntwo\n\nfour";
+        assert_eq!(source_line(text, &span(1)).as_deref(), Some("one"));
+        assert_eq!(source_line(text, &span(3)).as_deref(), Some(""));
+        assert_eq!(source_line(text, &span(4)).as_deref(), Some("four"));
+        assert_eq!(source_line(text, &span(5)), None);
+        assert_eq!(source_line(text, &span(0)), None);
+        let notebook = r##"{"cells": [
+            {"cell_type": "code", "source": "a = 1\nb = 2"},
+            {"cell_type": "markdown", "source": ["# T\n", "\n", "![x](y.png)"]}]}"##;
+        assert_eq!(
+            source_line(notebook, &cell_span(2, 0)).as_deref(),
+            Some("b = 2")
+        );
+        assert_eq!(
+            source_line(notebook, &cell_span(3, 1)).as_deref(),
+            Some("![x](y.png)")
+        );
+        assert_eq!(source_line(notebook, &cell_span(4, 1)), None);
+        assert_eq!(source_line(notebook, &cell_span(1, 2)), None);
+        assert_eq!(source_line("not json", &cell_span(1, 0)), None);
+    }
+
+    /// The excerpt of `err` in a file with `text`.
+    fn excerpt_of(err: &Error, text: &str) -> Option<Excerpt> {
+        err.excerpt(Path::new("f"), &|_| Some(text.to_string()))
+    }
+
+    #[test]
+    fn excerpts_underline_the_column_the_reference_or_the_text() {
+        let err = parse_error("f", Some(2), "bad");
+        let excerpt = excerpt_of(&err, "one\n  <!-- .slide: x -->  \n").unwrap();
+        assert_eq!(excerpt.line, 2);
+        assert_eq!(excerpt.text, "  <!-- .slide: x -->");
+        assert_eq!(excerpt.marker, Some((2, 18)));
+        // A blank line has nothing to underline; a missing line no excerpt.
+        assert_eq!(excerpt_of(&err, "one\n \t\n").unwrap().marker, None);
+        assert_eq!(excerpt_of(&err, "one\n"), None);
+        assert_eq!(err.excerpt(Path::new("f"), &|_| None), None);
+
+        let front = Error::FrontMatter("bad at line 1 column 3".into());
+        assert_eq!(excerpt_of(&front, "\ta: b").unwrap().marker, Some((5, 1)));
+        assert_eq!(excerpt_of(&front, "\ta: b").unwrap().text, "    a: b");
+
+        let missing = |path: &str| Error::MissingAsset {
+            path: PathBuf::from(path),
+            span: Some(span(1)),
+        };
+        let line = "![plot.png](figures/plot.png) and more";
+        let marker = |path| excerpt_of(&missing(path), line).unwrap().marker;
+        assert_eq!(marker("/deck/figures/plot.png"), Some((12, 16)));
+        assert_eq!(marker("/elsewhere/plot.png"), Some((20, 8)));
+        assert_eq!(
+            marker("/deck/other.png"),
+            Some((0, 38)),
+            "not referenced: the text"
+        );
+    }
+
+    #[test]
+    fn long_lines_are_cut_around_the_error() {
+        let line = format!("{}X{}", "a".repeat(300), "b".repeat(300));
+        let front = Error::FrontMatter("bad at line 1 column 301".into());
+        let excerpt = excerpt_of(&front, &line).unwrap();
+        assert_eq!(excerpt.text.chars().count(), EXCERPT_WIDTH + 2);
+        assert!(excerpt.text.starts_with('…') && excerpt.text.ends_with('…'));
+        let (column, width) = excerpt.marker.unwrap();
+        assert_eq!(excerpt.text.chars().nth(column), Some('X'));
+        assert_eq!(width, 1);
+        // The start of a line is kept without a mark.
+        let start = Error::FrontMatter("bad at line 1 column 2".into());
+        let excerpt = excerpt_of(&start, &line).unwrap();
+        assert!(excerpt.text.starts_with("aaa") && excerpt.text.ends_with('…'));
+        assert_eq!(excerpt.marker, Some((1, 1)));
+        // A column past the end of the line marks the end.
+        let past = Error::FrontMatter("bad at line 1 column 9".into());
+        assert_eq!(excerpt_of(&past, "ab").unwrap().marker, Some((2, 1)));
+    }
+
+    #[test]
+    fn quoted_lines_come_from_minijinja_toml_and_grass_excerpts() {
+        // minijinja's debug info: the `>` line.
+        let mut env = minijinja::Environment::new();
+        env.set_debug(true);
+        let err = env
+            .add_template("t.html", "<a>\n<h1>{{ x </h1>\n</a>\n")
+            .unwrap_err();
+        let err = Error::from(err);
+        assert_eq!(err.quoted_line(), Some("<h1>{{ x </h1>"));
+        // toml (theme.toml, presenter.toml): its one numbered line.
+        let err: Error = toml::from_str::<toml::Table>("a = 1\nb = = 2\n")
+            .unwrap_err()
+            .into();
+        assert_eq!(err.quoted_line(), Some("b = = 2"));
+        let grass = Error::Style {
+            file: "styles/x.scss".into(),
+            message: "Error: expected \";\".\n  ╷\n2 │ a { color: red }\n  │ ^\n  ╵\n".into(),
+        };
+        assert_eq!(grass.quoted_line(), Some("a { color: red }"));
+        for message in ["no excerpt", "1 | one\n2 | two", "3 |  \n"] {
+            assert_eq!(
+                Error::Other(message.into()).quoted_line(),
+                None,
+                "{message}"
+            );
+        }
+        let blank = Error::Other("   3 > \n".into());
+        assert_eq!(blank.quoted_line(), None);
     }
 }

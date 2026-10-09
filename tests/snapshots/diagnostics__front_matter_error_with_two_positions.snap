@@ -1,0 +1,9 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, Some(\"slides.md\"), \"slides.md\", deck)"
+---
+error: front matter: did not find expected key at line 2 column 16, while parsing a block mapping at line 2 column 1
+ --> slides.md:2:16
+  |
+2 | title: "Grüße" x: y
+  |                ^

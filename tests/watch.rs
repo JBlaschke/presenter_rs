@@ -491,7 +491,7 @@ fn build_watch_rebuilds_on_every_change() {
         "{stderr}"
     );
     assert!(stderr.contains("Rebuilding (content): fig.png"), "{stderr}");
-    assert!(stderr.contains("error: slides.md:"), "{stderr}");
+    assert!(stderr.contains("--> slides.md:13\n"), "{stderr}");
 }
 
 /// Whether some batch of `batches` lists `path`.
