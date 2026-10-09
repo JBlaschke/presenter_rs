@@ -300,13 +300,17 @@
  * Images, video and frames
  * ------------------------------------------------------------------------------------ */
 
-/* These rules style slide content only: reveal's slide backgrounds (`background-video`,
-   `background-iframe`) and its lightbox (`data-preview-image`) also hold images, videos and
-   iframes inside `.reveal`, and size them themselves. `:where(.slides)` adds no
-   specificity, so these rules weigh what they did before they were scoped. */
-.reveal :where(.slides) img,
-.reveal :where(.slides) video,
-.reveal :where(.slides) iframe {
+/* These rules style slide content only, the elements inside a slide's `section`: reveal's
+   slide backgrounds (`background-video`, `background-iframe`) and its lightbox
+   (`data-preview-image`) also hold images, videos and iframes inside `.reveal`, and size
+   them themselves. Scoping to `.slides` is not enough: in print view (`?print-pdf`, which
+   `presenter export pdf` loads) and in scroll view (`?view=scroll`, and reveal's default on
+   narrow screens) reveal moves each background into `.slides`, next to its slide's
+   `section` rather than inside it. `:where(.slides section)` adds no specificity, so these
+   rules weigh what they did before they were scoped. */
+.reveal :where(.slides section) img,
+.reveal :where(.slides section) video,
+.reveal :where(.slides section) iframe {
   max-width: 100%;
 }
 
@@ -314,18 +318,18 @@
    sizes itself: those that are direct children of the slide. reveal lifts the caps of every
    `.r-stretch` element, so a Markdown image (wrapped in a paragraph, which reveal does not
    stretch) gets them back here. */
-.reveal :where(.slides) :is(img, video):not(section > .r-stretch, section > .stretch) {
+.reveal :where(.slides section) :is(img, video):not(section > .r-stretch, section > .stretch) {
   max-width: 100%;
   max-height: var(--p-image-max-height);
   object-fit: contain;
 }
 
-.reveal :where(.slides) img {
+.reveal :where(.slides section) img {
   margin: 0;
   vertical-align: middle;
 }
 
-.reveal :where(.slides) iframe {
+.reveal :where(.slides section) iframe {
   border: 1px solid var(--p-border);
   border-radius: var(--p-radius);
 }

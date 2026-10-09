@@ -51,11 +51,17 @@
 //!   `poster`, reveal.js' `data-preview-image`/`-video`/`-link`, any `data-*`, … but not
 //!   the text attributes `alt`, `title`, `aria-*` and the like), a `srcset` candidate, a CSS
 //!   `url(…)` in a `style` attribute or `<style>` element, a URL written inside a
-//!   `<script>` element or an `on…` attribute (`'attachment:a.png'`), or a
-//!   `data-background`/`-image`/`-video`/`-iframe` slide attribute is registered as an
-//!   inline asset and becomes `asset:<id>`. HTML shown in code is text, not a tag, and stays
-//!   as written. The name is matched as written, then with HTML entities and percent escapes
-//!   decoded (`attachment:a%2Bb.png` names `a+b.png`), then without a `?query` or
+//!   `<script>` element, an `on…` attribute or another attribute value
+//!   (`'attachment:a.png'`, `srcdoc="<img src='attachment:a.png'>"`,
+//!   `content="0; url=attachment:a.png"`), or a `data-background`/`-image`/`-video`/`-iframe`
+//!   slide attribute is registered as an inline asset and becomes `asset:<id>`. Inside a
+//!   script or another value, a URL starts after a quote, `(` or `=` (also written as a
+//!   character reference), and one that names an attachment of the cell also at the start
+//!   or after white space; script code that only uses the word (`{attachment:true}`,
+//!   `// see attachment:notes`, `` `attachment:${name}` ``, `'attachment:' + name`) is
+//!   left alone. HTML shown in code is text, not a tag, and
+//!   stays as written. The name is matched as written, then with HTML entities and percent
+//!   escapes decoded (`attachment:a%2Bb.png` names `a+b.png`), then without a `?query` or
 //!   `#fragment`, which is kept after the placeholder. A URL whose attachment was skipped
 //!   stays as written (`notebook-attachment-skipped`, reported once per name); any other
 //!   unresolved one warns [`codes::MISSING_ATTACHMENT`].
@@ -1152,7 +1158,7 @@ impl<'a> Converter<'a> {
         html: &mut String,
         span: &SourceSpan,
     ) {
-        // Longest first, for the names written in scripts (`script_urls`).
+        // Longest first, for the names written in scripts and other values (`embedded_urls`).
         let mut names: Vec<&str> = cell.attachments.keys().map(String::as_str).collect();
         names.retain(|name| !name.is_empty());
         names.sort_by_key(|name| std::cmp::Reverse(name.len()));
@@ -1214,8 +1220,7 @@ impl<'a> Converter<'a> {
         url: &str,
         span: &SourceSpan,
     ) -> Option<String> {
-        let scheme = url.get(..ATTACHMENT_SCHEME.len())?;
-        if !scheme.eq_ignore_ascii_case(ATTACHMENT_SCHEME) {
+        if !is_attachment_url(url) {
             return None;
         }
         let written = &url[ATTACHMENT_SCHEME.len()..];
@@ -1522,19 +1527,23 @@ fn attachment_name(cell: &Cell, written: &str) -> Option<String> {
 
 /// The byte ranges of the URLs in `html` that may be `attachment:` URLs, in document order:
 ///
-/// - the value (white space trimmed) of every attribute that holds one URL: any attribute
-///   but `srcset`, `style`, the `on…` event handlers and the text attributes
-///   ([`TEXT_ATTRS`], `aria-*`), so `src`, `href`, `poster`, reveal.js'
+/// - the value (white space trimmed) of every attribute that holds one URL, when it is an
+///   `attachment:` URL: any attribute but `srcset`, `style`, the `on…` event handlers and
+///   the text attributes ([`TEXT_ATTRS`], `aria-*`), so `src`, `href`, `poster`, reveal.js'
 ///   `data-preview-image` / `-video` / `-link`, `data-src` and any other `data-*` attribute
-///   count ([`Converter::attachment_url`] then keeps only `attachment:` URLs);
+///   count ([`Converter::attachment_url`] then resolves or reports it);
+/// - the `attachment:` URLs written inside another value of such an attribute (an
+///   `<iframe srcdoc>`, a `<meta>` refresh's `content="0; url=attachment:a.png"`, JSON in a
+///   `data-*` attribute; [`embedded_urls`]);
 /// - each `srcset` candidate ([`srcset_urls`]), and each CSS `url(…)` ([`css_urls`]) of a
 ///   `style` attribute or a `<style>` element;
 /// - the `attachment:` URLs written inside scripts, `<script>` elements and `on…`
-///   attributes ([`script_urls`]; `names` are the cell's attachment names, longest first).
+///   attributes ([`embedded_urls`]).
 ///
-/// Attributes and elements are those of the start tags T12's HTML tokenizer finds
-/// ([`html_attr_values`]): text, comments and HTML shown in code (`&lt;img src=…`, quotes
-/// included) are not tags, so their URLs are not candidates.
+/// `names` are the cell's attachment names, longest first. Attributes and elements are
+/// those of the start tags T12's HTML tokenizer finds ([`html_attr_values`]): text,
+/// comments and HTML shown in code (`&lt;img src=…`, quotes included) are not tags, so their
+/// URLs are not candidates.
 fn attachment_url_candidates(html: &str, names: &[&str]) -> Vec<Range<usize>> {
     let shift = |base: usize| move |url: Range<usize>| base + url.start..base + url.end;
     let mut urls = Vec::new();
@@ -1544,8 +1553,15 @@ fn attachment_url_candidates(html: &str, names: &[&str]) -> Vec<Range<usize>> {
             "srcset" => srcset_urls(text),
             "style" => css_urls(text),
             name if TEXT_ATTRS.contains(&name) || name.starts_with("aria-") => continue,
-            name if name.starts_with("on") => script_urls(text, names),
-            _ => vec![trimmed(text)],
+            name if name.starts_with("on") => embedded_urls(text, names, Written::Attribute),
+            _ => {
+                let url = trimmed(text);
+                if is_attachment_url(&text[url.clone()]) {
+                    vec![url]
+                } else {
+                    embedded_urls(text, names, Written::Attribute)
+                }
+            }
         };
         urls.extend(found.into_iter().map(shift(value.start)));
     }
@@ -1554,11 +1570,17 @@ fn attachment_url_candidates(html: &str, names: &[&str]) -> Vec<Range<usize>> {
         urls.extend(found.into_iter().map(shift(content.start)));
     }
     for content in element_contents(html, "script") {
-        let found = script_urls(&html[content.clone()], names);
+        let found = embedded_urls(&html[content.clone()], names, Written::Script);
         urls.extend(found.into_iter().map(shift(content.start)));
     }
     urls.sort_by_key(|url| url.start);
     urls
+}
+
+/// Whether `url` starts with the `attachment:` scheme (any ASCII case).
+fn is_attachment_url(url: &str) -> bool {
+    url.get(..ATTACHMENT_SCHEME.len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(ATTACHMENT_SCHEME))
 }
 
 /// The byte ranges of the contents of the `name` elements of `html` (`style`, `script`:
@@ -1575,53 +1597,177 @@ fn element_contents(html: &str, name: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// The byte ranges of the `attachment:` URLs written inside a script (`script`: a
-/// `<script>` element's content, or an `on…` attribute's value as written), in order. A
-/// script has no URL syntax, so each `attachment:` (any ASCII case) is followed by a name:
-/// the longest of the cell's attachment `names` written there exactly, when the URL ends
-/// after it ([`ends_script_url`], or `?` / `#`, which stay after the placeholder);
-/// otherwise everything up to the first [`ends_script_url`] character, which
-/// [`Converter::attachment_url`] decodes or reports as missing. A bare `attachment:` (a
-/// script that builds the URL, `'attachment:' + name`) is not a candidate.
-fn script_urls(script: &str, names: &[&str]) -> Vec<Range<usize>> {
+/// How a text scanned by [`embedded_urls`] is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Written {
+    /// A `<script>` element's content: its characters are the script's.
+    Script,
+    /// An attribute value as written in HTML: a character reference (`&amp;`, `&quot;`,
+    /// `&#39;`) stands for the character it encodes.
+    Attribute,
+}
+
+/// The byte ranges of the `attachment:` URLs written inside a text that is not one URL: a
+/// script (a `<script>` element, an `on…` attribute) or another attribute value (`srcdoc`,
+/// a `<meta>` refresh's `content`, JSON in a `data-*` attribute). Such a text has no URL
+/// syntax, so an `attachment:` (any ASCII case) counts only where a URL can start: at the
+/// start of the text, or after white space or one of `` ' " ` ( = `` ([`url_may_start`];
+/// not inside a word or another URL, `/x/attachment:a.png`, nor as an object key or a
+/// label, `{attachment:x}`, `f(a,attachment:x)`). Then:
+///
+/// - the longest of the cell's attachment `names` written there (in an attribute value
+///   also with character references, `a&amp;b.png`) is the URL when it ends after the
+///   name ([`ends_embedded_url`], or `?` / `#`, which stay after the placeholder);
+/// - otherwise, only where a string or a URL starts (after a quote, `(` or `=`, also
+///   written as a character reference), the URL runs to the first [`ends_embedded_url`]
+///   character, and [`Converter::attachment_url`] decodes it or reports it as missing.
+///   An `attachment:` at the start or after white space that names no attachment is
+///   text or a comment (`// see attachment:notes`), not a URL.
+///
+/// A bare `attachment:` and one followed by `${` (a script that builds the URL,
+/// `'attachment:' + name`, `` `attachment:${name}` ``) are not candidates.
+fn embedded_urls(text: &str, names: &[&str], written: Written) -> Vec<Range<usize>> {
+    let entities = written == Written::Attribute;
     // ASCII lowercasing keeps every byte offset.
-    let lower = script.to_ascii_lowercase();
+    let lower = text.to_ascii_lowercase();
     let mut urls = Vec::new();
     let mut from = 0;
     while let Some(at) = lower[from..].find(ATTACHMENT_SCHEME) {
         let start = from + at;
-        let rest = &script[start + ATTACHMENT_SCHEME.len()..];
-        let exact = names.iter().find(|name| {
-            rest.strip_prefix(**name).is_some_and(|after| {
-                after
-                    .chars()
-                    .next()
-                    .is_none_or(|c| ends_script_url(c) || matches!(c, '?' | '#'))
-            })
-        });
-        let len = exact.map_or_else(
-            || rest.find(ends_script_url).unwrap_or(rest.len()),
-            |name| name.len(),
-        );
-        let end = start + ATTACHMENT_SCHEME.len() + len;
+        let rest = start + ATTACHMENT_SCHEME.len();
+        from = rest;
+        let Some(string) = url_may_start(&text[..start], entities) else {
+            continue;
+        };
+        let exact = names
+            .iter()
+            .find_map(|name| written_name_len(&text[rest..], name, entities));
+        let len = match exact {
+            Some(len) => len,
+            None if string => unknown_name_len(&text[rest..], entities),
+            None => 0,
+        };
         if len > 0 {
-            urls.push(start..end);
+            urls.push(start..rest + len);
+            from = rest + len;
         }
-        from = end;
     }
     urls
 }
 
-/// Whether `c` ends an `attachment:` URL written in a script ([`script_urls`]): white space,
-/// the quotes that delimit a string, `<` and `>` (a tag written in a string), parentheses
-/// (a call, a CSS `url(…)`), `\` (an escape), and `&`, `,`, `;` (an entity such as
-/// `&quot;` in an `on…` attribute, an argument list, a statement).
-fn ends_script_url(c: char) -> bool {
-    c.is_ascii_whitespace()
+/// Whether a URL can start at the end of `before` ([`embedded_urls`]): `None` if not;
+/// `Some(true)` after a quote, `(` or `=` (a string, a CSS `url(`, an HTML attribute
+/// written in a string); `Some(false)` at the start of the text and after white space.
+/// With `entities`, the character before may be written as a character reference
+/// (`&quot;`).
+fn url_may_start(before: &str, entities: bool) -> Option<bool> {
+    let Some(mut last) = before.chars().next_back() else {
+        return Some(false);
+    };
+    if entities && last == ';' {
+        let reference = before.rfind('&').and_then(|amp| {
+            let (len, c) = char_reference(&before[amp..])?;
+            (amp + len == before.len()).then_some(c)
+        });
+        last = reference.unwrap_or(last);
+    }
+    match last {
+        '\'' | '"' | '`' | '(' | '=' => Some(true),
+        c if c.is_whitespace() => Some(false),
+        _ => None,
+    }
+}
+
+/// The length in `text` of the attachment `name` written at its start (as is, or with
+/// `entities` also with character references, `a&amp;b.png` for `a&b.png`), when the URL
+/// ends after it: at the end of `text`, an [`ends_embedded_url`] character, `?` or `#`.
+fn written_name_len(text: &str, name: &str, entities: bool) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut chars = chars_of(text, entities);
+    let mut len = 0;
+    for expected in name.chars() {
+        let (range, c) = chars.next()?;
+        if c != expected {
+            return None;
+        }
+        len = range.end;
+    }
+    match chars.next() {
+        Some((_, c)) if !(ends_embedded_url(c) || matches!(c, '?' | '#')) => None,
+        _ => Some(len),
+    }
+}
+
+/// The length in `text` of a name that is none of the cell's attachments
+/// ([`embedded_urls`]): up to the first [`ends_embedded_url`] character; 0 when that is
+/// the first one, or when the name starts with `${` (a template literal builds the URL).
+fn unknown_name_len(text: &str, entities: bool) -> usize {
+    let mut lead = chars_of(text, entities).map(|(_, c)| c);
+    if lead.next() == Some('$') && lead.next() == Some('{') {
+        return 0;
+    }
+    chars_of(text, entities)
+        .take_while(|(_, c)| !ends_embedded_url(*c))
+        .last()
+        .map_or(0, |(range, _)| range.end)
+}
+
+/// Whether `c` ends an `attachment:` URL written in a script or an attribute value
+/// ([`embedded_urls`]; character references already decoded): white space, the quotes
+/// that delimit a string, `<` and `>` (a tag written in a string), brackets (a call, a
+/// CSS `url(…)`, an array, an object), `\` (an escape), `,` and `;` (an argument list, a
+/// statement).
+fn ends_embedded_url(c: char) -> bool {
+    c.is_whitespace()
         || matches!(
             c,
-            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '\\' | '&' | ',' | ';'
+            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | ',' | ';'
         )
+}
+
+/// The characters of `text` with their byte ranges in it: as written, or with `entities`
+/// with each character reference (`&amp;`, `&#39;`, `&quot;`) read as the one character
+/// it encodes ([`char_reference`]).
+fn chars_of(text: &str, entities: bool) -> impl Iterator<Item = (Range<usize>, char)> + '_ {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        let c = text[at..].chars().next()?;
+        let start = at;
+        let reference = (entities && c == '&').then(|| char_reference(&text[at..]));
+        match reference.flatten() {
+            Some((len, decoded)) => {
+                at += len;
+                Some((start..at, decoded))
+            }
+            None => {
+                at += c.len_utf8();
+                Some((start..at, c))
+            }
+        }
+    })
+}
+
+/// The HTML character reference at the start of `text` (`&amp;`, `&#39;`, `&#x27;`; with
+/// its `;`, as [`html_escape::decode_html_entities`] decodes them) and the one character it
+/// encodes: its length and that character. `None` for anything else.
+fn char_reference(text: &str) -> Option<(usize, char)> {
+    if !text.starts_with('&') {
+        return None;
+    }
+    // The longest named reference, `&CounterClockwiseContourIntegral;`, has 33 bytes.
+    let semicolon = text.bytes().take(40).position(|b| b == b';')?;
+    let reference = &text[..=semicolon];
+    if reference[1..].contains('&') {
+        return None;
+    }
+    let decoded = html_escape::decode_html_entities(reference);
+    let mut chars = decoded.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if decoded != reference => Some((reference.len(), c)),
+        _ => None,
+    }
 }
 
 /// The byte ranges of the URLs of the CSS `url(…)` functions in `css` (a `style` attribute
@@ -1821,7 +1967,7 @@ mod tests {
 
         let html = "<p style=\"background:url(attachment:a.png)\" title=\"attachment:t\">\
                     <img alt=attachment:x SRC = attachment:b.png srcset='c.png 2x, d.png'>\
-                    <svg><image xlink:href=\"e.png\"/></svg>\
+                    <svg><image xlink:href=\"attachment:e.png\"/></svg><a href=e.png>\
                     <STYLE>.x { background: url(f.png) } <img src=no.png></style>\
                     <!-- <img src=no.png> --><script>'<img src=no.png>'</script>\
                     <code>&lt;img src=\"no.png\"&gt;</code><style>url(g.png)";
@@ -1832,7 +1978,7 @@ mod tests {
                 "attachment:b.png",
                 "c.png",
                 "d.png",
-                "e.png",
+                "attachment:e.png",
                 "f.png",
                 "g.png"
             ]
@@ -1868,8 +2014,103 @@ mod tests {
         );
         // Without the names, a name with a space ends at the space.
         let script = "x = 'attachment:my plot.png'";
-        assert_eq!(texts(script, script_urls(script, &[])), ["attachment:my"]);
-        assert!(script_urls("'attachment:' + name", &names).is_empty());
+        let urls = embedded_urls(script, &[], Written::Script);
+        assert_eq!(texts(script, urls), ["attachment:my"]);
+        assert!(embedded_urls("'attachment:' + name", &names, Written::Script).is_empty());
+    }
+
+    /// `attachment:` URLs inside a larger attribute value (`srcdoc`, a refresh, JSON) are
+    /// candidates; so are names written with character references in an attribute.
+    #[test]
+    fn attachment_urls_inside_other_attribute_values_are_candidates() {
+        let texts = |html: &str| -> Vec<String> {
+            let names = ["a&b.png", "a.png"];
+            let ranges = attachment_url_candidates(html, &names);
+            ranges.into_iter().map(|r| html[r].to_owned()).collect()
+        };
+        let html = "<iframe srcdoc=\"<img src='attachment:a.png'><p>attachment:a.png</p>\" \
+                    data-x='{\"img\":\"attachment:a.png\",\"n\":\"attachment:no.png\"}'>\
+                    </iframe><iframe srcdoc=\"<img src=&quot;attachment:a.png&quot; \
+                    srcset=&quot;attachment:a.png 1x, attachment:a&amp;b.png 2x&quot;>\">\
+                    </iframe><meta http-equiv=refresh content=\"0; url=attachment:a.png\">\
+                    <meta http-equiv=refresh content=\"0;URL='attachment:gone.png'\">";
+        // The `<p>` in the first `srcdoc` is text, not a URL.
+        assert_eq!(
+            texts(html),
+            [
+                "attachment:a.png",
+                "attachment:a.png",
+                "attachment:no.png",
+                "attachment:a.png",
+                "attachment:a.png",
+                "attachment:a&amp;b.png",
+                "attachment:a.png",
+                "attachment:gone.png",
+            ]
+        );
+        // `on…` attributes: names with character references, quotes written as references.
+        let html = "<b onclick=\"show('attachment:a&amp;b.png'); show(&#39;attachment:a&#x26;b.png&#39;); \
+                    show(&quot;attachment:no&amp;pe.png&quot;)\">";
+        assert_eq!(
+            texts(html),
+            [
+                "attachment:a&amp;b.png",
+                "attachment:a&#x26;b.png",
+                "attachment:no&amp;pe.png"
+            ]
+        );
+        // Not URLs: inside another URL or a word, and text in a value that names no
+        // attachment.
+        let html = "<a href=\"https://example.org/attachment:a.png\" \
+                    data-note=\"see attachment:notes, [attachment:x] {attachment:y}\">a</a>";
+        assert!(texts(html).is_empty(), "{:?}", texts(html));
+    }
+
+    /// Scripts that use the word `attachment:` without writing an attachment URL: object
+    /// keys (also one whose value is written like an attachment's name), comments,
+    /// template literals and string concatenation.
+    #[test]
+    fn script_code_that_is_not_an_attachment_url_is_no_candidate() {
+        let names = ["a&b.png", "a.png"];
+        let script = "var o = {attachment:true}; f({attachment:x}); g([attachment:z]);\n\
+                      var k = {attachment:a.png}, l = {n,attachment:a.png};\n\
+                      // TODO: see attachment:notes later\n\
+                      /* attachment:old.png */ var u = `attachment:${name}`;\n\
+                      var v = 'attachment:' + name, w = \"attachment:\" + other;";
+        for written in [Written::Script, Written::Attribute] {
+            let urls = embedded_urls(script, &names, written);
+            assert!(urls.is_empty(), "{written:?}: {urls:?}");
+        }
+        // An exact name resolves after white space too (a comment that names it is
+        // harmless); `&` is part of a name in a `<script>`, which decodes no references.
+        let script = "// shows attachment:a.png\nload('attachment:a&b.png', 'attachment:x&y.png')";
+        let urls = embedded_urls(script, &names, Written::Script);
+        let texts: Vec<&str> = urls.into_iter().map(|r| &script[r]).collect();
+        assert_eq!(
+            texts,
+            [
+                "attachment:a.png",
+                "attachment:a&b.png",
+                "attachment:x&y.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn character_references_decode_to_one_character() {
+        assert_eq!(char_reference("&amp;b"), Some((5, '&')));
+        assert_eq!(char_reference("&#39;"), Some((5, '\'')));
+        assert_eq!(char_reference("&#x27;x"), Some((6, '\'')));
+        assert_eq!(char_reference("&quot;"), Some((6, '"')));
+        assert_eq!(char_reference("&nope;"), None);
+        assert_eq!(char_reference("&amp"), None);
+        assert_eq!(char_reference("&a&amp;"), None);
+        assert_eq!(char_reference("x&amp;"), None);
+        let chars: Vec<char> = chars_of("a&amp;b&x", true).map(|(_, c)| c).collect();
+        assert_eq!(chars, ['a', '&', 'b', '&', 'x']);
+        let ranges: Vec<Range<usize>> = chars_of("&lt;é", true).map(|(r, _)| r).collect();
+        assert_eq!(ranges, [0..4, 4..6]);
+        assert_eq!(chars_of("a&amp;", false).count(), 6);
     }
 
     #[test]

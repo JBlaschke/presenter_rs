@@ -1590,10 +1590,17 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
                   <span data-preview-video=\"attachment:v.mp4\">play</span>\n\
                   <a data-preview-link=\"attachment:page.html\">page</a>\n\
                   <span data-preview-image=\"attachment:nope.png\">nope</span>\n\
-                  <button onclick=\"show('attachment:a+b.png')\">show</button>\n\n\
+                  <button onclick=\"show('attachment:a+b.png')\">show</button>\n\
+                  <button onclick=\"show('attachment:a&amp;b.gif')\">amp</button>\n\
+                  <iframe srcdoc=\"<img src='attachment:a+b.png'><p>attachment:a+b.png</p>\"></iframe>\n\
+                  <meta http-equiv=\"refresh\" content=\"30; url=attachment:page.html\">\n\
+                  <div data-cfg='{\"img\":\"attachment:a+b.png\"}'>cfg</div>\n\
+                  <a href=\"https://example.org/attachment:a+b.png\">elsewhere</a>\n\n\
                   <script>document.write('<img src=\"attachment:a+b.png\">');\n\
                   var plot = \"attachment:my plot.png?v=2\", other = 'attachment:a%2Bb.png';\n\
-                  var gone = 'attachment:gone.png', built = 'attachment:' + name;</script>\n\n\
+                  var gone = 'attachment:gone.png', built = 'attachment:' + name;\n\
+                  var o = {attachment:true}; f({attachment:x}); // see attachment:notes\n\
+                  var u = `attachment:${name}`;</script>\n\n\
                   Shown: `<span data-preview-image=\"attachment:a+b.png\">` and\n\n\
                   ```html\n<script>document.write('<img src=\"attachment:a+b.png\">')</script>\n```\n";
     let cell = json!({
@@ -1603,6 +1610,7 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
             "my plot.png": {"image/svg+xml": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>"},
             "v.mp4": {"video/mp4": "AAAAGGZ0eXBtcDQy"},
             "page.html": {"text/html": "PHA+cGFnZTwvcD4="},
+            "a&b.gif": {"image/gif": "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"},
         },
     });
     let parsed = inline(json!([cell]));
@@ -1611,11 +1619,12 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
         let asset = parsed.deck.assets.iter().find(|a| a.mime == mime);
         format!("asset:{}", asset.unwrap_or_else(|| panic!("{mime}")).id)
     };
-    let (png, svg, mp4, page) = (
+    let (png, svg, mp4, page, gif) = (
         id("image/png"),
         id("image/svg+xml"),
         id("video/mp4"),
         id("text/html"),
+        id("image/gif"),
     );
     for resolved in [
         format!("<img src=\"{png}\" data-preview-image=\"{png}\""),
@@ -1625,16 +1634,25 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
         format!("data-preview-link=\"{page}\""),
         "data-preview-image=\"attachment:nope.png\"".to_owned(),
         format!("onclick=\"show('{png}')\""),
+        format!("onclick=\"show('{gif}')\""),
+        // Inside other values: HTML in `srcdoc` (its text stays), a refresh, JSON.
+        format!("srcdoc=\"<img src='{png}'><p>attachment:a+b.png</p>\""),
+        format!("content=\"30; url={page}\""),
+        format!("data-cfg='{{\"img\":\"{png}\"}}'"),
+        "href=\"https://example.org/attachment:a+b.png\"".to_owned(),
         format!("document.write('<img src=\"{png}\">');"),
         format!("var plot = \"{svg}?v=2\", other = '{png}';"),
         "var gone = 'attachment:gone.png', built = 'attachment:' + name;".to_owned(),
+        // Script code that only uses the word: no URL, no warning.
+        "var o = {attachment:true}; f({attachment:x}); // see attachment:notes".to_owned(),
+        "var u = `attachment:${name}`;".to_owned(),
         "<code>&lt;span data-preview-image=&quot;attachment:a+b.png&quot;&gt;</code>".to_owned(),
         "&lt;script&gt;document.write('&lt;img src=\"attachment:a+b.png\"&gt;')&lt;/script&gt;"
             .to_owned(),
     ] {
         assert!(body.contains(&resolved), "{resolved} in {body}");
     }
-    assert_eq!(parsed.deck.assets.len(), 4);
+    assert_eq!(parsed.deck.assets.len(), 5);
     let messages: Vec<(&str, &str)> = parsed
         .diagnostics
         .iter()
@@ -1670,6 +1688,9 @@ fn attachment_urls_resolve_in_other_attributes_and_scripts() {
         "data-preview-video=\"data:video/mp4;base64,".to_owned(),
         format!("document.write('<img src=\"{png}\">');"),
         format!("show('{png}')"),
+        format!("srcdoc=\"<img src='{png}'>"),
+        format!("data-cfg='{{\"img\":\"{png}\"}}'"),
+        "show('data:image/gif;base64,".to_owned(),
     ] {
         assert!(built.contains(&inlined), "{inlined}");
     }
