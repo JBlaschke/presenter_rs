@@ -222,7 +222,56 @@ already right for reveal (`fragment`, `r-stack`, `r-fit-text`, …). We special-
 | `:::columns [widths="1fr 2fr"]` | `<div class="columns" [style="grid-template-columns: 1fr 2fr"]>` | layout is CSS grid in the default theme |
 | `:::column [width=…]` | `<div class="column">` | |
 | `:::center`, `:::small`, `:::large`, `:::note`, `:::warning` and any other name | `<div class="name args">` (default) | the default theme styles a documented subset |
-| `:::include path` | reserved; not implemented in this plan | `check` warns "unknown directive include" |
+| `:::include path` | replaced by the included file's slides (§4.1, T48) | must be the only content of its horizontal slide |
+
+### 4.1 Includes: composing a deck from several files (T48, contract change 2026-10-09)
+
+```markdown
+---
+title: Rust for data people
+---
+
+# Intro {layout=title}
+
+---
+
+:::include analysis.ipynb
+:::
+
+---
+
+:::include part2.md
+:::
+```
+
+- `:::include PATH` followed by a closing `:::` (the body must be empty) pulls in another source
+  file: a `.ipynb` notebook or a `.md` deck (by extension). `PATH` is relative to the directory of
+  the file that contains the directive (absolute paths work; no URLs). Quote it if it contains
+  spaces (`:::include "my talk/part 2.md"`).
+- **Boundaries are horizontal only.** The directive must be the only visible content of its
+  horizontal slide (between top-level separators, or in headings mode the only content of a slide;
+  HTML comments do not count). That slide is replaced, in place, by every top-level slide of the
+  included file, each with its own vertical children. Included slides are never merged with
+  Markdown content, and an include in a vertical slide (after `--`), inside another directive, a
+  list or a quote, or next to other content is a build error (`Error::Parse` at the directive's
+  line) — `check` reports it as an error too.
+- Slide attributes on the include slide (a `--- {…}` separator or a `<!-- .slide: -->` comment)
+  are ignored with a warning `include-attrs-ignored`; `:::notes` on the include slide likewise.
+- The included file is parsed as if it were built on its own, with the **including deck's
+  effective config**; its own front matter / notebook metadata config tables (`slides:`,
+  `markdown:`, `math:`, `notebook:`) still apply to its own parsing. Its deck metadata (`title`,
+  `subtitle`, `author`, `date`, `description`, `lang`, `theme`, `reveal`, `vars`) is discarded; a
+  warning `include-meta-ignored` names the keys it sets that differ from the including deck's.
+- Includes nest (a `.md` may include further files) up to depth 8; a cycle is a build error
+  naming the chain. Notebooks cannot include (a `:::include` in a notebook markdown cell is a
+  warning `include-in-notebook` and renders nothing). A missing or unreadable file is a build
+  error in every mode (like a parse error, not like a missing image).
+- Assets, features and diagnostics of included files are merged into the deck (asset ids are
+  collision-free across files). Diagnostics keep the included file's path; slides from an
+  included file record it in `SourceSpan.file` (ir.md §1), and `Deck.includes` lists every
+  included file (transitively, in first-use order) so `serve`/`build --watch` watch them.
+- `Slide.title`, ids, layouts etc. are whatever the included file produced. Duplicate slide ids
+  across files are reported by `check` like any duplicate.
 
 Directive `info` is split on whitespace; the first token is the name, remaining tokens are
 classes unless they contain `=`, in which case they are `key=value` args. Args that are
@@ -321,7 +370,8 @@ than the reveal-compat forms are passed through unchanged.
 ## 10. What `check` reports for Markdown (T34)
 - raw `---`/`--` lines that did not become separators (setext or indentation pitfalls);
 - empty slides; separator with attributes but unknown keys; unknown `layout=` (not present in
-  the theme chain's `layouts/`); missing images; `:::include`; duplicate slide ids. (`:::notes` at any
+  the theme chain's `layouts/`); missing images; duplicate slide ids; and the same lints for every
+  included file (§4.1). (`:::notes` at any
   depth, including inside fragments, is extracted by T12, so no lint is needed for it.)
 
 > **A3 note (2026-10-09):** the Markdown frontend's own warnings, which `check` reports with the

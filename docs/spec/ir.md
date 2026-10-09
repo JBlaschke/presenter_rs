@@ -26,6 +26,10 @@ pub struct Deck {
     pub source: SourceInfo,
     /// Summary of registered assets without their bytes (for `dump` and `check`).
     pub assets: Vec<AssetInfo>,
+    /// Files pulled in with `:::include` (markdown-dialect §4.1), transitively, absolute, in
+    /// first-use order. Serialized only when non-empty. (T48, contract change 2026-10-09)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -153,7 +157,10 @@ pub enum SourceKind { Markdown, Notebook }
 /// 1-based inclusive line range. For notebooks, lines are within the cell's source and
 /// `cell` is the cell index; for Markdown `cell` is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceSpan { pub start_line: usize, pub end_line: usize, pub cell: Option<usize> }
+pub struct SourceSpan { pub start_line: usize, pub end_line: usize, pub cell: Option<usize>,
+    /// The file the lines belong to when it is not the deck's own source (an included file,
+    /// markdown-dialect §4.1); absolute. Serialized only when set. (T48, 2026-10-09)
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub file: Option<PathBuf> }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetInfo {

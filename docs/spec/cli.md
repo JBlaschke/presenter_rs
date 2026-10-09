@@ -108,7 +108,8 @@ presenter dump --default-config
 presenter check <INPUT>... [--format text|json] [--deny-warnings]
 ```
 - Runs the frontend and the lints (markdown-dialect.md §10, notebook-mapping.md §4 notes,
-  theme-format.md layouts). Text format: `path:line: level: message`. Exit 0 with no
+  theme-format.md layouts), for the input and for every file it includes (markdown-dialect §4.1),
+  each reported with its own path. Text format: `path:line: level: message`. Exit 0 with no
   warnings, 0 with warnings unless `--deny-warnings` (then 1), 1 on errors.
 - `-q` hides warnings in the text format, except when `--deny-warnings` makes them fail the run:
   then they are printed, so the failure says why (audit F24). JSON always lists everything.

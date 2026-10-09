@@ -48,6 +48,7 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T45 | PDF export via headless Chrome | M4 | S | T16 | done |
 | T46 | User documentation | M4 | M | M1–M3 | done |
 | T47 | Release builds | M4 | S | T16 | done |
+| T48 | `:::include`: compose decks from Markdown and notebooks | M5 | M | all | in progress |
 
 ## Order of execution (suggested waves)
 

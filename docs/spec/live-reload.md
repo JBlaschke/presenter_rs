@@ -159,7 +159,7 @@ fullReload(): location.reload()      // reveal `hash: true` restores the slide f
 
 ## 5. Watch set (T20)
 Computed from each successful build (and from the failed attempt's inputs when parsing failed):
-the source file; `presenter.toml` if found; every theme directory in the chain
+the source file and every file in `Deck.includes` (markdown-dialect §4.1); `presenter.toml` if found; every theme directory in the chain
 (recursive); the parent directories of all file assets (non-recursive, per directory);
 `assets/themes/default/` when running a debug build (so working on the built-in theme
 live-reloads too). Debounce 150 ms (implemented by T20 directly on `notify` with its own coalescing thread: a batch goes out after 150 ms without a relevant event, capped at 2 s; `notify-debouncer-full` dropped events for rename-replace editors). Editors that write via rename
