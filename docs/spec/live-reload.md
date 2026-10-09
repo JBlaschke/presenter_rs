@@ -81,6 +81,14 @@ fullReload(): location.reload()      // reveal `hash: true` restores the slide f
 - Never throw out of an event handler; log to `console.debug` with prefix `[presenter]`.
 
 ## 4. Server lifecycle (T21/T23)
+- Requests whose `Host` header is not the address the server listens on, `localhost`, `127.0.0.1`
+  or `[::1]` (with the bound port) are rejected with 421/403, so a web page cannot read the deck
+  or theme files through DNS rebinding (audit F07). In serve mode, URLs of theme files referenced
+  from CSS or `asset()` carry a content version (`?v=…`) like deck assets, so an edited theme image
+  shows up after a css/content swap (audit F03).
+- Theme stylesheet compilation (SCSS) runs on a dedicated thread with a large stack and a time
+  limit; a runaway or deeply recursive stylesheet becomes an `Error::Style`, never a crash or a
+  wedged server (audit F02/F06).
 - State: `Arc<RwLock<ServeState { build_id, document: Option<String>, theme_css: String,
   assets: AssetRegistry, status: Status }>>` plus a `tokio::sync::broadcast::Sender<BuildEvent>`
   (capacity 64) that the SSE handler subscribes to.

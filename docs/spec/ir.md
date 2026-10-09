@@ -222,6 +222,9 @@ Placeholder grammar: `asset:` followed by exactly 12 `[0-9a-f]`. The emitter rep
 every occurrence inside attribute values of the rendered document (`src`, `href`,
 `data-background-image`, `data-background-video`, `poster`, `srcset`, inline `style`
 `url(...)`) and inside compiled CSS `url(...)`. Unresolvable placeholders are a build error.
+Text content is never rewritten: a literal `asset:<12 hex>` in prose or code is left alone
+(audit F16). In site mode the emitted file name uses a hash of the asset's **bytes**, not its
+id, so outputs do not depend on the checkout location (audit F20, PLAN goal 7).
 
 ## 4. Frontend interface (implemented by T12 and T31; called by T16's pipeline)
 

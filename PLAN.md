@@ -35,6 +35,7 @@ Verified facts used in this plan are dated 2026-10-08 (versions, APIs). See §9.
 6. **Fast iteration:** `presenter serve deck.md` rebuilds in well under a second for a
    typical deck and reports parse errors in the browser as an overlay.
 7. **Deterministic, testable builds:** same inputs → byte-identical output; snapshot tests.
+   (HTML builds. PDF export embeds Chrome's creation timestamps and is not byte-reproducible.)
 
 ### Decisions already taken
 - License: MIT (`LICENSE` in the repo root, copyright Johannes Blaschke). Vendored reveal.js and
