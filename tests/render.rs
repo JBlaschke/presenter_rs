@@ -743,7 +743,8 @@ fn theme_stylesheet_errors() {
     let scss = disk_theme(
         &tmp.path().join("scss"),
         "name = \"scss\"\nextends = \"default\"\n[styles]\nentries = [\"styles/x.scss\"]\n",
-        &[("styles/x.scss", b"$a: 1;")],
+        // SCSS compiles since T42 (tests/styles.rs); a Sass error is an Error::Style.
+        &[("styles/x.scss", b"$a: 1;\na { b: $nope; }")],
     );
     let err = try_render_with(
         &sample_deck(),
@@ -753,7 +754,7 @@ fn theme_stylesheet_errors() {
     )
     .unwrap_err();
     assert!(
-        matches!(&err, Error::Style { file, message } if file == "@scss/styles/x.scss" && message.contains("SCSS support arrives in T42")),
+        matches!(&err, Error::Style { file, message } if file == "@scss/styles/x.scss" && message.starts_with("line 2, column ") && message.contains("Undefined variable")),
         "{err:?}"
     );
     let missing = disk_theme(

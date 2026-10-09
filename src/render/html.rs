@@ -44,7 +44,8 @@
 //! Fonts (vendored-assets.md §2 says their fonts are inlined; they are not). The import is
 //! kept (the theme's fonts load when online; offline the browser skips it) and a
 //! `remote-import` warning names the stylesheet and the URL. Site and serve output load
-//! such imports too, without a warning.
+//! such imports too, without a warning. In the theme stylesheet, imports of relative URLs
+//! are inlined and the absolute ones moved to its top (T42, `render::styles`).
 //!
 //! **Filters.** `attrs` renders a map as ` k="v"` pairs (escaped; `none` values skipped);
 //! `markdown` renders a string with the Markdown frontend's
@@ -102,7 +103,8 @@ pub const SERVE_LIVE_RELOAD_JS: &str = "/__presenter/live-reload.js";
 /// Errors: template errors ([`Error::Template`], with the source excerpt in serve mode), a
 /// helper path that resolves to nothing or a stylesheet `url()` that does (an
 /// [`Error::Template`] naming the path and the template), theme stylesheets
-/// ([`Error::Style`]: SCSS before T42, an unresolvable `url()`), theme manifest entries
+/// ([`Error::Style`]: a Sass error, a local `@import` that cannot be inlined, an
+/// unresolvable `url()`), theme manifest entries
 /// ([`Error::Theme`]) and placeholders naming unregistered assets.
 pub fn render(input: RenderInput<'_>) -> Result<RenderedDocument> {
     let mut diagnostics = Diagnostics::new();

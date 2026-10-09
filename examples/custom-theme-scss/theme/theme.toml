@@ -1,0 +1,13 @@
+# A child theme written in SCSS (docs/spec/theme-format.md §5; README.md next to slides.md).
+# It keeps the default theme's templates, layouts and rules, and replaces the stock reveal
+# theme with one derived from reveal.js's own theme template, as reveal's stock themes are.
+name = "midnight"
+extends = "default"
+description = "Dark theme in SCSS, derived from reveal.js's theme template"
+
+[styles]
+# Compiled with grass after the default theme's styles/theme.css (parent entries first).
+entries = ["styles/theme.scss"]
+# No stock reveal theme CSS: styles/theme.scss builds the whole reveal theme itself.
+reveal_theme = "none"
+highlight_style = "zenburn"

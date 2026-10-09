@@ -1,0 +1,12 @@
+// The colours of the theme, as a module: `@use "palette"` in theme.scss finds this partial
+// (`_palette.scss`) next to it.
+
+@use "sass:color";
+
+$night: #0b1021;
+$ink: #e6e6e6;
+$amber: #ffb454;
+$sky: #7fd1ff;
+
+// Slightly lighter than the background: code blocks, table stripes.
+$surface: color.scale($night, $lightness: 8%);

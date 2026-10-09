@@ -14,8 +14,14 @@
 //!   theme's own `assets/vendor/…` file wins); every reference must resolve. A chain hit is
 //!   named by its theme-root helper path `@<theme>/assets/<rel>`, which names that one file
 //!   whatever `rel` starts with (as a helper path, `vendor/x.png` alone names the embedded
-//!   tree). The theme stylesheet is processed by the renderer in every mode, so the fallback
-//!   works in serve mode too;
+//!   tree). Last of all, a `reveal/…` or `fonts/…` `rel` names reveal.js's theme sources
+//!   ([`reveal_fallback`], T42). The theme stylesheet is processed by the renderer in every
+//!   mode, so the fallback works in serve mode too;
+//! - a stylesheet inlined by a local `@import` of an entry (T42,
+//!   [`crate::theme::styles::inline_imports`]): against its own helper path; a theme file
+//!   with the rules of an entry, an embedded file (reveal's font CSS, KaTeX's CSS) leniently
+//!   like `style()` of a vendor stylesheet. Each stylesheet's own text is processed once,
+//!   before anything is spliced into it, so what a lenient file leaves as written stays so;
 //! - `style(path)` of a theme file (`@<theme>/…` or the `assets/` form): next to the
 //!   stylesheet only, as a browser resolves it; every reference must resolve (checked in
 //!   serve mode too, although the browser loads the files there);
@@ -47,6 +53,7 @@ use crate::assets::emit::register_css_urls;
 use crate::assets::registry::{AssetData, AssetRegistry};
 use crate::error::{Error, Result};
 use crate::theme::Theme;
+use crate::theme::styles::{compile_entry, inline_imports, reveal_fallback};
 
 /// How the relative `url()`s of one stylesheet are resolved (see the module docs).
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +76,17 @@ impl UrlRules {
         UrlRules {
             lenient: is_builtin(key),
             assets_fallback: false,
+        }
+    }
+
+    /// The rules for the stylesheet `key` of a theme entry's text (T42): the entry's own
+    /// and those of a theme file it imports are [`UrlRules::THEME_ENTRY`], an embedded
+    /// file's (imported) are those of `style(key)` (lenient).
+    fn for_entry_text(key: &str) -> UrlRules {
+        if is_builtin(key) {
+            UrlRules::for_style(key)
+        } else {
+            UrlRules::THEME_ENTRY
         }
     }
 
@@ -102,62 +120,69 @@ impl Targets<'_> {
 /// `assets/` directories (see the module docs), registered in `registry` as bytes and
 /// rewritten to `asset:<id>` placeholders (the caller resolves them for its output mode).
 ///
+/// Each entry is first compiled by [`crate::theme::styles::compile_entry`] (`.css` as
+/// written, `.scss`/`.sass` with grass, T42), then its local `@import`s are inlined
+/// ([`crate::theme::styles::inline_imports`]); the `url()`s of each stylesheet's own text
+/// are resolved against its own helper path before anything is spliced into it (the entry
+/// and theme files with the rules of an entry, embedded files leniently, like `style()` of
+/// a vendor stylesheet).
+///
 /// Errors: [`Error::Style`] (`file` = the entry as a normalized helper path,
-/// `@<theme>/<path>`) for a `.scss`/`.sass` entry ("SCSS support arrives in T42"), another
-/// extension, a file that is not UTF-8 or a `url()` that resolves to nothing;
-/// [`Error::Theme`] for an entry that does not exist.
+/// `@<theme>/<path>`, or for a Sass error the file it is in) for another extension, a file
+/// that is not UTF-8, a Sass error, a local `@import` that cannot be inlined or a `url()`
+/// that resolves to nothing; [`Error::Theme`] for an entry that does not exist.
 pub fn compile_theme_css(theme: &Theme, registry: &mut AssetRegistry) -> Result<String> {
     compile(theme, Targets::Placeholders(registry), &mut Vec::new())
 }
 
 /// [`compile_theme_css`] with the `url()`s turned into `targets`. Every absolute `@import`
-/// of an entry ([`remote_imports`]) is appended to `remote` as `(entry key, URL)`.
+/// of an entry or of a stylesheet inlined into it ([`remote_imports`]) is appended to
+/// `remote` as `(entry key, URL)`.
+///
+/// The top-level `@import` rules left after inlining (absolute URLs,
+/// [`crate::theme::styles::Inlined::imports`]) are moved to the top of the stylesheet, in
+/// entry order, each after a `/* hoisted from <stylesheet> */` comment naming the file
+/// that has it (T42; the entries keep their own `/* <entry key> */` comments): CSS ignores
+/// an `@import` that follows other rules, as every import of an entry after the first, or
+/// of an inlined file, would otherwise do. A rule from a file inlined by an import with
+/// media queries carries them.
 pub(super) fn compile(
     theme: &Theme,
     mut targets: Targets<'_>,
     remote: &mut Vec<(String, String)>,
 ) -> Result<String> {
     let mut css = String::new();
+    let mut imports = Vec::new();
     for entry in theme.style_entries()? {
         let written = format!("@{}/{}", entry.theme, entry.rel_path);
         // Normalized like every helper path, so a `\`-separated entry joins correctly.
         let key = normalize_helper_path(&written).unwrap_or(written);
-        let text = entry_text(&key, &entry.rel_path, entry.bytes)?;
-        remote.extend(
-            remote_imports(&text)
-                .into_iter()
-                .map(|url| (key.clone(), url)),
-        );
-        let text = rewrite_urls(
-            theme,
-            &key,
-            &text,
-            UrlRules::THEME_ENTRY,
-            targets.reborrow(),
-        )?;
+        let text = compile_entry(&entry, theme)?;
+        let inlined = inline_imports(theme, &key, &text, &mut |file, css| {
+            let rules = UrlRules::for_entry_text(file);
+            rewrite_urls(theme, file, &css, rules, targets.reborrow())
+        })?;
+        let rules = inlined.imports.iter().map(|(_, rule)| rule.as_str());
+        for text in rules.chain([inlined.css.as_str()]) {
+            remote.extend(
+                remote_imports(text)
+                    .into_iter()
+                    .map(|url| (key.clone(), url)),
+            );
+        }
+        // The imports taken out go first: after other rules CSS ignores them.
+        imports.extend(inlined.imports);
         let _ = writeln!(css, "/* {key} */");
-        css.push_str(&text);
+        css.push_str(&inlined.css);
         if !css.ends_with('\n') {
             css.push('\n');
         }
     }
-    Ok(css)
-}
-
-/// The text of the theme stylesheet entry `key` (written as `rel_path` in its manifest).
-fn entry_text(key: &str, rel_path: &str, bytes: Vec<u8>) -> Result<String> {
-    let style_error = |message: String| Error::Style {
-        file: key.to_string(),
-        message,
-    };
-    let lower = rel_path.to_ascii_lowercase();
-    if lower.ends_with(".scss") || lower.ends_with(".sass") {
-        return Err(style_error("SCSS support arrives in T42".into()));
+    let mut head = String::new();
+    for (file, rule) in imports {
+        let _ = writeln!(head, "/* hoisted from {file} */\n{rule}");
     }
-    if !lower.ends_with(".css") {
-        return Err(style_error("a style entry must be a .css file".into()));
-    }
-    decode_text(bytes).map_err(|e| style_error(format!("not valid UTF-8: {e}")))
+    Ok(head + &css)
 }
 
 /// `bytes` as UTF-8 text without a leading byte order mark (see the module docs).
@@ -191,7 +216,21 @@ pub(super) fn rewrite_urls(
         Targets::Placeholders(registry) => {
             let mut fetch =
                 |path: &str| Ok(resolve_helper_path(theme, path)?.map(|(bytes, _)| bytes));
-            register_urls(lookup, css, registry, &mut fetch)
+            // Registered in a scratch registry first, then moved into `registry` with the
+            // standard font MIME types (T42; ids hash the bytes only, so the placeholders
+            // stay valid).
+            let mut found = AssetRegistry::new();
+            let css = register_urls(lookup, css, &mut found, &mut fetch)?;
+            for asset in found.iter() {
+                match &asset.data {
+                    AssetData::Bytes(bytes) => {
+                        let mime = standard_font_mime(&asset.mime);
+                        registry.register_bytes(bytes.clone(), mime, &asset.file_name_hint)
+                    }
+                    AssetData::File(path) => registry.register_file(path),
+                };
+            }
+            Ok(css)
         }
         Targets::ServeUrls => {
             // A scratch registry is the id → helper path table: each target is registered
@@ -209,6 +248,18 @@ pub(super) fn rewrite_urls(
             }
             Ok(css)
         }
+    }
+}
+
+/// The RFC 8081 type for the legacy font MIME types `mime_guess` reports
+/// (`application/font-woff` for `.woff`, `application/font-sfnt` for `.otf`), so inlined
+/// reveal.js theme fonts are `data:font/woff` like in reveal's own `dist/theme/*.css`
+/// (vendored-assets.md §2); any other type unchanged.
+fn standard_font_mime(mime: &str) -> &str {
+    match mime {
+        "application/font-woff" => "font/woff",
+        "application/font-sfnt" => "font/otf",
+        other => other,
     }
 }
 
@@ -238,11 +289,13 @@ impl Lookup<'_> {
             .flatten();
         if let Some(rel) = fallback {
             let builtin = is_builtin(&rel).then(|| rel.clone());
+            // `reveal/…` and `fonts/…` among reveal.js's theme sources (T42).
+            let reveal = reveal_fallback(&rel);
             let chain = self
                 .chain
                 .iter()
                 .map(|name| format!("@{name}/assets/{rel}"));
-            for path in chain.chain(builtin) {
+            for path in chain.chain(builtin).chain(reveal) {
                 if !paths.contains(&path) {
                     paths.push(path);
                 }
@@ -257,6 +310,8 @@ impl Lookup<'_> {
             ""
         } else if normalize_helper_path(rel).is_some_and(|rel| is_builtin(&rel)) {
             ", in the theme chain's assets/ directories or among the built-in files"
+        } else if reveal_fallback(rel).is_some() {
+            ", in the theme chain's assets/ directories or among reveal.js's theme sources"
         } else {
             " or in the theme chain's assets/ directories"
         }
@@ -341,6 +396,14 @@ a { background: url(https://x.example/not-an-import.png) }"#;
     }
 
     #[test]
+    fn legacy_font_mime_types_are_standardized() {
+        assert_eq!(standard_font_mime("application/font-woff"), "font/woff");
+        assert_eq!(standard_font_mime("application/font-sfnt"), "font/otf");
+        assert_eq!(standard_font_mime("font/woff2"), "font/woff2");
+        assert_eq!(standard_font_mime("image/png"), "image/png");
+    }
+
+    #[test]
     fn decode_text_drops_one_leading_bom() {
         assert_eq!(decode_text(b"\xEF\xBB\xBFa{}".to_vec()).unwrap(), "a{}");
         assert_eq!(
@@ -403,6 +466,27 @@ a { background: url(https://x.example/not-an-import.png) }"#;
                 "@t/assets/@u/x.png",
                 "@default/assets/@u/x.png"
             ]
+        );
+        // T42: `reveal/…` and `fonts/…` finally name reveal.js's theme sources.
+        assert_eq!(
+            entry.candidates("./fonts/a/a.woff"),
+            [
+                "@t/styles/fonts/a/a.woff",
+                "@t/assets/fonts/a/a.woff",
+                "@default/assets/fonts/a/a.woff",
+                "vendor/reveal/css/theme/fonts/a/a.woff"
+            ]
+        );
+        assert_eq!(
+            entry
+                .candidates("reveal/theme/fonts/a/a.woff")
+                .last()
+                .unwrap(),
+            "vendor/reveal/css/theme/fonts/a/a.woff"
+        );
+        assert_eq!(
+            entry.looked_in("fonts/a.woff"),
+            ", in the theme chain's assets/ directories or among reveal.js's theme sources"
         );
         // A `rel` that climbs out of its root has no fallback; duplicates are dropped.
         assert_eq!(entry.candidates("../x.png"), ["@t/x.png"]);

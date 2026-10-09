@@ -46,6 +46,8 @@ regex = "1"
 walkdir = "2"
 open = "5"
 lol_html = "3"
+grass = { version = "0.13", default-features = false }
+codemap = "0.1"
 
 [dev-dependencies]
 insta = { version = "1.49", features = ["json", "filters", "redactions"] }

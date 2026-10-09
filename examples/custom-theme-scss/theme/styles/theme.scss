@@ -1,0 +1,76 @@
+// "midnight": a dark theme derived from reveal.js's theme template, exactly like reveal's
+// stock themes (vendor/reveal/css/theme/white.scss and friends) are. `reveal/…` names
+// reveal.js's Sass sources, which presenter ships; see the theme README's SCSS section.
+
+@use "sass:color";
+@use "palette" as p;
+
+// reveal's theme settings: every variable is exposed as a --r-* custom property.
+@use "reveal/theme/template/settings" with (
+  $background-color: p.$night,
+  $main-color: p.$ink,
+  $main-font: "'Source Sans Pro', Helvetica, sans-serif",
+  $main-font-size: 36px,
+  $heading-color: #ffffff,
+  $heading-font: "Georgia, serif",
+  $heading-font-weight: 700,
+  $heading-text-transform: none,
+  $heading1-size: 2.2em,
+  $heading2-size: 1.45em,
+  $heading3-size: 1.15em,
+  $code-font: "ui-monospace, 'SF Mono', Menlo, Consolas, monospace",
+  $link-color: p.$amber,
+  $link-color-hover: color.scale(p.$amber, $lightness: 25%),
+  $selection-background-color: p.$amber,
+  $selection-color: p.$night
+);
+
+// reveal's theme rules (they read the --r-* properties above).
+@use "reveal/theme/template/theme";
+@use "reveal/theme/template/mixins";
+
+// reveal's Source Sans Pro, vendored with presenter: the import is inlined, and the fonts
+// become data: URIs in a standalone build (no network needed).
+@import url("reveal/theme/fonts/source-sans-pro/source-sans-pro.css");
+
+// Text on slides with a light `background=` stays readable.
+@include mixins.light-bg-text-color(p.$night);
+
+// The default theme's tokens follow the palette.
+:root {
+  --p-accent: #{p.$amber};
+  --p-on-accent: #{p.$night};
+  --p-code-bg: #{p.$surface};
+  --p-surface: #{color.change(p.$sky, $alpha: 0.08)};
+}
+
+.reveal h1,
+.reveal h2 {
+  letter-spacing: -0.01em;
+}
+
+// Inline code in the palette's sky blue (but not on light slides).
+.reveal :not(pre) > code {
+  color: p.$sky;
+}
+
+.reveal section.has-light-background :not(pre) > code {
+  color: inherit;
+}
+
+// reveal's template centres code blocks and quotes at 90% and 70% of the width; keep the
+// default theme's left-aligned ones.
+.reveal pre,
+.reveal blockquote {
+  width: auto;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.reveal strong {
+  color: p.$amber;
+}
+
+.reveal blockquote {
+  border-left-color: p.$sky;
+}
