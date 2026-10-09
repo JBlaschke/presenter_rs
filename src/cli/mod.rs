@@ -292,11 +292,15 @@ pub struct ThemeCheckArgs {
     pub dir: PathBuf,
 }
 
-/// `presenter dump`.
+/// `presenter dump`. INPUT is optional only with `--default-config`, which takes no deck.
 #[derive(Debug, Clone, Args)]
+#[command(
+    override_usage = "presenter dump [OPTIONS] <INPUT>\n       presenter dump --default-config"
+)]
 pub struct DumpArgs {
     /// The deck: a .md or .ipynb file
-    pub input: PathBuf,
+    #[arg(required_unless_present = "default_config")]
+    pub input: Option<PathBuf>,
     /// Print the template context (theme resolved) instead of the deck IR
     #[arg(long)]
     pub context: bool,
@@ -309,6 +313,12 @@ pub struct DumpArgs {
     /// Print the JSON on one line
     #[arg(long, conflicts_with = "pretty")]
     pub compact: bool,
+    /// Print every presenter.toml setting with its default, commented out, instead (no INPUT)
+    #[arg(
+        long,
+        conflicts_with_all = ["input", "context", "theme", "pretty", "compact"]
+    )]
+    pub default_config: bool,
 }
 
 /// `check --format`.
