@@ -51,8 +51,8 @@ codemap = "0.1"
 
 [features]
 # Opt-in headless-browser smoke tests (T24): `cargo test --features browser-tests --test browser`.
-# They drive Chrome with presenter's own DevTools client (`presenter::pdf::devtools`, the
-# PDF export's machinery), so the feature adds no dependency.
+# They drive Chrome with presenter's own DevTools client, the PDF export's machinery; the
+# feature only compiles `presenter::pdf::devtools`, which exposes it, and adds no dependency.
 browser-tests = []
 
 [dev-dependencies]

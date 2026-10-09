@@ -70,9 +70,11 @@
 //!
 //! # Other uses
 //!
-//! [`devtools::Page`] starts Chrome the same way and opens one page to navigate and
-//! evaluate JavaScript in (the headless-browser smoke tests, `tests/browser.rs`, use it).
+//! With the `browser-tests` feature, `devtools::Page` starts Chrome the same way and opens
+//! one page to navigate and evaluate JavaScript in (the headless-browser smoke tests,
+//! `tests/browser.rs`, use it). Without that feature the module is not compiled.
 
+#[cfg(feature = "browser-tests")]
 pub mod devtools;
 
 use std::collections::VecDeque;
@@ -842,13 +844,24 @@ fn string_field(result: &Value, field: &str) -> std::result::Result<String, Fail
         .ok_or_else(|| Failure::Other(format!("DevTools reply without {field}: {result}")))
 }
 
-/// A `Runtime.ExceptionDetails` as one line.
+/// A `Runtime.ExceptionDetails` as one line: the exception's description (for an `Error`,
+/// the first line of its stack: `TypeError: …`), or for a thrown value without one, like
+/// `throw 'boom'`, Chrome's text and the value (`Uncaught boom`), else Chrome's text.
 fn exception_text(details: &Value) -> String {
-    let text = details["exception"]["description"]
-        .as_str()
-        .or_else(|| details["text"].as_str())
-        .unwrap_or("unknown error");
-    text.lines().next().unwrap_or(text).to_string()
+    let exception = &details["exception"];
+    let text = details["text"].as_str();
+    let text = match (exception["description"].as_str(), exception.get("value")) {
+        (Some(description), _) => description.to_string(),
+        (None, Some(value)) => {
+            let value = match value {
+                Value::String(value) => value.clone(),
+                other => other.to_string(),
+            };
+            format!("{} {value}", text.unwrap_or("Uncaught"))
+        }
+        (None, None) => text.unwrap_or("unknown error").to_string(),
+    };
+    text.lines().next().unwrap_or("").to_string()
 }
 
 /// The time left until `deadline`; `None` when it has passed.
@@ -893,7 +906,8 @@ struct Cdp<'a> {
     stage: &'static str,
     /// Whether `Page.loadEventFired` arrived since `loaded` was last reset.
     loaded: bool,
-    /// The page's uncaught exceptions, `console.error` messages and dismissed dialogs.
+    /// The page's uncaught exceptions, `console.error` messages, dismissed dialogs and
+    /// `error` entries of the `Log` domain (only `devtools::Page` enables that domain).
     page_errors: Vec<String>,
 }
 
@@ -1044,7 +1058,7 @@ impl<'a> Cdp<'a> {
                     self.page_errors.push(format!("console.error: {text}"));
                 }
             }
-            // Only with `Log.enable`, which [`devtools::Page`] sends (the export does not).
+            // Only with `Log.enable`, which `devtools::Page` sends (the export does not).
             Some("Log.entryAdded") => {
                 let entry = &params["entry"];
                 let text = entry["text"].as_str().unwrap_or("");
@@ -2311,5 +2325,35 @@ mod tests {
             err.to_string(),
             "cannot start /nonexistent/chrome: not an executable file"
         );
+    }
+
+    #[test]
+    fn exceptions_read_as_their_description_or_the_thrown_value() {
+        let error = json!({
+            "text": "Uncaught",
+            "exception": {
+                "type": "object", "subtype": "error", "className": "TypeError",
+                "description": "TypeError: x is null\n    at <anonymous>:1:1",
+            },
+        });
+        assert_eq!(exception_text(&error), "TypeError: x is null");
+        let string = json!({
+            "text": "Uncaught",
+            "exception": { "type": "string", "value": "boom\nsecond line" },
+        });
+        assert_eq!(exception_text(&string), "Uncaught boom");
+        let rejected = json!({
+            "text": "Uncaught (in promise)",
+            "exception": { "type": "object", "subtype": "null", "value": null },
+        });
+        assert_eq!(exception_text(&rejected), "Uncaught (in promise) null");
+        let number = json!({
+            "text": "Uncaught",
+            "exception": { "type": "number", "value": 3, "description": "3" },
+        });
+        assert_eq!(exception_text(&number), "3");
+        let undefined = json!({ "text": "Uncaught", "exception": { "type": "undefined" } });
+        assert_eq!(exception_text(&undefined), "Uncaught");
+        assert_eq!(exception_text(&json!({})), "unknown error");
     }
 }

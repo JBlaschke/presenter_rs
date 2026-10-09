@@ -54,8 +54,9 @@ jobs:
         run: cargo test --release
 
   # Opt-in headless-browser smoke tests (T24, tests/browser.rs): the example deck runs in
-  # Chrome (reveal.js ready, KaTeX and highlight.js ran, no console errors) and `serve`
-  # swaps the theme stylesheet without a reload. The runner image ships Google Chrome;
+  # Chrome (reveal.js ready, KaTeX and highlight.js ran, it steps through every slide, no
+  # console errors) and `serve` swaps the theme stylesheet without a reload, and reloads
+  # once when the page changes outside the slides. The runner image ships Google Chrome;
   # PRESENTER_REQUIRE_CHROME turns a missing browser into a failure instead of a skip.
   # Allowed to fail while the job settles in (first week; then drop continue-on-error).
   browser:
@@ -70,6 +71,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: browser version
         run: google-chrome --version || chromium --version || true
+      - name: unit tests of the DevTools page (compiled only with the feature)
+        run: cargo test --features browser-tests --lib pdf::devtools
       - name: cargo test --features browser-tests --test browser
         run: cargo test --features browser-tests --test browser -- --nocapture
 
