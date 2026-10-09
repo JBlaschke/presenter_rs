@@ -118,6 +118,132 @@ Item 24 needs the mock, which can fail `GET /` on purpose.
 
 ## Results
 
+### 2026-10-09: `presenter serve` (T23), real server, second run (review fixes)
+
+Every item but 24 against the real dev server; together with the first run below, the whole
+checklist except item 24 has now been run against `presenter serve`. Environment as in the
+first run (macOS 26.7, Google Chrome 154.0.8037.98 headless over the DevTools protocol,
+Node 26.10.0), a debug build of `presenter` from the T23 branch after the review fixes (bind
+probe, Ctrl-C handler installed before the first build, one-pass `?v=` versioning of deck
+assets), and the same 7959-byte `live-reload.js` (sha256 `3bdbe117eaf46889…`).
+
+Method: two Node drivers built on the connection code of the coordinator's CDP helper
+(`cdp.mjs`), each on a fresh scratch copy of `examples/basic` with the default theme
+ejected into it (as in the first run). Each edits the copy's files, polls
+`/__presenter/state` until the build is there, then waits until the client's
+`__presenterLiveReload.state.buildId` matches. `window.__qaMarker` and the count of
+`Page.loadEventFired` events tell swaps from reloads.
+- The first run's driver again (items 1, 3, 4, 7, 8, 9, 10, 19, 22, 26 and the image edit):
+  30 of 30 checks passed.
+- A second driver for the other items: 35 of 35 checks passed. The browser reached the server
+  through a TCP proxy in the driver that can drop every connection for 300 ms. That gives a
+  reconnect with the same build id without restarting the server, which is what the mock's
+  `/__mock/down` does. For items 17 and 20, the server process was stopped with Ctrl-C and
+  started again on the same port instead. Setup:
+  - for item 2, `theme/assets/extra.css`, linked with `{{ style("extra.css") }}` in the
+    copy's `deck.html`;
+  - for item 21, besides a raw `<script>` in `slides.md`, a notebook whose second slide has
+    a `display_data` `text/html` output with a `<script>`, served by a second
+    `presenter serve talk.ipynb --port 0`.
+
+| # | step | result | evidence |
+|---|---|---|---|
+| 2 | `extra.css` (a theme-chain stylesheet) edited | pass | stderr `(css)`; its link `/__presenter/asset/extra.css` → `?v=2` and the new rule applied; marker kept; the only requests were `theme.css?v=2` and `extra.css?v=2`, none under `vendor/` |
+| 5 | on `#/stack-child` (`{h:2,v:1}`), a slide inserted before the stack | pass | in place; still the `stack-child` slide, now `{h:3,v:1}`; hash `#/stack-child` 1.3 s later |
+| 5 | on the Math slide (no id, h=7), a slide inserted before slide 2 | pass | in place; h=7 kept, which now shows "Code with line stepping" (as a reload of `#/7` would) |
+| 6 | on the last slide (h=14), that slide removed | pass | in place; `{h:13}` |
+| 6 | on the bottom of the vertical stack (`{h:2,v:2}`), that slide removed | pass | in place; `{h:2,v:1}` |
+| 11 | on the stepped code slide at step 0 (`{h:5,f:0}`), the paragraph below the code edited | pass | in place; `f:0` kept; the `<pre>` HTML (6713 chars: 3 `.hljs`, 3 line-number tables, 1 `current-fragment`) identical before and after; edit shown (screenshot) |
+| 12 | `$x^2$` added to the math slide | pass | in place; `.katex` in the slide 4 → 5 |
+| 13 | front matter `title` changed | pass | `document.title` "Presenter basics" → "Presenter basics (QA)" with no reload |
+| 14 | slide edited in overview mode, paused | pass | `isOverview()` and `isPaused()` still true, marker kept, edit in the slides (screenshot: the pause screen) |
+| 15 | a `--- {visibility=hidden}` slide added | pass | `GET /` has `data-visibility="hidden"`; after the swap no such element and no text of it in the page; 17 slides before and after |
+| 16 | 5 edits 200 ms apart: theme CSS, `slides.md`, CSS, `slides.md`, CSS | pass | 4 builds (two edits merged into one rebuild: `css`, `content`, `content`, `css`); final heading `Math b2`, last CSS rule applied, one `#presenter-theme` with `?v=<last build>`; no reload |
+| 23 | parse error, overlay dismissed, then a reconnect while the same build fails | pass | overlay `build error (parse)` / `slides.md:192: unbalanced " quote …` / `slides.md:192` / `(click to dismiss)`; after the reconnect still hidden, same text, one overlay; no request besides the event stream; no reload |
+| 18 | `reveal_theme` `white` → `black` in `theme.toml` | pass | exactly one reload; `black.css` linked and `white.css` gone (screenshot); same slide and fragment (`{h:3,f:3}`); back to `white`: one reload |
+| 19 | `body_end` markup added to `deck.html` | pass | one reload, footer shown |
+| 27 | with that `body_end` markup: a slide edit, then a reconnect | pass | both in place (marker kept, the current slide a new element) |
+| 27 | `{{ live_reload() }}` moved before reveal's `<script>` in `partials/scripts.html` | pass | one reload, the client's script now first; then a slide edit and a reconnect both in place (screenshot) |
+| 28 | `theme.toml [scripts] entries = ["scripts/added.js"]`, a script that appends an `<aside>` to `<body>` in `Reveal.on('ready', …)` and a `<div>` on `DOMContentLoaded` | pass | one reload, both elements present (1 each); a slide edit and a reconnect in place, the elements kept (1 each); then `body_start` markup added: one reload, shown, elements present again (screenshot) |
+| 21 | a slide with `<div id="qa-widget">` and a `<script>` that fills it, added to `slides.md` | pass | one reload, `widget ran`; a text edit elsewhere (the script unchanged): one reload again, `widget ran`; removing that slide again was swapped in place |
+| 21 | notebook: the markdown cell of the slide with the HTML output edited | pass | `widget ran` on load; one reload, the edit shown, `widget ran` again (screenshot) |
+| 25 | page opened with `?view=scroll#/1`, a slide edited | pass | scroll view; one reload, edit shown, still the scroll view (screenshot) |
+| 17 | Ctrl-C to the server (exit 0), `slides.md` edited, server started again on the same port | pass | one reload when the client reconnected (`hello` build 1), the edit shown, same slide (`{h:3}`) |
+| 20 | speaker view opened (`Reveal.getPlugin('notes').open()`), then the restart of item 17 | pass | the speaker window ("reveal.js - Speaker View") had two deck frames (`?receiver&…&postMessageEvents=true` and `…&controls=false`), both connected; after the restart both had reloaded (markers gone), were on build 1 and showed the edit |
+| 26 | console of the main page during the whole run | pass | no uncaught exceptions; besides `[presenter]` lines only Chrome's `net::ERR_INCOMPLETE_CHUNKED_ENCODING` and `net::ERR_EMPTY_RESPONSE` for `/__presenter/events` when the proxy dropped the connections or the server was down. The speaker window's console was not recorded |
+
+Not run against the real server: item 24 (`GET /` failing during a content build), which
+needs the mock's `/__mock/failroot`.
+
+Also observed:
+- A theme image referenced from a template with `asset()`: the default theme's title-slide
+  logo (`logo: logo.svg` in the front matter, `theme/assets/logo.svg`, 100 px wide) was
+  replaced by a 300 px wide one. The change was a `css` build (it is under the theme's
+  `assets/`). The img src stayed `/__presenter/asset/logo.svg`, and the page kept showing
+  the 100 px image (`naturalWidth` 100), with no reload. A fresh `GET` of the same URL
+  returned the 300 px file. This is a known limitation now (below). The stylesheet `url()`
+  case named in the first run is still untested.
+- When files are written within a moment of `presenter serve` starting (here: the setup
+  edits, immediately before the start), the watcher may report them as a change, and one
+  extra `content` rebuild follows the first build. This is harmless: the build is
+  identical. The drivers wait 2 s after their setup.
+- Ctrl-C during the first build (a 3000-slide deck, whose first debug build takes about
+  3.6 s): exit 0, nothing on stdout (`tests/cli_serve.rs` covers it). A port held by
+  another server on `0.0.0.0:P` or a dual-stack `[::]:P`: `presenter serve --port P`
+  exits 1 with `another server already answers on 127.0.0.1:P (use --port 0 to pick a free
+  port)`. Before the fix, macOS let it bind `127.0.0.1:P` beside that server.
+
+### 2026-10-09: `presenter serve` (T23), real server
+
+First run against the real dev server instead of the mock. Environment: macOS 26.7, Google
+Chrome 154.0.8037.98 headless over the DevTools protocol, Node 26.10.0, a debug build of
+`presenter` from the T23 branch. `live-reload.js` was the 7959-byte client of the fifth
+mock run (sha256 `3bdbe117eaf46889…`).
+
+Method: a copy of `examples/basic` in a scratch directory, with the default theme ejected
+into it (`presenter theme eject default theme`, `[deck] theme = "theme"` in the copy's
+`presenter.toml`), served with `presenter serve slides.md --port 0`; the URL was read from
+the first stdout line. A Node driver, built on the coordinator's CDP helper (`cdp.mjs`)
+connection code, opened `<url>#/1` and set `window.__qaMarker = 1`. For each step it edited
+the copy, polled `/__presenter/state` until the build was there, then waited until the
+client's `__presenterLiveReload.state.buildId` matched. Rebuilds took 42–77 ms (stderr
+`rebuilt in <n> ms (<kind>)`).
+
+| # | step | result | evidence |
+|---|---|---|---|
+| — | first stdout line | pass | `Serving http://127.0.0.1:<port>/`; nothing else on stdout |
+| 1 | `.reveal h2 { color: rgb(200, 0, 0) }` appended to `theme/styles/theme.css` | pass | stderr `(css)`; marker kept; still `{h:1,v:0}`; one `#presenter-theme`, href `?v=1` → `?v=2`; the slide's `h2` turned red (screenshot) |
+| 3 | current slide's heading edited | pass | in place (marker kept), same slide, new text, still red |
+| 4 | slide inserted after the current one | pass | in place, same slide, 17 → 18 slides, the next slide is the new one |
+| 7 | separator `--- {title="oops}` appended | pass | `/state` error; overlay `build error (parse)` / `slides.md:196: unbalanced " quote …` / `slides.md:196` / `(click to dismiss)` over the unchanged deck (screenshot); no reload; a click hides it |
+| 22 | page reloaded while that build fails | pass | the last good deck, with the overlay and its details right away (`hello.error`) |
+| 8 | error fixed | pass | overlay hidden, in place, same slide |
+| 19 | `body_end` markup added to `theme/templates/deck.html` | pass | stderr `(content)`; one full reload (`page changed outside the slides`), the new footer shown, same slide (screenshot) |
+| — | `figures/plot.png` (640×400) replaced by a 1280×720 PNG, on the figure slide | pass after a fix (see below) | stderr `(content)`; in place, same slide; the `<img>` src `…/deck-asset/58443e8b3a14?v=2253…` → `?v=8715…`, `naturalWidth` 640 → 1280 (screenshot) |
+| 9 | Ctrl-C to the server | pass | exit 0; the deck stays usable; client retries after 500, 1000, 2000 ms |
+| 10 | server restarted on the same port | pass | `hello` build 1 ≠ 8: one full reload (`build 8 -> 1`), same slide |
+| 26 | console during the run | pass | no uncaught exceptions; besides `[presenter]` debug lines only the browser's own `net::ERR_CONNECTION_REFUSED` for `/__presenter/events` while the server was down |
+
+Defect found and fixed: in the first run the image edit failed. A file asset's id names its
+path, so the document kept the same `/__presenter/deck-asset/<id>` URL and Chrome showed the
+image it already had for it after the in-place swap (`naturalWidth` stayed 640). The server
+did serve the new bytes, and a reload showed them. Fix in `src/cli/serve.rs`: before a
+build is stored, each file asset's URL gets `?v=<hash of mtime and size>`, so an edited
+image gets a new URL and is fetched again, and an unchanged one keeps its URL. The asset
+route ignores the query, and the client strips `?v=<digits>` when it compares pages. The
+second run passed every step above.
+
+Also checked: `presenter serve slides.md --site-preview` opened at `#/9` with the CDP
+helper. The page links `assets/theme-<hash>.css`, has no live-reload script, renders 4
+KaTeX elements, loads both `assets/plot-<hash>.png` images, logs nothing to the console
+(screenshot).
+
+This run did not cover items 2, 5, 6, 11–18, 20, 21, 23–25, 27 and 28; the second run
+above covers all of them except 24. An edited image referenced from a theme stylesheet
+(`url()` of a theme asset) was not tested. Its URL does not change either, so after a `css`
+build it may also show stale; the second run confirmed this for a template's `asset()`
+image (see Known limitations).
+
 ### 2026-10-08: mock server, fifth run (W3FIX: whole served page compared)
 
 Environment as in the third run (macOS, Google Chrome 154.0.8037.98 headless over the
@@ -323,6 +449,16 @@ Still to do: repeat this checklist against `presenter serve` once T23 has landed
 - Editing a theme script file (`theme.toml [scripts]`) does not run the new code: its URL is
   unchanged, so the client swaps the slides only. Reload by hand. A serve-mode `script()`
   URL that carried a content hash would make this a full reload automatically.
+- Editing an image of a theme (a file under a theme's `assets/` that a template references
+  with `asset()`, such as the default theme's title-slide logo) does not show the new
+  image: the change is a `css` build (§2), its URL `/__presenter/asset/<path>` is
+  unchanged, and the client re-requests only stylesheets. Reload by hand. An image that a
+  theme stylesheet references with `url()` keeps its URL too and is probably affected as
+  well (not tested). Deck images (`/__presenter/deck-asset/<id>`) are not
+  affected: `presenter serve` adds `?v=<version>` to their URLs, which changes when the
+  file does (T23). Possible follow-up to the protocol: classify a theme `assets/` file
+  that is not a stylesheet as `content`, and version `/__presenter/asset/` URLs of images
+  the same way.
 - Elements that scripts add to the page are never compared, so they never cause a reload;
   they stay as they are across swaps (only the children of `.slides` are replaced).
 - `<meta>` elements are not compared, so a changed `<meta name="description">` (front
