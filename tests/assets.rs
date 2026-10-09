@@ -10,7 +10,7 @@ use presenter::Error;
 use presenter::assets::emit::{
     EmittedFile, Emitter, OutputMode, data_uri, hashed_file_name, register_css_urls,
 };
-use presenter::assets::registry::{AssetData, AssetRegistry, normalize_lexically};
+use presenter::assets::registry::{AssetData, AssetRegistry, content_hash, normalize_lexically};
 use presenter::ir::{Block, CellOutput, Deck};
 
 fn fixture(rel: &str) -> PathBuf {
@@ -32,6 +32,12 @@ fn all_modes() -> [OutputMode; 3] {
 
 const SVG: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"/>";
 const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00";
+
+/// The hash in the fixture PNG's site-mode file name: of its bytes, not of its id (which
+/// hashes its path; ir.md §3, audit F20).
+fn png_hash() -> String {
+    content_hash(&std::fs::read(fixture("md/images/ok.png")).unwrap())
+}
 
 /// A registry with one file asset (the fixture PNG) and two in-memory assets.
 fn registry() -> (AssetRegistry, [String; 3]) {
@@ -89,6 +95,7 @@ fn resolve_html_inlines_all_three_references_in_standalone_mode() {
 
 #[test]
 fn resolve_html_emits_hashed_files_in_site_mode() {
+    let ok = png_hash();
     let (registry, [png, gif, svg]) = registry();
     let mode = site_mode();
     let mut emitter = Emitter::new(&registry, &mode);
@@ -98,7 +105,7 @@ fn resolve_html_emits_hashed_files_in_site_mode() {
     assert_eq!(
         out,
         format!(
-            "<img src=\"assets/ok-{png}.png\" alt=\"\"> \
+            "<img src=\"assets/ok-{ok}.png\" alt=\"\"> \
              <section data-background-image=\"assets/background-{gif}.gif\"></section> \
              <div style=\"background:url(assets/output-{svg}.svg)\"></div>"
         )
@@ -108,7 +115,7 @@ fn resolve_html_emits_hashed_files_in_site_mode() {
         emitter.files,
         [
             EmittedFile {
-                path: PathBuf::from(format!("dist/assets/ok-{png}.png")),
+                path: PathBuf::from(format!("dist/assets/ok-{ok}.png")),
                 bytes: png_bytes,
             },
             EmittedFile {
@@ -211,6 +218,7 @@ fn data_uri_of_png_magic() {
 
 #[test]
 fn site_mode_writes_exactly_one_file_per_distinct_id_with_deterministic_names() {
+    let ok = png_hash();
     let (registry, [png, gif, svg]) = registry();
     let html = format!(
         "<img src=\"asset:{png}\"><img src=\"asset:{png}\" srcset=\"asset:{png} 1x, asset:{gif} 2x\">"
@@ -225,7 +233,7 @@ fn site_mode_writes_exactly_one_file_per_distinct_id_with_deterministic_names() 
         // Asking again for an id already emitted does not emit it twice.
         assert_eq!(
             emitter.url_for(&png).unwrap(),
-            format!("assets/ok-{png}.png")
+            format!("assets/ok-{ok}.png")
         );
         (html_out, css_out, emitter.files)
     };
@@ -234,13 +242,13 @@ fn site_mode_writes_exactly_one_file_per_distinct_id_with_deterministic_names() 
     assert_eq!(
         names,
         [
-            Path::new("dist/assets").join(hashed_file_name("ok.png", &png)),
+            Path::new("dist/assets").join(hashed_file_name("ok.png", &png_hash())),
             Path::new("dist/assets").join(hashed_file_name("background.gif", &gif)),
         ]
     );
     assert!(!html_out.contains(&svg) && !css_out.contains("asset:"));
     assert_eq!(
-        html_out.matches(&format!("assets/ok-{png}.png")).count(),
+        html_out.matches(&format!("assets/ok-{ok}.png")).count(),
         3,
         "{html_out}"
     );
@@ -415,6 +423,7 @@ fn fetched_file(referrer: &str, url: &str) -> PathBuf {
 /// the emitter emitted.
 #[test]
 fn site_mode_stylesheet_in_assets_dir_references_files_next_to_it() {
+    let ok = png_hash();
     let (mut registry, [png, gif, _]) = registry();
     let theme_css = ".reveal{background:url(img/bg.gif)} \
                      h1{background:url(\"images/ok.png?v=1#x\")} \
@@ -446,7 +455,7 @@ fn site_mode_stylesheet_in_assets_dir_references_files_next_to_it() {
         sheet,
         format!(
             ".reveal{{background:url(background-{gif}.gif)}} \
-             h1{{background:url(\"ok-{png}.png?v=1#x\")}} \
+             h1{{background:url(\"ok-{ok}.png?v=1#x\")}} \
              @font-face{{src:url(fonts/missing.woff)}}"
         )
     );
@@ -454,7 +463,7 @@ fn site_mode_stylesheet_in_assets_dir_references_files_next_to_it() {
     assert_eq!(
         emitted,
         [
-            PathBuf::from(format!("dist/assets/ok-{png}.png")),
+            PathBuf::from(format!("dist/assets/ok-{ok}.png")),
             PathBuf::from(format!("dist/assets/background-{gif}.gif")),
         ]
     );
@@ -500,6 +509,7 @@ fn site_mode_stylesheet_in_assets_dir_references_files_next_to_it() {
 /// calls; each id is still emitted exactly once.
 #[test]
 fn per_call_emitters_in_static_template_helpers_emit_each_id_once() {
+    let ok = png_hash();
     struct HelperState {
         registry: AssetRegistry,
         mode: OutputMode,
@@ -538,7 +548,7 @@ fn per_call_emitters_in_static_template_helpers_emit_each_id_once() {
         )
         .unwrap();
     let (a_url, b_url) = (
-        format!("assets/ok-{png}.png"),
+        format!("assets/ok-{ok}.png"),
         format!("assets/background-{gif}.gif"),
     );
     assert_eq!(out, format!("{a_url} {b_url}|{a_url} {a_url} {a_url} "));
@@ -747,4 +757,138 @@ fn standalone_drops_css_escaped_queries_whole() {
             "{css}: {site}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// End to end through `presenter build` (audits F16 and F20).
+
+/// `presenter build <args>` in `dir`; panics unless it succeeds.
+fn build(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+        .current_dir(dir)
+        .env_remove("RUST_LOG")
+        .arg("build")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "presenter build {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Copies the directory `from` into `to` (created), recursively.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Every file below `dir`: its `/`-separated path relative to `dir`, and its bytes.
+fn tree(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let rel = path.strip_prefix(dir).unwrap();
+                let rel: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                files.insert(rel.join("/"), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+/// ir.md §3 (audit F20, PLAN goal 7): the same deck built with `--site` from two checkouts
+/// gives the same file names and bytes; an edited image gets a new name.
+#[test]
+fn site_builds_do_not_depend_on_the_checkout_location() {
+    let tmp = tempfile::tempdir().unwrap();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/basic");
+    let first = tmp.path().join("a/basic");
+    let second = tmp.path().join("b/some/deeper/path/basic");
+    for checkout in [&first, &second] {
+        copy_dir(&example, checkout);
+        build(checkout, &["slides.md", "--site", "-o", "site"]);
+    }
+    let (one, two) = (tree(&first.join("site")), tree(&second.join("site")));
+    let names: Vec<&String> = one.keys().collect();
+    assert!(
+        names.iter().any(|name| name.starts_with("assets/plot-"))
+            && names.iter().any(|name| name.starts_with("assets/embed-")),
+        "the deck's files are emitted: {names:?}"
+    );
+    assert_eq!(names, two.keys().collect::<Vec<_>>());
+    for (name, bytes) in &one {
+        assert!(two[name] == *bytes, "{name} differs between the checkouts");
+    }
+
+    // An edited figure is written under a new name, and the page links the new one.
+    let plot = |files: &std::collections::BTreeMap<String, Vec<u8>>| -> String {
+        let names: Vec<&String> = files
+            .keys()
+            .filter(|name| name.starts_with("assets/plot-"))
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        names[0].clone()
+    };
+    let mut png = std::fs::read(first.join("figures/plot.png")).unwrap();
+    png.extend_from_slice(b"edited");
+    std::fs::write(first.join("figures/plot.png"), png).unwrap();
+    build(&first, &["slides.md", "--site", "-o", "site2"]);
+    let edited = tree(&first.join("site2"));
+    assert_ne!(plot(&edited), plot(&one));
+    let index = String::from_utf8(edited["index.html"].clone()).unwrap();
+    assert!(
+        index.contains(&plot(&edited)),
+        "the page links the new name"
+    );
+}
+
+/// ir.md §3 (audit F16): `asset:` and 12 hex digits written in prose, inline code, a code
+/// block or speaker notes is text: the deck builds, in every mode, and the text stays.
+#[test]
+fn literal_placeholders_in_slide_text_build_and_stay_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir(dir.join("images")).unwrap();
+    std::fs::copy(fixture("md/images/ok.png"), dir.join("images/ok.png")).unwrap();
+    // The id the image gets in this deck (blake3 of its absolute path), written as text too.
+    let mut registry = AssetRegistry::new();
+    let image = std::fs::canonicalize(dir.join("images/ok.png")).unwrap();
+    let id = registry.register_file(&image);
+    let deck = format!(
+        "# Placeholders\n\nThe id asset:3f9a1c2b7e0d is plain text, and so is `asset:{id}`.\n\n\
+         ![ok](images/ok.png)\n\n```html\n<img src=\"asset:0123456789ab\">\n```\n\n\
+         :::notes\nSay asset:{id} out loud.\n:::\n"
+    );
+    std::fs::write(dir.join("deck.md"), deck).unwrap();
+    build(dir, &["deck.md", "-o", "standalone.html"]);
+    build(dir, &["deck.md", "--site", "-o", "site"]);
+    let standalone = std::fs::read_to_string(dir.join("standalone.html")).unwrap();
+    let site = std::fs::read_to_string(dir.join("site/index.html")).unwrap();
+    for html in [&standalone, &site] {
+        assert!(html.contains("The id asset:3f9a1c2b7e0d is plain text"));
+        assert!(html.contains(&format!("<code>asset:{id}</code>")));
+        assert!(html.contains("&lt;img src=\"asset:0123456789ab\"&gt;"));
+        assert!(html.contains(&format!("Say asset:{id} out loud.")));
+    }
+    // The image itself is still resolved.
+    assert!(standalone.contains("<img src=\"data:image/png;base64,"));
+    assert!(site.contains(&format!("<img src=\"assets/ok-{}.png\"", png_hash())));
 }

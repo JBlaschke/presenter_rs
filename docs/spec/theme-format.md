@@ -85,6 +85,21 @@ Set `env.set_debug(true)` in serve mode and translate `minijinja::Error` to
 Asset lookup (`asset("fonts/x.woff2")`, CSS `url(fonts/x.woff2)`): same walk over
 `assets/` directories; `vendor/...` names come from the embedded vendor tree.
 
+> **Clarification (A4, 2026-10-09, audits F08 and F10):** a disk theme's files are its own.
+> Every lookup (templates, `assets/`, style and script entries, a path-valued
+> `highlight_style`, CSS `url()` targets, the dev server's `/__presenter/asset/` route) opens
+> a file only when its canonical path, symbolic links resolved, is inside the canonical theme
+> directory. A symbolic link inside the theme whose target is outside it
+> (`assets/logo.png -> /etc/hosts`, a linked shared `fonts/` directory) counts as missing;
+> links that stay inside the theme work. So a downloaded theme cannot pull other local files
+> into a deck's output or have the dev server serve them. To share files between themes,
+> copy them or use `extends` (a child sees its parents' `assets/`). A path-valued
+> `highlight_style` follows the rules of style entries (relative, inside the theme, existing;
+> otherwise `Error::Theme` when the context is built). `presenter check` reports the theme
+> problems a build fails on as errors located in the theme's files: missing or escaping style
+> and script entries and `highlight_style` files, templates that do not compile, an invalid
+> merged `[reveal] plugins` list (stylesheets are not compiled by `check`).
+
 ## 4. Template context
 
 The JSON object passed to `deck.html` (and visible to `presenter dump --context`):

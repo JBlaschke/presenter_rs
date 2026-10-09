@@ -2,8 +2,9 @@
 //!
 //! [`run`] parses the deck without building it ([`pipeline::parse_only`]), resolves its
 //! theme ([`pipeline::resolve_theme`]) and returns the frontend's diagnostics together with
-//! the deck-level lints below, ordered by position (deck-level findings first, then by cell
-//! and line). Missing assets are never errors here.
+//! the deck-level lints below, ordered by position (findings about the theme's files and
+//! deck-level findings first, then by cell and line; a notebook output's file warning, which
+//! has no line, after its cell's lines). Missing assets are never errors here.
 //!
 //! # What is reported
 //!
@@ -19,8 +20,10 @@
 //!   `notebook-attachment-skipped`, `empty-slide`, `unknown-slide-attr`, `invalid-slide-attr`,
 //!   `presenter-override-ignored`, `presenter-override-invalid`, `raw-cell-skipped`,
 //!   `missing-attachment`, `missing-asset`, `front-matter-ignored`, `front-matter-empty`,
-//!   `output-script`, `output-unsupported`, `output-invalid` and `output-widget` (§4
-//!   "interactive widget rendered as text").
+//!   `output-script`, `output-unsupported`, `output-invalid`, `output-widget` (§4
+//!   "interactive widget rendered as text"), `output-file-outside` (an output names a file
+//!   outside the notebook's directory, which is not embedded) and `notebook-single-slide`
+//!   (no cell has a slide type, so the whole notebook is one slide).
 //!
 //! Added here ([`codes`]):
 //!
@@ -47,8 +50,15 @@
 //!   `templates/layouts/<name>.html` file of the theme chain ([`Theme::has_layout`]).
 //! - `notebook-no-outputs` (notebook-mapping §4 notes): a notebook whose code cells were never
 //!   executed (no outputs, no execution count), with a hint to execute it.
-//! - `theme-error` (level error): the deck's theme cannot be resolved; `unknown-layout` is then
-//!   skipped.
+//! - `theme-error` (level error): the deck's theme cannot be resolved; `unknown-layout` and the
+//!   theme problems below are then skipped.
+//! - Theme problems a build fails on ([`Theme::problems`], level error, located in the
+//!   theme's `theme.toml` or template; audit F10): `theme-style-entry`, `theme-script-entry`
+//!   (a missing entry, or one outside its theme), `theme-highlight-style` (a `highlight_style`
+//!   file that is missing or outside its theme), `theme-template` (a template of a disk theme
+//!   that does not compile) and `theme-plugins` (an invalid merged `[reveal] plugins` list).
+//!   They are the build failures `presenter theme check` reports; a deck whose build fails on
+//!   its theme does not pass `check`. Stylesheets are not compiled here.
 //!
 //! Failures that leave no deck to lint (the input cannot be read or parsed, invalid front
 //! matter or `presenter.toml`) are [`run`]'s `Err`; [`error_diagnostic`] turns them into an
@@ -70,6 +80,7 @@ use crate::markdown::frontmatter::split_front_matter;
 use crate::markdown::split::{SplitMode, source_lines, split_with_source};
 use crate::notebook::convert::codes::FRONT_MATTER_IGNORED;
 use crate::notebook::nbformat::{self, Cell, CellType, SlideType};
+use crate::notebook::outputs::output_position;
 use crate::pipeline::{self, BuildOptions};
 use crate::theme::Theme;
 
@@ -119,8 +130,12 @@ pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
     let mut found = source_lints(opts, &deck, &config, &parsed.diagnostics);
     found.extend(duplicate_slide_ids(&deck));
     found.extend(notebook_without_outputs(&deck));
+    let mut theme_problems = Vec::new();
     match pipeline::resolve_theme(opts, &deck, &config, config_path.as_deref()) {
-        Ok(theme) => found.extend(unknown_layouts(&deck, &theme)),
+        Ok(theme) => {
+            found.extend(unknown_layouts(&deck, &theme));
+            theme_problems = theme.problems();
+        }
         Err(err) => found.push(Diagnostic::error(codes::THEME_ERROR, err.to_string())),
     }
     let mut diagnostics = parsed.diagnostics.into_vec();
@@ -129,15 +144,38 @@ pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
             .into_iter()
             .map(|diagnostic| diagnostic.with_path(&deck.source.path)),
     );
-    // Stable: deck-level findings (no span) first, then by cell and line; ties keep the
-    // frontend's order before this module's.
-    diagnostics.sort_by_key(|d| d.span.as_ref().map(|span| (span.cell, span.start_line)));
+    // Theme problems keep the theme file they are about (a built-in theme's have none).
+    diagnostics.extend(theme_problems.into_iter().map(|mut diagnostic| {
+        diagnostic
+            .path
+            .get_or_insert_with(|| deck.source.path.clone());
+        diagnostic
+    }));
+    sort_by_position(&mut diagnostics, &deck.source.path);
     tracing::debug!(
         diagnostics = diagnostics.len(),
         "checked {}",
         deck.source.path.display()
     );
     Ok(diagnostics.into())
+}
+
+/// Orders `diagnostics` (stable, so ties keep the frontend's order before this module's):
+/// findings about other files (theme problems) and deck-level ones (no position) first,
+/// then by cell and line; a notebook output's diagnostic, which has no line, after its
+/// cell's lines ([`output_position`]).
+fn sort_by_position(diagnostics: &mut [Diagnostic], deck: &Path) {
+    diagnostics.sort_by_key(|d| {
+        if d.path.as_deref() != Some(deck) {
+            return None;
+        }
+        match &d.span {
+            Some(span) => Some((span.cell, span.start_line, 0)),
+            None => {
+                output_position(&d.message).map(|(cell, output)| (Some(cell), usize::MAX, output))
+            }
+        }
+    });
 }
 
 /// `err` (a failure of [`run`] for `input`) as an error-level diagnostic for `input`: the
@@ -239,11 +277,11 @@ fn duplicate_slide_ids(deck: &Deck) -> Vec<Diagnostic> {
 }
 
 /// `unknown-layout`: every slide whose layout `theme` does not provide. The message is the
-/// renderer's (`render::context`), so `check` and `build` agree (a test compares them).
-/// Each distinct layout name is looked up once.
+/// renderer's ([`Theme::unknown_layout_message`], with a "did you mean" for a near miss), so
+/// `check` and `build` agree (a test compares them). Each distinct layout name is looked up
+/// once.
 fn unknown_layouts(deck: &Deck, theme: &Theme) -> Vec<Diagnostic> {
     let mut known: BTreeMap<&str, bool> = BTreeMap::new();
-    let mut available: Option<String> = None;
     let mut found = Vec::new();
     for (label, slide) in labelled_slides(deck) {
         let layout = slide.layout.as_str();
@@ -253,12 +291,7 @@ fn unknown_layouts(deck: &Deck, theme: &Theme) -> Vec<Diagnostic> {
         {
             continue;
         }
-        let available = available.get_or_insert_with(|| theme.layouts().join(", "));
-        let message = format!(
-            "{label}: unknown layout '{layout}' (theme '{}' has: {available}); using the \
-             default layout",
-            theme.name(),
-        );
+        let message = theme.unknown_layout_message(&label, layout);
         found.push(slide_warning(codes::UNKNOWN_LAYOUT, message, slide));
     }
     found
@@ -1457,8 +1490,10 @@ mod tests {
     fn notebooks_whose_code_never_ran_get_a_hint() {
         let code = |outputs: &str, count: &str| cell("code", "x", "{}", outputs, count);
         let output = r#"[{"output_type": "stream", "name": "stdout", "text": "1"}]"#;
+        // A slide type, so that the three cells are not one slide without one (F28).
+        let slide = r#"{"slideshow": {"slide_type": "slide"}}"#;
         let none = notebook(&[
-            cell("markdown", "x", "{}", "", ""),
+            cell("markdown", "x", slide, "", ""),
             code("[]", "null"),
             code("[]", "null"),
         ]);

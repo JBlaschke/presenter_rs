@@ -826,3 +826,26 @@ fn outputs_fixture_streams_error_and_widgets() {
         ["application/vnd.jupyter.widget-view+json", "text/plain"]
     );
 }
+
+/// Audit F43: one leading UTF-8 byte order mark is ignored, as for Markdown and TOML files;
+/// a second one, or one later in the text, is still invalid JSON.
+#[test]
+fn a_leading_byte_order_mark_is_ignored() {
+    let path = fixture_dir().join("slideshow.ipynb");
+    let json = std::fs::read_to_string(&path).unwrap();
+    let (plain, _) = parse_notebook(&path, &json).unwrap();
+    let (with_bom, warnings) = parse_notebook(&path, &format!("\u{feff}{json}")).unwrap();
+    assert_eq!(with_bom, plain);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    for bad in [
+        format!("\u{feff}\u{feff}{json}"),
+        format!(" \u{feff}{json}"),
+    ] {
+        match parse_notebook(&path, &bad) {
+            Err(Error::Parse { message, .. }) => {
+                assert!(message.starts_with("invalid notebook JSON: "), "{message}");
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+}

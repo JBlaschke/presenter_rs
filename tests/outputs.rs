@@ -14,7 +14,8 @@ use presenter::error::{Diagnostics, Error, Level};
 use presenter::ir::{CellOutput, Features};
 use presenter::notebook::nbformat::{MimeBundle, Output, parse_notebook};
 use presenter::notebook::outputs::{
-    ansi_to_html, choose_mime, codes, render_display, render_outputs,
+    ansi_to_html, choose_mime, codes, output_location, output_position, render_display,
+    render_outputs,
 };
 use serde_json::{Value, json};
 
@@ -1034,4 +1035,28 @@ fn no_outputs_render_nothing() {
     assert!(run.outputs.is_empty());
     assert_eq!(run.features, Features::default());
     assert!(run.diags.is_empty());
+}
+
+/// Audit F38: a diagnostic about an output names it as `cell C, output N`, which orders it.
+#[test]
+fn output_locations_are_written_and_read_back() {
+    assert_eq!(output_location(3, 1), "cell 3, output 1");
+    assert_eq!(
+        output_position("cell 3, output 1: image `x.png` not found"),
+        Some((3, 1))
+    );
+    assert_eq!(
+        output_position(&format!("{}:", output_location(12, 0))),
+        Some((12, 0))
+    );
+    for message in [
+        "cell 3, line 1: x",
+        "cell 3, output 1 x",
+        "cell , output 1: x",
+        "output 1: x",
+        "cell 3, output : x",
+        "",
+    ] {
+        assert_eq!(output_position(message), None, "{message}");
+    }
 }

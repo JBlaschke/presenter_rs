@@ -14,7 +14,9 @@
 //!
 //! Missing local files (in raw HTML cells, `text/html` outputs, Markdown images, slide
 //! backgrounds) never fail [`parse`]: they are `missing-asset` warnings, as in the Markdown
-//! frontend (ir.md §4).
+//! frontend (ir.md §4). Outputs come from executed code, so the local files they name are
+//! only embedded when they are inside the notebook's directory ([`outputs::OutputFiles`],
+//! notebook-mapping §4); files named by the author's cells resolve like in a Markdown deck.
 
 pub mod convert;
 pub mod nbformat;
@@ -87,12 +89,17 @@ fn parse_with(
 }
 
 /// Sets `path` on every diagnostic that has none and orders them by cell, then line
-/// (stable; diagnostics without a span come first).
+/// (stable; notebook-level diagnostics, without a span, come first; a local-file warning of
+/// an output, which names the output instead of a line, comes after its cell's lines).
 fn finish_diagnostics(diagnostics: Diagnostics, path: &Path) -> Diagnostics {
     let mut diagnostics = diagnostics.into_vec();
     for diagnostic in &mut diagnostics {
         diagnostic.path.get_or_insert_with(|| path.to_path_buf());
     }
-    diagnostics.sort_by_key(|d| d.span.as_ref().map(|span| (span.cell, span.start_line)));
+    diagnostics.sort_by_key(|d| match &d.span {
+        Some(span) => Some((span.cell, span.start_line, 0)),
+        None => outputs::output_position(&d.message)
+            .map(|(cell, output)| (Some(cell), usize::MAX, output)),
+    });
     diagnostics.into()
 }

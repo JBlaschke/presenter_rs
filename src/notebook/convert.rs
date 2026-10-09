@@ -70,8 +70,9 @@
 //!   placeholder. A URL whose attachment was skipped stays as written
 //!   (`notebook-attachment-skipped`, reported once per name); any other unresolved one warns
 //!   [`codes::MISSING_ATTACHMENT`].
-//! - **Code cells**: [`Block::Cell`] with the outputs of [`render_outputs`] (T32); relative
-//!   `src`/`poster` URLs in `text/html` outputs go through T12's raw-HTML asset rewriting.
+//! - **Code cells**: [`Block::Cell`] with the outputs of [`render_cell_outputs`] (T32), which
+//!   also resolves the local files `text/html` and `text/markdown` outputs name, but only
+//!   inside the notebook's directory (outputs are written by executed code; audit F08).
 //!   `hide_input` / `hide_output` come from the configured tag lists and
 //!   `metadata.jupyter.source_hidden` / `outputs_hidden` (a cell with both is contentless,
 //!   see above). `:::notes` in a `text/markdown` output go to `cur.notes` unless the outputs
@@ -94,9 +95,19 @@
 //! - **Spans**: a slide's span is the whole source of the cell that opened it
 //!   (`cell: Some(index)`); a slide opened by a separator inside a split cell spans the
 //!   separator's lines.
+//! - **Post-processing** (audit F17): each finished slide's HTML blocks and notes go through
+//!   the Markdown frontend's post-processing (`markdown::postprocess`), so
+//!   `[slides] incremental_lists`, the slide classes `.incremental` / `.no-incremental` and
+//!   `<!-- .element: -->` comments work as on a Markdown slide.
+//! - **One slide** (audit F28): when no cell has the slide type `slide` or `subslide` and the
+//!   whole notebook, with at least [`SINGLE_SLIDE_MIN_CELLS`] shown cells, became one slide,
+//!   a [`codes::SINGLE_SLIDE`] warning says how to set slide types.
 //!
 //! Every diagnostic carries the notebook path and a span with `cell: Some(index)`; lines are
-//! lines of the cell source (front matter included).
+//! lines of the cell source (front matter included). The exceptions have no span: the
+//! notebook-level [`codes::SINGLE_SLIDE`], and the warnings about the files of an output
+//! (`missing-asset`, `output-file-outside`), whose message names the output instead
+//! (`cell 3, output 1: …`; audit F38).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -117,7 +128,6 @@ use crate::ir::{
     Block, CellOutput, Deck, DeckMeta, Features, NotebookCell, Slide, SourceInfo, SourceSpan,
 };
 use crate::markdown::attrs::{ParsedAttrs, SlideAttrs};
-use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::{meta_from_json, parse_front_matter, split_front_matter};
 use crate::markdown::render::{
     RenderCtx, RenderMode, Rendered, has_math_markup, html_attr_values, html_start_tags,
@@ -125,8 +135,9 @@ use crate::markdown::render::{
     rewrite_slide_assets,
 };
 use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
+use crate::markdown::{comrak_options, postprocess};
 use crate::notebook::nbformat::{self, Cell, CellType, MultilineString, Notebook, SlideType};
-use crate::notebook::outputs::render_outputs;
+use crate::notebook::outputs::{self, OutputFiles, output_position, render_cell_outputs};
 
 /// The diagnostic codes [`convert`] records (all `Level::Warning`). Notebook parsing
 /// (`nbformat::codes`), outputs (`outputs::codes`) and Markdown rendering add their own.
@@ -155,7 +166,14 @@ pub mod codes {
     /// Front matter of the first markdown cell that sets nothing although it has text (only
     /// YAML comments, e.g. `# Intro` between `---` lines); that text is not shown.
     pub const FRONT_MATTER_EMPTY: &str = "front-matter-empty";
+    /// No cell has the slide type `slide` or `subslide`, so the whole notebook (at least
+    /// [`super::SINGLE_SLIDE_MIN_CELLS`] shown cells) is one slide (audit F28).
+    pub const SINGLE_SLIDE: &str = "notebook-single-slide";
 }
+
+/// The fewest shown cells (notes cells not counted) for which one slide without slide types
+/// is worth a [`codes::SINGLE_SLIDE`] warning: a title and a cell or two fit on a slide.
+pub const SINGLE_SLIDE_MIN_CELLS: usize = 3;
 
 /// The tag that makes a cell a fragment (spec §3; not configurable).
 const FRAGMENT_TAG: &str = "fragment";
@@ -163,13 +181,17 @@ const FRAGMENT_TAG: &str = "fragment";
 const NOTES_TAG: &str = "notes";
 /// The config tables front matter may override (config.md §3); merged key by key.
 const CONFIG_TABLES: [&str; 4] = ["slides", "markdown", "math", "notebook"];
-/// The config tables the conversion reads (`markdown.*` options, `notebook.*` tag lists, …);
-/// `slides` and `math` only matter to the Markdown frontend and the renderer.
+/// The config tables the conversion needs to go on when other deck metadata is rejected
+/// (`markdown.*` options, `notebook.*` tag lists, …; see `convert_deferring_config`). It
+/// also reads `slides.incremental_lists`, which a rejected deck never gets to use.
 const CONVERSION_TABLES: [&str; 2] = ["markdown", "notebook"];
 /// Splitter diagnostics kept for split markdown cells (the others are recomputed per deck).
 const SEPARATOR_NOT_RECOGNIZED: &str = "separator-not-recognized";
 /// The splitter's report of a leading `--`, which in a cell opens a vertical slide.
 const ORPHAN_VERTICAL: &str = "orphan-vertical";
+
+/// The code of the Markdown renderer's missing-file warnings (ir.md §4).
+const MISSING_ASSET: &str = "missing-asset";
 
 /// The scheme of a notebook attachment URL (`attachment:NAME`).
 const ATTACHMENT_SCHEME: &str = "attachment:";
@@ -514,6 +536,10 @@ struct Converter<'a> {
     /// Attachments registered so far, by (cell index, name): the asset id, or `None` when
     /// the attachment was skipped (and reported once).
     attachment_ids: BTreeMap<(usize, String), Option<String>>,
+    /// Cells that added content to a slide (not removed, contentless or notes).
+    shown: usize,
+    /// A cell that is not removed has the slide type `slide` or `subslide`.
+    structured: bool,
 }
 
 impl<'a> Converter<'a> {
@@ -540,6 +566,8 @@ impl<'a> Converter<'a> {
             deferred: None,
             features: Features::default(),
             attachment_ids: BTreeMap::new(),
+            shown: 0,
+            structured: false,
         }
     }
 
@@ -555,6 +583,7 @@ impl<'a> Converter<'a> {
         }
         let hidden = self.hidden(cell, &tags);
         let contentless = self.is_contentless(index, cell, hidden);
+        self.structured |= matches!(slide_type, SlideType::Slide | SlideType::Subslide);
         self.structure(index, cell, slide_type, contentless);
         let notes = slide_type == SlideType::Notes || has_tag(&tags, NOTES_TAG);
         let split = cell.cell_type == CellType::Markdown
@@ -572,6 +601,7 @@ impl<'a> Converter<'a> {
         if notes {
             return self.notes_cell(index, cell);
         }
+        self.shown += 1;
         let fragment = slide_type == SlideType::Fragment || has_tag(&tags, FRAGMENT_TAG);
         match cell.cell_type {
             CellType::Markdown => self.markdown_cell(index, cell, fragment),
@@ -989,67 +1019,32 @@ impl<'a> Converter<'a> {
         Ok(())
     }
 
-    /// The cell's outputs (T32), with `text/html` URLs rewritten to assets, and the
-    /// `:::notes` of its `text/markdown` outputs.
+    /// The cell's outputs (T32) with their local files resolved inside the notebook's
+    /// directory ([`render_cell_outputs`]), and the `:::notes` of its `text/markdown`
+    /// outputs. Warnings get the notebook path and the cell's span, except the local-file
+    /// ones, which name the output instead ([`output_diagnostic`]).
     fn outputs(&mut self, index: usize, cell: &Cell) -> Result<(Vec<CellOutput>, Option<String>)> {
-        let span = cell.span(index);
-        let mut local = Diagnostics::new();
-        // `text/markdown` outputs render into their own registry (see `render_outputs`) and
-        // their notes and features are collected here.
-        let mut md_assets = AssetRegistry::new();
-        let mut md_diags = Diagnostics::new();
-        let mut md_notes: Option<String> = None;
-        let mut md_features = Features::default();
-        let (opts, base_dir) = (&self.opts, self.source.base_dir.as_path());
-        let mut md = |text: &str| -> Result<String> {
-            let mut ctx = RenderCtx {
-                assets: &mut md_assets,
-                base_dir,
-                mode: RenderMode::Notebook,
-                diagnostics: &mut md_diags,
-                missing_asset_is_error: false,
-            };
-            let rendered = render_fragment(text, opts, &mut ctx)?;
-            md_features.merge(rendered.features);
-            if let Some(notes) = rendered.notes {
-                md_notes.get_or_insert_with(String::new).push_str(&notes);
-            }
-            Ok(rendered.html)
+        let files = OutputFiles {
+            base_dir: &self.source.base_dir,
+            markdown: &self.opts,
         };
-        let (mut outputs, features) = render_outputs(
+        let mut local = Diagnostics::new();
+        let rendered = render_cell_outputs(
             &cell.outputs,
             &self.config.notebook,
+            &files,
             self.assets,
             &mut local,
-            &mut md,
         )?;
-        self.assets.merge(md_assets);
-        local.extend(md_diags);
         // `notes` follows the slides' notes (`finish_slide`), which hidden outputs skip.
-        md_features.notes = false;
-        self.features.merge(md_features);
-        let mut ctx = RenderCtx {
-            assets: &mut *self.assets,
-            base_dir,
-            mode: RenderMode::Notebook,
-            diagnostics: &mut local,
-            missing_asset_is_error: false,
-        };
-        for output in &mut outputs {
-            if let CellOutput::Display { mime, html, .. } = output
-                && mime == "text/html"
-            {
-                rewrite_html_assets(html, Some(&span), &mut ctx)?;
-            }
-        }
-        self.features.merge(features);
-        let path = &self.source.path;
+        self.features.merge(rendered.features);
+        let (path, span) = (&self.source.path, cell.span(index));
         self.diags.extend(
             local
                 .into_iter()
-                .map(|d| d.with_path(path).with_span(span.clone())),
+                .map(|d| output_diagnostic(d, path, index, &span)),
         );
-        Ok((outputs, md_notes))
+        Ok((rendered.outputs, rendered.notes))
     }
 
     fn raw_cell(&mut self, index: usize, cell: &'a Cell, fragment: bool) -> Result<()> {
@@ -1266,8 +1261,9 @@ impl<'a> Converter<'a> {
     }
 
     /// Closes the walk: one empty slide for a notebook without content (it receives the
-    /// overrides of contentless cells), slide background assets, `empty-slide` warnings and
-    /// the derived features.
+    /// overrides of contentless cells), the [`codes::SINGLE_SLIDE`] hint, slide background
+    /// assets, incremental lists and `.element:` comments ([`Self::finish_slide`]),
+    /// `empty-slide` warnings and the derived features.
     fn finish(mut self) -> Result<(Vec<Slide>, Features)> {
         if self.top.is_none() {
             self.top = Some(Slide::new());
@@ -1276,6 +1272,7 @@ impl<'a> Converter<'a> {
         if let Some(top) = self.top.take() {
             self.done.push(top);
         }
+        self.single_slide_hint();
         let mut slides = std::mem::take(&mut self.done);
         for (i, slide) in slides.iter_mut().enumerate() {
             let label = (i + 1).to_string();
@@ -1288,11 +1285,51 @@ impl<'a> Converter<'a> {
         Ok((slides, self.features))
     }
 
+    /// The [`codes::SINGLE_SLIDE`] warning (notebook-level, no span) when the whole notebook
+    /// became one slide only because no cell has a slide type: one slide without vertical
+    /// slides, at least [`SINGLE_SLIDE_MIN_CELLS`] shown cells and no `slide` or `subslide`
+    /// cell. (With `split_markdown_cells`, separators that open slides make it more than one.)
+    fn single_slide_hint(&mut self) {
+        let one = matches!(self.done.as_slice(), [only] if only.children.is_empty());
+        if !one || self.structured || self.shown < SINGLE_SLIDE_MIN_CELLS {
+            return;
+        }
+        let message = format!(
+            "all {} cells are on one slide because no cell has a slide type (as in `jupyter \
+             nbconvert --to slides`); set the Slide Type of the cells that start a slide to \
+             Slide or Sub-Slide (JupyterLab: the property inspector, the gear icon in the right \
+             sidebar; Notebook 7: View > Slideshow), or set `[notebook] split_markdown_cells = \
+             true` and separate slides with `---` in markdown cells",
+            self.shown
+        );
+        self.diags
+            .push(Diagnostic::warning(codes::SINGLE_SLIDE, message).with_path(&self.source.path));
+    }
+
+    /// Finishes one slide: its background files (`rewrite_slide_assets`), the Markdown
+    /// post-processing of its HTML blocks and notes (`.element:` comments, and incremental
+    /// lists when `[slides] incremental_lists` or the slide's `.incremental` /
+    /// `.no-incremental` class say so, exactly as for a Markdown slide; audit F17) and the
+    /// `empty-slide` warning.
     fn finish_slide(&mut self, slide: &mut Slide, label: &str) -> Result<()> {
         let span = slide.span.clone();
         self.render(span.as_ref(), 0, |ctx, _| {
             rewrite_slide_assets(&mut slide.attrs, span.as_ref(), ctx)
         })?;
+        let incremental =
+            postprocess::incremental_enabled(self.config.slides.incremental_lists, &slide.classes);
+        let mut local = Diagnostics::new();
+        for block in &mut slide.blocks {
+            if let Block::Html { html } = block {
+                *html = postprocess::slide_html(html, incremental, span.as_ref(), &mut local)?;
+            }
+        }
+        if let Some(notes) = &mut slide.notes {
+            *notes = postprocess::element_attributes(notes, span.as_ref(), &mut local)?;
+        }
+        let path = &self.source.path;
+        self.diags
+            .extend(local.into_iter().map(|d| d.with_path(path)));
         if slide.blocks.is_empty() && slide.notes.is_none() {
             let has_attrs = slide.id.is_some()
                 || slide.layout != Slide::new().layout
@@ -1312,6 +1349,30 @@ impl<'a> Converter<'a> {
         self.features.notes |= slide.notes.is_some();
         Ok(())
     }
+}
+
+/// A warning of [`render_cell_outputs`] for cell `index` (whose span is `span`), with the
+/// notebook `path`. A local-file warning (`missing-asset`, `output-file-outside`) is about
+/// an output, not a line of the cell's source: its message starts with `cell <c>, output
+/// <i>: ` ([`outputs::output_location`]) and it has no span, so a report quotes no unrelated source
+/// line (audit F38). Every other one gets the cell's span.
+fn output_diagnostic(
+    mut diagnostic: Diagnostic,
+    path: &Path,
+    index: usize,
+    span: &SourceSpan,
+) -> Diagnostic {
+    diagnostic = diagnostic.with_path(path);
+    if !matches!(
+        diagnostic.code,
+        MISSING_ASSET | outputs::codes::OUTPUT_FILE_OUTSIDE
+    ) {
+        return diagnostic.with_span(span.clone());
+    }
+    diagnostic.span = None;
+    diagnostic.message = format!("cell {index}, {}", diagnostic.message);
+    debug_assert!(output_position(&diagnostic.message).is_some());
+    diagnostic
 }
 
 /// Moves a renderer diagnostic into a cell: path set; a span without a cell is shifted by

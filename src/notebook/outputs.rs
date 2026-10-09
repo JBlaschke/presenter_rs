@@ -25,24 +25,40 @@
 //! slice. That slice holds the outputs `nbformat` could parse, so after an output it skipped
 //! (its `notebook-output-skipped` warning counts positions in the `.ipynb` array) `i` is
 //! smaller than the output's position in the file. The caller attaches the notebook path and
-//! the cell span.
+//! the cell (`notebook::convert`: the cell's span, except for the local-file warnings
+//! `missing-asset` and [`codes::OUTPUT_FILE_OUTSIDE`], which name the output in their message,
+//! `cell <c>, output <i>: …` ([`output_location`]), and have no span: an output is not a line
+//! of the cell's source, so no source line is quoted for them).
 //!
-//! Known limitation (`docs/spec/ir.md` invariant 4): `text/html` is inserted verbatim, so a
-//! relative URL in it (`<img src="fig.png">`, IPython's `Video("clip.mp4")`) stays as written
-//! instead of becoming an `asset:<id>`; such a file is neither copied nor inlined.
+//! **Local files** (`docs/spec/notebook-mapping.md` §4): [`render_outputs`] leaves relative
+//! URLs of `text/html` as written and renders `text/markdown` with the caller's closure.
+//! [`render_cell_outputs`], which the notebook frontend uses, resolves them against the
+//! notebook's directory ([`OutputFiles`]): relative `src`/`poster` URLs of `text/html` (the
+//! Markdown renderer's raw-HTML rule) and the images and raw HTML of `text/markdown` become
+//! `asset:<id>` placeholders (ir.md invariant 4) **only for files inside the notebook's
+//! directory** (subdirectories included, symbolic links resolved). Outputs are written by
+//! executed code, not by the author, so a file outside it (`../secret.txt`, a link pointing
+//! elsewhere) is not embedded: the URL stays as written and a [`codes::OUTPUT_FILE_OUTSIDE`]
+//! warning names it (audit F08). A missing file is a `missing-asset` warning, as everywhere.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_PAD_INDIFFERENT;
+use comrak::Options;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::assets::registry::AssetRegistry;
+use crate::assets::registry::{AssetData, AssetRegistry};
 use crate::config::NotebookConfig;
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{CellOutput, Features};
+use crate::markdown::render::{
+    RenderCtx, RenderMode, html_attr_values, render_fragment, rewrite_html_assets,
+};
 use crate::notebook::nbformat::{MimeBundle, Output, mime_text};
 
 /// The diagnostic codes [`render_outputs`] records (all `Level::Warning`).
@@ -60,6 +76,53 @@ pub mod codes {
     /// (`application/vnd.jupyter.widget-view+json`) was rendered through another MIME type,
     /// usually its `text/plain` repr (spec §4: "interactive widget rendered as text").
     pub const OUTPUT_WIDGET: &str = "output-widget";
+    /// A `text/html` or `text/markdown` output names a local file outside the notebook's
+    /// directory; it is not embedded and the URL stays as written ([`super::OutputFiles`]).
+    pub const OUTPUT_FILE_OUTSIDE: &str = "output-file-outside";
+}
+
+/// How diagnostics name output `output` of cell `cell` (both 0-based): `cell 3, output 1`.
+/// The local-file warnings of outputs start with it (module docs).
+pub fn output_location(cell: usize, output: usize) -> String {
+    format!("cell {cell}, output {output}")
+}
+
+/// The `(cell, output)` of a diagnostic message that starts with an [`output_location`]
+/// followed by `:`, for ordering diagnostics without a span.
+pub fn output_position(message: &str) -> Option<(usize, usize)> {
+    let number = |text: &str| -> Option<(usize, usize)> {
+        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+        Some((text[..digits].parse().ok()?, digits))
+    };
+    let rest = message.strip_prefix("cell ")?;
+    let (cell, digits) = number(rest)?;
+    let rest = rest[digits..].strip_prefix(", output ")?;
+    let (output, digits) = number(rest)?;
+    rest[digits..].starts_with(':').then_some((cell, output))
+}
+
+/// Where [`render_cell_outputs`] resolves the local files outputs name, and how it renders
+/// `text/markdown` (module docs).
+#[derive(Debug, Clone, Copy)]
+pub struct OutputFiles<'a> {
+    /// The notebook's directory (`SourceInfo.base_dir`): relative URLs resolve here, and a
+    /// file is only embedded when it is inside it.
+    pub base_dir: &'a Path,
+    /// The comrak options `text/markdown` outputs are rendered with (notebook mode).
+    pub markdown: &'a Options<'static>,
+}
+
+/// What [`render_cell_outputs`] produced for one code cell.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CellOutputs {
+    /// One [`CellOutput`] per output (consecutive streams merged).
+    pub outputs: Vec<CellOutput>,
+    /// `math` (as [`render_outputs`] sets it) and the `code` and `math` of `text/markdown`
+    /// outputs (fenced code, math). `notes` is never set: whether the notes count depends on
+    /// whether the outputs are shown.
+    pub features: Features,
+    /// The `:::notes` of `text/markdown` outputs, rendered and concatenated.
+    pub notes: Option<String>,
 }
 
 /// The MIME type of an interactive widget view; never rendered, see [`codes::OUTPUT_WIDGET`].
@@ -110,7 +173,7 @@ const WIDGET_VIEW: &str = "application/vnd.jupyter.widget-view+json";
 /// # }
 /// ```
 ///
-/// `text/html` URLs are not rewritten; see the module docs.
+/// `text/html` URLs are not rewritten; see the module docs ([`render_cell_outputs`] does).
 ///
 /// # Errors
 /// Only the errors of `md`. Malformed payloads are warnings, never errors.
@@ -121,11 +184,53 @@ pub fn render_outputs(
     diags: &mut Diagnostics,
     md: &mut dyn FnMut(&str) -> Result<String>,
 ) -> Result<(Vec<CellOutput>, Features)> {
+    render_with(outputs, cfg, assets, diags, &mut Closure(md))
+}
+
+/// [`render_outputs`] for a code cell of a notebook in `files.base_dir`: `text/markdown`
+/// is rendered with T12's renderer in notebook mode (`files.markdown`), and the local files
+/// that `text/html` and `text/markdown` outputs name are resolved, inside the notebook's
+/// directory only (module docs). Assets go to `assets`; warnings (also those of the Markdown
+/// renderer) to `diags`, each message starting with `output <i>: `.
+///
+/// # Errors
+/// Those of the Markdown renderer (an unbalanced quote in a directive's attributes, …).
+/// Malformed payloads, missing files and files outside the directory are warnings.
+pub fn render_cell_outputs(
+    outputs: &[Output],
+    cfg: &NotebookConfig,
+    files: &OutputFiles<'_>,
+    assets: &mut AssetRegistry,
+    diags: &mut Diagnostics,
+) -> Result<CellOutputs> {
+    let mut local = LocalFiles {
+        files,
+        notes: None,
+        features: Features::default(),
+    };
+    let (outputs, mut features) = render_with(outputs, cfg, assets, diags, &mut local)?;
+    features.merge(local.features);
+    features.notes = false;
+    Ok(CellOutputs {
+        outputs,
+        features,
+        notes: local.notes,
+    })
+}
+
+/// The shared implementation of [`render_outputs`] and [`render_cell_outputs`].
+fn render_with(
+    outputs: &[Output],
+    cfg: &NotebookConfig,
+    assets: &mut AssetRegistry,
+    diags: &mut Diagnostics,
+    hooks: &mut dyn Hooks,
+) -> Result<(Vec<CellOutput>, Features)> {
     let mut renderer = Renderer {
         priority: &cfg.mime_priority,
         assets,
         diags,
-        md,
+        hooks,
         features: Features::default(),
     };
     let mut rendered = Vec::with_capacity(outputs.len());
@@ -187,8 +292,229 @@ struct Renderer<'a> {
     priority: &'a [String],
     assets: &'a mut AssetRegistry,
     diags: &'a mut Diagnostics,
-    md: &'a mut dyn FnMut(&str) -> Result<String>,
+    hooks: &'a mut dyn Hooks,
     features: Features,
+}
+
+/// What differs between [`render_outputs`] and [`render_cell_outputs`]: how `text/markdown`
+/// is rendered and whether local files of `text/html` are resolved. Warnings go to `diags`
+/// (the renderer prefixes them with the output), assets to `assets`.
+trait Hooks {
+    /// The HTML of a `text/markdown` payload.
+    fn markdown(
+        &mut self,
+        text: &str,
+        assets: &mut AssetRegistry,
+        diags: &mut Diagnostics,
+    ) -> Result<String>;
+
+    /// Resolves the local files a `text/html` payload names, in place.
+    fn html(
+        &mut self,
+        html: &mut String,
+        assets: &mut AssetRegistry,
+        diags: &mut Diagnostics,
+    ) -> Result<()>;
+}
+
+/// [`render_outputs`]' hooks: the caller's Markdown closure (with its own registry and
+/// diagnostics), `text/html` as is.
+struct Closure<'m>(&'m mut dyn FnMut(&str) -> Result<String>);
+
+impl Hooks for Closure<'_> {
+    fn markdown(
+        &mut self,
+        text: &str,
+        _: &mut AssetRegistry,
+        _: &mut Diagnostics,
+    ) -> Result<String> {
+        (self.0)(text)
+    }
+
+    fn html(&mut self, _: &mut String, _: &mut AssetRegistry, _: &mut Diagnostics) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// [`render_cell_outputs`]' hooks: local files inside the notebook's directory only.
+struct LocalFiles<'f> {
+    files: &'f OutputFiles<'f>,
+    /// The `:::notes` of the `text/markdown` outputs so far.
+    notes: Option<String>,
+    /// The features of the `text/markdown` outputs so far.
+    features: Features,
+}
+
+impl Hooks for LocalFiles<'_> {
+    fn markdown(
+        &mut self,
+        text: &str,
+        assets: &mut AssetRegistry,
+        diags: &mut Diagnostics,
+    ) -> Result<String> {
+        let base_dir = self.files.base_dir;
+        let render = |base_dir: &Path, assets: &mut AssetRegistry, diags: &mut Diagnostics| {
+            let mut ctx = RenderCtx {
+                assets,
+                base_dir,
+                mode: RenderMode::Notebook,
+                diagnostics: diags,
+                missing_asset_is_error: false,
+            };
+            render_fragment(text, self.files.markdown, &mut ctx)
+        };
+        let mut scratch = AssetRegistry::new();
+        let mut rendered = render(base_dir, &mut scratch, diags)?;
+        let outside = split_outside(&mut scratch, base_dir);
+        if !outside.is_empty() {
+            // The same text with no local file resolved: every URL as written. No directory
+            // has a NUL in its name, so nothing below this one exists.
+            let nowhere = base_dir.join("\0");
+            let written = render(&nowhere, &mut AssetRegistry::new(), &mut Diagnostics::new())?;
+            let mut restored = Vec::new();
+            rendered.html = restore_urls(&rendered.html, &written.html, &outside, &mut restored);
+            if let (Some(notes), Some(as_written)) = (&rendered.notes, &written.notes) {
+                rendered.notes = Some(restore_urls(notes, as_written, &outside, &mut restored));
+            }
+            warn_outside(&restored, &outside, base_dir, diags);
+        }
+        assets.merge(scratch);
+        self.features.merge(rendered.features);
+        if let Some(notes) = rendered.notes {
+            self.notes.get_or_insert_with(String::new).push_str(&notes);
+        }
+        Ok(rendered.html)
+    }
+
+    fn html(
+        &mut self,
+        html: &mut String,
+        assets: &mut AssetRegistry,
+        diags: &mut Diagnostics,
+    ) -> Result<()> {
+        let base_dir = self.files.base_dir;
+        let written = html.clone();
+        let mut scratch = AssetRegistry::new();
+        let mut ctx = RenderCtx {
+            assets: &mut scratch,
+            base_dir,
+            mode: RenderMode::Notebook,
+            diagnostics: diags,
+            missing_asset_is_error: false,
+        };
+        rewrite_html_assets(html, None, &mut ctx)?;
+        let outside = split_outside(&mut scratch, base_dir);
+        if !outside.is_empty() {
+            let mut restored = Vec::new();
+            *html = restore_urls(html, &written, &outside, &mut restored);
+            warn_outside(&restored, &outside, base_dir, diags);
+        }
+        assets.merge(scratch);
+        Ok(())
+    }
+}
+
+/// Removes from `registry` the file assets that are not inside `base_dir` (canonical paths,
+/// symbolic links resolved; a path that cannot be resolved counts as outside) and returns
+/// them by id.
+fn split_outside(registry: &mut AssetRegistry, base_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let root = std::fs::canonicalize(base_dir).ok();
+    let mut outside = BTreeMap::new();
+    let mut inside = AssetRegistry::new();
+    for asset in std::mem::take(registry).iter() {
+        match &asset.data {
+            AssetData::File(path) => {
+                let within = root.as_ref().is_some_and(|root| {
+                    std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(root))
+                });
+                if within {
+                    inside.register_file(path);
+                } else {
+                    outside.insert(asset.id.clone(), path.clone());
+                }
+            }
+            AssetData::Bytes(bytes) => {
+                inside.register_bytes(bytes.clone(), &asset.mime, &asset.file_name_hint);
+            }
+        }
+    }
+    *registry = inside;
+    outside
+}
+
+/// `rewritten` (HTML whose local URLs became placeholders) with every attribute value that
+/// names one of the `outside` ids put back as `written` (the same HTML before, or rendered
+/// without resolving files) has it; each value put back is appended to `restored` with the
+/// id, entities decoded. Both have the same start tags and attributes in the same order, as
+/// only attribute values were rewritten; should they not, `written` is returned whole
+/// (nothing from this output is embedded) and nothing is appended.
+fn restore_urls(
+    rewritten: &str,
+    written: &str,
+    outside: &BTreeMap<String, PathBuf>,
+    restored: &mut Vec<(String, String)>,
+) -> String {
+    let (new, old) = (html_attr_values(rewritten), html_attr_values(written));
+    let same_shape = new.len() == old.len() && new.iter().zip(&old).all(|(a, b)| a.0 == b.0);
+    if !same_shape {
+        tracing::debug!("output HTML changed shape while resolving files; keeping it as written");
+        return written.to_owned();
+    }
+    let mut out = String::with_capacity(rewritten.len());
+    let mut last = 0;
+    for ((_, value), (_, original)) in new.iter().zip(&old) {
+        let text = &rewritten[value.clone()];
+        let Some(id) = outside
+            .keys()
+            .find(|id| text.contains(&AssetRegistry::placeholder(id)))
+        else {
+            continue;
+        };
+        out.push_str(&rewritten[last..value.start]);
+        out.push_str(&written[original.clone()]);
+        last = value.end;
+        let url = html_escape::decode_html_entities(&written[original.clone()]).into_owned();
+        restored.push((url, id.clone()));
+    }
+    out.push_str(&rewritten[last..]);
+    out
+}
+
+/// One [`codes::OUTPUT_FILE_OUTSIDE`] warning per URL in `restored` (`(URL as written, id)`,
+/// in document order, each URL once), naming the file it resolved to; for the ids of
+/// `outside` that no restored URL names (the output was kept as written whole), one per file.
+fn warn_outside(
+    restored: &[(String, String)],
+    outside: &BTreeMap<String, PathBuf>,
+    base_dir: &Path,
+    diags: &mut Diagnostics,
+) {
+    let mut warn = |what: String, path: &Path| {
+        diags.warn(
+            codes::OUTPUT_FILE_OUTSIDE,
+            format!(
+                "{what} {}, which is outside the notebook's directory ({}): an output may only \
+                 embed files inside it, so it is not embedded and its URL is left as written",
+                path.display(),
+                base_dir.display()
+            ),
+        );
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    for (url, id) in restored {
+        if seen.contains(&url.as_str()) {
+            continue;
+        }
+        seen.push(url);
+        if let Some(path) = outside.get(id) {
+            warn(format!("`{url}` names"), path);
+        }
+    }
+    for (id, path) in outside {
+        if !restored.iter().any(|(_, named)| named == id) {
+            warn("an output names".to_owned(), path);
+        }
+    }
 }
 
 impl Renderer<'_> {
@@ -267,14 +593,24 @@ impl Renderer<'_> {
     ) -> Result<Option<(String, bool)>> {
         let attempt = if mime == "text/markdown" {
             match payload_text(payload) {
-                Ok(text) => Ok(((self.md)(&text)?, false)),
+                Ok(text) => Ok((
+                    self.with_hooks(index, |h, a, d| h.markdown(&text, a, d))?,
+                    false,
+                )),
                 Err(err) => Err(err),
             }
         } else {
             render_display(mime, payload, metadata, self.assets)
         };
         match attempt {
-            Ok(rendered) => Ok(Some(rendered)),
+            Ok((mut html, sets_math)) => {
+                if mime == "text/html" {
+                    self.with_hooks(index, |hooks, assets, diags| {
+                        hooks.html(&mut html, assets, diags)
+                    })?;
+                }
+                Ok(Some((html, sets_math)))
+            }
             Err(err) => {
                 let reason = match err {
                     Error::Other(message) => message,
@@ -287,6 +623,23 @@ impl Renderer<'_> {
                 Ok(None)
             }
         }
+    }
+}
+
+impl Renderer<'_> {
+    /// Runs a hook for output `index`; its warnings get the `output <index>: ` prefix.
+    fn with_hooks<T>(
+        &mut self,
+        index: usize,
+        hook: impl FnOnce(&mut dyn Hooks, &mut AssetRegistry, &mut Diagnostics) -> Result<T>,
+    ) -> Result<T> {
+        let mut local = Diagnostics::new();
+        let result = hook(&mut *self.hooks, &mut *self.assets, &mut local);
+        for mut diagnostic in local {
+            diagnostic.message = format!("output {index}: {}", diagnostic.message);
+            self.diags.push(diagnostic);
+        }
+        result
     }
 }
 
@@ -653,15 +1006,24 @@ pub fn ansi_to_html(text: &str) -> String {
 /// text as `color:var(--black,#000)` in the span of its background (`38;5;100;7`), gets the
 /// colour in its place. Text in an ANSI colour, of the span or an enclosing one, keeps it.
 ///
+/// That reverse span's `color:#…` is the colour notebook.css passes down to nested spans in
+/// `--ansi-fg` (it takes every span that starts with `color:#` for an 8-bit text colour), so
+/// a four-bit background opened inside it without a colour of its own (`38;5;17;7`, then `33`:
+/// reverse video draws the new text colour as the background) would get the white or black
+/// chosen for the hex background: white on yellow. Such a span gets `;--ansi-fg:initial`, so
+/// its text is the theme's black or white for its own background, as in a terminal
+/// (audit L-W6-1).
+///
 /// The converter's tags nest (text is escaped, so every `<` starts a tag), so a stack of the
-/// open tags tells whether the text has an ANSI colour.
+/// open tags tells whether the text has an ANSI colour and whether it is inside such a
+/// reverse span.
 fn readable_text_on_hex_backgrounds(html: String) -> String {
     if !html.contains("background:#") {
         return html;
     }
     let mut out = String::with_capacity(html.len() + 32);
-    // For each open tag: whether its text has an ANSI colour.
-    let mut coloured: Vec<bool> = Vec::new();
+    // For each open tag: the text's state inside it.
+    let mut open: Vec<TextState> = Vec::new();
     let mut rest = html.as_str();
     while let Some(lt) = rest.find('<') {
         let gt = rest[lt..].find('>').map_or(rest.len(), |at| lt + at + 1);
@@ -669,24 +1031,33 @@ fn readable_text_on_hex_backgrounds(html: String) -> String {
         let tag = &rest[lt..gt];
         rest = &rest[gt..];
         if tag.starts_with("</") {
-            coloured.pop();
+            open.pop();
             out.push_str(tag);
             continue;
         }
-        let parent = coloured.last().copied().unwrap_or(false);
-        let (tag, has_colour) = with_readable_text(tag, parent);
+        let parent = open.last().copied().unwrap_or_default();
+        let (tag, state) = with_readable_text(tag, parent);
         out.push_str(&tag);
-        coloured.push(has_colour);
+        open.push(state);
     }
     out.push_str(rest);
     out
 }
 
-/// One start tag of the converter for [`readable_text_on_hex_backgrounds`], given whether the
-/// enclosing text has an ANSI colour: the tag, with a text colour when it needs one, and
-/// whether its own text has an ANSI colour. The reversed default text
-/// (`color:var(--black,#000)` in a span that also sets the background) has none.
-fn with_readable_text(tag: &str, parent: bool) -> (Cow<'_, str>, bool) {
+/// The text inside an open tag, for [`readable_text_on_hex_backgrounds`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TextState {
+    /// It has an ANSI colour (of its span or an enclosing one).
+    coloured: bool,
+    /// It is inside a reverse-video span whose default text got a `color:#…` here.
+    in_hex_reverse: bool,
+}
+
+/// One start tag of the converter for [`readable_text_on_hex_backgrounds`], given the state of
+/// the enclosing text: the tag, with a text colour (or a `--ansi-fg` reset) when it needs one,
+/// and the state of its own text. The reversed default text (`color:var(--black,#000)` in a
+/// span that also sets the background) has no ANSI colour.
+fn with_readable_text(tag: &str, parent: TextState) -> (Cow<'_, str>, TextState) {
     let Some(style) = tag
         .strip_prefix("<span style='")
         .and_then(|rest| rest.strip_suffix("'>"))
@@ -700,21 +1071,38 @@ fn with_readable_text(tag: &str, parent: bool) -> (Cow<'_, str>, bool) {
     };
     let (colour, background) = (value("color"), value("background"));
     let reverse = colour.is_some() && background.is_some();
-    let coloured = match colour {
-        Some(colour) => !(reverse && colour.starts_with("var(--black,")),
-        None => parent,
+    let state = TextState {
+        coloured: match colour {
+            Some(colour) => !(reverse && colour.starts_with("var(--black,")),
+            None => parent.coloured,
+        },
+        ..parent
     };
-    let Some(rgb) = background.and_then(hex_rgb).filter(|_| !coloured) else {
-        return (Cow::Borrowed(tag), coloured);
+    let Some(rgb) = background.and_then(hex_rgb).filter(|_| !state.coloured) else {
+        // A background without a colour of its own inside a hex reverse span: its text
+        // must not take that span's colour (see above).
+        if background.is_some() && colour.is_none() && !state.coloured && parent.in_hex_reverse {
+            return (
+                Cow::Owned(format!("<span style='{style};--ansi-fg:initial'>")),
+                state,
+            );
+        }
+        return (Cow::Borrowed(tag), state);
     };
     let text = readable_on(rgb);
     let background = background.unwrap_or_default();
-    let tag = if reverse {
-        format!("<span style='color:{text};background:{background}'>")
-    } else {
-        format!("<span style='{style};color:{text}'>")
-    };
-    (Cow::Owned(tag), coloured)
+    if reverse {
+        let tag = format!("<span style='color:{text};background:{background}'>");
+        let state = TextState {
+            in_hex_reverse: true,
+            ..state
+        };
+        return (Cow::Owned(tag), state);
+    }
+    (
+        Cow::Owned(format!("<span style='{style};color:{text}'>")),
+        state,
+    )
 }
 
 /// The channels of a `#rgb` or `#rrggbb` colour; `None` for any other value.
@@ -1227,5 +1615,38 @@ mod tests {
         // Black and white change at a luminance of about 0.18 (#767676 is 0.181).
         assert_eq!(readable_on([0x76; 3]), "#000");
         assert_eq!(readable_on([0x75; 3]), "#fff");
+    }
+
+    /// Audit L-W6-1: after reverse video of an 8-bit or RGB colour, a four-bit colour draws a
+    /// four-bit background; its text must be the theme's black or white for that background,
+    /// not the hex reverse span's colour, which notebook.css passes down in `--ansi-fg`.
+    #[test]
+    fn four_bit_backgrounds_inside_hex_reverse_video_choose_their_own_text() {
+        assert_eq!(
+            ansi_to_html("\u{1b}[38;5;17;7m rev navy \u{1b}[33m then 33 \u{1b}[0m"),
+            "<span style='color:#00005f'><span style='color:#fff;background:#00005f'> rev navy \
+             <span style='background:var(--yellow,#a60);--ansi-fg:initial'> then 33 </span>\
+             </span></span>"
+        );
+        let html = ansi_to_html("\u{1b}[38;5;100;7mx\u{1b}[34my\u{1b}[97mz");
+        assert!(
+            html.contains("<span style='background:var(--blue,#00a);--ansi-fg:initial'>y"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span style='background:var(--bright-white,#fff);--ansi-fg:initial'>z"),
+            "{html}"
+        );
+        // Text with an ANSI colour of its own keeps it; four-bit reverse video and spans
+        // outside a hex reverse span are unchanged.
+        for sgr in ["38;5;241;43", "31;7", "7", "41"] {
+            assert!(!html_of(sgr).contains("--ansi-fg"), "{sgr}");
+        }
+        let coloured = ansi_to_html("\u{1b}[38;5;17;7mx\u{1b}[43my");
+        assert!(!coloured.contains("--ansi-fg"), "{coloured}");
+    }
+
+    fn html_of(sgr: &str) -> String {
+        ansi_to_html(&format!("\u{1b}[{sgr}mx\u{1b}[33my"))
     }
 }
