@@ -39,7 +39,11 @@ publishes that section as the GitHub Release notes (see
   boundary can end with a page that is empty but for the slide's background (about one in
   ten to twenty of the slides that run onto more pages).
 - `presenter dump` prints a deck's intermediate representation as JSON, or with
-  `--context` the template context.
+  `--context` the template context. `presenter dump --default-config` prints a
+  `presenter.toml` with every setting at its built-in default.
+- A user guide in `docs/guide/`: getting started, the Markdown dialect, notebooks, themes,
+  every setting and every command. Tests keep its `--help` blocks, its settings table and
+  its links in sync with the binary and the repository.
 - Every command takes `-v`/`-vv` (more logging), `-q` (errors only) and `--config PATH`.
   Errors name the file and line, with an excerpt of the source, on the terminal and in the
   `serve` overlay.
