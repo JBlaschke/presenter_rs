@@ -960,8 +960,9 @@ fn status_for_host(addr: SocketAddr, path: &str, host: &str) -> u16 {
 }
 
 /// live-reload.md §4 (audit F07): `serve_until` answers only requests for the address it
-/// listens on (`localhost` or an IP address, with its port); any other `Host` gets 403 on
-/// every route, merged ones included. `serve_until_allowing` adds a name (`--host`).
+/// listens on (that address, `localhost`, `127.0.0.1` or `[::1]`, with its port); any other
+/// `Host` gets 403 on every route, merged ones included. `serve_until_allowing` adds a name
+/// (`--host`).
 #[test]
 fn requests_for_other_hosts_get_403() {
     let (state, _) = state_with(&fixture("md/minimal.md"));
@@ -977,6 +978,8 @@ fn requests_for_other_hosts_get_403() {
         assert_eq!(status_for_host(server.addr, path, &evil), 403, "{path}");
         let local = format!("localhost:{port}");
         assert_eq!(status_for_host(server.addr, path, &local), 200, "{path}");
+        let lan = format!("192.168.1.5:{port}");
+        assert_eq!(status_for_host(server.addr, path, &lan), 403, "{path}");
     }
     let response = server.get_with("/", &[("Host", "evil.example")]);
     assert_eq!(response.status, 403);

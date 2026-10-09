@@ -66,12 +66,12 @@
 //! given to [`Watcher::start`] (and from [`Watcher::update`], as above). The receiving side
 //! decides where to rebuild: `presenter build --watch` blocks on it
 //! ([`run_build_watch_with`]); an async server should receive on a dedicated thread (or
-//! `spawn_blocking`) and forward to its rebuild task. [`Watcher`] is `Send`; keep it alive as long as changes are wanted
-//! (dropping it stops both threads; the coalescing thread then flushes what it holds and
-//! drops its `Sender`, so the channel closes) and call [`Watcher::update`] with the inputs
-//! of every build, from the thread that owns it. Start it **before** the first build (on
-//! [`watch_set_before_build`]), so that a change saved while that build runs is not lost
-//! ([`run_build_watch_with`] does).
+//! `spawn_blocking`) and forward to its rebuild task. [`Watcher`] is `Send`; keep it alive
+//! as long as changes are wanted (dropping it stops both threads; the coalescing thread
+//! then flushes what it holds and drops its `Sender`, so the channel closes) and call
+//! [`Watcher::update`] with the inputs of every build, from the thread that owns it. Start
+//! it **before** the first build (on [`watch_set_before_build`]), so that a change saved
+//! while that build runs is not lost ([`run_build_watch_with`] does).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;

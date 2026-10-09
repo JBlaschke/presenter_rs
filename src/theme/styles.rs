@@ -27,23 +27,34 @@
 //! as a backstop, a panic inside grass is caught and becomes an [`Error::Style`] as well).
 //!
 //! **Isolation (live-reload.md §4, audit F02/F06).** grass has no limit on recursion or
-//! loop iterations, and a stack overflow cannot be caught: it aborts the process (and with
-//! it `presenter serve`). So every Sass compilation runs on a thread of its own with a
-//! [`SASS_STACK_SIZE`] stack (deep but finite nesting and recursion compile, whatever the
-//! caller's stack), and the caller waits at most [`SASS_TIME_LIMIT`] for it:
+//! loop iterations and cannot be stopped, and a stack overflow cannot be caught: it aborts
+//! the process. So in the presenter binary every Sass compilation runs in a **worker
+//! process** (the binary itself, [`isolate_in_worker`]; protocol in the `worker` module),
+//! on a thread with a [`SASS_STACK_SIZE`] stack (deep but finite nesting and recursion
+//! compile), and the caller waits at most [`SASS_TIME_LIMIT`] for it:
 //! - a compilation that takes longer (an endless `@while`, a huge `@for`) is an
-//!   [`Error::Style`] saying so. grass cannot be stopped, so **its thread keeps running**
-//!   (using a CPU core, and memory when the loop emits CSS) until it ends by itself, which
-//!   for an endless loop means until the process exits. While it runs, compiling the same
-//!   entry of the same theme chain again with the files it read unchanged fails at once
-//!   with the same error instead of starting another such thread; any edit compiles anew;
-//! - grass offers no recursion limit, so before grass sees an SCSS file (`.scss`, read
-//!   through [`VirtualFs`]), [`unconditional_recursion`] looks for a `@mixin` that always
-//!   includes itself or a `@function` that always calls itself before any `@return`
-//!   (directly or through others of the same file), which would recurse until even that
-//!   stack overflows. Such a file is an [`Error::Style`] pointing at the call. Recursion
-//!   that only a condition guards is left to grass: one whose condition never ends it, or
-//!   one through several files or the indented `.sass` syntax, still overflows the stack.
+//!   [`Error::Style`] saying so; the worker is killed, which frees the CPU and memory it
+//!   used;
+//! - a recursion that never ends (a `@mixin` that includes itself, a `@function` that
+//!   calls itself, whether a condition that is never met guards it or not, in one file or
+//!   several) overflows the worker's stack and ends the worker only: an [`Error::Style`]
+//!   that names the recursion when the SCSS files read show one (`recursion` module),
+//!   else says what happened.
+//!
+//! A library user without a worker (a test binary is no presenter; [`with_worker`] names
+//! one) compiles on a thread of its own process with the same stack and time limit, which
+//! cannot be stopped: a compilation that times out **keeps running** (a CPU core, and
+//! memory when it emits CSS) until it ends by itself. To keep the process alive, each SCSS
+//! file is checked before grass reads it ([`unconditional_recursion`], with the references
+//! of the files loaded before): a `@mixin` that always includes itself or a `@function`
+//! that always calls itself before any `@return`, directly or through others of the file,
+//! is an [`Error::Style`] pointing at the call. Recursion that only a condition guards,
+//! that goes through several files, or that is written in the indented `.sass` syntax is
+//! left to grass, and overflows that process's stack if it never ends.
+//!
+//! After a compilation timed out or overflowed its stack, presenter remembers the files it
+//! read: compiling the same entry of the same theme chain again with those files unchanged
+//! fails at once with the same error instead of waiting again; any edit compiles anew.
 //!
 //! **Local `@import`s ([`inline_imports`]).** Sass passes CSS imports (`@import url(…)`,
 //! `@import "x.css"`) through verbatim, and a standalone document cannot load a relative
@@ -64,21 +75,27 @@
 //! font next to that CSS file and no text is processed twice.
 //!
 //! **Logging.** grass's `@debug` and `@warn` output goes to `tracing` (debug and warn;
-//! not to the build's diagnostics); each compilation logs its duration at debug level.
+//! not to the build's diagnostics), forwarded by the worker; each compilation logs its
+//! duration at debug level.
+
+mod recursion;
+mod worker;
 
 use std::any::Any;
 use std::cell::{OnceCell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::thread::JoinHandle;
+use std::sync::{Arc, LazyLock, Mutex, Once, PoisonError};
 use std::time::{Duration, Instant};
 
 use regex::{Captures, Regex};
+
+pub use recursion::{Recursion, RecursionKind, unconditional_recursion};
+pub use worker::{WORKER_ARG, WORKER_GRACE, isolate_in_worker, run_worker, with_worker};
 
 use super::{Theme, ThemeDir, ThemeFile, ThemeSource, exact_names, normalize_rel};
 use crate::error::{Error, Result};
@@ -175,132 +192,315 @@ pub fn compile_scss(theme: &Theme, path: &str) -> Result<String> {
 }
 
 /// Compiles `source`, the Sass file at the canonical key `key` (an entry or an imported
-/// file whose bytes are already read), on a thread of its own within [`SASS_TIME_LIMIT`].
+/// file whose bytes are already read), isolated within [`SASS_TIME_LIMIT`].
 fn compile_sass_source(theme: &Theme, key: &str, source: &[u8]) -> Result<String> {
     compile_sass_within(theme, key, source, SASS_TIME_LIMIT)
 }
 
-/// [`compile_sass_source`] with the time limit `limit` (module docs, "Isolation"): grass
-/// runs on a new thread with a [`SASS_STACK_SIZE`] stack; when it has not finished after
-/// `limit`, the thread is left running and the result is an [`Error::Style`] saying so.
+/// [`compile_sass_source`] with the time limit `limit` (module docs, "Isolation"): in the
+/// worker process if there is one, else on a thread of this process.
 fn compile_sass_within(theme: &Theme, key: &str, source: &[u8], limit: Duration) -> Result<String> {
     // grass's own UTF-8 error names neither the file nor the offending byte.
-    if let Err(e) = std::str::from_utf8(source) {
-        return Err(Error::Style {
-            file: key.to_string(),
-            message: format!("not valid UTF-8: {e}"),
-        });
+    let text = std::str::from_utf8(source).map_err(|e| Error::Style {
+        file: key.to_string(),
+        message: format!("not valid UTF-8: {e}"),
+    })?;
+    if let Some(err) = remembered_failure(theme, key, source) {
+        return Err(err);
     }
-    if unchanged_since_timeout(theme, key, source) {
-        return Err(timeout_error(key, limit, true));
+    let started = Instant::now();
+    let outcome = match worker::configured() {
+        Some(exe) => worker::compile(&exe, theme, key, text, limit).unwrap_or_else(|err| {
+            worker_unavailable(&exe, &err);
+            compile_in_thread(theme, key, source, limit)
+        }),
+        None => compile_in_thread(theme, key, source, limit),
+    };
+    tracing::debug!(
+        stylesheet = key,
+        elapsed_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
+        "compiled Sass"
+    );
+    match outcome {
+        Outcome::Finished(result) => result,
+        Outcome::Abandoned {
+            error,
+            reads,
+            again,
+        } => {
+            if let Some(again) = again {
+                remember_failure(theme, key, reads, &error, again);
+            }
+            Err(error)
+        }
     }
-    let reads = Reads::default();
+}
+
+/// Warns (once per process) that the worker `exe` cannot be used.
+fn worker_unavailable(exe: &Path, err: &io::Error) {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "cannot compile Sass in a worker process ({}: {err}); compiling in this process, \
+             which a Sass recursion that never ends aborts",
+            exe.display()
+        );
+    });
+}
+
+/// How a compilation ended (module docs, "Isolation").
+enum Outcome {
+    /// It finished: the CSS or its error.
+    Finished(Result<String>),
+    /// It did not finish (it timed out or crashed): `error`, after reading `reads`.
+    /// `again` is the message for compiling the same unchanged files again, which would end
+    /// the same way (`None`: not remembered).
+    Abandoned {
+        error: Error,
+        reads: Reads,
+        again: Option<String>,
+    },
+}
+
+/// Where a compilation runs (module docs, "Isolation").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Isolation {
+    /// In a worker process, which can be killed.
+    Worker,
+    /// On a thread of this process, which cannot be stopped.
+    Thread,
+}
+
+/// The message of a compilation that did not finish within `limit` (`again`: one with the
+/// same inputs as a compilation that timed out before).
+fn timeout_message(limit: Duration, isolation: Isolation, again: bool) -> String {
+    let when = match again {
+        true => "an earlier compilation of the same files did not finish within",
+        false => "the Sass compilation did not finish within",
+    };
+    let after = match (isolation, again) {
+        (Isolation::Worker, false) => " and was stopped",
+        (Isolation::Worker, true) => {
+            " and was stopped; they are unchanged, so they were not \
+                                       compiled again"
+        }
+        (Isolation::Thread, _) => {
+            ". It cannot be stopped and runs on in the background (a CPU core, and memory \
+             if it emits CSS) until the process exits: fix the stylesheet, and restart the \
+             process to free them"
+        }
+    };
+    format!(
+        "{when} {} s (an endless @while or @for loop?){after}",
+        limit.as_secs_f64()
+    )
+}
+
+/// The [`Error::Style`] of a compilation of `key` that did not finish within `limit`.
+fn timeout_error(key: &str, limit: Duration, isolation: Isolation) -> Error {
+    Error::Style {
+        file: key.to_string(),
+        message: timeout_message(limit, isolation, false),
+    }
+}
+
+/// The message of an [`Error::Style`], or the text of another error.
+fn style_message(error: &Error) -> String {
+    match error {
+        Error::Style { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The [`Error::Style`] for a stack overflow while compiling `key` (`source`) for `theme`
+/// after reading `reads`: the recursion that the SCSS files read show
+/// ([`recursion::recursion_hint`]), at its call; `None` when they show none.
+fn overflow_error(theme: &Theme, key: &str, source: &str, reads: &Reads) -> Option<Error> {
+    let fs = VirtualFs::new(theme);
+    let mut files: Vec<(String, String)> = Vec::new();
+    for (file, _) in reads {
+        if !is_scss(file) || files.iter().any(|(seen, _)| seen == file) {
+            continue;
+        }
+        let text = match file == key {
+            true => Some(source.to_string()),
+            false => fs
+                .read_key(file)
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok()),
+        };
+        if let Some(text) = text {
+            files.push((file.clone(), text));
+        }
+    }
+    let (at, found) = recursion::recursion_hint(&files)?;
+    let (file, text) = &files[at];
+    let error = Error::Style {
+        file: file.clone(),
+        message: found.message(text),
+    };
+    Some(naming_entry(error, key))
+}
+
+/// True for the key of an `.scss` file (any case).
+fn is_scss(key: &str) -> bool {
+    key.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("scss"))
+}
+
+/// Compiles `source`, the file `key` of `theme`, on a new thread of this process with a
+/// [`SASS_STACK_SIZE`] stack, its SCSS files checked for recursion as grass reads them
+/// (module docs, "Isolation"). After `limit` the thread is left running.
+fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -> Outcome {
+    let reads = Arc::new(Mutex::new(Reads::new()));
     let (tx, rx) = mpsc::channel();
     // The caller's subscriber (a test's, or the CLI's global one) gets grass's logs.
     let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
-    let job = (
-        theme.clone(),
-        key.to_string(),
-        source.to_vec(),
-        Arc::clone(&reads),
-    );
+    let recorded = Arc::clone(&reads);
+    let report = Reporter::new(move |report| match report {
+        Report::Read(key, hash) => recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((key, hash)),
+        Report::Debug(text) => tracing::debug!("{text}"),
+        Report::Warn(text) => tracing::warn!("{text}"),
+    });
+    let job = (theme.clone(), key.to_string(), source.to_vec(), report);
     let spawned = std::thread::Builder::new()
         .name("presenter-sass".into())
         .stack_size(SASS_STACK_SIZE)
         .spawn(move || {
-            let (theme, key, source, reads) = job;
+            let (theme, key, source, report) = job;
             let result = tracing::dispatcher::with_default(&dispatch, || {
                 let fs = VirtualFs::new(&theme)
                     .with_file(&key, &source)
-                    .recording(reads);
+                    .reporting(report)
+                    .guarded();
                 compile_sass(&fs, &key)
             });
             // The caller may have stopped waiting (timed out): nobody to tell then.
             let _ = tx.send(result);
         });
-    let thread = spawned.map_err(|err| Error::Style {
-        file: key.to_string(),
-        message: format!("cannot start a thread for the Sass compiler: {err}"),
-    })?;
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(err) => {
+            return Outcome::Finished(Err(Error::Style {
+                file: key.to_string(),
+                message: format!("cannot start a thread for the Sass compiler: {err}"),
+            }));
+        }
+    };
     match rx.recv_timeout(limit) {
         Ok(result) => {
             // It has sent its result: the thread is ending, and its stack is freed.
             let _ = thread.join();
-            result
+            Outcome::Finished(result)
         }
-        Err(RecvTimeoutError::Timeout) => {
-            remember_timeout(theme, key, reads, thread);
-            Err(timeout_error(key, limit, false))
-        }
-        Err(RecvTimeoutError::Disconnected) => Err(Error::Style {
+        Err(RecvTimeoutError::Timeout) => Outcome::Abandoned {
+            error: timeout_error(key, limit, Isolation::Thread),
+            reads: reads.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            again: Some(timeout_message(limit, Isolation::Thread, true)),
+        },
+        Err(RecvTimeoutError::Disconnected) => Outcome::Finished(Err(Error::Style {
             file: key.to_string(),
             message: "the Sass compiler (grass) stopped unexpectedly".into(),
-        }),
-    }
-}
-
-/// The [`Error::Style`] of a compilation of `key` that did not finish within `limit`
-/// (`again`: one with the same inputs as a compilation that timed out and still runs).
-fn timeout_error(key: &str, limit: Duration, again: bool) -> Error {
-    let when = match again {
-        true => "an earlier compilation of the same files did not finish within",
-        false => "the Sass compilation did not finish within",
-    };
-    Error::Style {
-        file: key.to_string(),
-        message: format!(
-            "{when} {} s (an endless @while or @for loop?). It cannot be stopped and runs on \
-             in the background (a CPU core, and memory if it emits CSS) until presenter \
-             exits: fix the stylesheet, and restart a running `presenter serve` or \
-             `build --watch` to free them",
-            limit.as_secs_f64()
-        ),
+        })),
     }
 }
 
 /// The files a compilation read through its [`VirtualFs`], by canonical key, with a hash
 /// of their contents, in the order read.
-type Reads = Arc<Mutex<Vec<(String, blake3::Hash)>>>;
+type Reads = Vec<(String, blake3::Hash)>;
 
-/// A compilation that did not finish within its time limit (module docs, "Isolation").
-struct TimedOut {
+/// What a compilation reports while it runs ([`Reporter`]).
+enum Report {
+    /// grass read the file with this canonical key and contents hash.
+    Read(String, blake3::Hash),
+    /// A `@debug` line, as it is logged.
+    Debug(String),
+    /// A `@warn` line, as it is logged.
+    Warn(String),
+}
+
+/// Where a compilation reports the files grass reads and its `@debug`/`@warn` output: to
+/// `tracing` and the caller's [`Reads`] on a thread, to the caller's pipe in a worker.
+#[derive(Clone)]
+struct Reporter(Arc<dyn Fn(Report) + Send + Sync>);
+
+impl Reporter {
+    fn new(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
+        Reporter(Arc::new(report))
+    }
+
+    fn send(&self, report: Report) {
+        (self.0)(report);
+    }
+}
+
+impl std::fmt::Debug for Reporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reporter")
+    }
+}
+
+/// A compilation that did not finish (module docs, "Isolation").
+struct Failed {
     /// The locations of its theme chain, child first: which theme it compiled for.
     chain: Vec<String>,
     /// Its entry's canonical key.
     key: String,
-    /// What it has read so far (it may read more while it runs).
+    /// What it had read.
     reads: Reads,
-    /// Its thread, still running unless finished.
-    thread: JoinHandle<()>,
+    /// The file of its error.
+    file: String,
+    /// The message for compiling the same files again.
+    again: String,
 }
 
-/// The compilations that timed out, for [`unchanged_since_timeout`].
-static TIMED_OUT: Mutex<Vec<TimedOut>> = Mutex::new(Vec::new());
+/// The compilations that did not finish, for [`remembered_failure`]; the latest
+/// [`REMEMBERED`].
+static FAILED: Mutex<Vec<Failed>> = Mutex::new(Vec::new());
+
+/// How many failed compilations [`FAILED`] keeps.
+const REMEMBERED: usize = 16;
 
 /// The locations of `theme`'s chain, child first.
 fn chain_locations(theme: &Theme) -> Vec<String> {
     theme.chain.iter().map(ThemeDir::location).collect()
 }
 
-/// Records a compilation of `key` for `theme` that did not finish in time.
-fn remember_timeout(theme: &Theme, key: &str, reads: Reads, thread: JoinHandle<()>) {
-    let mut timed_out = TIMED_OUT.lock().unwrap_or_else(PoisonError::into_inner);
-    timed_out.push(TimedOut {
-        chain: chain_locations(theme),
+/// Records a compilation of `key` for `theme` that did not finish after reading `reads`,
+/// with `error` and the message `again` for compiling the same files again.
+fn remember_failure(theme: &Theme, key: &str, reads: Reads, error: &Error, again: String) {
+    let Error::Style { file, .. } = error else {
+        return;
+    };
+    if reads.is_empty() {
+        return;
+    }
+    let chain = chain_locations(theme);
+    let mut failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+    failed.retain(|run| run.key != key || run.chain != chain);
+    if failed.len() >= REMEMBERED {
+        failed.remove(0);
+    }
+    failed.push(Failed {
+        chain,
         key: key.to_string(),
         reads,
-        thread,
+        file: file.clone(),
+        again,
     });
 }
 
-/// True when a compilation of `key` (whose contents are now `source`) for the chain of
-/// `theme` timed out and still runs, and every file it read is unchanged: compiling again
-/// would run into the same endless loop. Forgets the compilations that have ended.
-fn unchanged_since_timeout(theme: &Theme, key: &str, source: &[u8]) -> bool {
-    let mut timed_out = TIMED_OUT.lock().unwrap_or_else(PoisonError::into_inner);
-    timed_out.retain(|run| !run.thread.is_finished());
-    if timed_out.is_empty() {
-        return false;
+/// The error of a compilation of `key` (whose contents are now `source`) for the chain of
+/// `theme` that did not finish, when every file it read is unchanged: compiling again
+/// would end the same way.
+fn remembered_failure(theme: &Theme, key: &str, source: &[u8]) -> Option<Error> {
+    let failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+    if failed.is_empty() {
+        return None;
     }
     let chain = chain_locations(theme);
     let fs = VirtualFs::new(theme);
@@ -311,33 +511,30 @@ fn unchanged_since_timeout(theme: &Theme, key: &str, source: &[u8]) -> bool {
         };
         now.is_some_and(|bytes| blake3::hash(&bytes) == *hash)
     };
-    timed_out.iter().any(|run| {
-        let reads = run.reads.lock().unwrap_or_else(PoisonError::into_inner);
-        run.key == key && run.chain == chain && !reads.is_empty() && reads.iter().all(unchanged)
+    let run = failed
+        .iter()
+        .find(|run| run.key == key && run.chain == chain && run.reads.iter().all(unchanged))?;
+    Some(Error::Style {
+        file: run.file.clone(),
+        message: run.again.clone(),
     })
 }
 
-/// Runs grass on the file `key` of `fs`, logging the time it took.
+/// Runs grass on the file `key` of `fs`.
 fn compile_sass(fs: &VirtualFs<'_>, key: &str) -> Result<String> {
     let load_paths: Vec<PathBuf> = fs.load_paths().into_iter().map(PathBuf::from).collect();
+    let logger = ReportLogger(fs.report.as_ref());
     let options = grass::Options::default()
         .fs(fs)
-        .logger(&TracingLogger)
+        .logger(&logger)
         .load_paths(&load_paths)
         // The result is concatenated into one stylesheet, where a `@charset` would be
         // misplaced; it is UTF-8 in every output mode anyway.
         .allows_charset(false);
     let entry = VirtualFs::marked(key);
-    let started = Instant::now();
     // A backstop: grass has internal panics (`unreachable!`, `todo!`) that user input may
     // reach; a theme must not take `build` or `serve` down with it.
     let result = catch_unwind(AssertUnwindSafe(|| grass::from_path(&entry, &options)));
-    let elapsed = started.elapsed();
-    tracing::debug!(
-        stylesheet = key,
-        elapsed_ms = format_args!("{:.1}", elapsed.as_secs_f64() * 1000.0),
-        "compiled Sass"
-    );
     // A file that could not be loaded was read as empty: its error comes first.
     if let Some(err) = fs.failure.take() {
         return Err(naming_entry(err, key));
@@ -354,14 +551,17 @@ fn compile_sass(fs: &VirtualFs<'_>, key: &str) -> Result<String> {
     }
 }
 
-/// `err` with `(compiling '<entry>')` added when it is an [`Error::Style`] about another
-/// file than `entry`.
+/// `err` with `(compiling '<entry>')` added to its first line (before a quoted source
+/// line) when it is an [`Error::Style`] about another file than `entry`.
 fn naming_entry(err: Error, entry: &str) -> Error {
     match err {
-        Error::Style { file, message } if file != entry => Error::Style {
-            message: format!("{message} (compiling '{entry}')"),
-            file,
-        },
+        Error::Style { file, message } if file != entry => {
+            let (first, rest) = message.split_at(message.find('\n').unwrap_or(message.len()));
+            Error::Style {
+                message: format!("{first} (compiling '{entry}'){rest}"),
+                file,
+            }
+        }
         other => other,
     }
 }
@@ -443,8 +643,9 @@ fn decode(key: &str, bytes: Vec<u8>) -> Result<String> {
 /// [`grass::Fs::read`] never fails: grass 0.13.4 panics when reading a file it loads fails
 /// or gives invalid UTF-8, so the first such problem is recorded instead (an
 /// [`Error::Style`] naming the file), the file reads as empty, and the compilation reports
-/// the recorded error. An `.scss` file that recurses unconditionally
-/// ([`unconditional_recursion`]) is such a problem too: grass would overflow its stack.
+/// the recorded error. In a compilation on a thread of the calling process, an `.scss`
+/// file that recurses unconditionally ([`unconditional_recursion`]) is such a problem too:
+/// grass would overflow the process's stack (module docs, "Isolation").
 #[derive(Debug)]
 pub struct VirtualFs<'t> {
     theme: &'t Theme,
@@ -455,8 +656,11 @@ pub struct VirtualFs<'t> {
     embedded: OnceCell<BTreeSet<String>>,
     /// The first file grass could not read (see the type docs).
     failure: RefCell<Option<Error>>,
-    /// Where the files grass reads are recorded, if anywhere ([`compile_sass_within`]).
-    reads: Option<Reads>,
+    /// Where the files grass reads and its log output are reported, if anywhere.
+    report: Option<Reporter>,
+    /// When the SCSS files grass reads are checked for recursion: the references of the
+    /// files read so far.
+    guard: Option<RefCell<recursion::Refs>>,
 }
 
 /// Where a key of the [`VirtualFs`] lives.
@@ -475,7 +679,8 @@ impl<'t> VirtualFs<'t> {
             file: None,
             embedded: OnceCell::new(),
             failure: RefCell::new(None),
-            reads: None,
+            report: None,
+            guard: None,
         }
     }
 
@@ -486,9 +691,16 @@ impl<'t> VirtualFs<'t> {
         self
     }
 
-    /// The same tree, recording each file grass reads in `reads`.
-    fn recording(mut self, reads: Reads) -> Self {
-        self.reads = Some(reads);
+    /// The same tree, reporting each file grass reads and grass's log output to `report`.
+    fn reporting(mut self, report: Reporter) -> Self {
+        self.report = Some(report);
+        self
+    }
+
+    /// The same tree, checking each SCSS file grass reads for unconditional recursion
+    /// (module docs, "Isolation").
+    fn guarded(mut self) -> Self {
+        self.guard = Some(RefCell::default());
         self
     }
 
@@ -626,21 +838,23 @@ impl<'t> VirtualFs<'t> {
         })
     }
 
-    /// The UTF-8 contents of the file at `path`, recorded when [`VirtualFs::recording`];
-    /// [`Error::Style`] naming it otherwise, and for an `.scss` file that recurses
-    /// unconditionally ([`unconditional_recursion`]).
+    /// The UTF-8 contents of the file at `path`, reported when [`VirtualFs::reporting`];
+    /// [`Error::Style`] naming it otherwise, and, when [`VirtualFs::guarded`], for an
+    /// `.scss` file that recurses unconditionally ([`unconditional_recursion`], its
+    /// definitions reached from the files read before, too).
     fn read_text(&self, path: &Path) -> Result<Vec<u8>> {
         let (key, bytes) = self.read_utf8(path)?;
-        if let Some(reads) = &self.reads {
-            let mut reads = reads.lock().unwrap_or_else(PoisonError::into_inner);
-            reads.push((key.clone(), blake3::hash(&bytes)));
+        if let Some(report) = &self.report {
+            report.send(Report::Read(key.clone(), blake3::hash(&bytes)));
         }
-        let scss = key
-            .rsplit_once('.')
-            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("scss"));
+        let Some(guard) = self.guard.as_ref().filter(|_| is_scss(&key)) else {
+            return Ok(bytes);
+        };
         // `read_utf8` checked the bytes.
         let text = std::str::from_utf8(&bytes).unwrap_or_default();
-        match scss.then(|| unconditional_recursion(text)).flatten() {
+        let (found, refs) = recursion::always_recursion(text, &guard.borrow());
+        guard.borrow_mut().extend(refs);
+        match found {
             Some(found) => Err(Error::Style {
                 file: key,
                 message: found.message(text),
@@ -721,26 +935,34 @@ impl grass::Fs for VirtualFs<'_> {
     }
 }
 
-/// Sends grass's `@debug` and `@warn` output to `tracing`.
+/// Sends grass's `@debug` and `@warn` output to a [`Reporter`], else to `tracing`.
 #[derive(Debug)]
-struct TracingLogger;
+struct ReportLogger<'r>(Option<&'r Reporter>);
 
-impl grass::Logger for TracingLogger {
+impl grass::Logger for ReportLogger<'_> {
     fn debug(&self, location: codemap::SpanLoc, message: &str) {
-        tracing::debug!(
+        let text = format!(
             "{}:{}: @debug: {message}",
             location_name(&location),
             location.begin.line + 1
         );
+        match self.0 {
+            Some(report) => report.send(Report::Debug(text)),
+            None => tracing::debug!("{text}"),
+        }
     }
 
     fn warn(&self, location: codemap::SpanLoc, message: &str) {
-        tracing::warn!(
+        let text = format!(
             "{}:{}:{}: Sass warning: {message}",
             location_name(&location),
             location.begin.line + 1,
             location.begin.column + 1
         );
+        match self.0 {
+            Some(report) => report.send(Report::Warn(text)),
+            None => tracing::warn!("{text}"),
+        }
     }
 }
 
@@ -748,426 +970,6 @@ impl grass::Logger for TracingLogger {
 fn location_name(location: &codemap::SpanLoc) -> String {
     let name = location.file.name();
     VirtualFs::key(Path::new(name)).unwrap_or_else(|| name.replace(DIR_MARK, ""))
-}
-
-// ---------------------------------------------------------------------------------------
-// Unconditional recursion
-// ---------------------------------------------------------------------------------------
-
-/// A `@mixin` or `@function` that always recurses ([`unconditional_recursion`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Recursion {
-    /// `"mixin"` or `"function"`.
-    pub kind: &'static str,
-    /// The names on the cycle, starting and ending with the one defined first (`[a, a]`
-    /// for a mixin that includes itself).
-    pub cycle: Vec<String>,
-    /// The 1-based line of the `@include` or call in the first definition that starts the
-    /// cycle.
-    pub line: usize,
-}
-
-impl Recursion {
-    /// The message of the [`Error::Style`] for this recursion in the file `text`:
-    /// `line L: …` and the line itself, numbered (as grass quotes a line).
-    pub fn message(&self, text: &str) -> String {
-        let (name, calls) = match self.kind {
-            "mixin" => ("@mixin", "includes itself"),
-            _ => ("@function", "calls itself before any @return"),
-        };
-        let through = match self.cycle.as_slice() {
-            [_, _] => String::new(),
-            cycle => format!(" through {}", cycle[1..cycle.len() - 1].join(", ")),
-        };
-        let mut message = format!(
-            "line {}: {name} {} always {calls}{through}, so Sass would recurse until it runs \
-             out of stack; make the recursion depend on an @if that ends it",
-            self.line, self.cycle[0]
-        );
-        if let Some(source) = text.lines().nth(self.line - 1) {
-            let _ = write!(message, "\n {} | {}", self.line, source.trim_end());
-        }
-        message
-    }
-}
-
-/// The first `@mixin` (in source order) that always `@include`s itself, directly or through
-/// other mixins of `scss`, else the first such `@function` that always calls itself; `None`
-/// when there is neither. A mixin includes another always when the `@include` is not inside
-/// a control directive (`@if`, `@else`, `@each`, `@for`, `@while`) or a content block; a
-/// function calls another always when the call is outside control directives and the lazy
-/// `if()`, and comes before any `@return` (an `@if` that may return makes what follows
-/// conditional). Only names without a namespace count (`@include pad`, not
-/// `@include m.pad`), compared as Sass does (`-` and `_` are the same). The SCSS syntax is
-/// read leniently: comments, strings and unquoted `url()`s are skipped; invalid input finds
-/// nothing rather than failing.
-pub fn unconditional_recursion(scss: &str) -> Option<Recursion> {
-    let statements = parse_statements(scss);
-    let mut mixins = Vec::new();
-    let mut functions = Vec::new();
-    collect_definitions(&statements, &mut mixins, &mut functions);
-    first_cycle("mixin", &mixins).or_else(|| first_cycle("function", &functions))
-}
-
-/// One SCSS statement: its text up to `;` or `{` (comments removed, strings emptied) and
-/// its block, if it has one.
-#[derive(Debug, Default)]
-struct Statement {
-    /// The statement's text, trimmed.
-    head: String,
-    /// The 1-based line where it starts.
-    line: usize,
-    /// The statements of its `{ … }` block.
-    block: Option<Vec<Statement>>,
-}
-
-impl Statement {
-    /// The at-rule's name (`include` for `@include pad;`), lowercase; `""` for anything
-    /// else.
-    fn at_rule(&self) -> String {
-        let Some(rest) = self.head.strip_prefix('@') else {
-            return String::new();
-        };
-        rest.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-    }
-
-    /// The text after the at-rule's name.
-    fn at_rule_rest(&self) -> &str {
-        let name = 1 + self.at_rule().len();
-        self.head.get(name..).unwrap_or_default().trim_start()
-    }
-}
-
-/// A mixin or function definition: its name (normalized), and the names it always
-/// includes or calls, with the line of each.
-type Definition = (String, Vec<(String, usize)>);
-
-/// The control directives: what is inside them may not run.
-const CONTROL: [&str; 5] = ["if", "else", "each", "for", "while"];
-
-/// The SCSS statements of `text`, as a tree (see [`Statement`]).
-fn parse_statements(text: &str) -> Vec<Statement> {
-    let mut stack = vec![Statement::default()];
-    let mut head = Statement::default();
-    let mut chars = text.chars().peekable();
-    let mut line = 1;
-    while let Some(c) = chars.next() {
-        let comment = c == '/' && matches!(chars.peek(), Some('/' | '*'));
-        if !comment
-            && !c.is_whitespace()
-            && !matches!(c, '{' | ';' | '}')
-            && head.head.trim().is_empty()
-        {
-            head.line = line;
-            head.head.clear();
-        }
-        match c {
-            '/' if chars.peek() == Some(&'/') => while chars.next_if(|&c| c != '\n').is_some() {},
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut last = ' ';
-                for c in chars.by_ref() {
-                    line += usize::from(c == '\n');
-                    if last == '*' && c == '/' {
-                        break;
-                    }
-                    last = c;
-                }
-            }
-            '"' | '\'' => {
-                line += skip_string(&mut chars, c);
-                head.head.push_str("\"\"");
-            }
-            '(' if head.head.to_ascii_lowercase().ends_with("url") => {
-                head.head.push('(');
-                line += skip_unquoted_url(&mut chars, &mut head.head);
-            }
-            '#' if chars.peek() == Some(&'{') => {
-                head.head.push('#');
-                line += copy_interpolation(&mut chars, &mut head.head);
-            }
-            '{' | ';' | '}' => {
-                let done = std::mem::take(&mut head);
-                if c == '{' {
-                    stack.push(done);
-                    continue;
-                }
-                if !done.head.trim().is_empty()
-                    && let Some(open) = stack.last_mut()
-                {
-                    open.block.get_or_insert_default().push(trimmed(done));
-                }
-                if c == '}' && stack.len() > 1 {
-                    close_block(&mut stack);
-                }
-            }
-            _ => {
-                line += usize::from(c == '\n');
-                head.head.push(c);
-            }
-        }
-    }
-    while stack.len() > 1 {
-        close_block(&mut stack);
-    }
-    stack.pop().and_then(|top| top.block).unwrap_or_default()
-}
-
-/// `statement` with its head trimmed.
-fn trimmed(mut statement: Statement) -> Statement {
-    statement.head = statement.head.trim().to_string();
-    statement
-}
-
-/// Ends the innermost open block of `stack` (more than one entry): it becomes a statement
-/// of the block around it.
-fn close_block(stack: &mut Vec<Statement>) {
-    if let Some(mut closed) = stack.pop()
-        && let Some(open) = stack.last_mut()
-    {
-        closed.block.get_or_insert_default();
-        open.block.get_or_insert_default().push(trimmed(closed));
-    }
-}
-
-/// Skips a string literal opened by `quote` (escapes included, ended by the quote or a
-/// line break); returns the number of line breaks consumed.
-fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char) -> usize {
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            '\n' => return 1,
-            c if c == quote => return 0,
-            _ => {}
-        }
-    }
-    0
-}
-
-/// Copies an unquoted `url(` argument up to its `)` into `head` (a quoted one is left to
-/// the caller); returns the number of line breaks consumed.
-fn skip_unquoted_url(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    head: &mut String,
-) -> usize {
-    while chars.next_if(|c| c.is_whitespace() && *c != '\n').is_some() {}
-    if matches!(chars.peek(), Some('"' | '\'')) {
-        return 0;
-    }
-    let mut lines = 0;
-    for c in chars.by_ref() {
-        lines += usize::from(c == '\n');
-        head.push(c);
-        if c == ')' {
-            break;
-        }
-    }
-    lines
-}
-
-/// Copies an interpolation `{…}` (after its `#`) with nested braces into `head`; returns
-/// the number of line breaks consumed.
-fn copy_interpolation(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    head: &mut String,
-) -> usize {
-    let (mut depth, mut lines) = (0usize, 0);
-    for c in chars.by_ref() {
-        lines += usize::from(c == '\n');
-        head.push(c);
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    lines
-}
-
-/// A name as Sass compares it: `-` and `_` are the same.
-fn sass_name(name: &str) -> String {
-    name.replace('_', "-")
-}
-
-/// The leading identifier of `text` (letters, digits, `-`, `_`), normalized.
-fn leading_name(text: &str) -> Option<String> {
-    let end = text
-        .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-        .unwrap_or(text.len());
-    (end > 0).then(|| sass_name(&text[..end]))
-}
-
-/// Collects the `@mixin` and `@function` definitions of `statements` (at any depth outside
-/// definitions) with what each always includes or calls.
-fn collect_definitions(
-    statements: &[Statement],
-    mixins: &mut Vec<Definition>,
-    functions: &mut Vec<Definition>,
-) {
-    for statement in statements {
-        let Some(block) = &statement.block else {
-            continue;
-        };
-        let at = statement.at_rule();
-        let name = leading_name(statement.at_rule_rest());
-        match (at.as_str(), name) {
-            ("mixin", Some(name)) => {
-                let mut includes = Vec::new();
-                mixin_includes(block, &mut includes);
-                mixins.push((name, includes));
-            }
-            ("function", Some(name)) => {
-                let mut calls = Vec::new();
-                function_calls(block, &mut calls);
-                functions.push((name, calls));
-            }
-            _ => collect_definitions(block, mixins, functions),
-        }
-    }
-}
-
-/// The mixins `block` (of a mixin) always includes, with their lines.
-fn mixin_includes(block: &[Statement], includes: &mut Vec<(String, usize)>) {
-    for statement in block {
-        let at = statement.at_rule();
-        if at == "include" {
-            let rest = statement.at_rule_rest();
-            if let Some(name) = leading_name(rest)
-                && !rest[name.len()..].starts_with('.')
-            {
-                includes.push((name, statement.line));
-            }
-        } else if !CONTROL.contains(&at.as_str())
-            && !matches!(at.as_str(), "mixin" | "function")
-            && let Some(inner) = &statement.block
-        {
-            mixin_includes(inner, includes);
-        }
-    }
-}
-
-/// The functions `block` (of a function) always calls before any `@return`, with their
-/// lines.
-fn function_calls(block: &[Statement], calls: &mut Vec<(String, usize)>) {
-    for statement in block {
-        let at = statement.at_rule();
-        if CONTROL.contains(&at.as_str()) {
-            if statement.block.as_deref().is_some_and(returns) {
-                return; // what follows runs only if that branch did not return
-            }
-            continue;
-        }
-        if at == "error" {
-            return;
-        }
-        if at.is_empty() || matches!(at.as_str(), "return" | "debug" | "warn") {
-            let expression = match at.is_empty() {
-                true => statement.head.as_str(),
-                false => statement.at_rule_rest(),
-            };
-            calls.extend(
-                called_names(expression)
-                    .into_iter()
-                    .map(|name| (name, statement.line)),
-            );
-        }
-        if at == "return" {
-            return;
-        }
-    }
-}
-
-/// True if `block` contains a `@return` at any depth.
-fn returns(block: &[Statement]) -> bool {
-    block.iter().any(|statement| {
-        statement.at_rule() == "return" || statement.block.as_deref().is_some_and(returns)
-    })
-}
-
-/// The names of the functions `expression` calls (`name(`, without a namespace, not
-/// inside the arguments of the lazy `if()`), normalized.
-fn called_names(expression: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let bytes = expression.as_bytes();
-    let mut at = 0;
-    while at < expression.len() {
-        let rest = &expression[at..];
-        let Some(name) = leading_name(rest) else {
-            at += rest.chars().next().map_or(1, char::len_utf8);
-            continue;
-        };
-        let raw_len = rest
-            .find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(rest.len());
-        let before = expression[..at].chars().next_back();
-        let call = bytes.get(at + raw_len) == Some(&b'(')
-            && !matches!(before, Some('.' | '$' | '@' | '%' | '-' | '_'))
-            && !before.is_some_and(char::is_alphanumeric);
-        at += raw_len;
-        if call && name == "if" {
-            at += closing_paren(&expression[at..]).map_or(expression.len() - at, |end| end + 1);
-        } else if call {
-            names.push(name);
-        }
-    }
-    names
-}
-
-/// The first definition of `definitions` (in order) that reaches itself through the
-/// always-taken edges, as a [`Recursion`] of `kind`.
-fn first_cycle(kind: &'static str, definitions: &[Definition]) -> Option<Recursion> {
-    let edges: BTreeMap<&str, &[(String, usize)]> = definitions
-        .iter()
-        .rev()
-        .map(|(name, calls)| (name.as_str(), calls.as_slice()))
-        .collect();
-    definitions.iter().find_map(|(start, calls)| {
-        calls.iter().find_map(|(next, line)| {
-            let mut path = vec![start.clone()];
-            let mut seen = BTreeSet::new();
-            let found = cycle_back(start, next, &edges, &mut path, &mut seen);
-            found.then_some(Recursion {
-                kind,
-                cycle: path,
-                line: *line,
-            })
-        })
-    })
-}
-
-/// True if `start` is reached from `name` along `edges`; `path` then ends with the names
-/// from `name` to `start`. `seen` holds the names already explored.
-fn cycle_back(
-    start: &str,
-    name: &str,
-    edges: &BTreeMap<&str, &[(String, usize)]>,
-    path: &mut Vec<String>,
-    seen: &mut BTreeSet<String>,
-) -> bool {
-    path.push(name.to_string());
-    if name == start {
-        return true;
-    }
-    if seen.insert(name.to_string())
-        && let Some(calls) = edges.get(name)
-        && calls
-            .iter()
-            .any(|(next, _)| cycle_back(start, next, edges, path, seen))
-    {
-        return true;
-    }
-    path.pop();
-    false
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1705,111 +1507,17 @@ a::before { content: "@import url(string.css);" }
         );
     }
 
-    /// The kind, cycle and line [`unconditional_recursion`] finds in `scss`.
-    fn recursion(scss: &str) -> Option<(&'static str, String, usize)> {
-        unconditional_recursion(scss).map(|found| (found.kind, found.cycle.join(" > "), found.line))
-    }
-
     #[test]
-    fn unconditional_recursion_is_found() {
-        let found = |kind, cycle: &str, line| Some((kind, cycle.to_string(), line));
-        // The audit's examples (F02): a mixin without its base case, a function.
-        let pad =
-            "@mixin pad($n) { padding: $n; @include pad($n - 1); }\nbody { @include pad(3px); }\n";
-        assert_eq!(recursion(pad), found("mixin", "pad > pad", 1));
-        assert_eq!(
-            recursion("@function f(){@return f();}"),
-            found("function", "f > f", 1)
-        );
-        // Through others, on the line of the @include; `-` and `_` are the same name.
-        let mutual = "@mixin a {\n  color: red;\n  @include b;\n}\n@mixin b { @include my_c(); }\n\
-                      @mixin my-c { x: y; @include a }\n";
-        assert_eq!(recursion(mutual), found("mixin", "a > b > my-c > a", 3));
-        // Nested rules and @media blocks always run; so does a call before any @return.
-        let nested = "@mixin m {\n  #{$sel} a { @media print { @include m; } }\n}";
-        assert_eq!(recursion(nested), found("mixin", "m > m", 2));
-        let before = "@function f($n) {\n  $x: 1 + f($n);\n  @return $x;\n}";
-        assert_eq!(recursion(before), found("function", "f > f", 2));
-        let debug = "@function g() { @debug g(); @return 1; }";
-        assert_eq!(recursion(debug), found("function", "g > g", 1));
-        // An unquoted url() with `//` is no comment.
-        let url = "@mixin u { background: url(http://x.example/y.png); @include u; }";
-        assert_eq!(recursion(url), found("mixin", "u > u", 1));
-        // Mixins come first.
-        let both = "@function f() { @return f(); }\n@mixin m { @include m; }";
-        assert_eq!(recursion(both), found("mixin", "m > m", 2));
-    }
-
-    #[test]
-    fn guarded_or_foreign_recursion_is_left_to_sass() {
-        for scss in [
-            // A base case.
-            "@mixin pad($n) { @if $n > 0 { padding: $n; @include pad($n - 1); } }",
-            "@mixin pad($n) { @if $n == 0 { a: b; } @else { @include pad($n - 1); } }",
-            "@mixin l($list) { @each $x in $list { @include l(nth($x, 1)); } }",
-            "@function f($n) {\n  @if $n <= 0 { @return 0; }\n  @return f($n - 1);\n}",
-            "@function f($n) { @while $n > 0 { @return f($n - 1); } @return 0; }",
-            "@function f($n) { @return if($n > 0, f($n - 1), 0); }",
-            "@function f() { @error \"no\"; @return f(); }",
-            // A content block may not run.
-            "@mixin m { @include other { @include m; } }",
-            // Another module's mixin, a variable, text.
-            "@use \"m\";\n@mixin pad { @include m.pad; }",
-            "@function f() { @return $f + m.f(1) + -f(2); }",
-            "/* @mixin x { @include x; } */ // @mixin y { @include y; }\n\
-             @mixin z { content: \"@include z;\"; } @mixin w { content: '}'; }",
-            // Not a definition, or invalid.
-            "a { @include a; }",
-            "@mixin { @include x; }",
-            "@mixin m { @include m",
-            "}}} @mixin m { a: b }",
-            "",
-        ] {
-            assert_eq!(recursion(scss), None, "{scss}");
-        }
-    }
-
-    #[test]
-    fn recursion_messages_quote_the_call() {
-        let scss = "@mixin a {\n  @include b;\n}\n@mixin b { @include a; }\n";
-        let message = unconditional_recursion(scss).unwrap().message(scss);
-        assert_eq!(
-            message,
-            "line 2: @mixin a always includes itself through b, so Sass would recurse until it \
-             runs out of stack; make the recursion depend on an @if that ends it\n 2 |   \
-             @include b;"
-        );
-        let scss = "@function f() { @return f(); }";
-        let message = unconditional_recursion(scss).unwrap().message(scss);
-        assert!(
-            message.starts_with("line 1: @function f always calls itself before any @return, so"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn no_embedded_stylesheet_recurses_unconditionally() {
-        let mut checked = 0;
-        for path in crate::vendor::list("") {
-            if !path.to_ascii_lowercase().ends_with(".scss") {
-                continue;
-            }
-            let text = crate::vendor::get_str(&path).unwrap();
-            assert_eq!(unconditional_recursion(&text), None, "{path}");
-            checked += 1;
-        }
-        assert!(checked > 10, "only {checked} embedded .scss files");
-    }
-
-    #[test]
-    fn an_endless_loop_times_out_and_the_same_files_fail_at_once() {
+    fn a_long_loop_times_out_and_the_same_files_fail_at_once() {
+        // On a thread of this process (no worker here): the thread left behind cannot be
+        // stopped, so the loop ends by itself, some seconds after the limit in a debug
+        // build (it emits nothing: it only keeps a CPU core busy meanwhile).
         let theme = crate::theme::resolve("default", &[]).unwrap();
-        let key = "@default/styles/endless-loop-test.scss";
-        // Emits nothing: the thread left behind only keeps a CPU core busy.
-        let endless = b"$i: 0;\n@while $i < 1 { $x: 1; }\n";
-        let limit = Duration::from_millis(300);
+        let key = "@default/styles/long-loop-test.scss";
+        let long = b"@for $i from 1 through 4000000 { $x: $i; }\n";
+        let limit = Duration::from_millis(50);
         let start = Instant::now();
-        let err = compile_sass_within(&theme, key, endless, limit).unwrap_err();
+        let err = compile_sass_within(&theme, key, long, limit).unwrap_err();
         let took = start.elapsed();
         assert!(took >= limit && took < Duration::from_secs(5), "{took:?}");
         let Error::Style { file, message } = &err else {
@@ -1817,13 +1525,20 @@ a::before { content: "@import url(string.css);" }
         };
         assert_eq!(file, key);
         assert!(
-            message.starts_with("the Sass compilation did not finish within 0.3 s (an endless"),
+            message.starts_with(
+                "the Sass compilation did not finish within 0.05 s (an endless @while or @for \
+                 loop?). It cannot be stopped and runs on in the background"
+            ),
             "{message}"
         );
         // The same inputs again: at once, without another thread.
         let start = Instant::now();
-        let again = compile_sass_within(&theme, key, endless, limit).unwrap_err();
-        assert!(start.elapsed() < limit, "{:?}", start.elapsed());
+        let again = compile_sass_within(&theme, key, long, limit).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
         assert!(
             again
                 .to_string()
@@ -1833,6 +1548,50 @@ a::before { content: "@import url(string.css);" }
         // Edited: compiled anew.
         let fixed = compile_sass_within(&theme, key, b"a { b: c; }", limit).unwrap();
         assert!(fixed.contains("b: c;"), "{fixed}");
+    }
+
+    #[test]
+    fn errors_in_other_files_name_the_entry_on_their_first_line() {
+        let error = Error::Style {
+            file: "@t/styles/_p.scss".into(),
+            message: "line 2: x\n 2 | y".into(),
+        };
+        let Error::Style { message, .. } = naming_entry(error, "@t/styles/theme.scss") else {
+            unreachable!()
+        };
+        assert_eq!(
+            message,
+            "line 2: x (compiling '@t/styles/theme.scss')\n 2 | y"
+        );
+        let same = Error::Style {
+            file: "@t/a.scss".into(),
+            message: "m".into(),
+        };
+        assert_eq!(style_message(&naming_entry(same, "@t/a.scss")), "m");
+    }
+
+    #[test]
+    fn a_compilation_without_a_worker_rejects_unconditional_recursion() {
+        let theme = crate::theme::resolve("default", &[]).unwrap();
+        let key = "@default/styles/recursion-test.scss";
+        let scss =
+            b"@mixin pad($n) { padding: $n; @include pad($n - 1); }\nbody { @include pad(3px); }\n";
+        let err = compile_sass_source(&theme, key, scss).unwrap_err();
+        assert!(
+            style_message(&err).starts_with("line 1: @mixin pad always includes itself, so Sass"),
+            "{err}"
+        );
+        // Valid ones that the check used to reject compile (audit review): `@elseif`, the
+        // right-hand side of `or`, an unused mixin.
+        let valid = "@mixin unused { @include unused; }\n\
+                     @function f($n) { @return $n <= 0 or f($n - 1); }\n\
+                     @mixin pad($n) { @if $n <= 0 { padding: 0; } @elseif $n > 0 { margin: $n; @include pad($n - 1); } }\n\
+                     h1 { x: f(3); @include pad(2); }\n";
+        let css = compile_sass_source(&theme, key, valid.as_bytes()).unwrap();
+        assert!(
+            css.contains("x: true;") && css.contains("padding: 0;"),
+            "{css}"
+        );
     }
 
     #[test]

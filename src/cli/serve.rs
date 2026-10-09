@@ -16,7 +16,8 @@
 //!    else `127.0.0.1:3000`; port 0 picks a free one) and prints
 //!    `Serving http://<address>:<port>/` as the **first line on stdout** (always, also with
 //!    `-q`: with port 0 it is the only place the port is shown). It answers only requests
-//!    for `localhost`, an IP address or the `host` it was started with, on the port it
+//!    for the address it listens on (any IP address when that is `0.0.0.0` or `[::]`),
+//!    `localhost`, `127.0.0.1`, `[::1]` or the `host` it was started with, on the port it
 //!    listens on ([`server::AllowedHosts`]; live-reload.md §4: other `Host` headers get
 //!    `403`, against DNS rebinding). A port in use ends the
 //!    command with exit 1 and the hint to use `--port 0`, also when the other server
@@ -36,8 +37,9 @@
 //!    one line per rebuild: `rebuilt in <n> ms (css|content)` (not with `-q`), or the
 //!    build's error; diagnostics are printed as `presenter build` prints them. Rebuild
 //!    errors never stop the server: the pipeline runs on threads with 8 MiB stacks, as
-//!    `presenter build` does on the main thread, and theme stylesheets compile on a thread
-//!    of their own with a large stack and a time limit (`theme::styles`, "Isolation").
+//!    `presenter build` does on the main thread, and theme stylesheets compile in a worker
+//!    process with a large stack and a time limit (`theme::styles`, "Isolation"), so a
+//!    runaway Sass recursion or loop ends the worker, never the server.
 //! 5. Ctrl-C (SIGINT) shuts the server down gracefully ([`server::serve_until`]) and the
 //!    command exits 0. The handler is installed before anything else happens (only the
 //!    arguments are checked and the async runtime is started before it), so a Ctrl-C

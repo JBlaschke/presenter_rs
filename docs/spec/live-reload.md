@@ -112,28 +112,33 @@ fullReload(): location.reload()      // reveal `hash: true` restores the slide f
   wedged server (audit F02/F06).
 
 > **Note (A2, 2026-10-09), how the decisions above are implemented:**
-> - Host check: allowed are `localhost`, any IP address (a rebinding attack needs a DNS
->   name; this keeps `--host 0.0.0.0` usable from other machines at the machine's address)
->   and the `--host`/`[serve] host` value, each with the bound port (no port for port 80).
->   Any other `Host` gets `403 Forbidden`, on every route; a request without `Host`
->   (HTTP/1.0) passes. Another name for the machine (`mymac.local`) works only when the
->   server was started with it as `--host`.
+> - Host check: allowed are the address the server listens on, `localhost`, `127.0.0.1`,
+>   `[::1]` and the `--host`/`[serve] host` value, each with the bound port (no port for
+>   port 80). A server listening on every address (`--host 0.0.0.0` or `::`) listens on
+>   each of the machine's addresses, so any IP address is allowed then (other devices
+>   reach it at the machine's LAN address; a rebinding attack needs a DNS name). An
+>   IPv4-mapped IPv6 address counts as the IPv4 address. Any other `Host` gets
+>   `403 Forbidden`, on every route; a request without `Host` (HTTP/1.0) passes. Another
+>   name for the machine (`mymac.local`) works only when the server was started with it
+>   as `--host`.
 > - Content version: the first 8 bytes of the file's BLAKE3 hash, in decimal (digits only,
->   which the client disregards when it compares pages). Files of the embedded `vendor/…`
->   and `presenter/…` trees, and the URLs of `script()` and `style()` (re-requested by the
->   client on every build), are not versioned. A query the `url()` has itself follows:
->   `…?v=<n>&x=1`.
-> - Sass: a thread with a 256 MiB stack per compilation and a 10 s limit. grass offers no
->   recursion limit and cannot be stopped, so (1) a `@mixin` that always includes itself or a
->   `@function` that always calls itself before any `@return` (directly or through others of
->   the same `.scss` file) is reported as an `Error::Style` before grass runs; recursion that
->   only a condition guards, or that goes through several files or the indented `.sass`
->   syntax, still overflows the stack if it never ends; (2) a compilation that times out
->   keeps running in the background (a CPU core, and memory if it emits CSS) until it ends by
->   itself, i.e. for an endless loop until presenter exits: the error says so. While it runs,
->   compiling the same files again fails at once instead of starting another one. The serve
->   runtime's threads, where the pipeline runs, have the 8 MiB stack of `presenter build`'s
->   main thread.
+>   which the client disregards when it compares pages). For a file on disk it is
+>   remembered while the file's size and modification time stay the same, so a rebuild
+>   stats the theme files it names instead of reading them (an edit that keeps both keeps
+>   the old URL, as for deck assets). Files of the embedded `vendor/…` and `presenter/…`
+>   trees, and the URLs of `script()` and `style()` (re-requested by the client on every
+>   build), are not versioned. A query the `url()` has itself follows: `…?v=<n>&x=1`.
+> - Sass: `presenter` compiles each Sass file in a worker process, itself started with a
+>   hidden first argument, on a thread with a 256 MiB stack, and waits at most 10 s for
+>   it. A compilation that takes longer is an `Error::Style`, and its worker is killed,
+>   which frees the CPU and memory it used (an endless loop that emits CSS grows the
+>   worker's memory until then). A recursion that never ends, whatever guards it, in one
+>   file or several, overflows the worker's stack and ends only the worker: an
+>   `Error::Style` that names the `@mixin` or `@function` (file, line of the call, the line
+>   quoted) when the SCSS files read show it, else says the stack ran out. After a timeout
+>   or a stack overflow, compiling the same entry with the files it read unchanged fails at
+>   once with the same error. The serve runtime's threads, where the pipeline runs, have
+>   the 8 MiB stack of `presenter build`'s main thread.
 
 - State: `Arc<RwLock<ServeState { build_id, document: Option<String>, theme_css: String,
   assets: AssetRegistry, status: Status }>>` plus a `tokio::sync::broadcast::Sender<BuildEvent>`

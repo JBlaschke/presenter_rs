@@ -648,10 +648,36 @@ fn scss_project(scss: &str) -> tempfile::TempDir {
     ])
 }
 
+/// The Sass worker processes (`presenter __presenter-sass-worker`) of the process `parent`,
+/// with their resident memory in KiB (`ps`).
+#[cfg(unix)]
+fn workers_of(parent: u32) -> Vec<(u32, u64)> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "ppid=,pid=,rss=,command="])
+        .output()
+        .unwrap();
+    let table = String::from_utf8_lossy(&output.stdout).into_owned();
+    table
+        .lines()
+        .filter(|line| line.contains(" __presenter-sass-worker"))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(|field| field.parse::<u64>());
+            let (Some(Ok(ppid)), Some(Ok(pid)), Some(Ok(rss))) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return None;
+            };
+            (ppid == u64::from(parent)).then(|| (u32::try_from(pid).unwrap(), rss))
+        })
+        .collect()
+}
+
 /// Audit F02/F06 (live-reload.md §4, cli.md: rebuild errors do not stop the server): a
-/// theme stylesheet that would overflow the Sass compiler's stack or never finish is a
-/// style error in the overlay, while the server keeps answering; deep but finite
-/// recursion compiles; fixing the file brings the deck back.
+/// theme stylesheet that overflows the Sass compiler's stack or never finishes is a style
+/// error in the overlay, while the server keeps answering: recursion that always recurses
+/// or whose end condition is never met (it ends the Sass worker process only), an endless
+/// loop that emits CSS (its worker is killed at the time limit, which frees its memory);
+/// deep but finite recursion compiles; fixing the file brings the deck back.
 #[test]
 fn runaway_stylesheets_never_stop_the_server() {
     let dir = scss_project("h1 { color: red; }\n");
@@ -676,6 +702,32 @@ fn runaway_stylesheets_never_stop_the_server() {
     );
     assert_eq!(server.text("/"), document, "the last good document stays");
 
+    // The audit review's examples: a forgotten decrement behind an @if, and a base case
+    // that the recursion skips. They overflow the worker's stack, not the server's.
+    write(
+        &scss,
+        "@mixin pad($n) { @if $n > 0 { padding: $n; @include pad($n); } }\n\
+         body { @include pad(3px); }\n",
+    );
+    let forgotten = server.wait_for(build_id(&failed), "error");
+    let message = forgotten["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("Sass ran out of stack, most likely in the recursion of @mixin pad"),
+        "{forgotten}"
+    );
+    write(
+        &scss,
+        "@function spacing($n) { @if $n == 0 { @return 0px; } @return spacing($n - 2) + 4px; }\n\
+         .a { margin: spacing(3); }\n",
+    );
+    let skipped = server.wait_for(build_id(&forgotten), "error");
+    let message = skipped["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("the recursion of @function spacing, which calls itself here"),
+        "{skipped}"
+    );
+    assert_eq!(server.text("/"), document, "the last good document stays");
+
     // Deep but finite: 1500 nested @includes and 800 nested rules compile.
     let deep = format!(
         "@mixin pad($n) {{ @if $n > 0 {{ @include pad($n - 1); }} @else {{ .deep {{ x: y; }} }} }}\n\
@@ -684,12 +736,13 @@ fn runaway_stylesheets_never_stop_the_server() {
         "}".repeat(800)
     );
     write(&scss, &deep);
-    let deep_ok = server.wait_for(build_id(&failed), "ok");
+    let deep_ok = server.wait_for(build_id(&skipped), "ok");
     assert!(server.text("/__presenter/theme.css").contains(".deep {"));
 
-    // An endless loop: an error once the time limit has passed; the server answers
-    // meanwhile.
-    write(&scss, "$i: 0;\n@while $i < 1 { $x: 1; }\n");
+    // An endless loop that emits CSS (the audit's F06 example; its memory grows without
+    // end): an error once the time limit has passed, the server answering meanwhile; then
+    // its worker is gone.
+    write(&scss, "$i: 0;\n@while $i < 1 { a { b: c; } }\n");
     let timed_out = wait_for_within(
         &server,
         build_id(&deep_ok),
@@ -701,6 +754,21 @@ fn runaway_stylesheets_never_stop_the_server() {
         message.contains("the Sass compilation did not finish within 10 s"),
         "{timed_out}"
     );
+    assert!(message.contains("and was stopped"), "{timed_out}");
+    #[cfg(unix)]
+    {
+        assert_eq!(workers_of(server.child.id()), [], "the worker was killed");
+        // The server itself never held the loop's memory.
+        let output = Command::new("ps")
+            .args(["-o", "rss=", "-p", &server.child.id().to_string()])
+            .output()
+            .unwrap();
+        let rss: u64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(rss < 400 * 1024, "server RSS {rss} KiB");
+    }
 
     // Fixed: ok again.
     write(&scss, "h1 { color: blue; }\n");
@@ -838,10 +906,10 @@ fn status_for_host(server: &Server, path: &str, host: Option<&str>) -> u16 {
         .unwrap_or_else(|| panic!("status line {line:?}"))
 }
 
-/// live-reload.md §4 (audit F07): the dev server answers only requests for itself
-/// (`localhost`, an IP address, with the port it listens on: the one port 0 picked), so a
-/// web page that rebinds its own name to 127.0.0.1 cannot read the deck, its theme files
-/// or the build events.
+/// live-reload.md §4 (audit F07): the dev server answers only requests for itself (the
+/// address it listens on, `localhost`, `127.0.0.1` or `[::1]`, with the port it listens on:
+/// the one port 0 picked), so a web page that rebinds its own name to 127.0.0.1 cannot
+/// read the deck, its theme files or the build events.
 #[test]
 fn requests_for_other_hosts_are_refused() {
     let dir = project(&[("a.md", &minimal())]);
@@ -876,6 +944,9 @@ fn requests_for_other_hosts_are_refused() {
         "localhost".to_string(),
         format!("localhost:{}", port.wrapping_add(1)),
         format!("127.0.0.1.evil.example:{port}"),
+        // An address it does not listen on (it listens on 127.0.0.1).
+        format!("192.168.1.5:{port}"),
+        format!("[fe80::1]:{port}"),
     ] {
         assert_eq!(status_for_host(&server, "/", Some(&host)), 403, "{host}");
     }
@@ -884,6 +955,7 @@ fn requests_for_other_hosts_are_refused() {
         format!("localhost:{port}"),
         format!("LocalHost:{port}"),
         format!("[::1]:{port}"),
+        format!("[::ffff:127.0.0.1]:{port}"),
     ] {
         assert_eq!(status_for_host(&server, "/", Some(&host)), 200, "{host}");
         assert_eq!(

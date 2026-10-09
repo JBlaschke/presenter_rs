@@ -608,8 +608,9 @@ fn a_panic_inside_grass_is_a_style_error() {
 }
 
 /// Audit F02 (live-reload.md §4): grass has no recursion limit, and a stack overflow aborts
-/// the process. A mixin or function that always recurses is a style error pointing at the
-/// call, in a partial too; deep but finite recursion and nesting compile, on the
+/// the process. Without a worker process (a library user like this test), a mixin or
+/// function that always recurses is a style error pointing at the call, in a partial too
+/// (reached from the entry); deep but finite recursion and nesting compile, on the
 /// compiler's own big stack (a test thread has 2 MiB, which holds a few hundred levels).
 #[test]
 fn recursive_stylesheets_are_style_errors_and_deep_ones_compile() {
@@ -625,7 +626,7 @@ fn recursive_stylesheets_are_style_errors_and_deep_ones_compile() {
     let (file, message) = style_error(err);
     assert_eq!(file, "@t/styles/theme.scss");
     assert!(
-        message.starts_with("line 1: @mixin pad always includes itself, so Sass would recurse"),
+        message.starts_with("line 1: @mixin pad always includes itself, so Sass recurses"),
         "{message}"
     );
 
@@ -642,14 +643,19 @@ fn recursive_stylesheets_are_style_errors_and_deep_ones_compile() {
             ("styles/parts/_fns.scss", partial),
         ],
     );
-    let (file, message) = style_error(compile(&theme).unwrap_err());
+    let err = compile(&theme).unwrap_err();
+    assert_eq!(
+        err.quoted_line(),
+        Some("@function f($n) { @return g($n); }")
+    );
+    let (file, message) = style_error(err);
     assert_eq!(file, "@t/styles/parts/_fns.scss");
     assert!(
-        message.starts_with("line 2: @function f always calls itself before any @return through g"),
-        "{message}"
-    );
-    assert!(
-        message.contains("(compiling '@t/styles/theme.scss')"),
+        message.starts_with(
+            "line 2: @function f always calls itself before any @return through g, so Sass \
+             recurses until it runs out of stack; make the recursion depend on an @if that \
+             ends it (compiling '@t/styles/theme.scss')\n"
+        ),
         "{message}"
     );
 
@@ -677,38 +683,151 @@ fn recursive_stylesheets_are_style_errors_and_deep_ones_compile() {
     assert!(css.contains("width: 1px;"));
 }
 
-/// Audit F06 (live-reload.md §4): an endless `@while` is a style error after
-/// `SASS_TIME_LIMIT` instead of a compilation that never returns; compiling the same files
-/// again fails at once (the first compilation still runs in the background), and the fixed
-/// file compiles.
+/// The presenter binary, which compiles Sass in a worker process of itself (module docs of
+/// `presenter::theme::styles`, "Isolation").
+fn worker() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_presenter"))
+}
+
+/// Compiles `theme`'s stylesheet with the Sass compilations in a worker process, as the
+/// presenter binary does.
+fn compile_in_worker(theme: &Theme) -> presenter::Result<(String, AssetRegistry)> {
+    presenter::theme::styles::with_worker(worker(), || compile(theme))
+}
+
+/// Audit F02 (live-reload.md §4): in a worker process, every recursion that never ends
+/// overflows the worker's stack only, and is a style error naming the recursion: one that
+/// a condition never met guards (a forgotten decrement, a base case that is skipped), one
+/// through a partial, one that always recurses. The indented syntax has no hint. Compiling
+/// the same files again fails at once; edited, they compile; deep but finite recursion
+/// compiles in the worker too.
+#[test]
+fn recursion_that_never_ends_only_ends_the_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let forgotten = "@mixin pad($n) { @if $n > 0 { padding: $n; @include pad($n); } }\n\
+                     body { @include pad(3px); }\n";
+    let theme = scss_theme(
+        tmp.path(),
+        "theme.scss",
+        &[("styles/theme.scss", forgotten)],
+    );
+    let err = compile_in_worker(&theme).unwrap_err();
+    assert_eq!(
+        err.quoted_line(),
+        Some("@mixin pad($n) { @if $n > 0 { padding: $n; @include pad($n); } }")
+    );
+    let (file, message) = style_error(err);
+    assert_eq!(file, "@t/styles/theme.scss");
+    assert!(
+        message.starts_with(
+            "line 1: Sass ran out of stack, most likely in the recursion of @mixin pad, which \
+             includes itself here: the condition meant to end it is never met"
+        ),
+        "{message}"
+    );
+    // The same files again: at once, with the same error.
+    let start = Instant::now();
+    let (_, again) = style_error(compile_in_worker(&theme).unwrap_err());
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(again, message);
+
+    // A base case that is never met, in a partial reached from the entry.
+    let spacing = "@function spacing($n) {\n  @if $n == 0 { @return 0px; }\n  \
+                   @return spacing($n - 2) + 4px;\n}\n";
+    let theme = scss_theme(
+        &tmp.path().join("2"),
+        "theme.scss",
+        &[
+            (
+                "styles/theme.scss",
+                "@use \"parts/space\";\n.a { margin: space.spacing(3); }\n",
+            ),
+            ("styles/parts/_space.scss", spacing),
+        ],
+    );
+    let (file, message) = style_error(compile_in_worker(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/parts/_space.scss");
+    assert!(
+        message.starts_with(
+            "line 3: Sass ran out of stack, most likely in the recursion of @function \
+             spacing, which calls itself here: the condition meant to end it is never met \
+             (compiling '@t/styles/theme.scss')\n"
+        ),
+        "{message}"
+    );
+
+    // Always recursing: the same message as without a worker.
+    let pad = "@mixin pad($n) { padding: $n; @include pad($n - 1); }\nbody { @include pad(1); }\n";
+    let theme = scss_theme(
+        &tmp.path().join("3"),
+        "theme.scss",
+        &[("styles/theme.scss", pad)],
+    );
+    let (_, message) = style_error(compile_in_worker(&theme).unwrap_err());
+    assert!(
+        message.starts_with("line 1: @mixin pad always includes itself, so Sass recurses"),
+        "{message}"
+    );
+
+    // The indented syntax: no hint, but an error all the same.
+    let sass = "@mixin pad($n)\n  @if $n > 0\n    padding: $n\n    @include pad($n)\n\
+                body\n  @include pad(3px)\n";
+    let dir = tmp.path().join("4");
+    let theme = scss_theme(&dir, "theme.sass", &[("styles/theme.sass", sass)]);
+    let (file, message) = style_error(compile_in_worker(&theme).unwrap_err());
+    assert_eq!(file, "@t/styles/theme.sass");
+    assert!(
+        message.starts_with(
+            "the Sass compiler ran out of stack, which a recursion that never ends does"
+        ),
+        "{message}"
+    );
+    // Fixed: compiled anew, in the worker; deep but finite recursion compiles there too.
+    let fixed = "@mixin pad($n)\n  @if $n > 0\n    @include pad($n - 1)\n  @else\n    .deep\n      x: y\n\
+                 @include pad(2000)\n";
+    std::fs::write(dir.join("t/styles/theme.sass"), fixed).unwrap();
+    let (css, _) = compile_in_worker(&theme).unwrap();
+    assert!(css.contains(".deep {\n  x: y;\n}"), "{css}");
+}
+
+/// Audit F06 (live-reload.md §4): an endless `@while` that emits CSS is a style error after
+/// `SASS_TIME_LIMIT`; its worker is killed, so neither its CPU nor its memory outlives the
+/// error (`tests/cli_serve.rs` checks that no worker is left). Compiling the same files
+/// again fails at once, and the fixed file compiles.
 #[test]
 fn an_endless_loop_is_a_style_error_after_the_time_limit() {
     use presenter::theme::styles::SASS_TIME_LIMIT;
     let tmp = tempfile::tempdir().unwrap();
-    let endless = "$i: 0;\n@while $i < 1 { $x: 1; }\n";
+    // The audit's example: each pass emits a rule, so grass's memory grows without end.
+    let endless = "$i: 0;\n@while $i < 1 { a { b: c; } }\n";
     let theme = scss_theme(tmp.path(), "theme.scss", &[("styles/theme.scss", endless)]);
     let start = Instant::now();
-    let (file, message) = style_error(compile(&theme).unwrap_err());
+    let (file, message) = style_error(compile_in_worker(&theme).unwrap_err());
     let took = start.elapsed();
     assert!(
         took >= SASS_TIME_LIMIT && took < SASS_TIME_LIMIT + Duration::from_secs(20),
         "{took:?}"
     );
     assert_eq!(file, "@t/styles/theme.scss");
-    assert!(
-        message.starts_with("the Sass compilation did not finish within 10 s"),
-        "{message}"
+    assert_eq!(
+        message,
+        "the Sass compilation did not finish within 10 s (an endless @while or @for loop?) \
+         and was stopped"
     );
 
     let start = Instant::now();
-    let (_, message) = style_error(compile(&theme).unwrap_err());
+    let (_, message) = style_error(compile_in_worker(&theme).unwrap_err());
     assert!(
-        start.elapsed() < Duration::from_secs(5),
+        start.elapsed() < Duration::from_secs(1),
         "{:?}",
         start.elapsed()
     );
     assert!(
-        message.starts_with("an earlier compilation of the same files"),
+        message.starts_with("an earlier compilation of the same files did not finish within 10 s"),
         "{message}"
     );
 
@@ -717,8 +836,51 @@ fn an_endless_loop_is_a_style_error_after_the_time_limit() {
         "h1 { color: blue; }\n",
     )
     .unwrap();
-    let (css, _) = compile(&theme).unwrap();
+    let (css, _) = compile_in_worker(&theme).unwrap();
     assert!(css.contains("color: blue;"), "{css}");
+}
+
+/// grass's `@warn` and `@debug` output reaches the caller's log from the worker too.
+#[test]
+fn a_worker_forwards_grass_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scss = "@warn \"careful\";\n@debug \"look\";\na { b: c; }\n";
+    let theme = scss_theme(tmp.path(), "theme.scss", &[("styles/theme.scss", scss)]);
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let sink = std::sync::Arc::clone(&log);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || Writer(std::sync::Arc::clone(&sink)))
+        .finish();
+    let (css, _) =
+        tracing::subscriber::with_default(subscriber, || compile_in_worker(&theme)).unwrap();
+    assert!(css.contains("b: c;"), "{css}");
+    let log = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains(" WARN presenter::theme::styles::worker: @t/styles/theme.scss:1:7: Sass warning: \"careful\""),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            " DEBUG presenter::theme::styles::worker: @t/styles/theme.scss:2: @debug: \"look\""
+        ),
+        "{log}"
+    );
+}
+
+/// A `std::io::Write` into a shared buffer, for a test's tracing subscriber.
+struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Writer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]

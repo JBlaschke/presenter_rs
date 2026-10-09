@@ -35,18 +35,21 @@
 //! client re-requests the stylesheet (live-reload.md §4, audit F03).
 //!
 //! **Host check (live-reload.md §4, audit F07).** [`serve_until`] answers only requests
-//! whose `Host` header names this server: `localhost`, any IP address (a DNS rebinding
-//! attack needs a name; this also keeps `--host 0.0.0.0` usable from other machines at
-//! the machine's address) or a name it was given ([`AllowedHosts::with_name`], the
-//! `--host` of `presenter serve`), with the port it listens on (no port for port 80). Any
-//! other request, on every route, gets `403 Forbidden`: a web page that rebinds its own
-//! name to `127.0.0.1` cannot read the deck, its assets, the theme files or the build
-//! events. A request without a `Host` header (HTTP/1.0; browsers always send one) passes.
+//! whose `Host` header names this server: the address it listens on, `localhost`,
+//! `127.0.0.1` or `[::1]`, or a name it was given ([`AllowedHosts::with_name`], the
+//! `--host` of `presenter serve`), with the port it listens on (no port for port 80). A
+//! server that listens on every address (`0.0.0.0`, `[::]`) listens on each of the
+//! machine's addresses, so it takes any IP address (another device reaches it at the
+//! machine's LAN address; a DNS rebinding attack needs a name). An IPv4-mapped IPv6 address
+//! (`[::ffff:127.0.0.1]`) is the IPv4 address. Any other request, on every route, gets
+//! `403 Forbidden`: a web page that rebinds its own name to `127.0.0.1` cannot read the
+//! deck, its assets, the theme files or the build events. A request without a `Host`
+//! header (HTTP/1.0; browsers always send one) passes.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::{Future, IntoFuture};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::{Context, Poll};
@@ -289,40 +292,68 @@ async fn ctrl_c() {
     }
 }
 
-/// The `Host` headers the dev server answers (module docs, "Host check"): `localhost`,
-/// every IP address and the names added with [`AllowedHosts::with_name`], each with the
-/// port the server listens on.
+/// The `Host` headers the dev server answers (module docs, "Host check"): the address it
+/// listens on (any IP address when that is unspecified), `localhost`, `127.0.0.1`,
+/// `[::1]` and the names added with [`AllowedHosts::with_name`], each with the port the
+/// server listens on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedHosts {
     /// The port the server listens on.
     port: u16,
-    /// The host names allowed besides IP addresses, lowercase.
+    /// The host names allowed, lowercase.
     names: BTreeSet<String>,
+    /// The IP addresses allowed (canonical: an IPv4-mapped IPv6 address is the IPv4 one).
+    addresses: BTreeSet<IpAddr>,
+    /// True when the server listens on every address: any IP address is allowed.
+    any_address: bool,
 }
 
 impl AllowedHosts {
-    /// The hosts of a server listening on `addr`: `localhost` and every IP address, with
-    /// `addr`'s port (the bound one: not 0).
+    /// The hosts of a server listening on `addr`: `addr`'s address, `localhost`,
+    /// `127.0.0.1` and `[::1]`, with `addr`'s port (the bound one: not 0).
     pub fn new(addr: SocketAddr) -> Self {
-        AllowedHosts {
+        let loopback = [
+            IpAddr::from([127, 0, 0, 1]),
+            IpAddr::from(Ipv6Addr::LOCALHOST),
+        ];
+        let mut hosts = AllowedHosts {
             port: addr.port(),
             names: BTreeSet::from(["localhost".to_string()]),
-        }
+            addresses: BTreeSet::from(loopback),
+            any_address: false,
+        };
+        hosts.add_address(addr.ip());
+        hosts
     }
 
-    /// The same hosts and the host name `name` (the `--host` the server was started with;
-    /// an IP address or `localhost` adds nothing new), compared ignoring ASCII case.
+    /// The same hosts and `name` (the `--host` the server was started with: a name,
+    /// compared ignoring ASCII case, or an IP address, `[…]` for IPv6).
     pub fn with_name(mut self, name: &str) -> Self {
         let name = name.trim().to_ascii_lowercase();
-        if !name.is_empty() {
-            self.names.insert(name);
+        let bare = name.strip_prefix('[').and_then(|n| n.strip_suffix(']'));
+        match bare.unwrap_or(&name).parse::<IpAddr>() {
+            Ok(ip) => self.add_address(ip),
+            Err(_) if !name.is_empty() => {
+                self.names.insert(name);
+            }
+            Err(_) => {}
         }
         self
     }
 
+    /// Allows the address `ip`: every address if it is unspecified (`0.0.0.0`, `::`).
+    fn add_address(&mut self, ip: IpAddr) {
+        match ip.is_unspecified() {
+            true => self.any_address = true,
+            false => {
+                self.addresses.insert(ip.to_canonical());
+            }
+        }
+    }
+
     /// True if a request whose `Host` header is `host` (`None`: it has none) is for this
-    /// server: an allowed name or any IP address (IPv6 in brackets), with the server's
-    /// port, or without a port when that is 80.
+    /// server: an allowed name or IP address (IPv6 in brackets), with the server's port,
+    /// or without a port when that is 80.
     pub fn allows(&self, host: Option<&str>) -> bool {
         let Some(host) = host else {
             return true;
@@ -330,9 +361,11 @@ impl AllowedHosts {
         let Some((name, port)) = split_host(host) else {
             return false;
         };
-        let port = port.unwrap_or(80);
-        port == self.port
-            && (name.parse::<IpAddr>().is_ok() || self.names.contains(&name.to_ascii_lowercase()))
+        let allowed = match name.parse::<IpAddr>() {
+            Ok(ip) => self.any_address || self.addresses.contains(&ip.to_canonical()),
+            Err(_) => self.names.contains(&name.to_ascii_lowercase()),
+        };
+        allowed && port.unwrap_or(80) == self.port
     }
 }
 
@@ -381,9 +414,9 @@ async fn check_host(
     let host = host.unwrap_or_default().to_string();
     tracing::info!("refused a request for host {host:?} (not this server)");
     let message = format!(
-        "presenter serve answers requests for localhost, an IP address or its --host name \
-         on port {}, not for host {host:?} (a protection against DNS rebinding): open the \
-         address it printed\n",
+        "presenter serve answers requests for the address it listens on, localhost or its \
+         --host name on port {}, not for host {host:?} (a protection against DNS \
+         rebinding): open the address it printed\n",
         hosts.port
     );
     (StatusCode::FORBIDDEN, message).into_response()
@@ -1041,14 +1074,18 @@ mod tests {
             "LocalHost:4321",
             "127.0.0.1:4321",
             "[::1]:4321",
-            "192.168.1.5:4321",
-            "[fe80::1]:4321",
+            "[::ffff:127.0.0.1]:4321",
         ] {
             assert!(hosts.allows(Some(host)), "{host}");
         }
         // No Host header at all (HTTP/1.0): browsers always send one.
         assert!(hosts.allows(None));
         for host in [
+            // Addresses this server does not listen on (audit review: the contract's list).
+            "192.168.1.5:4321",
+            "[fe80::1]:4321",
+            "127.0.0.2:4321",
+            "0.0.0.0:4321",
             "evil.example:4321",
             "evil.example",
             "localhost.evil.example:4321",
@@ -1069,18 +1106,41 @@ mod tests {
         }
         // A configured name; port 80 may be left out.
         let named =
-            AllowedHosts::new(SocketAddr::from(([0, 0, 0, 0], 80))).with_name("MyMac.local");
+            AllowedHosts::new(SocketAddr::from(([192, 168, 1, 5], 80))).with_name("MyMac.local");
         for host in [
             "mymac.local",
             "MYMAC.LOCAL:80",
             "localhost",
-            "10.0.0.2",
+            "192.168.1.5",
             "[::1]",
         ] {
             assert!(named.allows(Some(host)), "{host}");
         }
-        assert!(!named.allows(Some("other.local")));
-        assert!(!named.allows(Some("mymac.local:8080")));
+        for host in ["other.local", "mymac.local:8080", "10.0.0.2", "[fe80::1]"] {
+            assert!(!named.allows(Some(host)), "{host}");
+        }
+        // Every address (`--host 0.0.0.0`): any IP address is one of the machine's; names
+        // stay limited.
+        let every = AllowedHosts::new(SocketAddr::from(([0, 0, 0, 0], 3000))).with_name("0.0.0.0");
+        for host in [
+            "10.0.0.2:3000",
+            "[fe80::1]:3000",
+            "localhost:3000",
+            "127.0.0.1:3000",
+        ] {
+            assert!(every.allows(Some(host)), "{host}");
+        }
+        for host in ["evil.example:3000", "10.0.0.2:3001"] {
+            assert!(!every.allows(Some(host)), "{host}");
+        }
+        // An IPv6 `--host`, written in brackets or not.
+        let v6 = AllowedHosts::new(SocketAddr::from(([127, 0, 0, 1], 3000)))
+            .with_name("[2001:db8::1]")
+            .with_name("2001:db8::2");
+        for host in ["[2001:db8::1]:3000", "[2001:DB8::2]:3000"] {
+            assert!(v6.allows(Some(host)), "{host}");
+        }
+        assert!(!v6.allows(Some("[2001:db8::3]:3000")));
     }
 
     #[test]
