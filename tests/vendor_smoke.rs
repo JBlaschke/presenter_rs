@@ -50,6 +50,9 @@ const KATEX_FONTS: [&str; 20] = [
 fn expected_vendor_files() -> Vec<String> {
     let mut files: Vec<String> = [
         "vendor/VERSIONS.toml",
+        // The licenses of the libraries reveal bundles into its plugins (audit F19).
+        "vendor/highlight.js/LICENSE",
+        "vendor/marked/LICENSE.md",
         "vendor/katex/LICENSE",
         "vendor/katex/katex.min.css",
         "vendor/katex/katex.min.js",
@@ -68,6 +71,8 @@ fn expected_vendor_files() -> Vec<String> {
         "vendor/reveal/css/theme/template/mixins.scss",
         // reveal 6.0.2 ships the theme fonts as .woff only (no .woff2 exists upstream).
         "vendor/reveal/css/theme/fonts/league-gothic/LICENSE",
+        // Written by vendor.sh: the font's copyright notice and the OFL text.
+        "vendor/reveal/css/theme/fonts/league-gothic/LICENSE-OFL.txt",
         "vendor/reveal/css/theme/fonts/league-gothic/league-gothic.css",
         "vendor/reveal/css/theme/fonts/league-gothic/league-gothic.woff",
         "vendor/reveal/css/theme/fonts/source-sans-pro/LICENSE",
@@ -291,21 +296,155 @@ fn get_str_reads_utf8_and_reports_missing() {
     assert!(vendor::get_str("vendor/katex/fonts/KaTeX_Main-Regular.woff2").is_err());
 }
 
-#[test]
-fn versions_toml_records_pins() {
+/// `VERSIONS.toml`'s `[[package]]` entries.
+fn versioned_packages() -> Vec<toml::Table> {
     let versions: toml::Table = toml::from_str(&vendor::get_str("vendor/VERSIONS.toml").unwrap())
         .expect("VERSIONS.toml is valid TOML");
-    let packages = versions["package"].as_array().expect("[[package]] array");
-    assert_eq!(packages.len(), 2);
-    for package in packages {
-        for key in ["name", "version", "license", "url", "sha256", "date"] {
+    versions["package"]
+        .as_array()
+        .expect("[[package]] array")
+        .iter()
+        .map(|package| package.as_table().expect("a table").clone())
+        .collect()
+}
+
+#[test]
+fn versions_toml_records_pins() {
+    let packages = versioned_packages();
+    let licenses: Vec<(&str, &str)> = packages
+        .iter()
+        .map(|p| (p["name"].as_str().unwrap(), p["license"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        licenses,
+        [
+            ("reveal.js", "MIT"),
+            ("katex", "MIT"),
+            ("highlight.js", "BSD-3-Clause"),
+            ("marked", "MIT"),
+        ]
+    );
+    for package in &packages {
+        for key in [
+            "name", "version", "license", "url", "sha256", "date", "path",
+        ] {
             assert!(package.get(key).is_some(), "missing {key} in {package:?}");
         }
         let sha = package["sha256"].as_str().unwrap();
         assert_eq!(sha.len(), 64);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(package["license"].as_str(), Some("MIT"));
+        let url = package["url"].as_str().unwrap();
+        let version = package["version"].as_str().unwrap();
+        assert!(
+            url.starts_with("https://registry.npmjs.org/")
+                && url.ends_with(&format!("-{version}.tgz")),
+            "{url}"
+        );
     }
+}
+
+/// Every vendored package's license file ships next to its files, where the release
+/// workflow's `licen[cs]e*` search finds it, and the license matches VERSIONS.toml (audit F19:
+/// reveal's plugins bundle highlight.js, BSD-3-Clause, and marked, MIT, whose notices are not
+/// in reveal's package).
+#[test]
+fn every_vendored_package_ships_its_license() {
+    for package in versioned_packages() {
+        let dir = format!("vendor/{}/", package["path"].as_str().unwrap());
+        // A file directly in the package's directory (not in a subdirectory).
+        let license = vendor::list(&dir)
+            .into_iter()
+            .find(|file| {
+                let name = &file[dir.len()..];
+                !name.contains('/') && name.to_ascii_lowercase().starts_with("license")
+            })
+            .unwrap_or_else(|| panic!("no license file directly in {dir}"));
+        let text = vendor::get_str(&license).unwrap();
+        let expected = match package["license"].as_str().unwrap() {
+            "MIT" => "Permission is hereby granted, free of charge",
+            "BSD-3-Clause" => "Redistributions in binary form must reproduce",
+            other => panic!("unexpected license {other}"),
+        };
+        assert!(text.contains(expected), "{license}");
+    }
+    let highlight = vendor::get_str("vendor/highlight.js/LICENSE").unwrap();
+    assert!(highlight.starts_with("BSD 3-Clause License"), "{highlight}");
+    assert!(highlight.contains("Copyright (c) 2006, Ivan Sagalaev."));
+    let marked = vendor::get_str("vendor/marked/LICENSE.md").unwrap();
+    assert!(marked.contains("Copyright (c) 2018+, MarkedJS"), "{marked}");
+}
+
+/// The licensed libraries are the ones reveal's plugins bundle: the highlight plugin carries
+/// highlight.js's version string, the notes plugin marked's own messages. A reveal upgrade
+/// that bundles another highlight.js version fails here until vendor.sh pins it too.
+#[test]
+fn bundled_libraries_match_their_pins() {
+    for package in versioned_packages() {
+        let Some(bundle) = package.get("bundled_in").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let code = vendor::get_str(&format!("vendor/{bundle}")).unwrap();
+        let marker = match package["name"].as_str().unwrap() {
+            "highlight.js" => package["version"].as_str().unwrap().to_string(),
+            "marked" => "markedjs/marked".to_string(),
+            other => panic!("unexpected bundled package {other}"),
+        };
+        assert!(
+            code.contains(&marker),
+            "{bundle} does not contain {marker:?}"
+        );
+    }
+    let names: Vec<String> = versioned_packages()
+        .iter()
+        .filter(|p| p.contains_key("bundled_in"))
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["highlight.js", "marked"]);
+}
+
+/// The SIL Open Font License asks every copy of a font to carry its copyright notice and the
+/// license text. reveal ships Source Sans Pro with both, but League Gothic with a LICENSE that
+/// only names the license, so vendor.sh writes LICENSE-OFL.txt next to it with the notice
+/// recorded in the font and the OFL 1.1 text.
+#[test]
+fn the_theme_fonts_carry_their_copyright_and_the_ofl_text() {
+    let fonts = "vendor/reveal/css/theme/fonts";
+    let source_sans = vendor::get_str(&format!("{fonts}/source-sans-pro/LICENSE")).unwrap();
+    let league = vendor::get_str(&format!("{fonts}/league-gothic/LICENSE-OFL.txt")).unwrap();
+    for (name, text, copyright) in [
+        (
+            "Source Sans Pro",
+            &source_sans,
+            "Copyright 2010, 2012 Adobe Systems Incorporated",
+        ),
+        (
+            "League Gothic",
+            &league,
+            "Copyright (c) 2009 - 2011, The League of Moveable Type",
+        ),
+    ] {
+        assert!(text.contains(copyright), "{name}");
+        for part in [
+            "SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007",
+            "PERMISSION & CONDITIONS",
+            "DISCLAIMER",
+        ] {
+            assert!(text.contains(part), "{name}: {part}");
+        }
+    }
+    // The OFL text is copied unchanged from Source Sans Pro's LICENSE.
+    let ofl = |text: &str| -> String {
+        let start = text.find("SIL OPEN FONT LICENSE Version 1.1").unwrap();
+        text[start..].trim_end().to_string()
+    };
+    assert_eq!(ofl(&league), ofl(&source_sans));
+    assert!(league.ends_with('\n'));
+    // reveal's own pointer file stays as shipped.
+    let pointer = vendor::get_str(&format!("{fonts}/league-gothic/LICENSE")).unwrap();
+    assert!(
+        pointer.starts_with("SIL Open Font License (OFL)"),
+        "{pointer}"
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 /*
- * presenter default theme (docs/spec/theme-format.md §5–§7).
+ * presenter default theme. Its layouts, tokens and how to extend it: ../README.md.
  *
  * Loaded after reveal's reset/core CSS, the stock reveal theme (theme.toml
  * `reveal_theme`), the highlight.js style and KaTeX, so plain rules win.
@@ -62,10 +62,10 @@
   --p-alert-warning: color-mix(in oklab, #d97706 75%, currentColor);   /* > [!WARNING] */
   --p-alert-caution: color-mix(in oklab, #dc2626 75%, currentColor);   /* > [!CAUTION] */
 
-  /* notebook cells (cell.html; styled further by T33) */
+  /* notebook cells (cell.html; styles/notebook.css designs them and has more tokens) */
   --p-cell-gap: 0.5em;                                /* vertical space around a .cell */
-  --p-cell-border: 1px solid rgba(128, 128, 128, 0.4); /* frame of .cell and its output area */
-  --p-output-max-height: 40vh;                        /* longer cell outputs scroll */
+  --p-cell-border: 1px solid rgba(128, 128, 128, 0.4); /* frame of a cell's output area */
+  --p-output-max-height: 40vh;                        /* longer cell outputs scroll (notebook.css: 288px) */
 }
 
 /* ------------------------------------------------------------------------------------
@@ -164,6 +164,44 @@
 
 .reveal dd {
   margin-left: 1.1em;
+}
+
+/* Task lists (`- [ ] open`, `- [x] done`): the checkbox takes the bullet's place, sized with
+   the text, and its text lines up with the other items' (box, gap and the space after the
+   box fill the list's 1.1em indent). The browser's checkbox would be a tiny greyed-out box
+   (it is disabled); this one is drawn in the accent colour, a done item with a tick. */
+.reveal li:has(> input[type="checkbox"]:first-child) {
+  list-style: none;
+}
+
+.reveal li > input[type="checkbox"]:first-child {
+  appearance: none;
+  position: relative;
+  box-sizing: border-box;
+  width: 0.75em;
+  height: 0.75em;
+  margin: 0 0.1em 0 -1.1em;
+  border: 0.08em solid var(--p-accent);
+  border-radius: 0.15em;
+  color: inherit;
+  font: inherit;
+  vertical-align: -0.1em;
+}
+
+.reveal li > input[type="checkbox"]:first-child:checked {
+  background: color-mix(in srgb, var(--p-accent) 15%, transparent);
+}
+
+.reveal li > input[type="checkbox"]:first-child:checked::after {
+  content: "";
+  position: absolute;
+  left: 0.22em;
+  top: 0.05em;
+  width: 0.19em;
+  height: 0.4em;
+  border: solid var(--p-accent);
+  border-width: 0 0.09em 0.09em 0;
+  transform: rotate(45deg);
 }
 
 .reveal a {
@@ -674,7 +712,8 @@
 }
 
 /* ------------------------------------------------------------------------------------
- * Notebook cells (cell.html). Structural rules only; T33 designs them.
+ * Notebook cells (cell.html). Structural fallbacks only: styles/notebook.css, listed after
+ * this file in theme.toml, designs the cells and replaces most of these rules.
  * ------------------------------------------------------------------------------------ */
 
 .reveal .cell {
@@ -744,4 +783,28 @@ html.reveal-print .reveal .slides section.layout-blank {
 html.reveal-print .reveal .slides section:not(.stack):has(> .r-fit-text) {
   padding-left: 0 !important;
   padding-right: 0 !important;
+}
+
+/* Paper cannot scroll, so a code block taller than --p-code-max-height prints in full: the
+   slide continues on extra pages (reveal counts them up to `pdfMaxPagesPerSlide`). These rules
+   apply to the print view (html.reveal-print) on screen too, because reveal measures each
+   slide's height there before Chrome prints. notebook.css does the same for cell outputs.
+   Long lines are still cut off at the right edge (reveal hides them: overflow: hidden).
+
+   Chrome moves a line that straddles a page break to the next page, so a box spanning pages
+   prints taller than reveal measured, and its last lines would fall off the slide's last
+   page. In print the box's lines are therefore set 5 % closer than the `pre` sets them on
+   screen (0.95lh: 1.33 instead of 1.4 here, and relative to a child theme's own value): the
+   space this saves on a page is more than the one line a page break moves. A break may fall
+   between any two lines (orphans and widows 1), so it moves at most one. */
+html.reveal-print .reveal pre code {
+  max-height: none;
+  orphans: 1;
+  widows: 1;
+}
+
+@media print {
+  html.reveal-print .reveal pre code {
+    line-height: 0.95lh;
+  }
 }

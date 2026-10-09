@@ -15,6 +15,26 @@ binary with `rust-embed` (`#[folder = "assets/"]`). Paths used by templates are 
 `assets/vendor/VERSIONS.toml` records name, version, tarball URL, SHA-256 of the tarball and
 the date; `scripts/vendor.sh` regenerates everything from scratch and must be idempotent.
 
+Other people's work inside those packages, each shipped with its license file (§2), which
+the release archives copy into `THIRD-PARTY-LICENSES/assets/` (`docs/dev/release.md`):
+
+| work | version | license | where it is | license file in `assets/vendor/` |
+|---|---|---|---|---|
+| highlight.js | 11.11.1 | BSD-3-Clause | bundled in `reveal/dist/plugin/highlight.js`; `dist/plugin/highlight/{monokai,zenburn}.css` are its styles | `highlight.js/LICENSE` |
+| marked | 17.0.6 | MIT | bundled in `reveal/dist/plugin/notes.js` | `marked/LICENSE.md` |
+| Source Sans Pro | — | OFL-1.1 | `reveal/css/theme/fonts/source-sans-pro/`, inlined in the `white`, `black`, `white-contrast` and `black-contrast` themes | `reveal/css/theme/fonts/source-sans-pro/LICENSE` |
+| League Gothic | — | OFL-1.1 | `reveal/css/theme/fonts/league-gothic/`, inlined in the `beige`, `league`, `moon` and `solarized` themes | `reveal/css/theme/fonts/league-gothic/LICENSE` and `LICENSE-OFL.txt` |
+
+reveal's package contains neither the highlight.js nor the marked license, so `vendor.sh`
+copies them from those libraries' own npm packages (pinned and checksummed like the two
+above, recorded in `VERSIONS.toml` with `bundled_in`; nothing else of them is vendored).
+highlight.js is the version whose version string the bundle carries; reveal 6.0.2 declares
+marked `^17.0.5`, and 17.0.6 was the newest 17.x when it was published (the license text of
+17.0.5 and 17.0.6 is identical). reveal ships League Gothic with a `LICENSE` that only names
+the OFL; the OFL asks every copy of the font to carry its copyright notice and the license
+text, so `vendor.sh` writes `LICENSE-OFL.txt` next to it: the copyright notice recorded in
+`league-gothic.woff` and the OFL 1.1 text from Source Sans Pro's `LICENSE`.
+
 ## 2. Files copied (and nothing else)
 
 From reveal.js (`package/` → `assets/vendor/reveal/`):
@@ -39,6 +59,23 @@ css/theme/fonts/**                                    (league-gothic, source-san
 > **Note (T15, 2026-10-08):** only 6 of the 14 `dist/theme/*.css` files inline their fonts
 > (white, black, white-contrast, black-contrast, dracula, serif). The other 8 `@import` Google
 > Fonts; standalone builds keep those imports (fonts load when online) and warn `remote-import`.
+
+> **Contract change (A5, 2026-10-09, audit finding F19):** besides the files above,
+> `scripts/vendor.sh` writes these license files (and nothing else of their packages):
+> ```
+> highlight.js/LICENSE        package/LICENSE of highlight.js 11.11.1 (BSD-3-Clause)
+> marked/LICENSE.md           package/LICENSE.md of marked 17.0.6 (MIT)
+> reveal/css/theme/fonts/league-gothic/LICENSE-OFL.txt   generated, see §1
+> ```
+> `VERSIONS.toml` lists highlight.js and marked as packages too, with `bundled_in` naming
+> the reveal file that contains them. Upgrading reveal means checking which versions its
+> plugins bundle (§5).
+
+> **Correction (A5, 2026-10-09):** the note above is wrong about which themes inline fonts.
+> Eight do: `white`, `black`, `white-contrast` and `black-contrast` inline Source Sans Pro,
+> `beige`, `league`, `moon` and `solarized` League Gothic (and also `@import` a Google Font
+> for their body text). `dracula` and `serif` use system fonts only. `beige`, `blood`,
+> `league`, `moon`, `night`, `simple`, `sky` and `solarized` `@import` Google Fonts.
 
 Not copied: `dist/plugin/markdown.js` (we render Markdown ourselves), `dist/plugin/math.js`
 (loads from CDN; we ship our own KaTeX init), `*.mjs`, `*.d.ts`, `index.html`, `demo.html`,
@@ -86,8 +123,10 @@ running `cargo run -- serve` live-reloads) and embeds in release builds. Add
 
 ## 5. Upgrade procedure
 1. Edit versions at the top of `scripts/vendor.sh`; run it; review the diff (expect only
-   version-related changes).
+   version-related changes). Pin the highlight.js and marked versions the new reveal
+   bundles (`tests/vendor_smoke.rs` checks highlight.js's version string in the bundle).
 2. Run `cargo test` and the browser smoke test (`cargo test --features browser-tests`).
 3. Read the upstream release notes for breaking changes (reveal 6.0 moved plugin paths —
    templates reference `dist/plugin/<name>.js`).
-4. Update `VERSIONS.toml`, `docs/spec/vendored-assets.md` §1 and the user docs.
+4. Update `docs/spec/vendored-assets.md` §1 and the user docs (`vendor.sh` writes
+   `VERSIONS.toml`).

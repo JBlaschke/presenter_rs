@@ -18,3 +18,26 @@ url = "https://registry.npmjs.org/katex/-/katex-0.19.0.tgz"
 sha256 = "d8e49f2fea6eeed7cdae2cf4fd48e2f1d348758aa9e5740715e4533c2c96d1ee"
 date = "2026-10-08"
 path = "katex"
+
+# Bundled inside reveal.js's dist/plugin/highlight.js (and the dist/plugin/highlight/*.css
+# styles); only its license file is vendored, at the path below.
+[[package]]
+name = "highlight.js"
+version = "11.11.1"
+license = "BSD-3-Clause"
+url = "https://registry.npmjs.org/highlight.js/-/highlight.js-11.11.1.tgz"
+sha256 = "fbc9443263e976583bd5640e550b77f84d8d7e19fc8408dfe53776a5bae7ed39"
+date = "2026-10-08"
+path = "highlight.js"
+bundled_in = "reveal/dist/plugin/highlight.js"
+
+# Bundled inside reveal.js's dist/plugin/notes.js; only its license file is vendored.
+[[package]]
+name = "marked"
+version = "17.0.6"
+license = "MIT"
+url = "https://registry.npmjs.org/marked/-/marked-17.0.6.tgz"
+sha256 = "d0ca499e365edfbdb6df8f769417bd7e9308d142f5e86e6ffe76918db6a399db"
+date = "2026-10-08"
+path = "marked"
+bundled_in = "reveal/dist/plugin/notes.js"

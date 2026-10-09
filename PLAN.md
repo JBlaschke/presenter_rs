@@ -39,7 +39,9 @@ Verified facts used in this plan are dated 2026-10-08 (versions, APIs). See §9.
 
 ### Decisions already taken
 - License: MIT (`LICENSE` in the repo root, copyright Johannes Blaschke). Vendored reveal.js and
-  KaTeX are MIT as well; their license files ship next to the assets.
+  KaTeX are MIT as well. reveal's plugins bundle highlight.js (BSD-3-Clause) and marked (MIT),
+  and its themes use the Source Sans Pro and League Gothic fonts (SIL OFL 1.1). Every one of
+  these licenses ships next to the assets (`docs/spec/vendored-assets.md` §1).
 - Crate structure: a single crate with a library and a binary (confirmed by the repo owner,
   2026-10-08). Do not split into a workspace; module ownership per task is the unit of parallelism.
 
@@ -171,36 +173,43 @@ Left: $E = mc^2$
 
 ```
 presenter_rs/
-├── Cargo.toml                 package "presenter": lib + bin
+├── Cargo.toml                 package "presenter": lib + bin; build.rs embeds the build id
 ├── PLAN.md                    this file
+├── CHANGELOG.md               release notes (the release workflow publishes a version's section)
 ├── docs/spec/*.md             frozen contracts (IR, dialect, theme, config, CLI, live reload, vendoring)
 ├── docs/tasks/*.md            one file per task, pick-up-able independently
-├── docs/guide/*.md            user documentation (T46); docs/dev/ holds QA checklists and release notes
+├── docs/guide/*.md            user documentation (T46, the last task)
+├── docs/dev/*.md              live-reload QA checklist, release process
+├── docs/screenshots/*.png     screenshots used by the READMEs
+├── .github/workflows/         ci.yml (checks, browser tests, vendor drift), release.yml (T47)
 ├── assets/                    embedded into the binary with rust-embed
 │   ├── vendor/reveal/…        reveal.js 6.0.2 subset (dist/, css/theme/**)  (see docs/spec/vendored-assets.md)
 │   ├── vendor/katex/…         KaTeX 0.19.0 (js, css, woff2 fonts)
+│   ├── vendor/{highlight.js,marked}/  license files of the libraries reveal's plugins bundle
 │   ├── presenter/             our own small JS: math.js (KaTeX init), live-reload.js
-│   └── themes/default/        the built-in theme (theme.toml, templates/, styles/, assets/)
+│   ├── themes/default/        the built-in theme (theme.toml, templates/, styles/, README.md)
+│   └── scaffold/              the files `presenter init` writes (T40)
 ├── scripts/vendor.sh          re-downloads and trims vendored packages; writes assets/vendor/VERSIONS.toml
-├── examples/                  basic/, notebook/, custom-theme/, headings-mode/
+├── examples/                  basic/, notebook/, custom-theme-scss/, headings-mode/
 ├── src/
 │   ├── main.rs                clap entry; delegates to cli::*
 │   ├── lib.rs                 pub mod declarations, re-exports
-│   ├── error.rs               thiserror Error enum + Result alias
+│   ├── error.rs               thiserror Error enum + Result alias, diagnostics
 │   ├── ir.rs                  Deck/Slide/Block/… (contract)
 │   ├── config.rs              Config structs, loading, merging
 │   ├── pipeline.rs            parse → resolve → render → emit orchestration (Build struct)
 │   ├── vendor.rs              rust-embed `Assets` + lookup helpers
-│   ├── markdown/{mod,frontmatter,split,attrs,render,code}.rs   (+ compat.rs, postprocess.rs in T43)
+│   ├── markdown/{mod,frontmatter,split,attrs,render,code,compat,postprocess}.rs
 │   ├── notebook/{mod,nbformat,convert,outputs}.rs
 │   ├── theme/{mod,manifest,resolve,templates,styles}.rs
 │   ├── assets/{mod,registry,emit}.rs
-│   ├── render/{mod,context,html,reveal}.rs
-│   ├── serve/{mod,server,watch,events}.rs
+│   ├── render/{mod,context,html,reveal,paths,styles}.rs
+│   ├── serve/{mod,server,watch,events,files}.rs
 │   ├── check.rs               lint rules
-│   ├── pdf.rs                 headless-Chrome PDF export (T45)
-│   └── cli/{mod,build,serve,init,theme,dump,check,export}.rs
-└── tests/                     integration tests + fixtures/{md,ipynb,ir,themes}
+│   ├── pdf.rs, pdf/devtools.rs  headless-Chrome PDF export (T45); the DevTools client of the browser tests (T24)
+│   └── cli/{mod,build,serve,init,theme,dump,check,export,report}.rs
+└── tests/                     integration tests (+ insta snapshots in tests/snapshots/)
+                               and fixtures/{md,ipynb,ir,themes,config,live-reload}
 ```
 
 ### 3.3 Technology decisions (and why)

@@ -85,7 +85,7 @@ is relative to the surrounding text.
 | `--p-code-bg` | `#272822` | Background of the code blocks the highlight style does not colour (`.plain` blocks, `highlight_style = "none"`); monokai's. Highlighted blocks take their background from `highlight_style`. |
 | `--p-code-color` | `#f8f8f2` | Text colour of those code blocks. Line numbers are a fainter shade of each block's text colour. |
 | `--p-code-font-size` | `0.6em` | Code block text size, relative to the slide text. |
-| `--p-code-max-height` | `520px` | Taller code blocks scroll (long lines always scroll sideways; they never wrap). |
+| `--p-code-max-height` | `520px` | Taller code blocks scroll (long lines always scroll sideways; they never wrap). Printed, they are shown in full ([Print and PDF](#print-and-pdf)). |
 | `--p-code-dim-opacity` | `0.5` | Opacity of the lines a line step (`lines="1\|3-4"`) does not highlight; they are dimmed, never hidden (reveal's own value is 0.4). |
 | `--p-inline-code-bg` | `color-mix(in srgb, currentColor 9%, transparent)` | Background of `code` in running text. |
 | `--p-table-font-size` | `0.75em` | Table text size. |
@@ -134,6 +134,7 @@ overrides these:
 | `.footnotes`, `sup.footnote-ref` | `[^1]` | small, muted, under a rule |
 | `.small`, `.large`, `.center` | `:::small`, `{.center}` on a slide, … | 0.7×, 1.3× text; centred text (and the whole slide when on a slide) |
 | `kbd`, `mark` | `<kbd>S</kbd>`, `<mark>` | key caps, highlighter |
+| `li > input[type=checkbox]` | task lists: `- [ ] open`, `- [x] done` | no bullet: a box sized with the text takes its place, in `--p-accent`, with a tick when done; the item's text lines up with the other items' |
 | `img`, `video`, `iframe` | images, raw HTML | fit the slide and keep the alignment of the text around them (`:::center` centres a figure); `.r-stretch` see below |
 | `[data-math-style]` | `$…$`, `$$…$$` | KaTeX; wide display math scrolls instead of overflowing |
 | `section.has-dark-background`, `section.has-light-background` | `background=` colours | white or dark text, and every derived token with it |
@@ -183,7 +184,8 @@ the input is a highlighted code block, and the outputs sit in a frame under it.
   `--p-prompt-color`. `show_prompts = false` under `[notebook]` in `presenter.toml`, or
   `notebook: {show_prompts: false}` in the front matter, leaves them out.
 - **Outputs** taller than `--p-output-max-height` scroll inside their frame, and lines longer
-  than the slide scroll it sideways (they never wrap). Images keep their size, or the width and
+  than the slide scroll it sideways (they never wrap). In print they are shown in full (see
+  [Print and PDF](#print-and-pdf)). Images keep their size, or the width and
   height the notebook recorded, and shrink to fit the frame instead of scrolling it.
 - **Streams:** stdout is plain text; stderr is tinted with `--p-stderr-color`.
 - **Errors:** the traceback sits in a box with a bar in `--p-error-color` and a tint of it.
@@ -228,7 +230,7 @@ the input is a highlighted code block, and the outputs sit in a frame under it.
 | `--p-prompt-color` | `color-mix(in srgb, currentColor 50%, transparent)` | Colour of the `In [n]:` and `Out [n]:` prompts. |
 | `--p-stderr-color` | `var(--p-alert-warning)` | Text and background tint of stderr output. |
 | `--p-error-color` | `var(--p-alert-caution)` | Bar and background tint of an error's traceback. |
-| `--p-output-max-height` | `288px` | Taller outputs scroll inside their frame; images shrink to fit it. 40 % of the default 720px slide height. Use slide pixels, not `vh`: reveal scales the slide to the window, so a `vh` length grows with the window and can overflow the slide. |
+| `--p-output-max-height` | `288px` | Taller outputs scroll inside their frame (printed, they are shown in full); images shrink to fit it. 40 % of the default 720px slide height. Use slide pixels, not `vh`: reveal scales the slide to the window, so a `vh` length grows with the window and can overflow the slide. |
 
 `--p-cell-gap` and `--p-cell-border` are in the [token table](#tokens).
 
@@ -252,6 +254,23 @@ fragment step with reveal's default `pdfSeparateFragments: true`. The theme keep
 code blocks and fills (`print-color-adjust: exact`), keeps the slide padding that reveal's
 print view would reset, and keeps slides one slide high so top-aligned slides stay top-aligned
 and title and section slides stay centred on the page.
+
+Paper cannot scroll, so the boxes that scroll on screen print in full: a code block taller
+than `--p-code-max-height` and a notebook cell's outputs taller than `--p-output-max-height`
+grow to their whole height, and the slide continues on extra pages (as many as it needs, up
+to reveal's `pdfMaxPagesPerSlide`). In print, and only there, their lines are set 4–5 %
+closer: code at `0.95lh`, 95 % of the line height its `pre` has on screen (1.33 instead of
+1.4), text outputs at 1.3 instead of 1.35 (a theme that changes the outputs' line height
+should lower its print value as well), and DataFrame rows get a little less padding. Chrome moves a line or row that straddles a page break to the
+next page; the space saved leaves room for that, so the last lines still fit on the pages
+reveal reserved. (It can also leave the last of those pages empty but for the slide's
+background.) A DataFrame's header rows print once, at the top of the table.
+
+What does not print in full: lines longer than the box and tables wider than it are cut off
+at its right edge (on screen they scroll sideways); a `.r-stretch` code block keeps the size
+it has on screen; and an image that straddles a page break moves to the next page whole, so
+a slide that spans pages with several images in it can lose its last lines; split such a
+slide.
 
 ## Extending it
 

@@ -136,8 +136,9 @@ jobs:
           fi
           notices="dist/$ARCHIVE/THIRD-PARTY-LICENSES"
           mkdir -p "$notices/assets" "$notices/crates"
-          # The web assets embedded from assets/vendor (reveal.js, KaTeX, their fonts): the
-          # license files, at their paths there, and the versions.
+          # The web assets embedded from assets/vendor (reveal.js, KaTeX, the highlight.js and
+          # marked code bundled in reveal's plugins, the fonts of reveal's themes): the license
+          # files, at their paths there, and the versions.
           cp assets/vendor/VERSIONS.toml "$notices/assets/"
           (cd assets/vendor && find . -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' \)) \
             | while IFS= read -r file; do
@@ -152,11 +153,12 @@ jobs:
           cargo metadata --locked --format-version 1 --filter-platform "$TARGET" \
             | jq -r '.resolve.root as $root | .packages[] | select(.id != $root)
                 | [.name, .version, (.license // "see the license files"), (.source // "path"),
-                   (.manifest_path | rtrimstr("/Cargo.toml"))]
+                   (.manifest_path | rtrimstr("/Cargo.toml")),
+                   (.authors | join(", ") | if . == "" then "the authors" else . end)]
                 | @tsv' \
             | sort > "$RUNNER_TEMP/packages.tsv"
           found=0
-          while IFS=$'\t' read -r name version license source dir; do
+          while IFS=$'\t' read -r name version license source dir authors; do
             grep -qxF "$name v$version" "$RUNNER_TEMP/linked.txt" || continue
             found=$((found + 1))
             if [[ "$source" == *crates.io-index ]]; then
@@ -166,9 +168,47 @@ jobs:
             mkdir -p "$notices/crates/$name-$version"
             find "$dir" -maxdepth 1 -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' -o -iname 'notice*' -o -iname 'unlicense*' \) \
               -exec cp {} "$notices/crates/$name-$version/" \;
-            if [[ -z "$(ls -A "$notices/crates/$name-$version")" ]]; then
+            if [[ -n "$(ls -A "$notices/crates/$name-$version")" ]]; then
+              continue
+            fi
+            # No license file in the crate. MIT asks for its copyright and permission notice
+            # in every copy: when MIT is (one of) the crate's license(s), write the MIT text
+            # with the authors from its Cargo.toml. Other licenses: crates.txt names them.
+            words=" $(tr '()/' '   ' <<<"$license") "
+            if [[ "$words" == *" MIT "* ]]; then
+              {
+                echo "$name $version ($source) names its license as \"$license\" in its"
+                echo "Cargo.toml but ships no license file. presenter's release workflow wrote"
+                echo "this file: the MIT license, with the crate's authors from its Cargo.toml."
+                echo
+                echo "MIT License"
+                echo
+                echo "Copyright (c) $authors"
+                echo
+                cat <<'MIT'
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+          MIT
+              } > "$notices/crates/$name-$version/LICENSE-MIT"
+              echo "note: $name $version has no license file; wrote the MIT text for $authors"
+            else
               rmdir "$notices/crates/$name-$version"
-              echo "note: $name $version has no license file; crates.txt names its license"
+              echo "note: $name $version has no license file; crates.txt names its license ($license)"
             fi
           done < "$RUNNER_TEMP/packages.tsv"
           # Every linked crate but presenter itself is accounted for.
@@ -182,8 +222,16 @@ jobs:
         run: |
           mkdir -p "dist/$ARCHIVE"
           cp target/release/presenter LICENSE README.md "dist/$ARCHIVE/"
-          # COPYFILE_DISABLE: no AppleDouble (._*) entries from macOS tar.
-          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
+          # Entries owned by root, without the builder's user and group names. On macOS
+          # (bsdtar): no extended attributes such as com.apple.provenance, which bsdtar
+          # would store as LIBARCHIVE.xattr.* headers that GNU tar warns about for every
+          # file, and (COPYFILE_DISABLE) no AppleDouble ._* entries.
+          if tar --version | grep -q 'GNU tar'; then
+            tar_flags=(--owner=root:0 --group=root:0)
+          else
+            tar_flags=(--no-xattrs --no-mac-metadata --uid 0 --gid 0 --uname root --gname root)
+          fi
+          COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
           # The contents, without the ~140 crate license directories.
           tar -tzvf "dist/$ARCHIVE.tar.gz" | grep -v "/THIRD-PARTY-LICENSES/crates/."
       - uses: actions/upload-artifact@v7

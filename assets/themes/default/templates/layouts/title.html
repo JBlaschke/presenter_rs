@@ -6,7 +6,7 @@
     theme's logo, `logo: true` keeps it, any other value that is not a string is ignored),
     then the slide's first block (normally the deck heading), then meta.subtitle,
     meta.author and meta.date when they are set, then the remaining blocks. author and date
-    fall back to the presenter.toml [deck] defaults (config.md §2). A Markdown slide is a
+    fall back to the presenter.toml [deck] defaults. A Markdown slide is a
     single HTML block, so there the meta follows all of its content; a notebook title slide
     (one block per cell) gets it right under the heading cell. -#}
 {%- extends "layouts/default.html" %}

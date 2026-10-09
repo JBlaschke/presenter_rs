@@ -1,4 +1,4 @@
-# The built-in theme (docs/spec/theme-format.md). It is the root of every theme chain, so it
+# The built-in theme. It is the root of every theme chain, so it
 # provides every required template: deck.html, slide.html, block.html, cell.html and
 # layouts/default.html. Its tokens, layouts and how to extend it: README.md.
 name = "default"

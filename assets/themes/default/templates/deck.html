@@ -1,7 +1,8 @@
-{#- Document shell (docs/spec/theme-format.md §7). A child theme can
+{#- Document shell. A child theme can
     {% extends "@default/deck.html" %} and override any of the blocks
     head, styles, body_start, slides, scripts, body_end.
-    The theme stylesheet (theme_style()) must stay the last stylesheet in <head> (§5). -#}
+    The theme stylesheet (theme_style()) must stay the last stylesheet in <head>: its rules
+    win over the ones before it, and live reload swaps exactly that one. -#}
 <!DOCTYPE html>
 <html lang="{{ meta.lang or config.deck.lang or 'en' }}">
 <head>

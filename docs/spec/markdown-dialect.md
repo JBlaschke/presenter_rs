@@ -254,5 +254,7 @@ than the reveal-compat forms are passed through unchanged.
 fence), `attributes.md` (separator attrs, heading lifting, shorthand expansion),
 `directives.md` (notes, fragment with index, columns, custom), `code.md` (every table row of
 §5), `math.md`, `images.md` (existing + missing + remote + raw HTML img), `notes.md`,
-`headings-mode.md` (T43), `reveal-compat.md` (T43). Each has a sibling
-`.expected.json` (IR) snapshot managed by `insta`.
+`headings-mode.md` (T43), `reveal-compat.md` (T43); `images/` holds the images that
+`images.md` finds. Each fixture's IR (the `Deck` as JSON, machine-dependent paths and asset
+ids normalized) is an `insta` snapshot, `tests/snapshots/markdown_snapshots__<name>.snap`,
+written by `tests/markdown_snapshots.rs`, which snapshots every `*.md` in the directory.
