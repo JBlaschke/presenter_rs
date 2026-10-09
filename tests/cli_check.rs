@@ -160,10 +160,20 @@ fn deny_warnings_flips_the_exit_code() {
         run(dir.path(), &["check", "clean.md", "--deny-warnings"]),
         (0, String::new(), String::new())
     );
-    // -q hides warnings in text mode, but the exit code still counts them.
+    // -q hides warnings in text mode, except when --deny-warnings makes them fail the run:
+    // then they say why it failed (audit F24).
     assert_eq!(
-        run(dir.path(), &["-q", "check", "slides.md", "--deny-warnings"]),
-        (1, String::new(), String::new())
+        run(dir.path(), &["-q", "check", "slides.md"]),
+        (0, String::new(), String::new())
+    );
+    let (code, stdout, stderr) = run(dir.path(), &["-q", "check", "slides.md", "--deny-warnings"]);
+    assert_eq!((code, stdout.as_str()), (1, ""));
+    assert_eq!(stderr.lines().count(), 3, "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .all(|line| line.starts_with("slides.md:") && line.contains(": warning: ")),
+        "{stderr}"
     );
     // JSON is the full result, -q or not.
     let (code, stdout, _) = run(

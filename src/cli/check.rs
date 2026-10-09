@@ -2,8 +2,10 @@
 //! ([`crate::check::run`]) and reports what it found.
 //!
 //! - `--format text` (the default): one `path:line: level: message` line per diagnostic on
-//!   stderr ([`report_diagnostics`]: paths relative to the current directory, the level in
-//!   color when stderr is a terminal, only errors with `-q`). Nothing on stdout.
+//!   stderr ([`report_diagnostics`]: paths as [`super::display_path`] shows them, the level
+//!   in color when stderr is a terminal). With `-q` only errors, unless `--deny-warnings`
+//!   makes the warnings fail the run: then they are printed too, so a failing `-q check
+//!   --deny-warnings` always says why (audit F24). Nothing on stdout.
 //! - `--format json`: one JSON array on stdout, `[{level, code, message, path, line, cell}]`
 //!   (`path` as in the text format; `line`/`cell` are `null` when unknown), every diagnostic
 //!   of every input, also with `-q`.
@@ -11,7 +13,8 @@
 //! Every input is checked, in the order given, even after one fails. An input that cannot be
 //! checked (it cannot be read or parsed, invalid front matter or `presenter.toml`, an unknown
 //! extension) is reported as an error-level diagnostic of that input
-//! ([`crate::check::error_diagnostic`]).
+//! ([`crate::check::error_diagnostic`]); the paths in its message are shown like those of
+//! `build`'s error report ([`report::with_display_paths`]).
 //!
 //! Exit codes (cli.md `check`): 1 when there is an error of any kind (also an unknown
 //! extension or an invalid `presenter.toml`, which other commands exit 2 for), or a warning
@@ -24,7 +27,7 @@ use serde::Serialize;
 
 use super::{
     CheckArgs, CheckFormat, EXIT_BUILD_ERROR, EXIT_OK, GlobalArgs, display_path, input_kind,
-    print_stdout, report_diagnostics,
+    print_stdout, report, report_diagnostics,
 };
 use crate::check;
 use crate::error::{Diagnostic, Diagnostics, Error, Level};
@@ -40,10 +43,19 @@ pub fn run(args: &CheckArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
         }
     }
     match args.format {
-        CheckFormat::Text => report_diagnostics(&all, global),
+        CheckFormat::Text => report_diagnostics(&all, &text_report_flags(global, args)),
         CheckFormat::Json => print_stdout(&json_report(&all)?)?,
     }
     Ok(ExitCode::from(exit_code(&all, args.deny_warnings)))
+}
+
+/// The flags the text report honours: `global`, except that `-q` does not hide warnings
+/// when `--deny-warnings` makes them decide the exit code (module docs).
+fn text_report_flags(global: &GlobalArgs, args: &CheckArgs) -> GlobalArgs {
+    GlobalArgs {
+        quiet: global.quiet && !args.deny_warnings,
+        ..global.clone()
+    }
 }
 
 /// The diagnostics of one input, or the failure that stopped its check as an error
@@ -70,7 +82,8 @@ fn check_input(
         ..BuildOptions::new(input)
     };
     opts.cli.theme = args.theme.clone();
-    check::run(&opts).map_err(|err| check::error_diagnostic(&err, input))
+    check::run(&opts)
+        .map_err(|err| check::error_diagnostic(&report::with_display_paths(err), input))
 }
 
 /// The exit code for `diagnostics` (see the module docs).
@@ -136,6 +149,47 @@ mod tests {
         assert_eq!(exit_code(&warned, true), EXIT_BUILD_ERROR);
         assert_eq!(exit_code(&failed, false), EXIT_BUILD_ERROR);
         assert_eq!(exit_code(&failed, true), EXIT_BUILD_ERROR);
+    }
+
+    #[test]
+    fn quiet_hides_warnings_only_when_they_cannot_fail_the_run() {
+        let args = |deny_warnings| CheckArgs {
+            inputs: vec![],
+            format: CheckFormat::Text,
+            deny_warnings,
+            theme: None,
+        };
+        let quiet = GlobalArgs {
+            quiet: true,
+            ..GlobalArgs::default()
+        };
+        assert!(text_report_flags(&quiet, &args(false)).quiet);
+        assert!(!text_report_flags(&quiet, &args(true)).quiet);
+        assert!(!text_report_flags(&GlobalArgs::default(), &args(true)).quiet);
+        assert!(!text_report_flags(&GlobalArgs::default(), &args(false)).quiet);
+    }
+
+    #[test]
+    fn config_errors_name_the_file_like_build_does() {
+        // tests/cli_build.rs checks the relative form from a chosen directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("presenter.toml"), "[deck]\ntheme = 3\n").unwrap();
+        std::fs::write(dir.path().join("s.md"), "# A\n").unwrap();
+        let args = CheckArgs {
+            inputs: vec![],
+            format: CheckFormat::Json,
+            deny_warnings: false,
+            theme: None,
+        };
+        let deck = dir.path().join("s.md");
+        let diagnostic = check_input(&deck, &args, &GlobalArgs::default()).unwrap_err();
+        let shown = display_path(&dir.path().join("presenter.toml"));
+        assert!(
+            diagnostic
+                .message
+                .starts_with(&format!("config: {}: ", shown.display())),
+            "{diagnostic}"
+        );
     }
 
     #[test]

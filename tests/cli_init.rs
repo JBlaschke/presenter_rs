@@ -252,16 +252,12 @@ fn scaffold_has_no_diagnostics_and_passes_check() {
         let diagnostics: Vec<String> = built.diagnostics.iter().map(|d| d.to_string()).collect();
         assert!(diagnostics.is_empty(), "{deck}: {diagnostics:?}");
 
-        // `presenter check` (T34) once it exists: no warnings.
+        // `presenter check`: no warnings.
         let output = presenter(&project)
             .args(["check", deck, "--deny-warnings"])
             .output()
             .unwrap();
         let stderr = text(&output.stderr);
-        if stderr.contains("not implemented yet") {
-            eprintln!("presenter check is not implemented in this build; skipped");
-            continue;
-        }
         let stdout = text(&output.stdout);
         assert!(output.status.success(), "check {deck}: {stdout}{stderr}");
         assert!(
@@ -536,6 +532,7 @@ fn full_theme_copies_the_default_theme() {
         .iter()
         .map(|key| format!("theme/{}", &key["themes/default/".len()..]))
         .collect();
+    assert!(expected.contains("theme/README.md"));
     let theme_files: BTreeSet<String> = files(&project)
         .into_iter()
         .filter(|f| f.starts_with("theme/"))
@@ -543,7 +540,7 @@ fn full_theme_copies_the_default_theme() {
     assert_eq!(theme_files, expected);
     for key in &builtin {
         let rel = &key["themes/default/".len()..];
-        if rel == "theme.toml" {
+        if rel == "theme.toml" || rel == "README.md" {
             continue;
         }
         let copied = std::fs::read(project.join("theme").join(rel)).unwrap();
@@ -575,6 +572,25 @@ fn full_theme_copies_the_default_theme() {
     original.insert("name".into(), "full".into());
     original.insert("description".into(), description.into());
     assert_eq!(manifest, original);
+
+    // The README says that it documents the built-in theme, and none of its links leaves
+    // the copy; the copied CSS and templates that point to it find it (audit F48).
+    let readme = read(project.join("theme/README.md"));
+    assert!(
+        readme.starts_with(
+            "> **A copy.** `presenter init --full-theme` copied presenter's built-in theme \
+             `default` here as the theme `full`.\n"
+        ),
+        "{readme}"
+    );
+    assert!(!readme.contains("](../"), "{readme}");
+    assert!(read(project.join("theme/templates/cell.html")).contains("(README.md, "));
+    for rel in ["styles/theme.css", "styles/notebook.css"] {
+        assert!(
+            read(project.join("theme").join(rel)).contains("../README.md"),
+            "{rel}"
+        );
+    }
 
     let html = build(&project, "slides.md", 6);
     let context = dump(&project, "slides.md", true);

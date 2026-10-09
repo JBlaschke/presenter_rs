@@ -5,7 +5,9 @@
 //! with `--notebook`), `theme/` (a child of the built-in `default` theme that overrides the
 //! `title` layout and sets a few CSS custom properties), `.gitignore` (`dist/`) and
 //! `README.md`. With `--full-theme`, `theme/` is a copy of the built-in `themes/default/`
-//! instead; its `theme.toml` gets a new header comment, `name` and `description`.
+//! instead: its `theme.toml` gets a new header comment, `name` and `description`, and its
+//! `README.md` a note on top saying that it documents the built-in theme, with its links
+//! into presenter's repository unlinked (audit F48).
 //!
 //! # The target directory
 //!
@@ -48,6 +50,7 @@ use std::process::ExitCode;
 use anyhow::{Context as _, anyhow};
 use serde_json::Value;
 
+use super::theme::{BUILTIN_THEME_README, copied_readme};
 use super::{GlobalArgs, InitArgs, UsageError, print_stdout};
 use crate::assets::registry::normalize_lexically;
 use crate::theme::resolve::MANIFEST_FILE;
@@ -57,6 +60,8 @@ use crate::vendor;
 const SCAFFOLD_PREFIX: &str = "scaffold/";
 /// The built-in theme `--full-theme` copies.
 const DEFAULT_THEME_PREFIX: &str = "themes/default/";
+/// The name of the built-in theme under [`DEFAULT_THEME_PREFIX`].
+const DEFAULT_THEME_NAME: &str = "default";
 /// The theme directory inside the new project (`[deck] theme` in the scaffold's
 /// `presenter.toml` names it).
 const THEME_DIR: &str = "theme";
@@ -222,7 +227,8 @@ impl Scaffold {
     }
 
     /// The built-in default theme's files below `theme/`, with a manifest made for this
-    /// project ([`copied_manifest`]).
+    /// project ([`copied_manifest`]) and its [`BUILTIN_THEME_README`] marked as the
+    /// built-in theme's documentation ([`copied_readme`]).
     fn default_theme_files(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
         let keys = vendor::list(DEFAULT_THEME_PREFIX);
         if keys.is_empty() {
@@ -236,6 +242,13 @@ impl Scaffold {
                     let text = String::from_utf8(data)
                         .with_context(|| format!("embedded {key} is not UTF-8"))?;
                     data = copied_manifest(&text, &self.theme_name).into_bytes();
+                } else if rel == BUILTIN_THEME_README {
+                    data = copied_readme(
+                        data,
+                        DEFAULT_THEME_NAME,
+                        &self.theme_name,
+                        "presenter init --full-theme",
+                    );
                 }
                 Ok((format!("{THEME_DIR}/{rel}"), data))
             })

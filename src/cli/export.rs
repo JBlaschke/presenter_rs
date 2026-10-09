@@ -12,6 +12,12 @@
 //!   [`crate::pipeline::default_output_path`] with `.pdf` (`dist/slides.pdf` for
 //!   `slides.md`). On success stdout gets one line, `Wrote <path> (<n> pages, <size>)`
 //!   (nothing with `-q`).
+//! - The PDF never overwrites an input (audit F01): before Chrome is looked for, the output
+//!   is compared by file identity with the input and the `presenter.toml` in use, and after
+//!   the build, before Chrome starts, with the deck's local assets and the theme's files
+//!   too ([`crate::pipeline::input_files`]). A clash is a usage error
+//!   (exit 2), and so is a `-o` that names a directory. A `-o` that does not end in `.pdf`
+//!   gets a warning once every check has passed, just before Chrome starts.
 //! - A Chrome failure (it exits, times out after [`crate::pdf::DEFAULT_TIMEOUT`], or the
 //!   page fails) is an error that includes Chrome's stderr: exit 1.
 //!
@@ -24,14 +30,15 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 
 use super::build::format_size;
-use super::report::report_error;
+use super::report::{report_build_failure, report_error};
 use super::{
-    ExportArgs, ExportCommand, ExportPdfArgs, GlobalArgs, display_path, input_kind, locate,
-    print_stdout, report_diagnostics,
+    ExportArgs, ExportCommand, ExportPdfArgs, GlobalArgs, clash_error, display_path, input_kind,
+    print_stdout, reject_directory, report_diagnostics,
 };
 use crate::config::{CliOverrides, Config};
+use crate::error::{Diagnostic, Diagnostics};
 use crate::pdf;
-use crate::pipeline::{self, BuildFailure, BuildOptions};
+use crate::pipeline::{self, BuildOptions, InputRole};
 
 /// Exit code of `export pdf` when no Chrome or Chromium is found (cli.md `export`).
 pub const EXIT_NO_CHROME: u8 = 3;
@@ -49,6 +56,9 @@ Limitations (reveal.js print mode, ?print-pdf):
     pdfMaxPagesPerSlide.
   - Needs Chrome or Chromium (Edge and Brave work too); without one the command
     exits with code 3. Chrome gets 120 s for the whole export.
+  - The PDF is not byte-for-byte reproducible, unlike `presenter build`: Chrome stamps
+    the export time (CreationDate, ModDate) and its own version (Creator, Producer)
+    into it, and another Chrome version lays the pages out differently.
 
 Tips: [reveal] options shape the PDF: width/height set the page size, showNotes = true
 prints the speaker notes, and pdfSeparateFragments = false gives one page per slide.";
@@ -72,11 +82,6 @@ pub fn run(args: &ExportArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
 /// `presenter export pdf` (module docs).
 fn export_pdf(args: &ExportPdfArgs, global: &GlobalArgs) -> anyhow::Result<ExitCode> {
     let kind = input_kind(&args.input)?;
-    let Some(chrome) = pdf::find_chrome(args.chrome.as_deref()) else {
-        report_error(&anyhow::anyhow!(no_chrome_message(args.chrome.as_deref())));
-        return Ok(ExitCode::from(EXIT_NO_CHROME));
-    };
-    tracing::info!("using {}", chrome.display());
     let mut opts = BuildOptions::new(&args.input);
     opts.format = Some(kind);
     opts.config_path = global.config.clone();
@@ -85,18 +90,21 @@ fn export_pdf(args: &ExportPdfArgs, global: &GlobalArgs) -> anyhow::Result<ExitC
         standalone: Some(true),
         ..CliOverrides::default()
     };
+    let out = pdf_output(args, &opts)?;
+    let Some(chrome) = pdf::find_chrome(args.chrome.as_deref()) else {
+        report_error(&anyhow::anyhow!(no_chrome_message(args.chrome.as_deref())));
+        return Ok(ExitCode::from(EXIT_NO_CHROME));
+    };
+    tracing::info!("using {}", chrome.display());
     let build = match pipeline::try_build_deck(&opts) {
         Ok(build) => build,
-        Err(BuildFailure { error, diagnostics }) => {
-            report_diagnostics(&diagnostics, global);
-            return Err(locate(error, &args.input));
-        }
+        Err(failure) => return Err(report_build_failure(failure, &args.input, global)),
     };
     report_diagnostics(&build.diagnostics, global);
-    let out = args
-        .out
-        .clone()
-        .unwrap_or_else(|| default_pdf_path(&args.input, &build.config));
+    if let Some(clash) = pipeline::find_clash([out.as_path()], &pipeline::input_files(&build)) {
+        return Err(clash_error(&clash, args.out.is_some()));
+    }
+    warn_unless_pdf_extension(args.out.as_deref(), global);
     let bytes = pdf::html_to_pdf(&chrome, &build.document.html, pdf::DEFAULT_TIMEOUT)?;
     write_pdf(&out, &bytes)?;
     if !global.quiet {
@@ -125,6 +133,49 @@ fn no_chrome_message(explicit: Option<&Path>) -> String {
         ),
     };
     format!("{what}\n  {INSTALL_HINTS}")
+}
+
+/// Where the PDF goes: `-o`, else [`default_pdf_path`] for the project config of `opts`.
+/// Checked before Chrome is looked for: a `-o` that names a directory, and an output that
+/// is the input or the `presenter.toml` in use, are usage errors.
+fn pdf_output(args: &ExportPdfArgs, opts: &BuildOptions) -> anyhow::Result<PathBuf> {
+    let (config, config_path) = pipeline::load_config(opts)?;
+    let out = match &args.out {
+        Some(out) => {
+            reject_directory(out, "give the PDF file to write")?;
+            out.clone()
+        }
+        None => default_pdf_path(&args.input, &config),
+    };
+    let mut inputs = vec![(args.input.clone(), InputRole::Source)];
+    inputs.extend(config_path.map(|path| (path, InputRole::Config)));
+    if let Some(clash) = pipeline::find_clash([out.as_path()], &inputs) {
+        return Err(clash_error(&clash, args.out.is_some()));
+    }
+    Ok(out)
+}
+
+/// The `pdf-extension` warning (not with `-q`) when the `-o` file does not end in `.pdf`.
+/// Printed once every check has passed, just before Chrome starts, so it never precedes
+/// a refusal to write that file.
+fn warn_unless_pdf_extension(out: Option<&Path>, global: &GlobalArgs) {
+    let Some(out) = out else {
+        return;
+    };
+    if out
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        return;
+    }
+    let warning = Diagnostic::warning(
+        "pdf-extension",
+        format!(
+            "-o {} does not end in .pdf; the file will hold a PDF",
+            display_path(out).display()
+        ),
+    );
+    report_diagnostics(&Diagnostics::from(vec![warning]), global);
 }
 
 /// Where the PDF goes without `-o`: the standalone HTML output path with `.pdf`.
@@ -170,6 +221,12 @@ mod tests {
         assert!(help.contains("fragments collapse"), "{help}");
         assert!(help.contains("static"), "{help}");
         assert!(help.contains("exits with code 3"), "{help}");
+        // Audit F21: PDF export is the documented exception to reproducible output.
+        assert!(
+            help.contains("The PDF is not byte-for-byte reproducible"),
+            "{help}"
+        );
+        assert!(help.contains("CreationDate, ModDate"), "{help}");
     }
 
     #[test]
