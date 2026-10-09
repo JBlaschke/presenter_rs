@@ -6,7 +6,9 @@
 //!
 //! A [`WatchSet`] lists the inputs of one build ([`watch_set_for`], or
 //! [`watch_set_for_failed`] when the build failed, or [`watch_set_before_build`] while the
-//! first build runs): the source file, the `presenter.toml` that was used, every file asset
+//! first build runs): the source file, the files it includes (`Deck.includes`; for a deck
+//! that does not parse, those [`scan_includes`] finds), the `presenter.toml` that was used,
+//! every file asset
 //! (and every missing one), each disk theme of the chain (when the theme does not resolve,
 //! every directory it may be in) and, in a debug build, `assets/themes/default/` of this
 //! crate (rust-embed reads it from disk then). All paths are canonical (`/tmp/x` on macOS
@@ -86,6 +88,7 @@ use crate::assets::registry::{AssetData, AssetRegistry, normalize_lexically};
 use crate::config::Config;
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{Deck, DeckMeta, Features, Parsed, SourceInfo, SourceKind};
+use crate::markdown::include::scan_includes;
 use crate::markdown::render::missing_asset_path;
 use crate::pipeline::{self, Build, BuildFailure, BuildOptions};
 use crate::theme::resolve::{MANIFEST_FILE, MAX_CHAIN_LEN};
@@ -114,7 +117,8 @@ pub enum ChangeKind {
 /// works too.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchSet {
-    /// Files whose changes count: the source, `presenter.toml`, the deck's file assets
+    /// Files whose changes count: the source, the files it includes, `presenter.toml`, the
+    /// deck's file assets
     /// (including missing ones, so that creating them, and any directories they need,
     /// rebuilds).
     pub files: Vec<PathBuf>,
@@ -164,11 +168,13 @@ impl WatchSet {
     }
 }
 
-/// The inputs of a successful build (live-reload.md §5): the source file, the
-/// `presenter.toml` that was used, every file asset and every asset reported missing, the
-/// chain's disk themes and, in a debug build, this crate's `assets/themes/default/`.
+/// The inputs of a successful build (live-reload.md §5): the source file, every file it
+/// includes (`Deck.includes`), the `presenter.toml` that was used, every file asset and every
+/// asset reported missing, the chain's disk themes and, in a debug build, this crate's
+/// `assets/themes/default/`.
 pub fn watch_set_for(build: &Build) -> WatchSet {
     let mut files = vec![build.deck.source.path.clone()];
+    files.extend(build.deck.includes.iter().cloned());
     files.extend(build.config_path.iter().cloned());
     files.extend(asset_files(&build.assets, &build.diagnostics));
     WatchSet::new(files, with_builtin_theme(build.theme.watch_dirs()))
@@ -177,9 +183,10 @@ pub fn watch_set_for(build: &Build) -> WatchSet {
 /// The inputs of a failed build, as far as they are known: the source file, the
 /// `presenter.toml` (`--config`, else the one discovery finds, even when it is invalid)
 /// and, in a debug build, this crate's `assets/themes/default/`. When the source still
-/// parses (the build failed later: a missing asset, the theme, a template), also the
-/// deck's file assets including the missing ones, and the theme's directories; when it
-/// does not parse, what [`watch_set_before_build`] finds. A theme that does not resolve
+/// parses (the build failed later: a missing asset, the theme, a template), also the files
+/// it includes, the deck's file assets including the missing ones, and the theme's
+/// directories; when it does not parse (also when an included file does not), what
+/// [`watch_set_before_build`] finds, which includes the files [`scan_includes`] finds. A theme that does not resolve
 /// (not found, an invalid `theme.toml`, a parent that is missing) contributes every
 /// directory it may be in (its name below the config file's directory, the deck's
 /// directory and the current directory, and where each parent named by `extends` is
@@ -224,8 +231,8 @@ fn unparsed_watch_set(opts: &BuildOptions, err: &Error) -> WatchSet {
 /// What [`watch_set_for_failed`] watches of a deck that parses, kept so that the set can
 /// be made after the parsed deck is gone (moved into the build's later stages).
 struct ParsedInputs {
-    /// The source, the deck's file assets (missing ones included) and the
-    /// `presenter.toml` that was used.
+    /// The source, the files it includes, the deck's file assets (missing ones included)
+    /// and the `presenter.toml` that was used.
     files: Vec<PathBuf>,
     /// The deck without its slides: what [`theme_dirs`] reads (`meta.theme`, `source`).
     deck: Deck,
@@ -245,6 +252,7 @@ impl ParsedInputs {
         config_path: Option<&Path>,
     ) -> ParsedInputs {
         let mut files = vec![opts.input.clone()];
+        files.extend(parsed.deck.includes.iter().cloned());
         files.extend(asset_files(&parsed.assets, &parsed.diagnostics));
         files.extend(config_path.map(Path::to_path_buf));
         let deck = Deck {
@@ -253,6 +261,7 @@ impl ParsedInputs {
             features: Features::default(),
             source: parsed.deck.source.clone(),
             assets: Vec::new(),
+            includes: Vec::new(),
         };
         ParsedInputs {
             files,
@@ -271,7 +280,9 @@ impl ParsedInputs {
 }
 
 /// The inputs of a build of `opts` that are known without parsing the deck: the source
-/// file, the `presenter.toml` (even when it is invalid), the theme named by `--theme` or
+/// file, the files a Markdown source includes as far as [`scan_includes`] finds them (an
+/// included file whose error stopped the build among them, so that fixing it rebuilds),
+/// the `presenter.toml` (even when it is invalid), the theme named by `--theme` or
 /// `[deck] theme` (as [`watch_set_for_failed`] watches it; a front matter `theme` is not
 /// known yet) and, in a debug build, this crate's `assets/themes/default/`. Cheap (it
 /// reads the config and the theme manifests only): watch this while the first build runs,
@@ -291,7 +302,13 @@ pub fn watch_set_before_build(opts: &BuildOptions) -> WatchSet {
             (config_path, themes)
         }
     };
-    let files = std::iter::once(opts.input.clone()).chain(config_path);
+    let includes = match deck.source.kind {
+        SourceKind::Markdown => scan_includes(&opts.input),
+        SourceKind::Notebook => Vec::new(),
+    };
+    let files = std::iter::once(opts.input.clone())
+        .chain(includes)
+        .chain(config_path);
     WatchSet::new(files, with_builtin_theme(themes))
 }
 
@@ -422,6 +439,7 @@ fn placeholder_deck(opts: &BuildOptions) -> Deck {
             base_dir,
         },
         assets: Vec::new(),
+        includes: Vec::new(),
     }
 }
 

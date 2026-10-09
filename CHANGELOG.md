@@ -58,6 +58,10 @@ publishes that section as the GitHub Release notes (see
   - speaker notes and incremental lists;
   - GitHub tables, task lists, footnotes and alerts;
   - reveal.js Markdown-plugin comments (`<!-- .slide: … -->`, `<!-- .element: … -->`).
+- `:::include part2.md` (or `analysis.ipynb`), alone on a slide, composes a Markdown deck
+  from other Markdown files and notebooks: their slides take the directive's place, `serve`
+  and `build --watch` watch them, and errors and `presenter check` name the included file
+  and line (example: `examples/mixed`).
 - Notebooks (`docs/spec/notebook-mapping.md`) map onto slides through the Jupyter
   slideshow metadata (`slide_type`) and cell tags (`hide-input`, `hide-output`, …).
   Notebooks are not executed; the outputs already stored in them are rendered:

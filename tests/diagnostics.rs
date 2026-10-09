@@ -100,6 +100,7 @@ fn missing_plot() -> Error {
             start_line: 3,
             end_line: 3,
             cell: None,
+            file: None,
         }),
     }
 }

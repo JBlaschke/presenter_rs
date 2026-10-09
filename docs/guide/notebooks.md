@@ -15,6 +15,13 @@ Jupyter. [`examples/notebook`](../../examples/notebook/README.md) is an executed
 with a plot, a DataFrame, math and a traceback. `presenter init --notebook talk` starts a
 new presentation from a small notebook.
 
+To mix a notebook with slides written in Markdown, include it from a Markdown deck:
+`:::include analysis.ipynb` and a `:::` line, alone on a slide, pulls in all of the
+notebook's slides there ([Writing slides: including files](authoring.md#including-files);
+[`examples/mixed`](../../examples/mixed/README.md)). The notebook's slide types, tags and
+outputs work as below; the deck's metadata (title, theme, …) applies, not the notebook's.
+A notebook itself cannot include other files.
+
 ![A code cell with its plot](../screenshots/notebook-code-plot.png)
 
 ## Slide types

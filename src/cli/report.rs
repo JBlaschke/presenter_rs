@@ -335,6 +335,13 @@ impl<'a> Report<'a> {
         };
         let file = match err {
             Error::Parse { .. } => err.path().map(Path::to_path_buf),
+            // A missing asset of an included file: its span names the file (T48).
+            Error::MissingAsset {
+                span: Some(SourceSpan {
+                    file: Some(file), ..
+                }),
+                ..
+            } => Some(file.clone()),
             Error::MissingAsset { .. } | Error::FrontMatter(_) => input.map(Path::to_path_buf),
             _ => None,
         };
@@ -462,7 +469,8 @@ pub fn with_display_paths(err: Error) -> Error {
 /// [`report_error`]. The diagnostics found before the error are printed first
 /// ([`report_diagnostics`]). When the build failed on a missing asset, every missing asset
 /// is reported the same way, as a located error with its source line, in source order
-/// (audit F37): those before the last are printed here, the last is returned.
+/// (audit F37; `source_order`): those before the last are printed here, the last is
+/// returned.
 pub fn report_build_failure(
     failure: BuildFailure,
     input: &Path,
@@ -480,12 +488,7 @@ pub fn report_build_failure(
     let mut errors: Vec<Error> = std::iter::once(error)
         .chain(missing.iter().filter_map(missing_asset_as_error))
         .collect();
-    // Stable: errors on the same line (or without one, last) keep their order.
-    errors.sort_by_key(|err| {
-        err.span().map_or((usize::MAX, usize::MAX), |span| {
-            (span.cell.unwrap_or(0), span.start_line)
-        })
-    });
+    source_order(&mut errors);
     let last = errors.pop();
     for err in errors {
         report_error(&super::locate(err, input));
@@ -495,6 +498,30 @@ pub fn report_build_failure(
         // The list starts with `error`, so it is never empty.
         None => anyhow::anyhow!("the build failed"),
     }
+}
+
+/// Sorts the missing assets of a failed build (`errors`, in the frontend's order: the deck's
+/// own, then those of the files it includes, in first-use order) into source order: the
+/// deck's first, then each included file's (`SourceSpan.file`, T48) in the order the files
+/// first appear, each file's by cell and line. Stable: errors on the same line keep their
+/// order, and errors without a span come last.
+fn source_order(errors: &mut [Error]) {
+    let mut files: Vec<Option<PathBuf>> = vec![None];
+    for span in errors.iter().filter_map(Error::span) {
+        if !files.contains(&span.file) {
+            files.push(span.file);
+        }
+    }
+    errors.sort_by_key(|err| {
+        err.span().map_or((usize::MAX, 0, 0), |span| {
+            let file = files.iter().position(|file| *file == span.file);
+            (
+                file.unwrap_or(usize::MAX),
+                span.cell.unwrap_or(0),
+                span.start_line,
+            )
+        })
+    });
 }
 
 /// The text after `-->`: `file:line[:column]` for a file, `file: cell C, line L[, column N]`
@@ -576,6 +603,7 @@ mod tests {
                 start_line: 7,
                 end_line: 7,
                 cell: None,
+                file: None,
             });
         let cwd = Path::new("/work");
         assert_eq!(
@@ -606,6 +634,7 @@ mod tests {
                 start_line: 2,
                 end_line: 2,
                 cell: Some(5),
+                file: None,
             });
         assert_eq!(
             diagnostic_line(&diagnostic, Some(Path::new("/work")), false),
@@ -623,7 +652,52 @@ mod tests {
             start_line: line,
             end_line: line,
             cell,
+            file: None,
         }
+    }
+
+    /// Audit F37 with includes (T48): the deck's missing assets first, then each included
+    /// file's in the order the files first appear, each by cell and line; no span last.
+    #[test]
+    fn missing_assets_are_sorted_into_source_order_per_file() {
+        let missing = |name: &str, line: usize, cell: Option<usize>, file: Option<&str>| {
+            Error::MissingAsset {
+                path: PathBuf::from(name),
+                span: Some(SourceSpan {
+                    file: file.map(PathBuf::from),
+                    ..span(line, cell)
+                }),
+            }
+        };
+        let mut errors = vec![
+            missing("p9", 9, None, Some("/d/part.md")),
+            Error::MissingAsset {
+                path: PathBuf::from("none"),
+                span: None,
+            },
+            missing("n1", 1, Some(1), Some("/d/nb.ipynb")),
+            missing("d14", 14, None, None),
+            missing("p3", 3, None, Some("/d/part.md")),
+            missing("n0", 5, Some(0), Some("/d/nb.ipynb")),
+            missing("d3", 3, None, None),
+        ];
+        source_order(&mut errors);
+        let names: Vec<String> = errors
+            .iter()
+            .map(|err| match err {
+                Error::MissingAsset { path, .. } => path.display().to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["d3", "d14", "p3", "p9", "n0", "n1", "none"]);
+        // The report quotes the included file's line.
+        let err = missing("/d/parts/y.png", 2, None, Some("/d/parts/p.md"));
+        let cache = one_file("/d/parts/p.md", "# P\n![y](y.png)\n");
+        assert_eq!(
+            format_error(&err, Some(Path::new("/d/deck.md")), &cache, false),
+            "error: asset not found: /d/parts/y.png\n --> /d/parts/p.md:2\n  |\n\
+             2 | ![y](y.png)\n  |      ^^^^^"
+        );
     }
 
     #[test]

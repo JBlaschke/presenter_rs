@@ -1113,6 +1113,7 @@ fn line_span(line: usize) -> SourceSpan {
         start_line: line,
         end_line: line,
         cell: None,
+        file: None,
     }
 }
 

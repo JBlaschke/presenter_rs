@@ -239,6 +239,7 @@ fn invariant_violations_are_detected() {
                 start_line: 0,
                 end_line: 1,
                 cell: None,
+                file: None,
             })
         },
         "bad span",

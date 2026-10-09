@@ -93,7 +93,8 @@ impl Error {
     /// file of [`Error::Parse`] (as the frontend was given it; `None` when empty). Every
     /// other variant gives `None`: the path of [`Error::MissingAsset`] is the missing file,
     /// while its span is in the deck source, which only the caller knows (the CLI adds it
-    /// as context, `cli::locate`); a template's name is not a file path.
+    /// as context, `cli::locate`), or in the included file the span's `file` names (T48); a
+    /// template's name is not a file path.
     pub fn path(&self) -> Option<&Path> {
         match self {
             Error::Parse { path, .. } if !path.as_os_str().is_empty() => Some(path),
@@ -108,7 +109,7 @@ impl Error {
     /// |---|---|
     /// | `Parse` with `line` | that line of [`path`](Self::path) |
     /// | `Parse` whose message starts `cell N, line M: ` (a notebook cell) | line M of cell N |
-    /// | `MissingAsset` | its `span` (in the deck source) |
+    /// | `MissingAsset` | its `span` (in the deck source, or in the included file its `file` names) |
     /// | `FrontMatter` with `at line L column C` | line L of the deck source; of cell N for a notebook (`cell N: …`) |
     /// | `Template` with `line` | that line of the template |
     ///
@@ -118,6 +119,7 @@ impl Error {
             start_line: line,
             end_line: line,
             cell,
+            file: None,
         };
         match self {
             Error::Parse {
@@ -813,6 +815,7 @@ mod tests {
             start_line: line,
             end_line: line,
             cell: None,
+            file: None,
         }
     }
 
@@ -951,6 +954,7 @@ mod tests {
             start_line: 2,
             end_line: 4,
             cell: Some(7),
+            file: None,
         };
         let md = Diagnostic::warning("empty-slide", "slide 3 is empty");
         let cases = [

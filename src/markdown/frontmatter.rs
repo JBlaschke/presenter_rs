@@ -274,6 +274,7 @@ pub fn parse_deck_front_matter(
         start_line,
         end_line: closing,
         cell: None,
+        file: None,
     };
     let keyless = yaml.lines().all(|line| {
         let line = line.trim();

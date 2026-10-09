@@ -13,10 +13,10 @@
 #     first `:::` closes the outer directive.
 #   - any other name → comrak's default <div class="name args">: `:::center`,
 #     `:::warning large` (extra tokens are classes), `:::r-stack`;
-#   - unconsumed `key=value` args → data-<key>="<value>": `:::callout tip title=Hint`;
-#   - `:::include path` is reserved, not implemented (`check` warns "unknown directive
-#     include").
-# Expected shape: 5 horizontal slides, no vertical slides. Slide 1 has notes.
+#   - unconsumed `key=value` args → data-<key>="<value>": `:::callout tip title=Hint`.
+#   `:::include path` (dialect §4.1, T48) has fixtures of its own in
+#     tests/fixtures/include/.
+# Expected shape: 4 horizontal slides, no vertical slides. Slide 1 has notes.
 title: Directives
 ---
 
@@ -75,12 +75,4 @@ The unconsumed `title=Hint` becomes `data-title="Hint"`.
 
 :::r-stack
 reveal's own layout helper class `r-stack`.
-:::
-
----
-
-## Reserved
-
-:::include other.md
-`:::include` is reserved and not implemented.
 :::

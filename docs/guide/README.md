@@ -7,7 +7,7 @@ browser and updates it on every save of the deck, its images or its theme.
 | Page | What it covers |
 |---|---|
 | [Getting started](getting-started.md) | Install, create a deck with `presenter init`, preview it, build it, export a PDF |
-| [Writing slides](authoring.md) | The Markdown dialect: separators, attributes, directives, code, math, images, notes, headings mode, `presenter check` |
+| [Writing slides](authoring.md) | The Markdown dialect: separators, attributes, directives, code, math, images, notes, including files, headings mode, `presenter check` |
 | [Notebooks](notebooks.md) | Slide types and tags from Jupyter, front matter in the first cell, which outputs render, running the notebook first |
 | [Themes](themes.md) | Theme directories, tokens, layouts, extending and ejecting, SCSS, templates and their context, the live-reload loop |
 | [Configuration](configuration.md) | `presenter.toml`, front matter and flags: every setting with its default and how they combine |
@@ -19,6 +19,7 @@ The repository's `examples/` directory has a deck for each part of the guide:
 |---|---|
 | [`examples/basic`](../../examples/basic/README.md) | The Markdown features, with the built-in theme |
 | [`examples/notebook`](../../examples/notebook/README.md) | An executed notebook: plots, a DataFrame, math, a traceback |
+| [`examples/mixed`](../../examples/mixed/README.md) | A Markdown deck that includes that notebook and a Markdown part (`:::include`) |
 | [`examples/headings-mode`](../../examples/headings-mode/slides.md) | Slides that start at headings, as in pandoc, and reveal.js-style comments |
 | [`examples/custom-theme-scss`](../../examples/custom-theme-scss/README.md) | A dark child theme written in SCSS on top of reveal.js's theme template |
 
@@ -34,9 +35,6 @@ These do not exist yet. Each entry says what to do instead.
   images instead ([Notebooks: interactive outputs](notebooks.md#interactive-outputs-widgets-plotly-bokeh)).
 - **Interactive widgets** (`ipywidgets`). They need a running kernel. presenter shows the
   widget's text form (`IntSlider(value=3)`) and `presenter check` warns about it.
-- **`:::include`.** Including another Markdown file is reserved but does nothing: the
-  directive renders as a plain `<div>`, and `presenter check` warns. Keep the deck in one
-  file.
 - **A logo file next to the deck.** The title layout's `logo:` must name a file in a theme's
   `assets/` directory ([Themes: the logo](themes.md#the-title-slides-logo)).
 - **Minified output.** `[build] minify` is accepted and does nothing.

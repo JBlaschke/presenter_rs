@@ -11,7 +11,8 @@
 //!    [`BuildOptions::format`] or the extension ([`detect_kind`]) and parses it into a
 //!    [`Parsed`] deck. The returned config also has the deck's front matter merged.
 //! 3. [`prepare`]: escalates the first `missing-asset` warning to [`Error::MissingAsset`]
-//!    when [`BuildOptions::missing_asset_is_error`] (ir.md §4 contract change), resolves the
+//!    when [`BuildOptions::missing_asset_is_error`] (ir.md §4 contract change; the span of
+//!    one in an included file names that file, [`missing_asset_as_error`]), resolves the
 //!    theme (`cli.theme` → front matter `theme` → `[deck] theme`, searched in the config
 //!    file's directory, the input's directory and the current directory), checks the
 //!    theme's `[reveal] plugins` (an [`Error::Theme`] naming the theme) and builds the
@@ -354,6 +355,35 @@ pub fn parse_only(opts: &BuildOptions) -> Result<(Parsed, Config, Option<PathBuf
 pub fn try_parse_only(
     opts: &BuildOptions,
 ) -> std::result::Result<(Parsed, Config, Option<PathBuf>), BuildFailure> {
+    let parsed = try_parse_with_includes(opts)?;
+    Ok((parsed.parsed, parsed.config, parsed.config_path))
+}
+
+/// What [`parse_with_includes`] returns.
+#[derive(Debug)]
+pub(crate) struct ParsedWithIncludes {
+    /// The deck, as [`parse_only`] returns it.
+    pub(crate) parsed: Parsed,
+    /// The config, as [`parse_only`] returns it.
+    pub(crate) config: Config,
+    /// The `presenter.toml` that was used, as [`parse_only`] returns it.
+    pub(crate) config_path: Option<PathBuf>,
+    /// Every file a Markdown deck includes (transitively, each once, in first-use order),
+    /// with the config the frontend parsed it with (dialect §4.1, T48); empty for a notebook.
+    pub(crate) includes: Vec<crate::markdown::include::IncludedSource>,
+}
+
+/// [`parse_only`], with the files the deck includes and the config each was parsed with, from
+/// the same parse: for `check`, which lints the source of every included file as the frontend
+/// read it.
+pub(crate) fn parse_with_includes(opts: &BuildOptions) -> Result<ParsedWithIncludes> {
+    try_parse_with_includes(opts).map_err(|failure| failure.error)
+}
+
+/// [`try_parse_only`] with the included files ([`parse_with_includes`]).
+fn try_parse_with_includes(
+    opts: &BuildOptions,
+) -> std::result::Result<ParsedWithIncludes, BuildFailure> {
     let kind = match opts.format {
         Some(kind) => kind,
         None => detect_kind(&opts.input)?,
@@ -361,12 +391,16 @@ pub fn try_parse_only(
     let text = read_source(&opts.input)?;
     let source = source_info(&opts.input, kind)?;
     let (mut config, config_path) = load_config(opts)?;
-    let (parsed, deferred) = match kind {
-        SourceKind::Markdown => (
-            crate::markdown::parse_deferring_config(&source, &text, &config)?,
-            None,
-        ),
-        SourceKind::Notebook => crate::notebook::parse_deferring_config(&source, &text, &config)?,
+    let (parsed, deferred, includes) = match kind {
+        SourceKind::Markdown => {
+            let (parsed, includes) = crate::markdown::parse_with_includes(&source, &text, &config)?;
+            (parsed, None, includes)
+        }
+        SourceKind::Notebook => {
+            let (parsed, deferred) =
+                crate::notebook::parse_deferring_config(&source, &text, &config)?;
+            (parsed, deferred, Vec::new())
+        }
     };
     tracing::debug!(
         diagnostics = parsed.diagnostics.len(),
@@ -384,7 +418,12 @@ pub fn try_parse_only(
         });
     }
     config.apply_cli(&opts.cli);
-    Ok((parsed, config, config_path))
+    Ok(ParsedWithIncludes {
+        parsed,
+        config,
+        config_path,
+        includes,
+    })
 }
 
 /// Stage 1 of the module docs: the project config (`opts.config_path`, else the first
@@ -521,16 +560,20 @@ pub enum InputRole {
     Asset,
     /// A file of a theme directory the build uses ([`input_files`] says which).
     Theme,
+    /// A file the deck pulls in with `:::include` (markdown-dialect §4.1, T48).
+    Include,
 }
 
 impl fmt::Display for InputRole {
-    /// `the input file`, `the config file`, `the deck's asset` or `the theme file`.
+    /// `the input file`, `the config file`, `the deck's asset`, `the theme file` or `the
+    /// included file`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             InputRole::Source => "the input file",
             InputRole::Config => "the config file",
             InputRole::Asset => "the deck's asset",
             InputRole::Theme => "the theme file",
+            InputRole::Include => "the included file",
         })
     }
 }
@@ -575,7 +618,8 @@ const THEME_INPUT_DIRS: [&str; 4] = ["templates", "styles", "assets", "scripts"]
 const OUTPUT_EXTENSIONS: [&str; 3] = ["html", "htm", "pdf"];
 
 /// The files `build` read, or may read, that its output must never overwrite, each with
-/// its role: the source, the `presenter.toml` that was used, every local file asset of the
+/// its role: the source, the files it includes (`Deck.includes`, T48), the `presenter.toml`
+/// that was used, every local file asset of the
 /// deck and the files of each theme directory of the chain ([`InputRole::Theme`]): its
 /// top-level files (`theme.toml` among them) except `.html`, `.htm` and `.pdf` files,
 /// which may be earlier outputs; every file in its `templates/`, `styles/`, `assets/` and
@@ -587,6 +631,13 @@ const OUTPUT_EXTENSIONS: [&str; 3] = ["html", "htm", "pdf"];
 /// have no files on disk.
 pub fn input_files(build: &Build) -> Vec<(PathBuf, InputRole)> {
     let mut inputs = vec![(build.deck.source.path.clone(), InputRole::Source)];
+    inputs.extend(
+        build
+            .deck
+            .includes
+            .iter()
+            .map(|path| (path.clone(), InputRole::Include)),
+    );
     inputs.extend(
         build
             .config_path
@@ -940,6 +991,9 @@ fn missing_asset_error(diagnostics: &Diagnostics) -> Option<Error> {
 /// with: the missing file from its message (else the diagnostic's path), the span from the
 /// diagnostic. `None` for any other diagnostic. The CLI uses it to report every missing
 /// asset of a failed build the same way (audit F37).
+///
+/// For a missing asset of an included file the span's `file` names that file
+/// (`SourceSpan.file`, T48): the CLI's report and the serve overlay locate and quote it there.
 pub fn missing_asset_as_error(diagnostic: &Diagnostic) -> Option<Error> {
     if diagnostic.code != MISSING_ASSET {
         return None;
@@ -1574,6 +1628,7 @@ mod tests {
                     start_line: 4,
                     end_line: 4,
                     cell: None,
+                    file: None,
                 }),
         );
         match missing_asset_error(&diagnostics) {

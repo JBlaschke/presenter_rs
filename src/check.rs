@@ -13,7 +13,8 @@
 //!   `separator-not-recognized` (lines that look like `--- {…}` separators but are not),
 //!   `unknown-slide-attr`, `invalid-slide-attr`, `missing-asset`, `invalid-directive`,
 //!   `invalid-directive-arg`, `duplicate-footnote`, `footnote-elsewhere`,
-//!   `misplaced-slide-comment`, `element-comment-ignored`, `invalid-element-attr`.
+//!   `misplaced-slide-comment`, `element-comment-ignored`, `invalid-element-attr`;
+//!   `include-attrs-ignored` and `include-meta-ignored` (dialect §4.1, T48).
 //! - Notebooks (notebook-mapping §1–§5; T30–T32): `unknown-slide-type`, `unknown-cell-type`,
 //!   `nbformat-newer`, `presenter-not-object`, `notebook-output-skipped`,
 //!   `notebook-attachment-skipped`, `empty-slide`, `unknown-slide-attr`, `invalid-slide-attr`,
@@ -21,8 +22,20 @@
 //!   `missing-attachment`, `missing-asset`, `front-matter-ignored`, `front-matter-empty`,
 //!   `output-script`, `output-unsupported`, `output-invalid`, `output-widget` (§4
 //!   "interactive widget rendered as text"), `output-file-outside` (an output names a file
-//!   outside the notebook's directory, which is not embedded) and `notebook-single-slide`
-//!   (no cell has a slide type, so the whole notebook is one slide).
+//!   outside the notebook's directory, which is not embedded), `notebook-single-slide`
+//!   (no cell has a slide type, so the whole notebook is one slide) and `include-in-notebook`
+//!   (a `:::include` in a markdown cell, which includes nothing).
+//!
+//! Included files (dialect §4.1, §10; T48): the frontend's diagnostics of every file a
+//! Markdown deck includes come with that file's path, and this module's source lints
+//! (`separator-not-recognized`, below) run on each included Markdown file and each included
+//! notebook too, with the config the frontend parsed it with (from the same parse,
+//! `pipeline::parse_with_includes`), reported with its path; `notebook-no-outputs` runs on
+//! each included notebook (its slides, `SourceSpan.file`). The slide lints
+//! (`duplicate-slide-id`, `unknown-layout`) of a slide from an included file name that file
+//! (`SourceSpan.file`), and a message that points at a slide of another file names that
+//! file. A misplaced `:::include` or a file that cannot be included is the frontend's
+//! [`Error::Parse`], which [`run`] returns.
 //!
 //! Added here ([`codes`]):
 //!
@@ -42,13 +55,12 @@
 //!   every other pitfall is. In notebooks the markdown cells are scanned when
 //!   `[notebook] split_markdown_cells` is on (then `---`/`--` open slides there), except
 //!   speaker-notes cells.
-//! - `unknown-directive` (dialect §4): `:::include`, which is reserved and not implemented,
-//!   in a Markdown deck or in a shown markdown cell.
 //! - `duplicate-slide-id`: a slide `id` used by an earlier slide.
 //! - `unknown-layout` (theme-format §2 `[layouts]`): a slide's `layout` is not a
 //!   `templates/layouts/<name>.html` file of the theme chain ([`Theme::has_layout`]).
-//! - `notebook-no-outputs` (notebook-mapping §4 notes): a notebook whose code cells were never
-//!   executed (no outputs, no execution count), with a hint to execute it.
+//! - `notebook-no-outputs` (notebook-mapping §4 notes): a notebook (the input or an included
+//!   one) whose code cells were never executed (no outputs, no execution count), with a hint
+//!   to execute it.
 //! - `theme-error` (level error): the deck's theme cannot be resolved; `unknown-layout` and the
 //!   theme problems below are then skipped.
 //! - Theme problems ([`Theme::deck_problems`], located in the theme's `theme.toml`, template
@@ -88,6 +100,7 @@ use crate::error::{Diagnostic, Diagnostics, Error, Level, Result};
 use crate::ir::{Block, Deck, Slide, SourceKind, SourceSpan};
 use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::split_front_matter;
+use crate::markdown::include::IncludedSource;
 use crate::markdown::split::{SplitMode, source_lines, split_with_source};
 use crate::notebook::convert::codes::FRONT_MATTER_IGNORED;
 use crate::notebook::nbformat::{self, Cell, CellType, SlideType};
@@ -99,8 +112,6 @@ use crate::theme::{self, Theme, ThemeSource};
 pub mod codes {
     /// A raw `---`/`--` line that did not become a slide separator (warning).
     pub const SEPARATOR_NOT_RECOGNIZED: &str = "separator-not-recognized";
-    /// `:::include`, reserved and not implemented (warning).
-    pub const UNKNOWN_DIRECTIVE: &str = "unknown-directive";
     /// A slide id that an earlier slide already uses (warning).
     pub const DUPLICATE_SLIDE_ID: &str = "duplicate-slide-id";
     /// A `layout` the theme chain has no template for (warning).
@@ -128,19 +139,26 @@ pub mod codes {
 }
 
 /// Lints `opts.input` (see the module docs): the frontend's diagnostics plus this module's
-/// lints, ordered by position. `opts.output`, `opts.build` and
-/// `opts.missing_asset_is_error` are ignored (nothing is rendered).
+/// lints, for the input and every file it includes, ordered by position
+/// (`sort_by_position`). `opts.output`, `opts.build` and `opts.missing_asset_is_error` are
+/// ignored (nothing is rendered).
 ///
 /// Errors: everything [`pipeline::parse_only`] fails on (the input cannot be read, an
 /// unknown extension, invalid `presenter.toml` or front matter, the frontend's parse
 /// errors). A theme that cannot be resolved is not an error here but a `theme-error`
 /// diagnostic.
 pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
-    let (parsed, config, config_path) = pipeline::parse_only(opts)?;
+    let pipeline::ParsedWithIncludes {
+        parsed,
+        config,
+        config_path,
+        includes,
+    } = pipeline::parse_with_includes(opts)?;
     let deck = parsed.deck;
     let mut found = source_lints(opts, &deck, &config, &parsed.diagnostics);
+    found.extend(included_lints(&includes, &parsed.diagnostics));
     found.extend(duplicate_slide_ids(&deck));
-    found.extend(notebook_without_outputs(&deck));
+    found.extend(notebooks_without_outputs(&deck, &includes));
     let mut theme_problems = Vec::new();
     match pipeline::resolve_theme(opts, &deck, &config, config_path.as_deref()) {
         Ok(theme) => {
@@ -153,11 +171,12 @@ pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
         Err(err) => found.push(Diagnostic::error(codes::THEME_ERROR, err.to_string())),
     }
     let mut diagnostics = parsed.diagnostics.into_vec();
-    diagnostics.extend(
-        found
-            .into_iter()
-            .map(|diagnostic| diagnostic.with_path(&deck.source.path)),
-    );
+    diagnostics.extend(found.into_iter().map(|mut diagnostic| {
+        diagnostic
+            .path
+            .get_or_insert_with(|| deck.source.path.clone());
+        diagnostic
+    }));
     // Theme problems keep the theme file they are about (a built-in theme's have none).
     diagnostics.extend(theme_problems.into_iter().map(|mut diagnostic| {
         diagnostic
@@ -165,7 +184,7 @@ pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
             .get_or_insert_with(|| deck.source.path.clone());
         diagnostic
     }));
-    sort_by_position(&mut diagnostics, &deck.source.path);
+    sort_by_position(&mut diagnostics, &deck.source.path, &deck.includes);
     tracing::debug!(
         diagnostics = diagnostics.len(),
         "checked {}",
@@ -176,19 +195,25 @@ pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
 
 /// Orders `diagnostics` (stable, so ties keep the frontend's order before this module's):
 /// findings about other files (theme problems) and deck-level ones (no position) first,
-/// then by cell and line.
-fn sort_by_position(diagnostics: &mut [Diagnostic], deck: &Path) {
+/// then the deck's by cell and line, then those of each included file (`includes`, in
+/// first-use order), each by cell and line.
+fn sort_by_position(diagnostics: &mut [Diagnostic], deck: &Path, includes: &[PathBuf]) {
     diagnostics.sort_by_key(|d| {
-        if d.path.as_deref() != Some(deck) {
-            return None;
+        let position = d.span.as_ref().map(|span| (span.cell, span.start_line));
+        let path = d.path.as_deref()?;
+        if path == deck {
+            return position.map(|position| (0, Some(position)));
         }
-        d.span.as_ref().map(|span| (span.cell, span.start_line))
+        let file = includes.iter().position(|include| include == path)?;
+        Some((file + 1, position))
     });
 }
 
 /// `err` (a failure of [`run`] for `input`) as an error-level diagnostic for `input`: the
 /// code names the kind of failure ([`codes`]), the span is the error's line when it has one.
-/// The path is `input` made absolute, like the frontends' diagnostic paths.
+/// The path is `input` made absolute, like the frontends' diagnostic paths, or the file the
+/// error is in when it names one: a parse error's file, a missing asset's `SourceSpan.file`
+/// (an included file, T48).
 pub fn error_diagnostic(err: &Error, input: &Path) -> Diagnostic {
     let (code, message, span) = match err {
         Error::Parse { line, message, .. } => (
@@ -198,12 +223,20 @@ pub fn error_diagnostic(err: &Error, input: &Path) -> Diagnostic {
                 start_line: line,
                 end_line: line,
                 cell: None,
+                file: None,
             }),
         ),
         Error::MissingAsset { span, .. } => (codes::MISSING_ASSET, err.to_string(), span.clone()),
         _ => (error_code(err), err.to_string(), None),
     };
-    let mut diagnostic = Diagnostic::error(code, message).with_path(absolute(input));
+    let path = match err {
+        Error::Parse { .. } => err.path().unwrap_or(input),
+        Error::MissingAsset {
+            span: Some(span), ..
+        } => span.file.as_deref().unwrap_or(input),
+        _ => input,
+    };
+    let mut diagnostic = Diagnostic::error(code, message).with_path(absolute(path));
     diagnostic.span = span;
     diagnostic
 }
@@ -243,20 +276,31 @@ fn labelled_slides(deck: &Deck) -> Vec<(String, &Slide)> {
     slides
 }
 
-/// A warning about `slide` (its span, no path yet).
+/// A warning about `slide` (its span; the path of the included file it comes from, else
+/// none yet).
 fn slide_warning(code: &'static str, message: String, slide: &Slide) -> Diagnostic {
     let mut diagnostic = Diagnostic::warning(code, message);
     diagnostic.span = slide.span.clone();
+    diagnostic.path = slide.span.as_ref().and_then(|span| span.file.clone());
     diagnostic
 }
 
-/// Where `span` starts, for messages: `line 12`, or `cell 3, line 2` in a notebook.
-fn position(span: Option<&SourceSpan>) -> Option<String> {
+/// Where `span` starts, for a message reported in the file `here` (`None`: the deck's
+/// source, `deck`): `line 12`, or `cell 3, line 2` in a notebook; with the file's name in
+/// front when the span is in another file (a slide of an included file, or of the deck in a
+/// message about an included file: `part2.md, line 4`).
+fn position(span: Option<&SourceSpan>, deck: &Path, here: Option<&Path>) -> Option<String> {
     let span = span?;
-    Some(match span.cell {
+    let at = match span.cell {
         Some(cell) => format!("cell {cell}, line {}", span.start_line),
         None => format!("line {}", span.start_line),
-    })
+    };
+    let file = span.file.as_deref();
+    if file == here {
+        return Some(at);
+    }
+    let name = file.unwrap_or(deck).file_name().unwrap_or_default();
+    Some(format!("{}, {at}", name.to_string_lossy()))
 }
 
 /// `duplicate-slide-id`: every slide whose id an earlier slide already has.
@@ -272,7 +316,9 @@ fn duplicate_slide_ids(deck: &Deck) -> Vec<Diagnostic> {
                 first.insert(id, (label, slide.span.as_ref()));
             }
             Some((earlier, span)) => {
-                let at = position(*span).map_or(String::new(), |at| format!(" ({at})"));
+                let here = slide.span.as_ref().and_then(|span| span.file.as_deref());
+                let at = position(*span, &deck.source.path, here)
+                    .map_or(String::new(), |at| format!(" ({at})"));
                 let message = format!(
                     "{label}: id `{id}` is already the id of {earlier}{at}; links to `#/{id}` \
                      go to the first one"
@@ -346,30 +392,54 @@ fn theme_file_path(theme: &Theme, key: &str) -> Option<PathBuf> {
     }
 }
 
-/// `notebook-no-outputs`: a notebook deck with code cells that were never executed: none
-/// has an output or an execution count (executed cells that print nothing are fine).
-fn notebook_without_outputs(deck: &Deck) -> Option<Diagnostic> {
-    if deck.source.kind != SourceKind::Notebook {
-        return None;
+/// `notebook-no-outputs` for a notebook deck and for every notebook a Markdown deck includes
+/// (`includes`; the cells of the slides whose `SourceSpan.file` is that notebook, each once
+/// however often it is included, reported with its path).
+fn notebooks_without_outputs(deck: &Deck, includes: &[IncludedSource]) -> Vec<Diagnostic> {
+    let slides = labelled_slides(deck);
+    let mut found = Vec::new();
+    if deck.source.kind == SourceKind::Notebook {
+        let all = slides.iter().map(|(_, slide)| *slide);
+        found.extend(notebook_without_outputs(all, &deck.source.path));
     }
-    let cells: Vec<_> = labelled_slides(deck)
-        .into_iter()
-        .flat_map(|(_, slide)| &slide.blocks)
+    for include in includes {
+        if include.kind != SourceKind::Notebook {
+            continue;
+        }
+        let from_it = slides.iter().map(|(_, slide)| *slide).filter(|slide| {
+            slide.span.as_ref().and_then(|span| span.file.as_deref())
+                == Some(include.path.as_path())
+        });
+        if let Some(diagnostic) = notebook_without_outputs(from_it, &include.path) {
+            found.push(diagnostic.with_path(&include.path));
+        }
+    }
+    found
+}
+
+/// `notebook-no-outputs`: the notebook `path` (its `slides`) has code cells that were never
+/// executed: none has an output or an execution count (executed cells that print nothing are
+/// fine). Each cell counts once (by its index in the notebook): a notebook included on two
+/// include slides has its slides in the deck twice.
+fn notebook_without_outputs<'s>(
+    slides: impl Iterator<Item = &'s Slide>,
+    path: &Path,
+) -> Option<Diagnostic> {
+    let cells: BTreeMap<usize, _> = slides
+        .flat_map(|slide| &slide.blocks)
         .filter_map(|block| match block {
-            Block::Cell(cell) => Some(cell),
+            Block::Cell(cell) => Some((cell.index, cell)),
             Block::Html { .. } => None,
         })
         .collect();
     if cells.is_empty()
         || cells
-            .iter()
+            .values()
             .any(|cell| !cell.outputs.is_empty() || cell.execution_count.is_some())
     {
         return None;
     }
-    let file = deck
-        .source
-        .path
+    let file = path
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let finding = match cells.len() {
@@ -397,7 +467,8 @@ fn shell_quoted(word: &str) -> Cow<'_, str> {
     }
 }
 
-/// The lints that need the source text: `separator-not-recognized` and `unknown-directive`.
+/// The lints that need the source text: `separator-not-recognized`, for the deck (for the
+/// files it includes, [`included_lints`]).
 ///
 /// The text is read again from `opts.input`, the path [`pipeline::parse_only`] read (not
 /// `deck.source.path`: that is normalized lexically and names another file when the input
@@ -419,20 +490,59 @@ fn source_lints(
             return vec![Diagnostic::error(codes::IO_ERROR, message)];
         }
     };
+    let path = &deck.source.path;
     match deck.source.kind {
-        SourceKind::Markdown => markdown_lints(&text, config, frontend),
-        SourceKind::Notebook => notebook_lints(&text, &deck.source.path, config, frontend)
-            .unwrap_or_else(|err| {
+        SourceKind::Markdown => markdown_lints(&text, path, config, frontend),
+        SourceKind::Notebook => {
+            notebook_lints(&text, path, config, frontend).unwrap_or_else(|err| {
                 let message =
                     format!("cannot parse the notebook again for the source lints: {err}");
                 vec![Diagnostic::error(codes::PARSE_ERROR, message)]
-            }),
+            })
+        }
     }
 }
 
-/// The source lints of a Markdown deck. `config` is the deck's (front matter merged),
-/// `frontend` the frontend's diagnostics.
-fn markdown_lints(text: &str, config: &Config, frontend: &Diagnostics) -> Vec<Diagnostic> {
+/// The source lints of every file a Markdown deck includes (`sources`, dialect §4.1, §10),
+/// each with the config the frontend parsed it with, with its path (also in the span,
+/// `SourceSpan.file`, as the frontend's diagnostics of an included file have it). When an
+/// included file can no longer be read or parsed (it changed since the frontend read it),
+/// that is an error diagnostic.
+fn included_lints(sources: &[IncludedSource], frontend: &Diagnostics) -> Vec<Diagnostic> {
+    let mut found = Vec::new();
+    for source in sources {
+        let path = &source.path;
+        let lints = match std::fs::read_to_string(path) {
+            Ok(text) => match source.kind {
+                SourceKind::Markdown => Ok(markdown_lints(&text, path, &source.config, frontend)),
+                SourceKind::Notebook => notebook_lints(&text, path, &source.config, frontend)
+                    .map_err(|err| (codes::PARSE_ERROR, err.to_string())),
+            },
+            Err(err) => Err((codes::IO_ERROR, err.to_string())),
+        };
+        let lints = lints.unwrap_or_else(|(code, err)| {
+            let message =
+                format!("cannot read the included file again for the source lints: {err}");
+            vec![Diagnostic::error(code, message)]
+        });
+        found.extend(lints.into_iter().map(|mut diagnostic| {
+            if let Some(span) = &mut diagnostic.span {
+                span.file = Some(path.clone());
+            }
+            diagnostic.with_path(path)
+        }));
+    }
+    found
+}
+
+/// The source lints of a Markdown deck (or included file) `path`. `config` is the one it was
+/// parsed with (front matter merged), `frontend` the frontend's diagnostics.
+fn markdown_lints(
+    text: &str,
+    path: &Path,
+    config: &Config,
+    frontend: &Diagnostics,
+) -> Vec<Diagnostic> {
     // As the frontend splits it (`markdown::split_mode`).
     let split = match config.slides.split {
         SlideSplit::Rules => SplitMode::Rules,
@@ -441,12 +551,12 @@ fn markdown_lints(text: &str, config: &Config, frontend: &Diagnostics) -> Vec<Di
         },
     };
     let options = comrak_options(&config.markdown);
-    lint_text(text, &options, Origin::DECK, Some(split), frontend)
+    lint_text(text, &options, Origin::deck(path), split, frontend)
 }
 
-/// The source lints of the shown markdown cells of a notebook (`text` is its JSON):
-/// `unknown-directive` in each, and with `[notebook] split_markdown_cells` (`---`/`--` open
-/// slides there, as in a deck) `separator-not-recognized` in each that is not speaker notes.
+/// The source lints of the shown markdown cells of a notebook `path` (`text` is its JSON):
+/// with `[notebook] split_markdown_cells` (`---`/`--` open slides there, as in a deck)
+/// `separator-not-recognized` in each that is not speaker notes.
 /// A cell's front matter block is left out as the frontend leaves it out: always in the
 /// first markdown cell (notebook-mapping §5), in another one when the frontend reported it
 /// as `front-matter-ignored`.
@@ -465,21 +575,31 @@ fn notebook_lints(
         .iter()
         .position(|cell| cell.cell_type == CellType::Markdown);
     let mut found = Vec::new();
+    if !config.notebook.split_markdown_cells {
+        return Ok(found);
+    }
     for (index, cell) in notebook.cells.iter().enumerate() {
-        if cell.cell_type != CellType::Markdown || is_removed(cell, config) {
+        if cell.cell_type != CellType::Markdown || is_removed(cell, config) || is_notes(cell) {
             continue;
         }
         let ignored = frontend.iter().any(|d| {
-            d.code == FRONT_MATTER_IGNORED && d.span.as_ref().and_then(|s| s.cell) == Some(index)
+            d.code == FRONT_MATTER_IGNORED
+                && d.path.as_deref() == Some(path)
+                && d.span.as_ref().and_then(|s| s.cell) == Some(index)
         });
         let (body, offset) = cell_markdown(cell, ignored || first_markdown == Some(index));
-        let split =
-            (config.notebook.split_markdown_cells && !is_notes(cell)).then_some(SplitMode::Rules);
         let origin = Origin {
+            path,
             cell: Some(index),
             offset,
         };
-        found.extend(lint_text(body, &options, origin, split, frontend));
+        found.extend(lint_text(
+            body,
+            &options,
+            origin,
+            SplitMode::Rules,
+            frontend,
+        ));
     }
     Ok(found)
 }
@@ -510,22 +630,28 @@ fn cell_markdown(cell: &Cell, front_matter: bool) -> (&str, usize) {
     }
 }
 
-/// Where a Markdown text sits in the input: the whole deck, or a notebook cell whose text
-/// starts after `offset` removed lines (its front matter).
+/// Where a Markdown text sits in a source file `path` (the deck or an included file): the
+/// whole file, or a notebook cell whose text starts after `offset` removed lines (its front
+/// matter).
 #[derive(Debug, Clone, Copy)]
-struct Origin {
+struct Origin<'p> {
+    /// The source file (as the frontend's diagnostics name it).
+    path: &'p Path,
     /// The notebook cell, `None` for a Markdown deck.
     cell: Option<usize>,
     /// Lines of the input (cell) before line 1 of the text.
     offset: usize,
 }
 
-impl Origin {
-    /// A whole Markdown deck.
-    const DECK: Origin = Origin {
-        cell: None,
-        offset: 0,
-    };
+impl<'p> Origin<'p> {
+    /// A whole Markdown file.
+    fn deck(path: &'p Path) -> Origin<'p> {
+        Origin {
+            path,
+            cell: None,
+            offset: 0,
+        }
+    }
 
     /// A warning at `line` of the text (no path yet).
     fn warning(self, code: &'static str, line: usize, message: String) -> Diagnostic {
@@ -534,6 +660,7 @@ impl Origin {
             start_line: line,
             end_line: line,
             cell: self.cell,
+            file: None,
         })
     }
 
@@ -543,6 +670,7 @@ impl Origin {
         frontend
             .iter()
             .filter(|d| d.code == codes::SEPARATOR_NOT_RECOGNIZED)
+            .filter(|d| d.path.as_deref() == Some(self.path))
             .filter_map(|d| d.span.as_ref())
             .filter(|span| span.cell == self.cell)
             .filter_map(|span| span.start_line.checked_sub(self.offset))
@@ -550,36 +678,26 @@ impl Origin {
     }
 }
 
-/// `unknown-directive` and, when `split` is given (the text is split into slides that way:
-/// the deck's mode, or rules mode for a split notebook cell), `separator-not-recognized` for
-/// one Markdown text at `origin`.
+/// `separator-not-recognized` for one Markdown text at `origin`, split into slides in
+/// `split` mode (the deck's mode, or rules mode for a split notebook cell).
 fn lint_text(
     text: &str,
     options: &Options<'_>,
-    origin: Origin,
-    split: Option<SplitMode>,
+    origin: Origin<'_>,
+    split: SplitMode,
     frontend: &Diagnostics,
 ) -> Vec<Diagnostic> {
     let arena = Arena::new();
     let root = parse_document(&arena, text, options);
-    let mut found: Vec<Diagnostic> = include_directives(root)
-        .into_iter()
-        .map(|line| origin.warning(codes::UNKNOWN_DIRECTIVE, line, INCLUDE_MESSAGE.into()))
-        .collect();
-    let Some(split) = split else {
-        return found;
-    };
     let lines = source_lines(text);
     let Some(opened) = opened_lines(root, text, &lines, split) else {
-        return found;
+        return Vec::new();
     };
     let reported = origin.reported(frontend);
-    found.extend(
-        unrecognized_separators(root, &lines, split, &opened, &reported)
-            .into_iter()
-            .map(|(line, message)| origin.warning(codes::SEPARATOR_NOT_RECOGNIZED, line, message)),
-    );
-    found
+    unrecognized_separators(root, &lines, split, &opened, &reported)
+        .into_iter()
+        .map(|(line, message)| origin.warning(codes::SEPARATOR_NOT_RECOGNIZED, line, message))
+        .collect()
 }
 
 /// The lines on which a separator opened a slide when `text` (parsed as `root`, split into
@@ -641,28 +759,10 @@ fn separator_line(lines: &[&str], end: usize) -> usize {
     }
 }
 
-/// The `unknown-directive` message for `:::include`.
-const INCLUDE_MESSAGE: &str = "unknown directive 'include': including files is not \
-                               implemented, so nothing is included (the directive renders as \
-                               a plain <div>)";
-
 /// The first and last source line of `node`.
 fn lines_of<'a>(node: &'a AstNode<'a>) -> (usize, usize) {
     let pos = node.data().sourcepos;
     (pos.start.line, pos.end.line)
-}
-
-/// The line of every `:::include` (dialect §4: reserved, not implemented).
-fn include_directives<'a>(root: &'a AstNode<'a>) -> Vec<usize> {
-    root.descendants()
-        .filter(|node| match &node.data().value {
-            NodeValue::BlockDirective(directive) => {
-                directive.info.split_whitespace().next() == Some("include")
-            }
-            _ => false,
-        })
-        .map(|node| lines_of(node).0)
-        .collect()
 }
 
 /// Disjoint line ranges with a value each, sorted for lookups by line in O(log n).
@@ -992,6 +1092,7 @@ fn nested(value: &NodeValue, opened: usize, dash: &DashLine<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::include::codes::INCLUDE_IN_NOTEBOOK;
 
     /// `(code, line)` of every diagnostic `run` reports for `text` written to `name` in a
     /// fresh directory (no `presenter.toml` above it is expected).
@@ -1453,9 +1554,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ids_unknown_layouts_and_include_are_reported() {
+    fn duplicate_ids_and_unknown_layouts_are_reported() {
         let text = "# One {#same}\n\n---\n\n# Two {#same layout=nope}\n\n--\n\n\
-                    ## Three {#same layout=title}\n\n:::include other.md\n:::\n";
+                    ## Three {#same layout=title}\n";
         let found = check_text("deck.md", text);
         let some = |code: &str, line: usize| (code.to_string(), Some(line));
         assert_eq!(
@@ -1464,7 +1565,6 @@ mod tests {
                 some("duplicate-slide-id", 3),
                 some("unknown-layout", 3),
                 some("duplicate-slide-id", 7),
-                some("unknown-directive", 11),
             ]
         );
         let dir = tempfile::tempdir().unwrap();
@@ -1485,7 +1585,66 @@ mod tests {
             messages[2].starts_with("slide 2.1: id `same`"),
             "{messages:?}"
         );
-        assert_eq!(messages[3], INCLUDE_MESSAGE);
+    }
+
+    /// T48: the slide lints of slides from an included file and the source lints of the
+    /// included files are reported with those files' paths and lines, after the deck's own.
+    #[test]
+    fn included_files_are_linted_with_their_own_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let deck = dir.path().join("deck.md");
+        let part = dir.path().join("sub/part.md");
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(
+            &deck,
+            "# One {#same}\n\nText\n--\n\n---\n\n:::include sub/part.md\n:::\n\n---\n\n\
+             ## Last {#same}\n",
+        )
+        .unwrap();
+        std::fs::write(&part, "# Part {#same}\n\nSome text\n--\n\n---\n\n## Two\n").unwrap();
+        let diagnostics = run(&BuildOptions::new(&deck)).unwrap();
+        let found: Vec<(&str, String, Option<usize>)> = diagnostics
+            .iter()
+            .map(|d| {
+                let file = d.path.as_deref().unwrap().file_name().unwrap();
+                let line = d.span.as_ref().map(|s| s.start_line);
+                (d.code, file.to_string_lossy().into_owned(), line)
+            })
+            .collect();
+        let at = |code, file: &str, line| (code, file.to_string(), Some(line));
+        assert_eq!(
+            found,
+            [
+                at(codes::SEPARATOR_NOT_RECOGNIZED, "deck.md", 4),
+                at(codes::DUPLICATE_SLIDE_ID, "deck.md", 11),
+                at(codes::DUPLICATE_SLIDE_ID, "part.md", 1),
+                at(codes::SEPARATOR_NOT_RECOGNIZED, "part.md", 4),
+            ]
+        );
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages[1].starts_with("slide 4: id `same` is already the id of slide 1 (line 1)"),
+            "{messages:?}"
+        );
+        // In a message about an included file, a slide of the deck names the deck.
+        assert!(
+            messages[2]
+                .starts_with("slide 2: id `same` is already the id of slide 1 (deck.md, line 1)"),
+            "{messages:?}"
+        );
+        // A misplaced include is the frontend's error, located at the directive.
+        std::fs::write(&deck, "# One\n\n:::include sub/part.md\n:::\n").unwrap();
+        let err = run(&BuildOptions::new(&deck)).unwrap_err();
+        let diagnostic = error_diagnostic(&err, &deck);
+        assert_eq!(diagnostic.code, codes::PARSE_ERROR);
+        assert_eq!(diagnostic.span.map(|span| span.start_line), Some(3));
+        // An error inside the included file names that file.
+        std::fs::write(&deck, ":::include sub/part.md\n:::\n").unwrap();
+        std::fs::write(&part, "# A\n\n--- {.x title=\"open}\n\n# B\n").unwrap();
+        let err = run(&BuildOptions::new(&deck)).unwrap_err();
+        let diagnostic = error_diagnostic(&err, &deck);
+        assert_eq!(diagnostic.path.as_deref(), Some(part.as_path()));
+        assert_eq!(diagnostic.span.map(|span| span.start_line), Some(3));
     }
 
     #[test]
@@ -1586,8 +1745,9 @@ mod tests {
         assert_eq!(shell_quoted(""), "''");
     }
 
-    /// `(code, cell, line)` of this module's source lints for a notebook with `cells`,
-    /// with `presenter_toml` next to it.
+    /// `(code, cell, line)` of this module's source lints and the frontend's
+    /// `include-in-notebook` warnings for a notebook with `cells`, with `presenter_toml` next
+    /// to it.
     fn notebook_source_lints(
         cells: &[String],
         presenter_toml: &str,
@@ -1599,9 +1759,7 @@ mod tests {
         run(&BuildOptions::new(&path))
             .unwrap()
             .iter()
-            .filter(|d| {
-                [codes::SEPARATOR_NOT_RECOGNIZED, codes::UNKNOWN_DIRECTIVE].contains(&d.code)
-            })
+            .filter(|d| [codes::SEPARATOR_NOT_RECOGNIZED, INCLUDE_IN_NOTEBOOK].contains(&d.code))
             .map(|d| {
                 let span = d.span.as_ref().unwrap();
                 (d.code, span.cell, span.start_line)
@@ -1642,7 +1800,8 @@ mod tests {
                 "",
             ),
         ];
-        let include = codes::UNKNOWN_DIRECTIVE;
+        // The frontend reports `:::include` in shown cells (T48; `check` used to).
+        let include = INCLUDE_IN_NOTEBOOK;
         let separator = codes::SEPARATOR_NOT_RECOGNIZED;
         assert_eq!(
             notebook_source_lints(&cells, ""),
@@ -1721,6 +1880,22 @@ mod tests {
         assert_eq!(config.code, codes::CONFIG_ERROR);
         let other = error_diagnostic(&Error::Other("x".into()), Path::new("/x/a.txt"));
         assert_eq!(other.code, codes::ERROR);
+        // A missing asset of an included file is in that file (T48).
+        let span = SourceSpan {
+            start_line: 3,
+            end_line: 3,
+            cell: None,
+            file: Some(PathBuf::from("/x/parts/p.md")),
+        };
+        let missing = Error::MissingAsset {
+            path: PathBuf::from("/x/parts/y.png"),
+            span: Some(span),
+        };
+        let diagnostic = error_diagnostic(&missing, Path::new("/x/deck.md"));
+        assert_eq!(
+            diagnostic.to_string(),
+            "/x/parts/p.md:3: error: asset not found: /x/parts/y.png"
+        );
     }
 
     #[test]
@@ -1738,14 +1913,15 @@ mod tests {
             let diagnostics = run(&BuildOptions::new(root.join(deck))).unwrap();
             assert!(diagnostics.is_empty(), "{deck}: {diagnostics:#?}");
         }
-        // directives.md documents `:::include` ("`check` warns") and is otherwise clean.
-        let path = root.join("tests/fixtures/md/directives.md");
-        let found: Vec<(&str, Option<usize>)> = run(&BuildOptions::new(path))
-            .unwrap()
-            .iter()
-            .map(|d| (d.code, d.span.as_ref().map(|s| s.start_line)))
-            .collect();
-        assert_eq!(found, [("unknown-directive", Some(84))]);
+        // directives.md documented `:::include` as reserved before T48; examples/mixed
+        // includes a notebook and a Markdown part, both clean.
+        for deck in [
+            "tests/fixtures/md/directives.md",
+            "examples/mixed/slides.md",
+        ] {
+            let diagnostics = run(&BuildOptions::new(root.join(deck))).unwrap();
+            assert!(diagnostics.is_empty(), "{deck}: {diagnostics:#?}");
+        }
     }
 
     #[test]

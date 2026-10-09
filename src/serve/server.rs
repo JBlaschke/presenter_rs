@@ -913,6 +913,7 @@ mod tests {
                 start_line: 4,
                 end_line: 4,
                 cell: None,
+                file: None,
             }),
         });
         assert_eq!((err.file.as_deref(), err.line), (None, Some(4)));

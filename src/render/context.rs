@@ -187,13 +187,15 @@ fn decorated(
 }
 
 /// The `unknown-layout` warning for `slide` ([`Theme::unknown_layout_message`], shared with
-/// `presenter check`).
+/// `presenter check`), located in the file the slide comes from (an included file's,
+/// `SourceSpan.file`, T48).
 fn unknown_layout(slide: &Slide, label: &str, deck: &Deck, theme: &Theme) -> Diagnostic {
+    let file = slide.span.as_ref().and_then(|span| span.file.as_ref());
     let mut diagnostic = Diagnostic::warning(
         "unknown-layout",
         theme.unknown_layout_message(label, &slide.layout),
     )
-    .with_path(&deck.source.path);
+    .with_path(file.unwrap_or(&deck.source.path));
     diagnostic.span = slide.span.clone();
     diagnostic
 }
