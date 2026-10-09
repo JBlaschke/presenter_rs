@@ -46,7 +46,7 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T43 | Heading-split mode, incremental lists, reveal compat comments | M4 | M | T11, T12 | done |
 | T44 | Diagnostics quality | M4 | S | T16, T22 | done |
 | T45 | PDF export via headless Chrome | M4 | S | T16 | done |
-| T46 | User documentation | M4 | M | M1–M3 | todo |
+| T46 | User documentation | M4 | M | M1–M3 | done |
 | T47 | Release builds | M4 | S | T16 | done |
 
 ## Order of execution (suggested waves)

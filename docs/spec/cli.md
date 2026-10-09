@@ -89,11 +89,19 @@ presenter theme check <DIR>                # validate theme.toml, chain, require
 ## dump
 ```
 presenter dump <INPUT> [--context] [--theme …] [--pretty]
+presenter dump --default-config
 ```
 - Default: `Deck` IR as JSON. `--context`: the full template context (theme resolved).
 - Always pretty-printed with sorted keys unless `--compact`. `--context` keeps its top-level keys
   in theme-format.md §4 order (`deck, meta, slides, features, config, reveal, theme, build`); the
   keys below them are sorted (audit F46).
+- `--default-config` (no INPUT; INPUT, `--context`, `--theme`, `--pretty` and `--compact` with it are
+  usage errors, exit 2; `--config` is ignored) prints every `presenter.toml` setting with its built-in
+  default as TOML on stdout (`Config::default()` with `[reveal]` filled from the built-in reveal
+  defaults). Every value line is commented out (`#key = value`); a key without a default is a
+  `# key: unset` line; a header explains that the text changes nothing as it is. Saved as
+  `presenter.toml` it therefore builds exactly like no file (T46; docs/guide/configuration.md is
+  generated from it and kept in sync by tests/guide.rs).
 
 ## check
 ```
