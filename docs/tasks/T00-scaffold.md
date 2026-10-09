@@ -56,7 +56,7 @@ that prints.
    tempfile = "3"
    ureq = "3"
    ```
-   `grass` (T42), `lol_html` (T43), `headless_chrome` (T24) are added by those tasks.
+   `grass` (T42) and `lol_html` (T43) are added by those tasks (T24 ended up reusing T45's DevTools client instead of `headless_chrome`).
 3. `scripts/vendor.sh` (bash, `set -euo pipefail`): download both tarballs to a temp dir,
    verify SHA-256 against values hard-coded in the script, extract, copy exactly the files in
    `vendored-assets.md` §2 into `assets/vendor/{reveal,katex}/`, delete anything else, write

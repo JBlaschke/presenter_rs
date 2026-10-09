@@ -34,7 +34,7 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T21 | Dev server with SSE | M2 | M | T16 | done |
 | T22 | Live-reload client script | M2 | M | — (protocol only) | done |
 | T23 | `serve` CLI and integration tests | M2 | S | T20, T21, T22 | done |
-| T24 | Headless-browser smoke tests (opt-in) | M2 | S | T16 | todo |
+| T24 | Headless-browser smoke tests (opt-in) | M2 | S | T16 | done |
 | T30 | nbformat model and notebook fixtures | M3 | M | T01 | done |
 | T31 | Cells → slides | M3 | M | T30, T12 | done |
 | T32 | Output rendering | M3 | M | T30, T14 | done |

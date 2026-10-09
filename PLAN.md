@@ -356,7 +356,7 @@ then T12 and T15, then T16 integrates. After T16, M2/M3/M4 tasks are almost all 
 | Golden HTML | `insta` snapshots of `<div class="slides">…</div>` only | theme output stability (build info stripped) |
 | CLI | `assert_cmd` + `tempfile` | `build`, `dump`, `check`, `init`, `theme` exit codes and files written |
 | Serve | integration test with `ureq` | start server on port 0, GET `/`, edit file, read one SSE event |
-| Browser (opt-in) | `headless_chrome` | open built HTML, assert `Reveal.isReady()`, slide count, no console errors |
+| Browser (opt-in) | presenter's own DevTools client (`pdf::devtools`, feature `browser-tests`) | open built HTML, assert `Reveal.isReady()`, slide count, no console errors |
 
 Fixture corpus (created in T01, extended by later tasks). No `presenter.toml` may live in an
 ancestor directory of `tests/fixtures/{md,ipynb}` (config discovery would pick it up); the

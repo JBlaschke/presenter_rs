@@ -34,3 +34,10 @@ or highlight not running, live reload not swapping CSS.
 ## Hints
 - `headless_chrome::Browser::new(LaunchOptions { headless: true, path: Some(chrome), ..Default::default() })`,
   `tab.navigate_to(url)?.wait_until_navigated()?`, `tab.evaluate("Reveal.isReady()", false)?.value`.
+
+## Amendments (coordinator, 2026-10-09)
+- The tests reuse presenter's own DevTools-protocol client (`presenter::pdf::devtools`, compiled
+  only with the `browser-tests` feature; T45's `--remote-debugging-pipe` launcher and
+  `find_chrome`) instead of `headless_chrome`. The feature adds no dependency, so "default
+  `cargo test` does not compile `headless_chrome`" holds trivially. `PRESENTER_REQUIRE_CHROME=1`
+  turns the no-Chrome skip into a failure (the CI job sets it).
