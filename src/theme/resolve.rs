@@ -17,7 +17,8 @@ use crate::error::{Error, Result};
 
 use super::manifest::REVEAL_THEMES;
 use super::{
-    REQUIRED_TEMPLATES, Theme, ThemeDir, ThemeManifest, ThemeSource, closest_name, disk_file,
+    LINKED_OUTSIDE, REQUIRED_TEMPLATES, Theme, ThemeDir, ThemeManifest, ThemeSource, closest_name,
+    disk_file, linked_outside,
 };
 
 /// The most themes one chain may contain (the requested theme plus seven ancestors).
@@ -168,7 +169,9 @@ fn candidate_dirs(spec: &str, roots: &[&Path]) -> Vec<PathBuf> {
     candidates
 }
 
-/// "not found" with every directory tried and the built-in names.
+/// "not found" with every directory tried and the built-in names, and for each tried
+/// directory that exists why it is no theme (no `theme.toml`, a case variant of the name,
+/// or a `theme.toml` that is a symbolic link out of the directory).
 fn not_found_message(candidates: &[PathBuf], builtins: &[String]) -> String {
     let tried = if candidates.is_empty() {
         "no search directories".to_string()
@@ -184,6 +187,14 @@ fn not_found_message(candidates: &[PathBuf], builtins: &[String]) -> String {
         builtins.join(", ")
     );
     for candidate in candidates.iter().filter(|c| c.is_dir()) {
+        if linked_outside(candidate, MANIFEST_FILE) {
+            // Audit F08: the manifest is there, but a link takes it out of the theme.
+            message.push_str(&format!(
+                " ({} has a {MANIFEST_FILE} that {LINKED_OUTSIDE})",
+                candidate.display()
+            ));
+            continue;
+        }
         message.push_str(&format!(
             " ({} exists but has no {MANIFEST_FILE}",
             candidate.display()

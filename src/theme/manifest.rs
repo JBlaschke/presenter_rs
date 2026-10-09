@@ -168,10 +168,132 @@ fn toml_to_json(value: toml::Value) -> std::result::Result<Value, String> {
     })
 }
 
+// ---------------------------------------------------------------------------------------
+// Lines of values in a `theme.toml` text, for located diagnostics. The same rules as
+// `presenter theme check` (src/cli/theme.rs `ManifestFile`), so that `check` and
+// `theme check` report a problem at the same line (audit F10 review).
+
+/// The 1-based line of `text` (a `theme.toml`) where `value` is written as a quoted TOML
+/// string in the value of `key` in `[table]` (an array may span several lines), comments
+/// ignored. When it is not written that way (a dotted key, an inline table), the first line
+/// that has it outside a comment.
+pub(crate) fn line_of_value(text: &str, table: &str, key: &str, value: &str) -> Option<usize> {
+    let quoted = [format!("\"{value}\""), format!("'{value}'")];
+    let has_value = |code: &str| quoted.iter().any(|q| code.contains(q.as_str()));
+    let mut current: Option<String> = None;
+    let mut in_value = false;
+    let scoped = line_where(text, |line| {
+        let code = toml_code(line).trim();
+        if let Some(header) = table_header(code) {
+            current = Some(header);
+            in_value = false;
+            return false;
+        }
+        if let Some((name, rest)) = split_key(code) {
+            in_value = current.as_deref() == Some(table) && is_key(name, key);
+            return in_value && has_value(rest);
+        }
+        in_value && has_value(code)
+    });
+    scoped.or_else(|| line_where(text, |line| has_value(toml_code(line))))
+}
+
+/// The 1-based line of `key = …` (bare or quoted key) in the table `[table]` of `text`.
+pub(crate) fn line_of_key(text: &str, table: &str, key: &str) -> Option<usize> {
+    let mut current: Option<String> = None;
+    line_where(text, |line| {
+        let code = toml_code(line).trim();
+        if let Some(header) = table_header(code) {
+            current = Some(header);
+            return false;
+        }
+        current.as_deref() == Some(table)
+            && split_key(code).is_some_and(|(name, _)| is_key(name, key))
+    })
+}
+
+/// The 1-based number of the first line of `text` for which `matches` is true.
+fn line_where(text: &str, matches: impl FnMut(&str) -> bool) -> Option<usize> {
+    text.lines().position(matches).map(|index| index + 1)
+}
+
+/// The byte index of the first `stop` character of `line` outside a TOML string.
+fn outside_strings(line: &str, stop: char) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, c) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == stop => return Some(index),
+            None => {}
+        }
+    }
+    None
+}
+
+/// `line` without its comment: the text before the first `#` outside a TOML string.
+fn toml_code(line: &str) -> &str {
+    outside_strings(line, '#').map_or(line, |at| &line[..at])
+}
+
+/// The table a header line (comment removed, trimmed) opens, without brackets or spaces:
+/// `[ styles ]` → `styles`. `None` for any other line.
+fn table_header(code: &str) -> Option<String> {
+    let inner = code.strip_prefix('[')?.strip_suffix(']')?;
+    let inner = inner.trim_start_matches('[').trim_end_matches(']');
+    Some(inner.chars().filter(|c| !c.is_whitespace()).collect())
+}
+
+/// A `key = value` line (comment removed) split at its first `=` outside a string: the
+/// trimmed key and the rest. `None` for a line without one (an array continuation line).
+fn split_key(code: &str) -> Option<(&str, &str)> {
+    let at = outside_strings(code, '=')?;
+    Some((code[..at].trim(), &code[at + 1..]))
+}
+
+/// True if the written key `name` (bare, `"quoted"` or `'quoted'`) is `key`.
+fn is_key(name: &str, key: &str) -> bool {
+    name == key
+        || ['"', '\''].iter().any(|quote| {
+            name.strip_prefix(*quote)
+                .and_then(|rest| rest.strip_suffix(*quote))
+                .is_some_and(|inner| inner == key)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lines_of_values_follow_tables_strings_and_comments() {
+        let text = "name = \"t\" # entries = [\"a.css\"]\n\
+                    [scripts]\n\
+                    entries = [\"a.css\"]\n\
+                    [ styles ]\n\
+                    highlight_style = 'a.css'\n\
+                    entries = [\n  \"x#y.css\", # \"b.css\"\n  \"a.css\",\n]\n\
+                    [reveal]\n\
+                    \"plugins\" = [\"zoom\"]\n";
+        assert_eq!(line_of_value(text, "styles", "entries", "a.css"), Some(8));
+        assert_eq!(line_of_value(text, "scripts", "entries", "a.css"), Some(3));
+        assert_eq!(
+            line_of_value(text, "styles", "highlight_style", "a.css"),
+            Some(5)
+        );
+        assert_eq!(line_of_value(text, "styles", "entries", "x#y.css"), Some(7));
+        // In a comment only: not found in the table; no other line has it either.
+        assert_eq!(line_of_value(text, "styles", "entries", "b.css"), None);
+        // Not in the table it is looked for in: the first line that has it.
+        assert_eq!(line_of_value(text, "reveal", "plugins", "a.css"), Some(3));
+        assert_eq!(line_of_key(text, "reveal", "plugins"), Some(11));
+        assert_eq!(line_of_key(text, "styles", "plugins"), None);
+    }
 
     fn parse(text: &str) -> Result<ThemeManifest> {
         ThemeManifest::from_toml_str(text, "t", "t/theme.toml")

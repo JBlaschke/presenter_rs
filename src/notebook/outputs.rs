@@ -25,10 +25,9 @@
 //! slice. That slice holds the outputs `nbformat` could parse, so after an output it skipped
 //! (its `notebook-output-skipped` warning counts positions in the `.ipynb` array) `i` is
 //! smaller than the output's position in the file. The caller attaches the notebook path and
-//! the cell (`notebook::convert`: the cell's span, except for the local-file warnings
-//! `missing-asset` and [`codes::OUTPUT_FILE_OUTSIDE`], which name the output in their message,
-//! `cell <c>, output <i>: …` ([`output_location`]), and have no span: an output is not a line
-//! of the cell's source, so no source line is quoted for them).
+//! the cell (`notebook::convert`: the span of the whole cell, also for the local-file warnings
+//! `missing-asset` and [`codes::OUTPUT_FILE_OUTSIDE`]; an output is not a line of the cell's
+//! source, so a report quotes no source line for a missing file the line does not mention).
 //!
 //! **Local files** (`docs/spec/notebook-mapping.md` §4): [`render_outputs`] leaves relative
 //! URLs of `text/html` as written and renders `text/markdown` with the caller's closure.
@@ -79,26 +78,6 @@ pub mod codes {
     /// A `text/html` or `text/markdown` output names a local file outside the notebook's
     /// directory; it is not embedded and the URL stays as written ([`super::OutputFiles`]).
     pub const OUTPUT_FILE_OUTSIDE: &str = "output-file-outside";
-}
-
-/// How diagnostics name output `output` of cell `cell` (both 0-based): `cell 3, output 1`.
-/// The local-file warnings of outputs start with it (module docs).
-pub fn output_location(cell: usize, output: usize) -> String {
-    format!("cell {cell}, output {output}")
-}
-
-/// The `(cell, output)` of a diagnostic message that starts with an [`output_location`]
-/// followed by `:`, for ordering diagnostics without a span.
-pub fn output_position(message: &str) -> Option<(usize, usize)> {
-    let number = |text: &str| -> Option<(usize, usize)> {
-        let digits = text.bytes().take_while(u8::is_ascii_digit).count();
-        Some((text[..digits].parse().ok()?, digits))
-    };
-    let rest = message.strip_prefix("cell ")?;
-    let (cell, digits) = number(rest)?;
-    let rest = rest[digits..].strip_prefix(", output ")?;
-    let (output, digits) = number(rest)?;
-    rest[digits..].starts_with(':').then_some((cell, output))
 }
 
 /// Where [`render_cell_outputs`] resolves the local files outputs name, and how it renders

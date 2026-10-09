@@ -45,9 +45,24 @@ pub fn resolve_helper_path(theme: &Theme, path: &str) -> Result<Option<(Vec<u8>,
     Ok(bytes.map(|bytes| (bytes, mime_of(&key))))
 }
 
-/// `path` normalized as in [`resolve_helper_path`]; `None` if it is empty or climbs out.
+/// `path` normalized as in [`resolve_helper_path`]; `None` if it is empty or climbs out,
+/// and for `@<theme>/<path>` if `<path>` climbs out of that theme (`@t/../x.css` would
+/// otherwise name `x.css` in the chain's `assets/`; theme-format.md §4, audit F10).
 pub fn normalize_helper_path(path: &str) -> Option<String> {
-    normalize_rel(path).filter(|key| !key.is_empty())
+    let key = normalize_rel(path).filter(|key| !key.is_empty())?;
+    let mut segments = path
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".");
+    if segments.next().is_some_and(|first| first.starts_with('@')) {
+        let mut depth = 0usize;
+        for segment in segments {
+            depth = match segment {
+                ".." => depth.checked_sub(1)?,
+                _ => depth + 1,
+            };
+        }
+    }
+    Some(key)
 }
 
 /// True if [`resolve_helper_path`] finds a file at the normalized helper path `key`, without
@@ -109,7 +124,8 @@ pub(super) fn mime_of(key: &str) -> String {
 /// mode, such a URL leaves `/__presenter/asset/`).
 pub(super) fn join_relative(base: &str, rel: &str) -> Option<String> {
     let dir = base.rsplit_once('/').map_or("", |(dir, _)| dir);
-    normalize_helper_path(&format!("{dir}/{rel}"))
+    // Like a browser, so `..` may leave `@<theme>/` here (unlike in a helper's argument).
+    normalize_rel(&format!("{dir}/{rel}")).filter(|key| !key.is_empty())
 }
 
 /// Why `path` (as given to a helper) resolves to nothing, for "unknown path" messages.
@@ -119,6 +135,11 @@ pub(super) fn unknown_reason(theme: &Theme, path: &str) -> String {
     };
     if key.is_empty() {
         return "the path is empty".into();
+    }
+    if normalize_helper_path(path).is_none() {
+        return "it climbs out of the theme it names with '..'; an @<theme>/ path stays inside \
+                that theme"
+            .into();
     }
     match path_form(&key) {
         PathForm::Builtin if key.starts_with("vendor/") => {

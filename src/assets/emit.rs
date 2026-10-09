@@ -44,18 +44,23 @@
 //! longer hash is never cut to its first 12 chars), any other following character or the end
 //! of the text ends it. Unique ids are collected first, each is resolved once, then all
 //! occurrences are replaced. An id that is not registered is an [`Error::Other`] naming it
-//! (and, in a document, the attribute or element it was found in).
+//! (and, in a document, the attribute it was found in).
 //!
 //! In an HTML document ([`Emitter::resolve_html`]) placeholders are replaced only where the
-//! frontends and the notebook attachment resolver write them (ir.md §3, audit F16): inside the
-//! **attribute values** of start tags (`src`, `href`, `srcset`, `poster`,
-//! `data-background-*`, inline `style` `url()`, …) and inside the content of **`<style>` and
-//! `<script>` elements** (attachments resolved in a notebook cell's CSS or script). Text
-//! content is never rewritten: a literal `asset:` + 12 hex digits in prose, inline code, a
-//! code block or speaker notes is left alone. The document is tokenized like a browser does
-//! (the Markdown renderer's HTML tokenizer: comments, raw-text elements and quoted values are
-//! honoured), so `<p>asset:…</p>` and `<code>&lt;img src="asset:…"&gt;</code>` are text. In a
-//! stylesheet ([`Emitter::resolve_css`]) the whole text is scanned.
+//! frontends, the templates' helpers and the notebook attachment resolver write them (ir.md
+//! §3, audit F16): inside the **attribute values** of start tags (`src`, `href`, `srcset`,
+//! `poster`, `data-background-*`, inline `style` `url()`, `data-src`, …) except the
+//! attributes that hold text for people (`alt`, `title`, `placeholder`, `label`, `value`,
+//! `abbr`, `aria-*`; `is_text_attribute`), and inside the content of **`<style>` and
+//! `<script>` elements** (attachments resolved in a notebook cell's CSS or script, `asset()`
+//! in an inline script of a template). Text content is never rewritten: a literal `asset:` +
+//! 12 hex digits in prose, inline code, a code block, speaker notes, alt text or a link title
+//! is left alone. Inside `<style>`/`<script>` only registered ids are replaced (an unknown one
+//! there is a string the author wrote, left alone); an unknown id in an attribute value is an
+//! error. The document is tokenized like a browser does (the Markdown renderer's HTML
+//! tokenizer: comments, raw-text elements and quoted values are honoured), so `<p>asset:…</p>`
+//! and `<code>&lt;img src="asset:…"&gt;</code>` are text. In a stylesheet
+//! ([`Emitter::resolve_css`]) the whole text is scanned.
 //!
 //! **Query strings and fragments.** [`register_css_urls`] keeps a reference's `?query#frag`
 //! after the placeholder (`url(asset:<id>?#iefix)`), so site and serve URLs keep it. A
@@ -173,11 +178,12 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Replace every `asset:<id>` in the attribute values and the `<style>` and `<script>`
-    /// elements of an HTML document; text content is left alone (see the module docs).
+    /// Replace every `asset:<id>` in the attribute values (except text attributes such as
+    /// `alt` and `title`) and the `<style>` and `<script>` elements of an HTML document; text
+    /// content is left alone (see the module docs).
     ///
-    /// Site-mode URLs are relative to the document. Errors: an unknown id ([`Error::Other`],
-    /// naming the attribute or element), a file asset that disappeared
+    /// Site-mode URLs are relative to the document. Errors: an unknown id in an attribute
+    /// value ([`Error::Other`], naming the attribute), a file asset that disappeared
     /// ([`Error::MissingAsset`], standalone and site modes only) or another read failure.
     pub fn resolve_html(&mut self, html: &str) -> Result<String> {
         self.resolve_placeholders(html, Referrer::Document, Scope::Html)
@@ -251,6 +257,9 @@ impl<'a> Emitter<'a> {
         let mut found = find_placeholders(text);
         if scope == Scope::Html && !found.is_empty() {
             found = in_html_values(text, found);
+            // Inside `<style>`/`<script>` an unregistered id is the author's text (a string
+            // in a script), not a placeholder: what presenter writes there is registered.
+            found.retain(|p| !p.in_element() || self.registry.get(p.id).is_some());
         }
         if found.is_empty() {
             return Ok(text.to_string());
@@ -466,6 +475,15 @@ struct Placeholder<'t> {
     place: Option<String>,
 }
 
+impl Placeholder<'_> {
+    /// True if it was found in the content of a `<style>` or `<script>` element.
+    fn in_element(&self) -> bool {
+        self.place
+            .as_deref()
+            .is_some_and(|place| place.starts_with('<'))
+    }
+}
+
 /// Which parts of a text the `resolve_*` methods rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scope {
@@ -512,14 +530,27 @@ fn in_html_values<'t>(html: &str, found: Vec<Placeholder<'t>>) -> Vec<Placeholde
         .collect()
 }
 
+/// The HTML attributes whose value is text for people, not a URL ([`is_text_attribute`]).
+const TEXT_ATTRS: [&str; 6] = ["alt", "title", "placeholder", "label", "value", "abbr"];
+
+/// True if the attribute `name` (lowercase) holds text for people rather than a URL: `alt`,
+/// `title`, `placeholder`, `label`, `value`, `abbr` and every `aria-*` attribute. No
+/// placeholder is ever written there: the emitter leaves their values alone (audit F16) and
+/// the notebook frontend resolves no `attachment:` URL there.
+pub(crate) fn is_text_attribute(name: &str) -> bool {
+    TEXT_ATTRS.contains(&name) || name.starts_with("aria-")
+}
+
 /// The byte ranges of `html` where placeholders are replaced (module docs), sorted and
 /// disjoint, each with where it is for messages (an attribute's name, or `<style>` /
 /// `<script>`): the value of every attribute of a start tag (outside comments and raw-text
-/// elements, quotes excluded) and the content of every `<style>` and `<script>` element (up
-/// to its end tag, or the end of `html`).
+/// elements, quotes excluded) except the text attributes ([`is_text_attribute`]), and the
+/// content of every `<style>` and `<script>` element (up to its end tag, or the end of
+/// `html`).
 fn html_regions(html: &str) -> Vec<(Range<usize>, String)> {
     let mut regions: Vec<(Range<usize>, String)> = html_attr_values(html)
         .into_iter()
+        .filter(|(name, _)| !is_text_attribute(name))
         .map(|(name, range)| (range, name))
         .collect();
     // ASCII lowercasing keeps every byte offset.
@@ -535,16 +566,12 @@ fn html_regions(html: &str) -> Vec<(Range<usize>, String)> {
     regions
 }
 
-/// The error for an unregistered id found in a document, at `place` of [`html_regions`].
-fn unknown_id_in(id: &str, place: &str) -> Error {
-    let place = if place.starts_with('<') {
-        format!("a {place} element")
-    } else {
-        format!("a `{place}` attribute")
-    };
+/// The error for an unregistered id found in a document in the value of the attribute
+/// `attribute` (only attribute values make an unknown id an error, see the module docs).
+fn unknown_id_in(id: &str, attribute: &str) -> Error {
     Error::Other(format!(
-        "unknown asset id '{id}': the placeholder 'asset:{id}' in {place} of the document \
-         does not name a registered asset"
+        "unknown asset id '{id}': the placeholder 'asset:{id}' in the `{attribute}` attribute \
+         of an element of the document does not name a registered asset"
     ))
 }
 
@@ -1472,8 +1499,9 @@ mod tests {
         );
     }
 
-    /// ir.md §3 (audit F16): in a document, placeholders are replaced in attribute values and
-    /// in `<style>`/`<script>` elements only; the same text in prose, code or notes stays.
+    /// ir.md §3 (audit F16): in a document, placeholders are replaced in attribute values
+    /// (not in text attributes such as `alt` and `title`) and in `<style>`/`<script>`
+    /// elements only; the same text in prose, code, notes, alt text or titles stays.
     #[test]
     fn html_text_content_is_never_rewritten() {
         let mut registry = AssetRegistry::new();
@@ -1493,8 +1521,17 @@ mod tests {
             format!("<!-- <img src=\"asset:{id}\"> -->"),
             format!("<textarea><img src=\"asset:{id}\"></textarea>"),
             format!("<p title='x'>asset:{id}</p>"),
-            // Unregistered ids in text are not errors either.
+            // Text attributes hold the author's words, not URLs.
+            format!("<img src=\"x.png\" alt=\"The id asset:{id}\" title='asset:{id}'>"),
+            format!("<a href=\"https://e.org\" title=\"see asset:{id}\">x</a>"),
+            format!("<div aria-label=\"asset:{id}\" ARIA-DESCRIPTION=asset:{id}></div>"),
+            format!("<input placeholder=\"asset:{id}\" value=\"asset:{id}\">"),
+            // Unregistered ids in text, text attributes and scripts are not errors either.
             "<p>asset:0123456789ab and `asset:3f9a1c2b7e0d`</p>".to_string(),
+            "<img alt=\"asset:0123456789ab\" src=\"x.png\">".to_string(),
+            "<a title=\"see asset:0123456789ab\" href=\"https://e.org\">x</a>".to_string(),
+            "<script>console.log(\"asset:0123456789ab\")</script>".to_string(),
+            "<style>a::after{content:\"asset:0123456789ab\"}</style>".to_string(),
         ] {
             assert_eq!(resolve(&text), text);
         }
@@ -1502,7 +1539,11 @@ mod tests {
         for (html, expected) in [
             (
                 format!("<img src=\"asset:{id}\" alt=\"asset:{id}\">"),
-                format!("<img src=\"{uri}\" alt=\"{uri}\">"),
+                format!("<img src=\"{uri}\" alt=\"asset:{id}\">"),
+            ),
+            (
+                format!("<div data-src='asset:{id}' data-background-image=asset:{id}></div>"),
+                format!("<div data-src='{uri}' data-background-image={uri}></div>"),
             ),
             (
                 format!("<img src=asset:{id}><p>asset:{id}</p>"),
@@ -1535,13 +1576,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown asset id '0123456789ab': the placeholder 'asset:0123456789ab' in a `src` \
-             attribute of the document does not name a registered asset"
+            "unknown asset id '0123456789ab': the placeholder 'asset:0123456789ab' in the `src` \
+             attribute of an element of the document does not name a registered asset"
         );
-        let err = emitter
-            .resolve_html("<style>x{y:url(asset:0123456789ab)}</style>")
-            .unwrap_err();
-        assert!(err.to_string().contains("in a <style> element"), "{err}");
+        // In `<style>`/`<script>` an unknown id is the author's text and stays.
+        let style = "<style>x{y:url(asset:0123456789ab)}</style>";
+        assert_eq!(emitter.resolve_html(style).unwrap(), style);
         // Stylesheets are scanned whole.
         let err = emitter.resolve_css("/* asset:0123456789ab */").unwrap_err();
         assert!(err.to_string().contains("'asset:0123456789ab'"), "{err}");

@@ -1240,11 +1240,14 @@ fn html_outputs_and_markdown_outputs_resolve_local_files() {
     assert_eq!(htmls[2], "<img src=\"nope.png\">");
     assert_eq!(deck.assets.len(), 1, "one file, registered once");
     assert!(deck.features.math);
-    // An output is no line of the cell's source: the warning names the output (F38).
-    assert_eq!(codes(&parsed), [("missing-asset", None, 0)]);
-    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    // The warning has the span of the whole cell (cell-level, so the cell is known
+    // everywhere) and names the output in its message (F38).
+    assert_eq!(codes(&parsed), [("missing-asset", Some(0), 1)]);
+    let diagnostic = parsed.diagnostics.iter().next().unwrap();
+    assert_eq!(diagnostic.span.as_ref().map(|s| s.end_line), Some(1));
+    let message = &diagnostic.message;
     assert!(
-        message.starts_with("cell 0, output 2: file `nope.png` not found (looked for "),
+        message.starts_with("output 2: file `nope.png` not found (looked for "),
         "{message}"
     );
 }
@@ -2072,6 +2075,36 @@ fn notebook_slides_honour_incremental_lists_and_element_comments() {
     assert_eq!([0, 1, 2].map(|slide| fragments(&front, slide)), [2, 2, 0]);
 }
 
+/// F17 (review): an `.element:` comment's warning names the cell that has the comment, not
+/// the cell that opened the slide; the same for a comment in a notes cell.
+#[test]
+fn element_comment_warnings_name_the_cell_that_has_the_comment() {
+    let cells = json!([
+        md("# T", slide_type("slide")),
+        code("x = 1", json!({}), json!([])),
+        md(
+            "Text\n\nMore\n\n- a <!-- .element: data-x=\"1 -->\n",
+            json!({})
+        ),
+        md(
+            "Say *this* <!-- .element: data-y=\"2 -->",
+            slide_type("notes")
+        ),
+    ]);
+    let parsed = inline(cells);
+    let ignored: Vec<_> = codes(&parsed)
+        .into_iter()
+        .filter(|(code, ..)| *code == "element-comment-ignored")
+        .collect();
+    assert_eq!(
+        ignored,
+        [
+            ("element-comment-ignored", Some(2), 1),
+            ("element-comment-ignored", Some(3), 1)
+        ]
+    );
+}
+
 /// F28: one slide without slide types is reported once there is enough on it.
 #[test]
 fn a_notebook_without_slide_types_is_one_slide_with_a_hint() {
@@ -2220,17 +2253,22 @@ fn output_files_must_resolve_inside_the_notebook_directory() {
     ]) {
         assert!(
             message.starts_with(&format!(
-                "cell 1, output {output}: `{written}` names {}, which is outside the \
-                 notebook's directory",
+                "output {output}: `{written}` names {}, which is outside the notebook's \
+                 directory",
                 secret.display()
             )),
             "{message}"
         );
     }
+    // Located at the cell (its whole span), not at a line of its code (F38).
     assert!(
         parsed
             .diagnostics
             .iter()
-            .all(|d| d.code != "output-file-outside" || d.span.is_none())
+            .filter(|d| d.code == "output-file-outside")
+            .all(|d| d
+                .span
+                .as_ref()
+                .is_some_and(|s| s.cell == Some(1) && s.start_line == 1))
     );
 }

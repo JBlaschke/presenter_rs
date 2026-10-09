@@ -155,9 +155,15 @@ text/markdown, text/latex, application/json, text/plain
 >   (`../secret.txt`, a link pointing elsewhere) is not embedded: its URL stays as written and
 >   an `output-file-outside` warning names it. Markdown and raw cells, which the author wrote,
 >   resolve `..` like a Markdown deck.
-> - Warnings about an output's files (`missing-asset`, `output-file-outside`) have no span (an
->   output is not a line of the cell's source); their message starts with `cell <c>, output
->   <i>: `. The other output warnings keep the cell's span.
+> - Every warning about an output, those about its files (`missing-asset`,
+>   `output-file-outside`) included, has the span of the whole cell, like every cell-level
+>   warning, so `check --format json` gives its `cell` and a build that fails on a missing
+>   file names the cell after `-->`. Its message starts with `output <i>: ` (0-based, among
+>   the cell's outputs that could be read). An output is not a line of the cell's source, so a report quotes no
+>   source line for a missing file that the line does not mention.
+> - This is an exception to ir.md §2 invariant 4 for outputs: a URL of an output that names a
+>   file outside the notebook's directory stays as written, as does one naming a missing
+>   file (ir.md itself is the coordinator's to annotate).
 
 Other outputs:
 - `Stream { name, text }` → `CellOutput::Stream { name, html }` with `html = ansi_to_html::convert(&html_escape::encode_text(text))`

@@ -1101,3 +1101,252 @@ fn unknown_layouts_get_a_did_you_mean() {
         "{message}"
     );
 }
+
+/// `(code, path relative to `root`, level)` of each diagnostic.
+fn problem_summary(
+    found: &[presenter::error::Diagnostic],
+    root: &Path,
+) -> Vec<(String, String, presenter::error::Level)> {
+    let root = root.canonicalize().unwrap();
+    found
+        .iter()
+        .map(|d| {
+            let path = d.path.as_ref().map_or(String::new(), |p| {
+                p.strip_prefix(&root).unwrap().display().to_string()
+            });
+            (d.code.to_string(), path, d.level)
+        })
+        .collect()
+}
+
+/// F10 (review): a template that does not compile is an error for a deck whose build loads
+/// it (the required templates, the deck's layouts and what these include, extend or import
+/// by a literal name) and a warning otherwise: a layout no slide uses, a partial nothing
+/// includes (a mention in a comment does not count), a parent's template the child
+/// overrides. `Theme::problems`, which knows no deck, reports every one as an error.
+#[test]
+fn deck_problems_warn_about_templates_the_deck_does_not_use() {
+    use presenter::error::Level::{Error as E, Warning as W};
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(
+        &tmp.path().join("p"),
+        &[
+            ("theme.toml", "name = \"p\"\nextends = \"default\"\n"),
+            ("templates/layouts/title.html", "{%- endiff %}"),
+        ],
+    );
+    let theme = {
+        write_files(
+            &tmp.path().join("t"),
+            &[
+                ("theme.toml", "name = \"t\"\nextends = \"../p\"\n"),
+                (
+                    "templates/layouts/unused.html",
+                    "<section>{%- endiff %}</section>",
+                ),
+                ("templates/partials/draft.html", "{% if x %}"),
+                ("templates/partials/broken.html", "{{ 1 + }}"),
+                (
+                    "templates/layouts/fancy.html",
+                    "{#- {% include \"partials/draft.html\" %} -#}\n\
+                     {%- extends \"layouts/default.html\" -%}\n\
+                     {% block x %}{% include ['partials/missing.html', \"partials/broken.html\"] %}{% endblock %}",
+                ),
+                (
+                    "templates/layouts/title.html",
+                    "{%- extends \"@default/layouts/title.html\" %}",
+                ),
+            ],
+        );
+        resolve("t", &[tmp.path()]).unwrap()
+    };
+    let layouts = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    };
+    let template = |path: &str| ("theme-template".to_string(), path.to_string());
+    let summary = |found: &[presenter::error::Diagnostic]| {
+        problem_summary(found, tmp.path())
+            .into_iter()
+            .map(|(code, path, level)| ((code, path), level))
+            .collect::<Vec<_>>()
+    };
+    // The child's templates first, then the parent's (the chain's order).
+    let unused = template("t/templates/layouts/unused.html");
+    let broken = template("t/templates/partials/broken.html");
+    let draft = template("t/templates/partials/draft.html");
+    let parent = template("p/templates/layouts/title.html");
+    assert_eq!(
+        summary(&theme.deck_problems(&layouts(&["default", "title"]))),
+        [
+            (unused.clone(), W),
+            (broken.clone(), W),
+            (draft.clone(), W),
+            (parent.clone(), W)
+        ]
+    );
+    // `fancy` includes the broken partial; an unknown layout falls back to the default one.
+    assert_eq!(
+        summary(&theme.deck_problems(&layouts(&["fancy", "unused", "nope"]))),
+        [
+            (unused.clone(), E),
+            (broken.clone(), E),
+            (draft.clone(), W),
+            (parent.clone(), W)
+        ]
+    );
+    assert_eq!(
+        summary(&theme.problems()),
+        [(unused, E), (broken, E), (draft, E), (parent, E)]
+    );
+    let found = theme.deck_problems(&layouts(&["default"]));
+    assert!(
+        found[0].message.ends_with(
+            "(this deck does not use the template, so its build does not fail on it; a deck \
+             that uses it does)"
+        ),
+        "{}",
+        found[0].message
+    );
+    // The parent's template is reached when the child's version extends it by name.
+    write_files(
+        &tmp.path().join("t"),
+        &[(
+            "templates/layouts/title.html",
+            "{%- extends \"@p/layouts/title.html\" %}",
+        )],
+    );
+    let found = theme.deck_problems(&layouts(&["title"]));
+    assert_eq!(
+        summary(&found)[3],
+        (template("p/templates/layouts/title.html"), E)
+    );
+}
+
+/// F10 (b, review): in a helper's argument, `@<theme>/<path>` stays inside that theme:
+/// `..` cannot climb out of it into the chain's `assets/` (`@t/../x.css` named
+/// `assets/x.css`) or into another theme. Inside the theme, `..` works.
+#[test]
+fn theme_helper_paths_stay_inside_their_theme() {
+    use presenter::render::{normalize_helper_path, resolve_helper_path};
+    for (path, expected) in [
+        ("@t/../x.css", None),
+        ("@t/../@default/styles/theme.css", None),
+        ("./@t/a/../../x.css", None),
+        ("@t\\..\\x.css", None),
+        ("@t/a/../b.css", Some("@t/b.css")),
+        ("@t/assets/../assets/x.css", Some("@t/assets/x.css")),
+        ("./@t//x.css", Some("@t/x.css")),
+        ("img/../x.css", Some("x.css")),
+        ("vendor/../x.css", Some("x.css")),
+    ] {
+        assert_eq!(normalize_helper_path(path).as_deref(), expected, "{path}");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(tmp.path(), &[("x.css", "/* intended */")]);
+    let theme = child_of_default(tmp.path(), "", &[("assets/x.css", "/* assets */")]);
+    assert_eq!(resolve_helper_path(&theme, "@t/../x.css").unwrap(), None);
+    assert_eq!(
+        resolve_helper_path(&theme, "@t/assets/../assets/x.css")
+            .unwrap()
+            .map(|(bytes, _)| bytes),
+        Some(b"/* assets */".to_vec())
+    );
+    assert_eq!(
+        resolve_helper_path(&theme, "x.css")
+            .unwrap()
+            .map(|(bytes, _)| bytes),
+        Some(b"/* assets */".to_vec())
+    );
+}
+
+/// F08 (review): a file that a symbolic link takes out of its theme is reported as such:
+/// `theme-link-outside` warnings for each such link (not for links inside the theme), and
+/// the messages about an entry or a manifest name the link instead of saying "not found".
+#[cfg(unix)]
+#[test]
+fn links_out_of_a_theme_are_named() {
+    use presenter::error::Level::Warning as W;
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    write_files(
+        tmp.path(),
+        &[
+            ("secret/hosts", "SECRET"),
+            ("secret/b.css", "x{}"),
+            ("t2/x", ""),
+        ],
+    );
+    let theme = child_of_default(
+        tmp.path(),
+        "[styles]\nentries = [\"styles/linked.css\"]\n",
+        &[("assets/real.png", "REAL")],
+    );
+    let root = tmp.path().join("t");
+    fs::create_dir_all(root.join("styles")).unwrap();
+    symlink(
+        tmp.path().join("secret/hosts"),
+        root.join("assets/logo.png"),
+    )
+    .unwrap();
+    symlink(tmp.path().join("secret"), root.join("assets/shared")).unwrap();
+    symlink(root.join("assets/real.png"), root.join("assets/alias.png")).unwrap();
+    symlink(
+        tmp.path().join("secret/b.css"),
+        root.join("styles/linked.css"),
+    )
+    .unwrap();
+    symlink(tmp.path().join("nowhere"), root.join("assets/dangling.png")).unwrap();
+
+    let dir = &theme.chain[0];
+    assert!(dir.linked_outside("assets/logo.png"));
+    assert!(dir.linked_outside("assets/shared/hosts"));
+    assert!(!dir.linked_outside("assets/alias.png"));
+    assert!(!dir.linked_outside("assets/nope.png"));
+    assert!(!dir.linked_outside("assets/dangling.png"));
+
+    let found = theme.problems();
+    let style = ("theme-style-entry".to_string(), "t/theme.toml".to_string());
+    let link = |path: &str| ("theme-link-outside".to_string(), path.to_string());
+    assert_eq!(
+        problem_summary(&found, tmp.path())
+            .into_iter()
+            .map(|(code, path, level)| ((code, path), level))
+            .collect::<Vec<_>>(),
+        [
+            (style, presenter::error::Level::Error),
+            (link("t/assets/logo.png"), W),
+            (link("t/assets/shared"), W),
+            (link("t/styles/linked.css"), W),
+        ]
+    );
+    assert!(
+        found[0].message.contains(
+            "entry 'styles/linked.css' is a symbolic link (or below one) to a file outside \
+             the theme directory"
+        ),
+        "{}",
+        found[0].message
+    );
+    assert!(
+        found[2]
+            .message
+            .starts_with("theme 't': assets/shared is a symbolic link to ")
+            && found[2]
+                .message
+                .contains("presenter ignores it and everything below it, so it counts as missing"),
+        "{}",
+        found[2].message
+    );
+    let Err(Error::Theme { message, .. }) = theme.style_entries() else {
+        panic!("expected Error::Theme");
+    };
+    assert!(message.contains("is a symbolic link"), "{message}");
+
+    // A manifest that is a link out of its directory.
+    symlink(root.join("theme.toml"), tmp.path().join("t2/theme.toml")).unwrap();
+    let (_, message) = theme_error(resolve("t2", &[tmp.path()]));
+    assert!(
+        message.contains("t2 has a theme.toml that is a symbolic link (or below one) to a file outside the theme directory"),
+        "{message}"
+    );
+}

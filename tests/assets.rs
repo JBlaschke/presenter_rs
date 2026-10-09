@@ -762,15 +762,19 @@ fn standalone_drops_css_escaped_queries_whole() {
 // ---------------------------------------------------------------------------------------
 // End to end through `presenter build` (audits F16 and F20).
 
-/// `presenter build <args>` in `dir`; panics unless it succeeds.
-fn build(dir: &Path, args: &[&str]) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+/// `presenter <args>` in `dir`.
+fn presenter(dir: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
         .current_dir(dir)
         .env_remove("RUST_LOG")
-        .arg("build")
         .args(args)
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+/// `presenter build <args>` in `dir`; panics unless it succeeds.
+fn build(dir: &Path, args: &[&str]) {
+    let output = presenter(dir, &[&["build"], args].concat());
     assert!(
         output.status.success(),
         "presenter build {args:?}: {}",
@@ -872,9 +876,14 @@ fn literal_placeholders_in_slide_text_build_and_stay_text() {
     let mut registry = AssetRegistry::new();
     let image = std::fs::canonicalize(dir.join("images/ok.png")).unwrap();
     let id = registry.register_file(&image);
+    // Also in alt text, a link title, a raw `title`/`aria-label` and a script's string.
     let deck = format!(
         "# Placeholders\n\nThe id asset:3f9a1c2b7e0d is plain text, and so is `asset:{id}`.\n\n\
          ![ok](images/ok.png)\n\n```html\n<img src=\"asset:0123456789ab\">\n```\n\n\
+         ![The id asset:0123456789ab](https://example.com/x.png)\n\n\
+         [link](https://example.com \"see asset:0123456789ab\") [mine](https://example.com \"asset:{id}\")\n\n\
+         <div title=\"asset:0123456789ab\" aria-label=\"asset:{id}\">d</div>\n\n\
+         <script>console.log(\"asset:0123456789ab\")</script>\n\n\
          :::notes\nSay asset:{id} out loud.\n:::\n"
     );
     std::fs::write(dir.join("deck.md"), deck).unwrap();
@@ -887,7 +896,16 @@ fn literal_placeholders_in_slide_text_build_and_stay_text() {
         assert!(html.contains(&format!("<code>asset:{id}</code>")));
         assert!(html.contains("&lt;img src=\"asset:0123456789ab\"&gt;"));
         assert!(html.contains(&format!("Say asset:{id} out loud.")));
+        assert!(html.contains("alt=\"The id asset:0123456789ab\""), "{html}");
+        assert!(html.contains("title=\"see asset:0123456789ab\""));
+        assert!(html.contains(&format!("title=\"asset:{id}\"")));
+        assert!(html.contains(&format!("aria-label=\"asset:{id}\"")));
+        assert!(html.contains("<div title=\"asset:0123456789ab\""));
+        assert!(html.contains("console.log(\"asset:0123456789ab\")"));
     }
+    // `check` agrees: nothing to report about these.
+    let out = presenter(dir, &["check", "--deny-warnings", "deck.md"]);
+    assert!(out.status.success(), "{out:?}");
     // The image itself is still resolved.
     assert!(standalone.contains("<img src=\"data:image/png;base64,"));
     assert!(site.contains(&format!("<img src=\"assets/ok-{}.png\"", png_hash())));

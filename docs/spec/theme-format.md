@@ -95,10 +95,16 @@ Asset lookup (`asset("fonts/x.woff2")`, CSS `url(fonts/x.woff2)`): same walk ove
 > into a deck's output or have the dev server serve them. To share files between themes,
 > copy them or use `extends` (a child sees its parents' `assets/`). A path-valued
 > `highlight_style` follows the rules of style entries (relative, inside the theme, existing;
-> otherwise `Error::Theme` when the context is built). `presenter check` reports the theme
-> problems a build fails on as errors located in the theme's files: missing or escaping style
-> and script entries and `highlight_style` files, templates that do not compile, an invalid
-> merged `[reveal] plugins` list (stylesheets are not compiled by `check`).
+> otherwise `Error::Theme` when the context is built). A lookup refused because of such a
+> link logs a warning that says so, and messages about a missing entry, `highlight_style` or
+> `theme.toml` name the link. `presenter check` reports, as errors located in the theme's
+> files, the theme problems the deck's build fails on: missing or escaping style and script
+> entries and `highlight_style` files, an invalid merged `[reveal] plugins` list, a
+> stylesheet that does not compile, and a template that does not compile when the build loads
+> it (the required templates, the layouts the deck's slides use, and what these name as
+> string literals in `include`/`extends`/`import`/`from` tags). A template that does not
+> compile but that the deck does not use is a warning (a deck that uses it fails to build),
+> and so is every symbolic link whose target is outside its theme (`theme-link-outside`).
 
 ## 4. Template context
 

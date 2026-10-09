@@ -3,8 +3,7 @@
 //! [`run`] parses the deck without building it ([`pipeline::parse_only`]), resolves its
 //! theme ([`pipeline::resolve_theme`]) and returns the frontend's diagnostics together with
 //! the deck-level lints below, ordered by position (findings about the theme's files and
-//! deck-level findings first, then by cell and line; a notebook output's file warning, which
-//! has no line, after its cell's lines). Missing assets are never errors here.
+//! deck-level findings first, then by cell and line). Missing assets are never errors here.
 //!
 //! # What is reported
 //!
@@ -52,13 +51,20 @@
 //!   executed (no outputs, no execution count), with a hint to execute it.
 //! - `theme-error` (level error): the deck's theme cannot be resolved; `unknown-layout` and the
 //!   theme problems below are then skipped.
-//! - Theme problems a build fails on ([`Theme::problems`], level error, located in the
-//!   theme's `theme.toml` or template; audit F10): `theme-style-entry`, `theme-script-entry`
-//!   (a missing entry, or one outside its theme), `theme-highlight-style` (a `highlight_style`
-//!   file that is missing or outside its theme), `theme-template` (a template of a disk theme
-//!   that does not compile) and `theme-plugins` (an invalid merged `[reveal] plugins` list).
-//!   They are the build failures `presenter theme check` reports; a deck whose build fails on
-//!   its theme does not pass `check`. Stylesheets are not compiled here.
+//! - Theme problems ([`Theme::deck_problems`], located in the theme's `theme.toml`, template
+//!   or stylesheet; audit F10). Errors, each a failure of this deck's build:
+//!   `theme-style-entry`, `theme-script-entry` (a missing entry, or one outside its theme),
+//!   `theme-highlight-style` (a `highlight_style` file that is missing or outside its theme),
+//!   `theme-template` (a template of a disk theme that does not compile and that the build
+//!   of this deck loads), `theme-plugins` (an invalid merged `[reveal] plugins` list) and
+//!   `style-error` (the theme's stylesheet does not compile: a Sass error, a local `@import`
+//!   or `url()` that finds no file). Warnings: `theme-template` for a template that does not
+//!   compile but that this deck does not use (a layout no slide uses, a partial nothing
+//!   includes: which templates a build loads is followed through the names written as
+//!   string literals in `include`/`extends`/`import` tags, plus the deck's layouts), and
+//!   `theme-link-outside` (a symbolic link in a theme whose target is outside it, which
+//!   lookups ignore). So a deck whose build fails on its theme does not pass `check`, unless
+//!   a template is reached only through a name built at render time.
 //!
 //! Failures that leave no deck to lint (the input cannot be read or parsed, invalid front
 //! matter or `presenter.toml`) are [`run`]'s `Err`; [`error_diagnostic`] turns them into an
@@ -71,18 +77,19 @@ use std::path::{Path, PathBuf};
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{Arena, Options, parse_document};
 
+use crate::assets::registry::AssetRegistry;
 use crate::assets::registry::normalize_lexically;
 use crate::config::{Config, SlideSplit};
-use crate::error::{Diagnostic, Diagnostics, Error, Result};
+use crate::error::{Diagnostic, Diagnostics, Error, Level, Result};
 use crate::ir::{Block, Deck, Slide, SourceKind, SourceSpan};
 use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::split_front_matter;
 use crate::markdown::split::{SplitMode, source_lines, split_with_source};
 use crate::notebook::convert::codes::FRONT_MATTER_IGNORED;
 use crate::notebook::nbformat::{self, Cell, CellType, SlideType};
-use crate::notebook::outputs::output_position;
 use crate::pipeline::{self, BuildOptions};
-use crate::theme::Theme;
+use crate::render::compile_theme_css;
+use crate::theme::{self, Theme, ThemeSource};
 
 /// The diagnostic codes this module adds to the frontends' (module docs).
 pub mod codes {
@@ -133,8 +140,11 @@ pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
     let mut theme_problems = Vec::new();
     match pipeline::resolve_theme(opts, &deck, &config, config_path.as_deref()) {
         Ok(theme) => {
+            // Theme problems first: they report the links out of the theme, which the
+            // lookups below would otherwise log.
+            theme_problems = theme.deck_problems(&used_layouts(&deck));
+            theme_problems.extend(style_problem(&theme, &theme_problems));
             found.extend(unknown_layouts(&deck, &theme));
-            theme_problems = theme.problems();
         }
         Err(err) => found.push(Diagnostic::error(codes::THEME_ERROR, err.to_string())),
     }
@@ -162,19 +172,13 @@ pub fn run(opts: &BuildOptions) -> Result<Diagnostics> {
 
 /// Orders `diagnostics` (stable, so ties keep the frontend's order before this module's):
 /// findings about other files (theme problems) and deck-level ones (no position) first,
-/// then by cell and line; a notebook output's diagnostic, which has no line, after its
-/// cell's lines ([`output_position`]).
+/// then by cell and line.
 fn sort_by_position(diagnostics: &mut [Diagnostic], deck: &Path) {
     diagnostics.sort_by_key(|d| {
         if d.path.as_deref() != Some(deck) {
             return None;
         }
-        match &d.span {
-            Some(span) => Some((span.cell, span.start_line, 0)),
-            None => {
-                output_position(&d.message).map(|(cell, output)| (Some(cell), usize::MAX, output))
-            }
-        }
+        d.span.as_ref().map(|span| (span.cell, span.start_line))
     });
 }
 
@@ -295,6 +299,47 @@ fn unknown_layouts(deck: &Deck, theme: &Theme) -> Vec<Diagnostic> {
         found.push(slide_warning(codes::UNKNOWN_LAYOUT, message, slide));
     }
     found
+}
+
+/// The layouts the slides of `deck` name (known to the theme or not).
+fn used_layouts(deck: &Deck) -> BTreeSet<String> {
+    labelled_slides(deck)
+        .into_iter()
+        .map(|(_, slide)| slide.layout.clone())
+        .collect()
+}
+
+/// `style-error`: the theme's stylesheet does not compile ([`compile_theme_css`], what a
+/// build does for `theme_style()`: Sass errors, a local `@import` or `url()` that finds no
+/// file), located in the stylesheet when it is a disk theme's file. Skipped when `problems`
+/// already has an error about a style entry, which the compilation would only repeat.
+fn style_problem(theme: &Theme, problems: &[Diagnostic]) -> Option<Diagnostic> {
+    if problems
+        .iter()
+        .any(|p| p.level == Level::Error && p.code == theme::codes::THEME_STYLE_ENTRY)
+    {
+        return None;
+    }
+    let err = compile_theme_css(theme, &mut AssetRegistry::new()).err()?;
+    let file = match &err {
+        Error::Style { file, .. } => theme_file_path(theme, file),
+        _ => None,
+    };
+    let diagnostic = Diagnostic::error(error_code(&err), err.to_string());
+    Some(match file {
+        Some(file) => diagnostic.with_path(file),
+        None => diagnostic,
+    })
+}
+
+/// The file on disk of the helper path `key` when it is `@<theme>/<path>` of a disk theme of
+/// the chain.
+fn theme_file_path(theme: &Theme, key: &str) -> Option<PathBuf> {
+    let (name, rel) = key.strip_prefix('@')?.split_once('/')?;
+    match &theme.dir(name)?.source {
+        ThemeSource::Disk { dir } => Some(dir.join(rel)),
+        ThemeSource::Embedded { .. } => None,
+    }
 }
 
 /// `notebook-no-outputs`: a notebook deck with code cells that were never executed: none
