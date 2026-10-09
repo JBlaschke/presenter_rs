@@ -64,10 +64,10 @@
  * ------------------------------------------------------------------------------------ */
 
 .reveal .cell-outputs {
-  /* The 16 ANSI colours of streams and tracebacks (`color:var(--red,#a00)` spans; SGR 30-37,
-     90-97 and their backgrounds), mixed with the text colour so they stay readable on light
-     and dark slides. Black and white are shades of the text colour, the bright colours are the
-     normal ones. */
+  /* The 16 ANSI colours of streams and tracebacks (`color:var(--red,#a00)` spans; SGR 30-37
+     and 90-97), mixed with the text colour so they stay readable as text on light and dark
+     slides. Black and white are shades of the text colour, the bright colours are the normal
+     ones. Text on an ANSI background uses a terminal palette instead (below). */
   --black: color-mix(in oklab, #000 40%, currentColor);
   --red: color-mix(in oklab, #dc2626 80%, currentColor);
   --green: color-mix(in oklab, #16a34a 75%, currentColor);
@@ -130,6 +130,80 @@
   border-radius: 0 var(--p-radius) var(--p-radius) 0;
   background: color-mix(in srgb, var(--p-error-color) 9%, transparent);
 }
+
+/* ------------------------------------------------------------------------------------
+ * Text on an ANSI background (SGR 40-47 and 100-107, and reverse video, SGR 7) sits on a
+ * fixed colour instead of the slide, so there the 16 colours are a terminal palette of
+ * Tailwind shades: the normal colours dark enough for white text, except yellow and white,
+ * the bright colours light enough for black text, except bright black.
+ *
+ * - Text in an ANSI colour keeps that colour, taken from this palette. The converter often
+ *   writes the colour on a span that encloses the background's span (SGR 97;41 is a `color:`
+ *   span around a `background:` span), so every colour span passes its colour down in
+ *   --ansi-fg.
+ * - Text without an ANSI colour is black or white (--ansi-default-fg), whichever reads on the
+ *   background.
+ * - Reverse video writes text and background in one span, the terminal's default background
+ *   as black text: that text has no ANSI colour of its own either (SGR 31;7 is white on red).
+ *
+ * Only inside `pre`, where the converter's spans are.
+ * ------------------------------------------------------------------------------------ */
+
+.reveal .cell-outputs pre span[style*="background:var(--"] {
+  --black: #000;
+  --red: #b91c1c;
+  --green: #15803d;
+  --yellow: #fde047;
+  --blue: #1d4ed8;
+  --magenta: #a21caf;
+  --cyan: #0e7490;
+  --white: #f3f4f6;
+  --bright-black: #4b5563;
+  --bright-red: #fca5a5;
+  --bright-green: #86efac;
+  --bright-yellow: #fef08a;
+  --bright-blue: #93c5fd;
+  --bright-magenta: #f0abfc;
+  --bright-cyan: #67e8f9;
+  --bright-white: #fff;
+  --ansi-default-fg: #000;
+  color: var(--ansi-fg, var(--ansi-default-fg));
+}
+
+/* The backgrounds white text reads on. */
+.reveal .cell-outputs pre span:is([style*="background:var(--black,"],
+  [style*="background:var(--red,"], [style*="background:var(--green,"],
+  [style*="background:var(--blue,"], [style*="background:var(--magenta,"],
+  [style*="background:var(--cyan,"], [style*="background:var(--bright-black,"]) {
+  --ansi-default-fg: #fff;
+}
+
+/* Reverse video's default text (its colour is in the span's style attribute, hence
+   !important). */
+.reveal .cell-outputs pre span[style^="color:var(--black,"][style*="background:var(--"] {
+  --ansi-fg: initial;
+  color: var(--ansi-default-fg) !important;
+}
+
+/* Each ANSI text colour in the palette above (keep the values equal), and an 8-bit or RGB
+   colour as written. */
+.reveal .cell-outputs pre span[style*="color:var(--black,"] { --ansi-fg: #000; }
+.reveal .cell-outputs pre span[style*="color:var(--red,"] { --ansi-fg: #b91c1c; }
+.reveal .cell-outputs pre span[style*="color:var(--green,"] { --ansi-fg: #15803d; }
+.reveal .cell-outputs pre span[style*="color:var(--yellow,"] { --ansi-fg: #fde047; }
+.reveal .cell-outputs pre span[style*="color:var(--blue,"] { --ansi-fg: #1d4ed8; }
+.reveal .cell-outputs pre span[style*="color:var(--magenta,"] { --ansi-fg: #a21caf; }
+.reveal .cell-outputs pre span[style*="color:var(--cyan,"] { --ansi-fg: #0e7490; }
+.reveal .cell-outputs pre span[style*="color:var(--white,"] { --ansi-fg: #f3f4f6; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-black,"] { --ansi-fg: #4b5563; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-red,"] { --ansi-fg: #fca5a5; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-green,"] { --ansi-fg: #86efac; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-yellow,"] { --ansi-fg: #fef08a; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-blue,"] { --ansi-fg: #93c5fd; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-magenta,"] { --ansi-fg: #f0abfc; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-cyan,"] { --ansi-fg: #67e8f9; }
+.reveal .cell-outputs pre span[style*="color:var(--bright-white,"] { --ansi-fg: #fff; }
+.reveal .cell-outputs pre span[style*="color:#"] { --ansi-fg: currentColor; }
 
 .reveal .cell-outputs .output-unsupported {
   color: var(--p-muted);

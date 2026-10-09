@@ -13,7 +13,8 @@
 //! - (T33) `styles/notebook.css`: its tokens are in the README's "Notebook cells" section,
 //!   and the rules behind the notebook browser checks (outputs that scroll past a cap in
 //!   slide pixels, hidden parts, DataFrame headers that stick flush with the frame and give
-//!   way on slides with their own background, tinted stderr and errors, all 16 ANSI colours).
+//!   way on slides with their own background, tinted stderr and errors, all 16 ANSI colours,
+//!   readable text on ANSI backgrounds and in reverse video).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -715,7 +716,8 @@ fn the_output_cap_is_in_slide_pixels() {
 
 /// ansi-to-html writes `var(--<name>,<fallback>)` for all 16 four-bit colours, text and
 /// background; `.cell-outputs` sets every one, so none falls back to the converter's colours
-/// for a black terminal (`#ff5` bright yellow is invisible on a white slide).
+/// for a black terminal (`#ff5` bright yellow is invisible on a white slide). These values
+/// are for text on the slide; text on an ANSI background is the next test's.
 #[test]
 fn every_ansi_colour_is_themed() {
     let mut sgr = String::new();
@@ -756,6 +758,154 @@ fn every_ansi_colour_is_themed() {
             "{name} in the README"
         );
     }
+}
+
+/// `#rgb` or `#rrggbb` as 8-bit channels.
+fn hex_rgb(hex: &str) -> [u8; 3] {
+    let digits = hex
+        .strip_prefix('#')
+        .unwrap_or_else(|| panic!("{hex} is not a hex colour"));
+    let wide: String = match digits.len() {
+        3 => digits.chars().flat_map(|c| [c, c]).collect(),
+        6 => digits.to_string(),
+        _ => panic!("{hex} is not a hex colour"),
+    };
+    let channel = |i: usize| u8::from_str_radix(&wide[i..i + 2], 16).unwrap();
+    [channel(0), channel(2), channel(4)]
+}
+
+/// The WCAG 2 contrast ratio of two colours (1 to 21).
+fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let luminance = |rgb: [u8; 3]| {
+        let linear = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+    };
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// The test above mixes the 16 colours with the text colour, which is right for text on the
+/// slide but not on an ANSI background or in reverse video (SGR 7 became dark grey on darker
+/// grey). Inside a background span, notebook.css switches to a fixed terminal palette for the
+/// background and the text: an ANSI text colour comes from its own span or an enclosing one
+/// (`--ansi-fg`, set by every colour span), other text and reverse video's default text are
+/// black or white by background (`--ansi-default-fg`). The selectors match the converter's
+/// spans, and the palette keeps that text readable (WCAG AA, 4.5:1).
+#[test]
+fn ansi_backgrounds_and_reverse_video_keep_their_text_readable() {
+    let html = |sgr: &str| presenter::notebook::outputs::ansi_to_html(&format!("\u{1b}[{sgr}mx"));
+    // Reverse video: one span, the default background as black text.
+    assert_eq!(
+        html("7"),
+        "<span style='color:var(--black,#000);background:var(--bright-white,#fff)'>x</span>"
+    );
+    assert_eq!(
+        html("31;7"),
+        "<span style='color:var(--red,#a00)'><span style='color:var(--black,#000);\
+         background:var(--red,#a00)'>x</span></span>"
+    );
+    // A text colour encloses the background's span, also an 8-bit one (IPython 9 marks the
+    // failing expression of a traceback this way).
+    assert_eq!(
+        html("97;41"),
+        "<span style='color:var(--bright-white,#fff)'><span style='background:var(--red,#a00)'>\
+         x</span></span>"
+    );
+    assert_eq!(
+        html("38;5;241;43"),
+        "<span style='color:#626262'><span style='background:var(--yellow,#a60)'>x</span></span>"
+    );
+    let background = Regex::new(r"background:var\(--([a-z-]+),").unwrap();
+    let names: Vec<String> = (40..=47)
+        .chain(100..=107)
+        .map(|code| {
+            let html = html(&code.to_string());
+            let caps = background
+                .captures(&html)
+                .unwrap_or_else(|| panic!("SGR {code}: {html}"));
+            format!("--{}", &caps[1])
+        })
+        .collect();
+    assert_eq!(names.len(), 16);
+
+    let rules = rules(&notebook_css());
+    let palette = rule(
+        &rules,
+        r#".reveal .cell-outputs pre span[style*="background:var(--"]"#,
+    );
+    let colour = |name: &str| {
+        hex_rgb(
+            palette
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is not in the terminal palette")),
+        )
+    };
+    assert_eq!(palette.get("--ansi-default-fg"), Some("#000"));
+    assert_eq!(
+        palette.get("color"),
+        Some("var(--ansi-fg, var(--ansi-default-fg))")
+    );
+    let white_text = rules
+        .iter()
+        .find(|r| r.get("--ansi-default-fg") == Some("#fff"))
+        .expect("a rule for the backgrounds white text reads on");
+    let on_white: BTreeSet<String> = background
+        .captures_iter(&white_text.selector)
+        .map(|caps| format!("--{}", &caps[1]))
+        .collect();
+    let expected = [
+        "--black",
+        "--red",
+        "--green",
+        "--blue",
+        "--magenta",
+        "--cyan",
+        "--bright-black",
+    ];
+    assert_eq!(on_white, BTreeSet::from(expected.map(String::from)));
+    let reverse = rule(
+        &rules,
+        r#".reveal .cell-outputs pre span[style^="color:var(--black,"][style*="background:var(--"]"#,
+    );
+    assert_eq!(reverse.get("--ansi-fg"), Some("initial"));
+    assert_eq!(
+        reverse.get("color"),
+        Some("var(--ansi-default-fg) !important")
+    );
+    for name in &names {
+        let selector = format!(r#".reveal .cell-outputs pre span[style*="color:var({name},"]"#);
+        assert_eq!(rule(&rules, &selector).get("--ansi-fg"), palette.get(name));
+    }
+    let raw = rule(
+        &rules,
+        r#".reveal .cell-outputs pre span[style*="color:#"]"#,
+    );
+    assert_eq!(raw.get("--ansi-fg"), Some("currentColor"));
+
+    let (black, white) = ([0, 0, 0], [255, 255, 255]);
+    for name in &names {
+        let bg = colour(name);
+        let (default, pairs): ([u8; 3], &[&str]) = if on_white.contains(name) {
+            (white, &["--white", "--bright-white"])
+        } else {
+            (black, &["--black"])
+        };
+        let ratio = contrast(default, bg);
+        assert!(ratio >= 4.5, "default text on {name}: {ratio:.2}");
+        for &fg in pairs {
+            let ratio = contrast(colour(fg), bg);
+            assert!(ratio >= 4.5, "{fg} on {name}: {ratio:.2}");
+        }
+    }
+    let ratio = contrast(hex_rgb("#626262"), colour("--yellow"));
+    assert!(ratio >= 4.5, "IPython's highlight: {ratio:.2}");
 }
 
 /// The DataFrame header: the whole `thead` sticks (pandas writes two header rows for a named

@@ -45,14 +45,15 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// A running `presenter serve`; killed (and reaped) when dropped.
+/// A running `presenter serve`; killed (and reaped) when dropped, also when a test fails.
 struct Server {
     child: Child,
-    /// `http://127.0.0.1:<port>/`, from the first stdout line.
+    /// `http://127.0.0.1:<port>/`, from the first stdout line (empty until [`Server::start`]
+    /// reads it).
     url: String,
     /// Everything the child wrote on stderr so far.
     stderr: Arc<Mutex<String>>,
-    /// The stdout lines after the first one.
+    /// The stdout lines not read yet ([`Server::start`] reads the first one).
     stdout_rest: mpsc::Receiver<String>,
 }
 
@@ -60,12 +61,27 @@ impl Server {
     /// Starts `presenter serve <args>` in `dir` and waits for its first stdout line, which
     /// must be `Serving http://127.0.0.1:<port>/`.
     fn start(dir: &Path, args: &[&str]) -> Server {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_presenter"))
-            .arg("serve")
-            .args(args)
+        let mut command = Command::new(env!("CARGO_BIN_EXE_presenter"));
+        command.arg("serve").args(args).env_remove("NO_COLOR");
+        let mut server = Server::spawn(dir, command);
+        let first = server
+            .stdout_rest
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("no URL on stdout; stderr:\n{}", server.stderr()));
+        let pattern = Regex::new(r"^Serving (http://127\.0\.0\.1:[1-9][0-9]*/)$").unwrap();
+        let captures = pattern
+            .captures(&first)
+            .unwrap_or_else(|| panic!("first stdout line: {first:?}"));
+        server.url = captures[1].to_string();
+        server
+    }
+
+    /// Spawns `command` (the `presenter` binary with its arguments) in `dir`, without
+    /// `RUST_LOG`, collecting stderr and the stdout lines; does not wait for anything.
+    fn spawn(dir: &Path, mut command: Command) -> Server {
+        let mut child = command
             .current_dir(dir)
             .env_remove("RUST_LOG")
-            .env_remove("NO_COLOR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -95,22 +111,12 @@ impl Server {
                 }
             }
         });
-        let mut server = Server {
+        Server {
             child,
             url: String::new(),
             stderr,
             stdout_rest: rx,
-        };
-        let first = server
-            .stdout_rest
-            .recv_timeout(Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("no URL on stdout; stderr:\n{}", server.stderr()));
-        let pattern = Regex::new(r"^Serving (http://127\.0\.0\.1:[1-9][0-9]*/)$").unwrap();
-        let captures = pattern
-            .captures(&first)
-            .unwrap_or_else(|| panic!("first stdout line: {first:?}"));
-        server.url = captures[1].to_string();
-        server
+        }
     }
 
     fn stderr(&self) -> String {
@@ -539,7 +545,8 @@ fn ctrl_c_exits_0() {
 
 /// cli.md: Ctrl-C exits 0 also during the first build (before the URL is printed): the
 /// handler is installed before it starts. The deck is large enough that a debug build of it
-/// takes a while; the signal is sent once the log says the first build has started.
+/// takes a while; the signal is sent once the log says the first build has started, and
+/// nothing on stdout shows that it arrived before the URL line.
 #[cfg(unix)]
 #[test]
 fn ctrl_c_during_the_first_build_exits_0() {
@@ -547,41 +554,28 @@ fn ctrl_c_during_the_first_build_exits_0() {
         .map(|i| format!("## Slide {i}\n\nText with *emphasis* and `code`.\n\n---\n\n"))
         .collect();
     let dir = project(&[("big.md", &slides)]);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_presenter"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_presenter"));
+    command
         .args(["-v", "serve", "big.md", "--port", "0"])
-        .current_dir(dir.path())
-        .env_remove("RUST_LOG")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stderr = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&stderr);
-    let mut err = child.stderr.take().unwrap();
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = err.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            sink.lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
-    });
+        .env("NO_COLOR", "1");
+    let mut server = Server::spawn(dir.path(), command);
     let start = Instant::now();
-    while !stderr.lock().unwrap().contains("first build of big.md") {
+    while !server.stderr().contains("first build of big.md") {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the first build never started:\n{}",
-            stderr.lock().unwrap()
+            server.stderr()
         );
         thread::sleep(Duration::from_millis(5));
     }
-    let code = interrupt(&mut child, &stderr);
-    assert_eq!(code, Some(0), "{}", stderr.lock().unwrap());
+    assert_eq!(server.interrupt(), Some(0), "{}", server.stderr());
+    // The child has exited, so its stdout has ended: the URL line never came.
+    let stdout: Vec<String> = server.stdout_rest.iter().collect();
+    assert!(
+        stdout.is_empty(),
+        "the signal came after the first build: {stdout:?}\n{}",
+        server.stderr()
+    );
 }
 
 /// A `presenter.toml` that cannot be loaded at start: the server still starts, on the
