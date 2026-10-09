@@ -58,13 +58,26 @@
   color: inherit;
 }
 
-// reveal's template centres code blocks and quotes at 90% and 70% of the width; keep the
-// default theme's left-aligned ones.
+// reveal's template rules come after the default theme's (parent entries first), so where
+// both style the same thing reveal's win. It centres code blocks and quotes at 90% and 70% of
+// the width, and gives code blocks a shadow, 5px of padding and their own size, line height
+// and height cap; keep the default theme's left-aligned blocks and its code.
 .reveal pre,
 .reveal blockquote {
   width: auto;
   margin-left: 0;
   margin-right: 0;
+}
+
+.reveal pre {
+  box-shadow: none;
+  font-size: var(--p-code-font-size);
+  line-height: 1.4;
+}
+
+.reveal pre code {
+  max-height: var(--p-code-max-height);
+  padding: 0.75em 1em;
 }
 
 .reveal strong {

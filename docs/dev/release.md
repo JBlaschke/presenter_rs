@@ -14,10 +14,13 @@ holds one archive per platform and a `SHA256SUMS` file.
 
 Each archive holds one directory with the archive's name. That directory contains the
 `presenter` binary, `LICENSE`, `README.md` and `THIRD-PARTY-LICENSES/` (see
-[Third-party licenses](#third-party-licenses)). The binary is self-contained: the themes,
-reveal.js and KaTeX are embedded. It needs only the system's own libraries. On macOS those
-are `libSystem` and `libiconv` (checked with `otool -L`). On Linux they are glibc and
-`libgcc_s`, as for any Rust binary.
+[Third-party licenses](#third-party-licenses)). Every entry is owned by `root`, and macOS
+archives carry no extended attributes; the workflow fails otherwise (see
+[What the workflow checks](#what-the-workflow-checks)).
+The binary is self-contained: the themes, reveal.js and KaTeX are embedded. It needs only
+the system's own libraries. On macOS those are `libSystem`, `libiconv` and the
+CoreFoundation and CoreServices frameworks, which the file watcher uses for FSEvents
+(checked with `otool -L`). On Linux they are glibc and `libgcc_s`, as for any Rust binary.
 
 ## Checklist
 
@@ -27,9 +30,11 @@ are `libSystem` and `libiconv` (checked with `otool -L`). On Linux they are glib
    pinned by two tests: the `VERSION_LINE` regex in `tests/cli_version.rs`, and the
    `version_string` test in `src/cli/mod.rs`. `tests/cli_build.rs` reads the version from
    Cargo and needs no change.
-3. In `CHANGELOG.md`, rename `## [Unreleased]` to `## [<version>] - <YYYY-MM-DD>`, and add
-   a new empty `## [Unreleased]` section above it. The workflow publishes the version's
-   section as the release notes: everything from its heading to the next `## ` heading.
+3. In `CHANGELOG.md`, check that `## [Unreleased]` covers every user-visible change since
+   the last tag (`git log <last tag>..main`; new commands, options and behaviour, fixes
+   users would notice). Then rename it to `## [<version>] - <YYYY-MM-DD>`, and add a new
+   empty `## [Unreleased]` section above it. The workflow publishes the version's section
+   as the release notes: everything from its heading to the next `## ` heading.
 4. Run `cargo test`, commit (`Release v<version>`) and merge to `main`.
 5. Tag the merged commit with an **annotated** tag and push it:
 
@@ -63,7 +68,7 @@ are `libSystem` and `libiconv` (checked with `otool -L`). On Linux they are glib
 | job | checks |
 |---|---|
 | `label` | On a tag push, the tag is exactly `v` + the `Cargo.toml` version, and it is annotated. |
-| `build` (×4) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. |
+| `build` (×4) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. The "package" step reads the archive back (Python's `tarfile`) and fails unless every entry belongs to `root:root` (uid and gid 0, so not to the builder's user), no entry is an AppleDouble `._*` file, and no entry has a pax header keyword that POSIX does not define. macOS `tar` would store extended attributes such as `com.apple.provenance` as `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*` headers, and GNU `tar` warns about each of them when it extracts the archive. |
 | `release` | All four archives exist. `gh release create --verify-tag` publishes them with `SHA256SUMS`. |
 
 The release job runs only after all four builds succeed, so a release is never partial.
@@ -78,14 +83,23 @@ The binary contains other people's work, and their licenses (MIT, Apache-2.0, OF
 and others) ask that their notices travel with it. The workflow's "third-party licenses"
 step fills `THIRD-PARTY-LICENSES/` in each archive:
 
-- `assets/`: the license files of the web assets embedded from `assets/vendor`
-  (reveal.js, KaTeX, and the Source Sans Pro and League Gothic fonts), at their paths
-  there, and `VERSIONS.toml` with their versions and sources.
+- `assets/`: the license files of the web assets embedded from `assets/vendor`, at their
+  paths there, and `VERSIONS.toml` with their versions and sources. These are reveal.js and
+  KaTeX (MIT); the libraries reveal.js bundles into its files: highlight.js (BSD-3-Clause)
+  and highlightjs-line-numbers.js (MIT) in the highlight plugin, marked (MIT) in the notes
+  plugin and fitty (MIT) in `reveal.js` itself; and the Source Sans Pro and League Gothic
+  fonts of reveal's themes (SIL OFL 1.1). `scripts/vendor.sh` fetches the bundled
+  libraries' licenses from their own npm packages, because reveal's package does not
+  contain them, and completes League Gothic's notice (`docs/spec/vendored-assets.md` §1).
 - `crates.txt`: every crate linked into the binary for that target, with its version,
   license expression and crates.io page (where the source of, for example, the MPL-2.0
   `selectors` crate is available).
-- `crates/<name>-<version>/`: those crates' own license files. Two crates ship none
-  (`ansi-to-html`, `selectors`); `crates.txt` names their licenses.
+- `crates/<name>-<version>/`: those crates' own license files. Four crates ship none:
+  `ansi-to-html` (MIT OR Apache-2.0), `grass` and `grass_compiler` (MIT), and `selectors`
+  (MPL-2.0). MIT asks for its copyright and permission notice in every copy, so for a
+  crate whose licenses include MIT the step writes `LICENSE-MIT`: the MIT text with the
+  authors from the crate's `Cargo.toml`, under a line saying the workflow wrote it. For
+  `selectors`, `crates.txt` names the license and where the source is.
 
 "Linked" means the normal dependencies for the target (`cargo tree -e normal,no-proc-macro`):
 build scripts, proc-macros and dev-dependencies run only at build time and are not
@@ -181,15 +195,17 @@ test cannot use the runtime environment to tell an override apart.
 `Cargo.toml` sets `[profile.release]`: `opt-level = 3`, `lto = "thin"`,
 `codegen-units = 1`, `strip = true`. `cargo test --release` uses the same settings.
 
-The table below was measured on 2026-10-08 on an Apple Silicon Mac (macOS 26.7, rustc 1.99.0,
-aarch64-apple-darwin). Each time is the median of 30 runs for `--version` and 15 runs for
-the builds.
+The table below was measured on 2026-10-08 on the T47 branch (commits 256aa8e and 26c4ff8,
+based on 33a4607), on an Apple Silicon Mac (macOS 26.7, rustc 1.99.0, aarch64-apple-darwin).
+Each time is the median of 30 runs for `--version` and 15 runs for the builds. On that
+branch the example deck had 15 slides; T17, merged next to it, grew it to 17, and the binary
+has grown with the commands merged after it (see below the table).
 
 | | Cargo's default release profile | T47 profile |
 |---|---|---|
 | binary size | 14,243,728 B (13.6 MiB) | 10,963,392 B (10.5 MiB) |
 | `presenter --version` | 3.5 ms | 3.3 ms |
-| `presenter build examples/basic/slides.md` (15 slides, 2.4 MB output) | 31.9 ms | 31.6 ms |
+| `presenter build examples/basic/slides.md` (then 15 slides, 2.4 MB output) | 31.9 ms | 31.6 ms |
 | the same with `--site` | 34.0 ms | 35.5 ms |
 | clean `cargo build --release` (all dependencies) | — | 33 s wall, 118 s CPU |
 | `cargo test --release` (after the release build above) | — | 71 s wall |
@@ -197,6 +213,11 @@ the builds.
 About 4.8 MB of the binary is embedded assets from `assets/`: reveal.js, KaTeX and the
 themes. The task plan expected 15–25 MB; the binary is smaller. The profile makes no
 measurable difference to run time; it is there for size.
+
+Since then the binary has gained `serve`, `check`, `init`, the `theme` commands, SCSS and
+`export pdf`. On 2026-10-09, on top of commit b69ace7, the release binary was 15,018,112 B
+(14.3 MiB) on the same Mac, and `presenter build examples/basic/slides.md` wrote 17 slides,
+2.5 MB (2.4 MB with `--site`). The times were not measured again.
 
 ## Offline builds
 
@@ -215,11 +236,11 @@ the same 10,963,392-byte binary.
 
 ## Design choices
 
-- **A hand-written workflow, not `cargo-dist`.** The workflow is under 200 lines, and it
-  uses only GitHub's own actions, `dtolnay/rust-toolchain` and the `gh` CLI that is already
-  on the runners. `cargo-dist` generates a longer workflow, adds its own config and
-  installer scripts, and must be re-generated with a pinned `dist` binary whenever it is
-  upgraded. It would not reduce the YAML for four plain tarballs. Reconsider it if
+- **A hand-written workflow, not `cargo-dist`.** The workflow is about 300 lines, most of
+  them comments and the license step, and it uses only GitHub's own actions,
+  `dtolnay/rust-toolchain` and the `gh` CLI that is already on the runners. `cargo-dist`
+  generates a longer workflow, adds its own config and installer scripts, and must be
+  re-generated with a pinned `dist` binary whenever it is upgraded. It would not reduce the YAML for four plain tarballs. Reconsider it if
   installers (shell, Homebrew, MSI) or Windows builds are wanted.
 - **Native runners, not `cross`.** Every target has a GitHub-hosted runner, so each binary
   is tested on its own platform before it is packaged. `cross` would build Linux arm64 under
@@ -235,7 +256,8 @@ the same 10,963,392-byte binary.
 
 This repository had no GitHub remote when the workflow was written, so the workflow has not
 yet run on GitHub. The "four artifacts from a tag" check is still open; do it on a fork with
-the first release. Checks done so far, on 2026-10-08:
+the first release. Checks done by T47 on 2026-10-08, on its branch (15 example slides,
+before the commands merged later):
 
 - `actionlint` 1.7.12 with `shellcheck`: no findings. It also checks runner labels and
   action versions, and rejects `macos-13`.
@@ -268,3 +290,22 @@ the first release. Checks done so far, on 2026-10-08:
   its revert; on the annotated tag (`v0.1.0`, then `v0.1.0-dirty` after an edit); after
   `git gc` and a commit; and in a reftable clone after a commit. A `tests/` edit left the
   crate fresh.
+
+Checks done on 2026-10-09 after the license and packaging changes of the audit fixes (A5),
+on top of commit b69ace7:
+
+- `actionlint` 1.7.12 with `shellcheck`: no findings.
+- The "third-party licenses" step, run locally for `aarch64-apple-darwin` and
+  `x86_64-unknown-linux-gnu`, accounted for all 153 and 158 linked crates, copied the nine
+  license files of `assets/vendor` (reveal.js, KaTeX, highlight.js,
+  highlightjs-line-numbers.js, marked, fitty, Source Sans Pro, League Gothic and its
+  `LICENSE-OFL.txt`), and wrote `LICENSE-MIT` for `ansi-to-html`, `grass` and
+  `grass_compiler`; `selectors` got its note.
+- The "package" step, run with macOS `tar` (bsdtar 3.5.3) on files that carry
+  `com.apple.provenance`: GNU tar 1.35 extracts the archive without a warning, where the
+  previous command gave 442 "Ignoring unknown extended header keyword" warnings, and
+  lists every entry as `root/root`. Run with GNU tar in place of `tar`, the entries are
+  `root/root` too. The step's archive check passed both archives, and failed (exit 1) on
+  an archive made without the ownership and `--no-xattrs` flags, with two errors for each of
+  its 103 entries: owned by the builder, and `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*`
+  headers.

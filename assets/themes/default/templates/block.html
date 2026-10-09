@@ -1,4 +1,4 @@
-{#- One Block (docs/spec/theme-format.md §7). Receives `block`. HTML blocks are already
-    rendered (ir.md invariant 5) and are the only content inserted unescaped. A cell is
-    handed to cell.html as `cell`. -#}
+{#- One block of a slide. Receives `block`. HTML blocks are already rendered by
+    presenter's Markdown and notebook readers and are the only content inserted unescaped.
+    A cell is handed to cell.html as `cell`. -#}
 {%- if block.type == "html" %}{{ block.html|safe }}{% else %}{% with cell = block %}{% include "cell.html" %}{% endwith %}{% endif %}

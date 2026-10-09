@@ -5,7 +5,7 @@ All vendored files are committed to the repo under `assets/vendor/` and embedded
 binary with `rust-embed` (`#[folder = "assets/"]`). Paths used by templates are relative to
 `assets/`, e.g. `vendor/reveal/dist/reveal.js`.
 
-## 1. Versions (pinned; verified 2026-10-08)
+## 1. Versions (pinned; verified 2026-10-09)
 
 | package | version | license | source |
 |---|---|---|---|
@@ -14,6 +14,32 @@ binary with `rust-embed` (`#[folder = "assets/"]`). Paths used by templates are 
 
 `assets/vendor/VERSIONS.toml` records name, version, tarball URL, SHA-256 of the tarball and
 the date; `scripts/vendor.sh` regenerates everything from scratch and must be idempotent.
+
+Other people's work inside those packages, each shipped with its license file (§2), which
+the release archives copy into `THIRD-PARTY-LICENSES/assets/` (`docs/dev/release.md`):
+
+| work | version | license | where it is | license file in `assets/vendor/` |
+|---|---|---|---|---|
+| highlight.js | 11.11.1 | BSD-3-Clause | bundled in `reveal/dist/plugin/highlight.js`; `dist/plugin/highlight/{monokai,zenburn}.css` are its styles | `highlight.js/LICENSE` |
+| highlightjs-line-numbers.js | 2.8.0 | MIT | bundled in `reveal/dist/plugin/highlight.js` (reveal copies it into the plugin's source) | `highlightjs-line-numbers.js/LICENSE` |
+| marked | 17.0.5 | MIT | bundled in `reveal/dist/plugin/notes.js` | `marked/LICENSE.md` |
+| fitty | 2.4.2 | MIT | bundled in `reveal/dist/reveal.js` (sizes `r-fit-text`) | `fitty/LICENSE` |
+| Source Sans Pro | — | OFL-1.1 | `reveal/css/theme/fonts/source-sans-pro/`, inlined in the `white`, `black`, `white-contrast` and `black-contrast` themes | `reveal/css/theme/fonts/source-sans-pro/LICENSE` |
+| League Gothic | — | OFL-1.1 | `reveal/css/theme/fonts/league-gothic/`, inlined in the `beige`, `league`, `moon` and `solarized` themes | `reveal/css/theme/fonts/league-gothic/LICENSE` and `LICENSE-OFL.txt` |
+
+reveal's package contains none of the four libraries' licenses, so `vendor.sh` copies them
+from the libraries' own npm packages (pinned and checksummed like the two above, recorded in
+`VERSIONS.toml` with `bundled_in`; nothing else of them is vendored). The versions are the
+ones reveal 6.0.2 was built with. For highlight.js, marked and fitty, reveal's npm
+dependencies, that is reveal's `package-lock.json` at the `6.0.2` tag
+(`packages["node_modules/<name>"].version`; highlight.js's bundle also carries its version
+string). highlightjs-line-numbers.js is not a dependency: reveal copies it into
+`plugin/highlight/plugin.js`, whose header comment at that tag names version 2.8.0.
+
+reveal ships League Gothic with a `LICENSE` that only names the OFL; the OFL asks every copy
+of the font to carry its copyright notice and the license text, so `vendor.sh` writes
+`LICENSE-OFL.txt` next to it: the copyright notice recorded in `league-gothic.woff` and the
+OFL 1.1 text from Source Sans Pro's `LICENSE`.
 
 ## 2. Files copied (and nothing else)
 
@@ -39,6 +65,26 @@ css/theme/fonts/**                                    (league-gothic, source-san
 > **Note (T15, 2026-10-08):** only 6 of the 14 `dist/theme/*.css` files inline their fonts
 > (white, black, white-contrast, black-contrast, dracula, serif). The other 8 `@import` Google
 > Fonts; standalone builds keep those imports (fonts load when online) and warn `remote-import`.
+
+> **Contract change (A5, 2026-10-09, audit finding F19):** besides the files above,
+> `scripts/vendor.sh` writes these license files (and nothing else of their packages):
+> ```
+> highlight.js/LICENSE                  package/LICENSE of highlight.js 11.11.1 (BSD-3-Clause)
+> highlightjs-line-numbers.js/LICENSE   package/LICENSE of highlightjs-line-numbers.js 2.8.0 (MIT)
+> marked/LICENSE.md                     package/LICENSE.md of marked 17.0.5 (MIT)
+> fitty/LICENSE                         package/LICENSE of fitty 2.4.2 (MIT)
+> reveal/css/theme/fonts/league-gothic/LICENSE-OFL.txt   generated, see §1
+> ```
+> `VERSIONS.toml` lists the four libraries as packages too, with `bundled_in` naming the
+> reveal file that contains them. The versions are those of reveal's `package-lock.json` at
+> its release tag (and, for highlightjs-line-numbers.js, the header of reveal's
+> `plugin/highlight/plugin.js`); upgrading reveal means reading them again (§5).
+
+> **Correction (A5, 2026-10-09):** the note above is wrong about which themes inline fonts.
+> Eight do: `white`, `black`, `white-contrast` and `black-contrast` inline Source Sans Pro,
+> `beige`, `league`, `moon` and `solarized` League Gothic (and also `@import` a Google Font
+> for their body text). `dracula` and `serif` use system fonts only. `beige`, `blood`,
+> `league`, `moon`, `night`, `simple`, `sky` and `solarized` `@import` Google Fonts.
 
 Not copied: `dist/plugin/markdown.js` (we render Markdown ourselves), `dist/plugin/math.js`
 (loads from CDN; we ship our own KaTeX init), `*.mjs`, `*.d.ts`, `index.html`, `demo.html`,
@@ -86,8 +132,16 @@ running `cargo run -- serve` live-reloads) and embeds in release builds. Add
 
 ## 5. Upgrade procedure
 1. Edit versions at the top of `scripts/vendor.sh`; run it; review the diff (expect only
-   version-related changes).
+   version-related changes). Pin the versions of the libraries the new reveal bundles: read
+   highlight.js, marked and fitty from reveal's `package-lock.json` at the new release tag
+   (`https://raw.githubusercontent.com/hakimel/reveal.js/<version>/package-lock.json`,
+   `packages["node_modules/<name>"].version`) and highlightjs-line-numbers.js from the header
+   comment of `plugin/highlight/plugin.js` at that tag. Check the new reveal's `js/` and
+   `plugin/*/plugin.js` imports for a library not listed in §1. (`tests/vendor_smoke.rs`
+   checks highlight.js's version string and a piece of each other library's code in the
+   bundles.)
 2. Run `cargo test` and the browser smoke test (`cargo test --features browser-tests`).
 3. Read the upstream release notes for breaking changes (reveal 6.0 moved plugin paths —
    templates reference `dist/plugin/<name>.js`).
-4. Update `VERSIONS.toml`, `docs/spec/vendored-assets.md` §1 and the user docs.
+4. Update `docs/spec/vendored-assets.md` §1 and the user docs (`vendor.sh` writes
+   `VERSIONS.toml`).

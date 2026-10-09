@@ -15,6 +15,9 @@
 //!   slide pixels, hidden parts, DataFrame headers that stick flush with the frame and give
 //!   way on slides with their own background, tinted stderr and errors, all 16 ANSI colours,
 //!   readable text on ANSI backgrounds and in reverse video).
+//! - (audit fixes) print rules that show scrolling code and cell outputs in full and leave
+//!   room for the lines Chrome moves past page breaks (F15), task-list checkboxes (F45), and
+//!   shipped theme files that name no task ids or repository-only documents (F47).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1085,6 +1088,434 @@ fn theme_css_contains_no_text_that_document_tests_look_for() {
         for needle in ["In [", "Out [", "katex", "<section"] {
             assert!(!source.contains(needle), "{entry} contains {needle:?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Print and PDF: boxes that scroll on screen print in full (audit F15)
+// ---------------------------------------------------------------------------------------
+
+/// The rule with exactly `selector` inside `context` (`""` for top level, `"@media print"`).
+fn rule_in<'a>(rules: &'a [Rule], context: &str, selector: &str) -> &'a Rule {
+    rules
+        .iter()
+        .find(|r| r.context == context && r.selector == selector)
+        .unwrap_or_else(|| panic!("no rule `{selector}` in `{context}`"))
+}
+
+/// A unitless `line-height` or a length in px/em, as a number.
+fn number(value: &str, unit: &str) -> f64 {
+    value
+        .strip_suffix(unit)
+        .unwrap_or_else(|| panic!("{value} is not in {unit}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{value} is not a number"))
+}
+
+/// reveal's print view (`html.reveal-print`, which `presenter export pdf` loads) counts each
+/// slide's pages from its height on screen, then Chrome prints. So the scroll caps of code
+/// blocks (`--p-code-max-height`) and cell outputs (`--p-output-max-height`) must be lifted
+/// in the print view itself, not only under `@media print`: there reveal would still measure
+/// one page and clip the rest (the audit's variant B). Nothing scrolls sideways either: long
+/// lines are clipped at the box (documented in the README's "Print and PDF").
+#[test]
+fn scroll_boxes_print_in_full() {
+    let rules = rules(&css());
+    for selector in [
+        "html.reveal-print .reveal pre code",
+        "html.reveal-print .reveal .cell-outputs",
+    ] {
+        let lifted = rule_in(&rules, "", selector);
+        assert_eq!(lifted.get("max-height"), Some("none"), "{selector}");
+        // A page break may fall between any two lines: it moves at most one.
+        assert_eq!(lifted.get("orphans"), Some("1"), "{selector}");
+        assert_eq!(lifted.get("widows"), Some("1"), "{selector}");
+    }
+    assert!(
+        rules
+            .iter()
+            .all(|r| r.context != "@media print" || r.get("max-height").is_none()),
+        "the caps are lifted where reveal measures, not only in print"
+    );
+    let outputs = rule_in(&rules, "", "html.reveal-print .reveal .cell-outputs");
+    assert_eq!(outputs.get("overflow"), Some("hidden"));
+    // A DataFrame header prints once: not sticky, not a repeated table header group.
+    let thead = rule_in(
+        &rules,
+        "",
+        "html.reveal-print .reveal .output-display table thead",
+    );
+    assert_eq!(thead.get("display"), Some("table-row-group"));
+    assert_eq!(thead.get("position"), Some("static"));
+}
+
+/// Chrome moves a line (or table row) that straddles a page break to the next page, so a
+/// box that spans pages prints taller than reveal measured, and its last lines fell off the
+/// slide's last page (the example notebook lost rows 198 and 199 of 200). In print the
+/// lifted boxes set their lines closer than on screen; the space that saves on a full page
+/// must exceed the one line a page break moves, for the default sizes (36px text, code at
+/// 0.6em, outputs and tables at 0.5em) on reveal's default 720px slide with its 4 % margin,
+/// and not so much that a long slide often ends a page early (a blank last page).
+#[test]
+fn print_leaves_room_for_the_line_each_page_break_moves() {
+    let rules = rules(&css());
+    let root = rule(&rules, ":root");
+    let text = number(root.get("--r-main-font-size").unwrap(), "px");
+    let page = (720.0_f64 * 1.04).floor();
+    let tokens = declared(&css(), "--p-");
+    let em = |token: &str| number(&tokens[token], "em") * text;
+    let code_font = em("--p-code-font-size");
+    let cell_font = em("--p-cell-font-size");
+    // Code sets its print line height relative to its `pre`'s (`lh` in `line-height` is the
+    // parent's line height), so a child theme's own code line height is tightened too.
+    let screen_code = number(rule(&rules, ".reveal pre").get("line-height").unwrap(), "");
+    let print_code = screen_code
+        * number(
+            rule_in(&rules, "@media print", "html.reveal-print .reveal pre code")
+                .get("line-height")
+                .unwrap(),
+            "lh",
+        );
+    let screen_output = number(
+        rule(
+            &rules,
+            ".reveal .cell-outputs :where(pre.output, pre.output-text, pre.output-json)",
+        )
+        .get("line-height")
+        .unwrap(),
+        "",
+    );
+    let print_output = number(
+        rule_in(
+            &rules,
+            "@media print",
+            "html.reveal-print .reveal .cell-outputs pre",
+        )
+        .get("line-height")
+        .unwrap(),
+        "",
+    );
+    // A table row: its line, the vertical padding and the 1px rule under it.
+    let cell = rule(&rules, ".reveal .output-display table :is(th, td)");
+    let screen_padding = number(
+        cell.get("padding").unwrap().split(' ').next().unwrap(),
+        "em",
+    );
+    let table_line = number(cell.get("line-height").unwrap(), "");
+    let print_cell = rule_in(
+        &rules,
+        "@media print",
+        "html.reveal-print .reveal .output-display table :is(th, td)",
+    );
+    let print_padding = number(print_cell.get("padding-top").unwrap(), "em");
+    assert_eq!(
+        print_cell.get("padding-bottom"),
+        print_cell.get("padding-top")
+    );
+    // (box, the height of one of its lines on screen and in print, in px)
+    let cases = [
+        ("code", code_font * screen_code, code_font * print_code),
+        (
+            "outputs",
+            cell_font * screen_output,
+            cell_font * print_output,
+        ),
+        (
+            "table rows",
+            cell_font * (table_line + 2.0 * screen_padding) + 1.0,
+            cell_font * (table_line + 2.0 * print_padding) + 1.0,
+        ),
+    ];
+    for (name, screen, print) in cases {
+        assert!(print < screen, "{name}: {print} vs {screen}");
+        // Not so much closer that a slide ends a whole page early (a blank last page).
+        assert!(print / screen > 0.9, "{name}: {print} vs {screen}");
+        let lines_per_page = (page / print).floor();
+        let saved = lines_per_page * (screen - print);
+        assert!(
+            saved > print,
+            "{name}: a page saves {saved:.1}px, a moved line needs {print:.1}px"
+        );
+    }
+}
+
+/// The print rules sit in the theme's print sections and say why (the README documents
+/// them for theme authors).
+#[test]
+fn the_readme_documents_the_print_rules() {
+    let readme = readme();
+    let start = readme
+        .find("\n## Print and PDF\n")
+        .expect("README section Print and PDF");
+    let section = &readme[start..];
+    let section = &section[..section[3..].find("\n## ").map_or(section.len(), |i| i + 3)];
+    let section = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    for part in [
+        "--p-code-max-height",
+        "--p-output-max-height",
+        "pdfMaxPagesPerSlide",
+        "0.95lh",
+        "text outputs at 1.3",
+        "cut off",
+        "header rows print once",
+        // The trade-off of the closer lines (the review's sweeps of long code slides).
+        "prints empty but for the slide's background",
+        "one in ten to twenty",
+    ] {
+        assert!(section.contains(part), "README Print and PDF: {part}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The SCSS example keeps the default theme's code blocks (audit F44)
+// ---------------------------------------------------------------------------------------
+
+/// `examples/custom-theme-scss` includes reveal's theme template, whose rules come after the
+/// default theme's: its `.reveal pre code { padding: 5px }` put the code 5px from the box
+/// edge. The value that wins for each property (the last top-level rule that sets it for
+/// exactly that selector; they all weigh the same) is the default theme's again.
+#[test]
+fn the_scss_example_keeps_the_default_code_blocks() {
+    let deck =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/custom-theme-scss/slides.md");
+    let built = build_deck(&BuildOptions::new(&deck)).unwrap();
+    let comments = Regex::new(r"(?s)/\*.*?\*/").unwrap();
+    let default = rules(&css());
+    let rules = rules(&comments.replace_all(&built.document.theme_css, ""));
+    let winner = |selector: &str, property: &str| -> String {
+        rules
+            .iter()
+            .filter(|r| r.context.is_empty() && complex_selectors(&r.selector).contains(&selector))
+            .filter_map(|r| r.get(property))
+            .next_back()
+            .unwrap_or_else(|| panic!("nothing sets {property} on {selector}"))
+            .to_string()
+    };
+    // reveal's template does set these, so the example overrides something.
+    assert!(
+        rules
+            .iter()
+            .any(|r| r.selector == ".reveal pre code" && r.get("padding") == Some("5px")),
+        "reveal's template rules are in the theme stylesheet"
+    );
+    assert_eq!(winner(".reveal pre code", "padding"), "0.75em 1em");
+    assert_eq!(
+        winner(".reveal pre code", "max-height"),
+        "var(--p-code-max-height)"
+    );
+    assert_eq!(
+        winner(".reveal pre", "font-size"),
+        "var(--p-code-font-size)"
+    );
+    assert_eq!(winner(".reveal pre", "line-height"), "1.4");
+    assert_eq!(winner(".reveal pre", "box-shadow"), "none");
+    assert_eq!(winner(".reveal pre", "width"), "auto");
+    assert_eq!(
+        rule(&default, ".reveal pre code").get("padding"),
+        Some("0.75em 1em")
+    );
+    assert_eq!(
+        rule(&default, ".reveal pre").get("line-height"),
+        Some("1.4")
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Task lists (audit F45)
+// ---------------------------------------------------------------------------------------
+
+/// comrak renders `- [ ] open` as `<li><input type="checkbox" disabled="" /> open</li>` in a
+/// plain list: without rules that is a bullet plus the browser's 12px greyed-out box next to
+/// 36px text. The theme drops the bullet, draws a box sized in em in the accent colour, and
+/// moves it into the bullet's place so the item's text lines up with the other items'.
+#[test]
+fn task_list_items_show_a_text_sized_box_instead_of_a_bullet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deck = tmp.path().join("tasks.md");
+    std::fs::write(&deck, "# Tasks\n\n- [ ] open\n- [x] done\n").unwrap();
+    let html = build_deck(&BuildOptions::new(&deck)).unwrap().document.html;
+    assert!(
+        html.contains("<li><input type=\"checkbox\" disabled=\"\" /> open</li>"),
+        "the markup the rules select"
+    );
+    assert!(html.contains("<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> done</li>"));
+
+    let rules = rules(&css());
+    let item = rule(
+        &rules,
+        r#".reveal li:has(> input[type="checkbox"]:first-child)"#,
+    );
+    assert_eq!(item.get("list-style"), Some("none"));
+    let box_ = rule(&rules, r#".reveal li > input[type="checkbox"]:first-child"#);
+    assert_eq!(box_.get("appearance"), Some("none"), "not greyed out");
+    assert_eq!(box_.get("font"), Some("inherit"), "em of the item's text");
+    for side in ["width", "height"] {
+        let size = number(box_.get(side).unwrap(), "em");
+        assert!((0.6..=1.0).contains(&size), "{side}: {size}em");
+    }
+    assert!(box_.get("border").unwrap().contains("var(--p-accent)"));
+    // The box starts where the bullet's indentation starts, and box, gap and the space after
+    // the box (about 0.25em) end where the item's text would start: its text lines up with
+    // the other items'.
+    let list = rule(&rules, ".reveal ul, .reveal ol, .reveal dl");
+    let indent = number(list.get("margin").unwrap().split(' ').nth(3).unwrap(), "em");
+    let margin: Vec<&str> = box_.get("margin").unwrap().split(' ').collect();
+    assert_eq!(number(margin[3], "em"), -indent);
+    let width = number(box_.get("width").unwrap(), "em");
+    let end = width + number(margin[1], "em") + 0.25;
+    assert!((end - indent).abs() < 0.05, "{margin:?}");
+    // Form controls do not inherit the text colour, which --p-accent mixes in.
+    assert_eq!(box_.get("color"), Some("inherit"));
+    let tick = rule(
+        &rules,
+        r#".reveal li > input[type="checkbox"]:first-child:checked::after"#,
+    );
+    assert!(tick.get("border").unwrap().contains("var(--p-accent)"));
+    assert!(
+        readme().contains("| `li > input[type=checkbox]` | task lists"),
+        "README: what the stylesheet styles"
+    );
+}
+
+/// In a loose task list (items separated by blank lines, or an item with a second
+/// paragraph) comrak puts the item's text in a `<p>` after the box. A block paragraph put
+/// the box alone on a line with the text a line below it (the review's CDP check: box at
+/// y=217, text at y=270). The first paragraph stays on the box's line, and the item takes
+/// the paragraph's margins instead, so it is spaced like an item of a loose plain list
+/// (checked with the CDP helper: same line as the box, 66px apart like plain loose items).
+#[test]
+fn loose_task_list_items_keep_their_text_on_the_box_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deck = tmp.path().join("tasks.md");
+    std::fs::write(
+        &deck,
+        "# Tasks\n\n- [ ] open\n\n- [x] done\n\n  more about it\n",
+    )
+    .unwrap();
+    let html = build_deck(&BuildOptions::new(&deck)).unwrap().document.html;
+    assert!(
+        html.contains("<li><input type=\"checkbox\" disabled=\"\" /> \n<p>open</p>\n</li>"),
+        "the markup the rules select: {html}"
+    );
+    assert!(html.contains(
+        "<li><input type=\"checkbox\" checked=\"\" disabled=\"\" /> \n<p>done</p>\n<p>more about it</p>"
+    ));
+
+    let rules = rules(&css());
+    let first = rule(
+        &rules,
+        r#".reveal li > input[type="checkbox"]:first-child + p"#,
+    );
+    assert_eq!(first.get("display"), Some("inline"), "on the box's line");
+    let item = rule(
+        &rules,
+        r#".reveal li:has(> input[type="checkbox"]:first-child + p)"#,
+    );
+    // The margin an inline paragraph no longer has: the one `.reveal p` sets above and below.
+    let paragraph = rule(&rules, ".reveal p").get("margin").unwrap();
+    assert_eq!(
+        item.get("margin-block"),
+        paragraph.split(' ').next(),
+        "{paragraph}"
+    );
+    // Only a paragraph right after the box: a second paragraph stays a block.
+    assert!(
+        rules
+            .iter()
+            .filter(|r| r.selector.contains("checkbox"))
+            .all(|r| r.get("display").is_none() || r.selector.ends_with(":first-child + p")),
+    );
+    assert!(
+        readme().contains("In a loose list (blank lines between items"),
+        "README: the loose list case"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Shipped files (audit F47)
+// ---------------------------------------------------------------------------------------
+
+/// Fails if a file that reaches users names a task id or points into the repository: at its
+/// `docs/` (a binary user has neither), or with a Markdown link that leaves the theme
+/// directory (dead in an ejected or scaffolded copy).
+fn assert_names_no_tasks_or_repository_documents(name: &str, text: &str) {
+    let task = Regex::new(r"\bT[0-9]{2}\b").unwrap();
+    assert!(!task.is_match(text), "{name} names a task id");
+    for reference in [
+        "docs/spec",
+        "docs/tasks",
+        "docs/dev",
+        ".md §",
+        "config.md",
+        "ir.md",
+        "](../",
+    ] {
+        assert!(!text.contains(reference), "{name} points at {reference}");
+    }
+}
+
+/// The theme's files ship in the binary: the CSS is inlined into every standalone deck, and
+/// `theme eject` and `init --full-theme` copy all of them, README.md included. They must
+/// not name the tasks that built them or point at the repository's `docs/`; the theme's
+/// own README is the documentation that travels with it.
+#[test]
+fn shipped_theme_files_name_no_tasks_or_repository_documents() {
+    let mut checked = 0;
+    for entry in walkdir::WalkDir::new(theme_dir()) {
+        let entry = entry.unwrap();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let text = std::fs::read_to_string(path).unwrap();
+        let name = path
+            .strip_prefix(theme_dir())
+            .unwrap()
+            .display()
+            .to_string();
+        assert_names_no_tasks_or_repository_documents(&name, &text);
+        checked += 1;
+    }
+    assert!(checked >= 15, "{checked} files");
+}
+
+/// The other files that reach users' decks and directories: what `presenter init` writes
+/// (`assets/scaffold`), the KaTeX script inlined into every deck with math, and the
+/// `theme.toml` and stylesheet that `presenter theme new` writes.
+#[test]
+fn scaffold_math_script_and_new_themes_name_no_repository_documents() {
+    let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let mut checked = 0;
+    for entry in walkdir::WalkDir::new(assets.join("scaffold")) {
+        let entry = entry.unwrap();
+        if entry.file_type().is_file() {
+            let name = entry
+                .path()
+                .strip_prefix(&assets)
+                .unwrap()
+                .display()
+                .to_string();
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            assert_names_no_tasks_or_repository_documents(&name, &text);
+            checked += 1;
+        }
+    }
+    assert!(checked >= 5, "{checked} scaffold files");
+    let math = std::fs::read_to_string(assets.join("presenter/math.js")).unwrap();
+    assert_names_no_tasks_or_repository_documents("presenter/math.js", &math);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let theme = tmp.path().join("mytheme");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_presenter"))
+        .args(["--quiet", "theme", "new"])
+        .arg(&theme)
+        .current_dir(tmp.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "presenter theme new: {status}");
+    for file in ["theme.toml", "styles/theme.css"] {
+        let text = std::fs::read_to_string(theme.join(file)).unwrap();
+        assert_names_no_tasks_or_repository_documents(&format!("theme new: {file}"), &text);
     }
 }
 
