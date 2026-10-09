@@ -56,7 +56,9 @@
 //! never lower the level a bare `RUST_LOG` level (or a target prefix of `presenter`) gives
 //! presenter: `RUST_LOG=debug` with `-v` logs presenter at debug. `-q` logs only errors and
 //! ignores `RUST_LOG`. Logs and diagnostics go to stderr, in color when stderr is a terminal
-//! and `NO_COLOR` is not set. Stdout carries only a command's result.
+//! and `NO_COLOR` is not set (the full rules, those of clap's own colors: `CLICOLOR_FORCE`,
+//! `CLICOLOR`, `TERM`, are [`report::stderr_color`]'s). Stdout carries only a command's
+//! result.
 
 pub mod build;
 pub mod check;

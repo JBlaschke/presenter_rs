@@ -1,0 +1,6 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, None, \"slides.md\", MISSING_DECK)"
+---
+error: asset not found: figures/plot.png
+ --> line 3

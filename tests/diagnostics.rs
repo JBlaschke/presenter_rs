@@ -1,21 +1,28 @@
 //! Diagnostics quality (T44): how errors are printed on stderr, with their location and the
-//! offending source line (`presenter::cli::report`), colors (`NO_COLOR`), and the panic
-//! hook.
+//! offending source line (`presenter::cli::report`), the overlay payload of the same errors
+//! in serve mode, colors (`NO_COLOR`), and the panic hook.
 //!
-//! The snapshots are `format_error` output without colors (what `print_error` and a failed
-//! command print). The errors come from the real frontends, minijinja and the theme
-//! manifest parser where possible; paths are relative so the snapshots do not depend on
-//! where the tests run.
+//! The snapshots are `format_error` output without colors. With `input` `None` that is
+//! exactly the text `print_error` prints; with the deck source as `input` (a missing asset,
+//! a front matter error) it is the text of `print_error_in` and of a failed command
+//! (`report_error` with `cli::locate`'s context, also checked end to end below). The errors
+//! come from the real frontends, minijinja and the theme manifest parser where possible;
+//! paths are relative so the snapshots do not depend on where the tests run.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use presenter::assets::emit::OutputMode;
 use presenter::cli::report::format_error;
 use presenter::config::Config;
 use presenter::error::{Error, template_error};
 use presenter::ir::{SourceInfo, SourceKind, SourceSpan};
+use presenter::pipeline::{BuildOptions, try_build_deck};
+use presenter::render::BuildInfo;
+use presenter::serve::events::ErrorPayload;
 use presenter::theme::ThemeManifest;
+use serde_json::json;
 
 /// A source cache with one file.
 fn one_file<'a>(name: &'a str, text: &'a str) -> impl Fn(&Path) -> Option<String> + 'a {
@@ -75,19 +82,41 @@ fn parse_error_in_notebook_json() {
 }
 
 #[test]
-fn missing_asset() {
-    // As the pipeline reports it: the resolved path, the span in the deck source, which
-    // the CLI knows (`cli::locate`).
-    let deck = "# Results\n\n![The plot](figures/plot.png){width=80%}\n";
-    let err = Error::MissingAsset {
+fn parse_error_in_notebook_json_after_wide_characters() {
+    // serde_json counts the column in bytes; the caret marks the character.
+    let json = "{\"cells\": [\n  {\"source\": \"Grüße, 世界\", , }\n]}\n";
+    let err = frontend_error("talk.ipynb", SourceKind::Notebook, json);
+    insta::assert_snapshot!(printed(&err, None, "talk.ipynb", json));
+}
+
+const MISSING_DECK: &str = "# Results\n\n![The plot](figures/plot.png){width=80%}\n";
+
+/// A missing asset as the pipeline reports it: the resolved path, and the span in the deck
+/// source, which only the caller knows.
+fn missing_plot() -> Error {
+    Error::MissingAsset {
         path: PathBuf::from("figures/plot.png"),
         span: Some(SourceSpan {
             start_line: 3,
             end_line: 3,
             cell: None,
         }),
-    };
-    insta::assert_snapshot!(printed(&err, Some("slides.md"), "slides.md", deck));
+    }
+}
+
+#[test]
+fn missing_asset() {
+    // With the deck source (`print_error_in`; a failed command through `cli::locate`).
+    let err = missing_plot();
+    insta::assert_snapshot!(printed(&err, Some("slides.md"), "slides.md", MISSING_DECK));
+}
+
+#[test]
+fn missing_asset_printed_without_the_deck_source() {
+    // Exactly what `print_error` prints: the error does not name the deck source, so the
+    // location is its line alone and there is nothing to quote.
+    let err = missing_plot();
+    insta::assert_snapshot!(printed(&err, None, "slides.md", MISSING_DECK));
 }
 
 #[test]
@@ -95,6 +124,79 @@ fn front_matter_error() {
     let deck = "---\ntitle: Diagnostics: a talk\n---\n\n# One\n";
     let err = frontend_error("slides.md", SourceKind::Markdown, deck);
     insta::assert_snapshot!(printed(&err, Some("slides.md"), "slides.md", deck));
+}
+
+#[test]
+fn front_matter_error_with_two_positions() {
+    // libyaml names the problem's position, then its context's: the location is the first.
+    let deck = "---\ntitle: \"Grüße\" x: y\n---\n\n# One\n";
+    let err = frontend_error("slides.md", SourceKind::Markdown, deck);
+    insta::assert_snapshot!(printed(&err, Some("slides.md"), "slides.md", deck));
+}
+
+/// A notebook whose first cell's front matter has a YAML error on its line 2.
+const NOTEBOOK_FRONT_MATTER: &str = r###"{"nbformat": 4, "nbformat_minor": 5, "metadata": {}, "cells": [
+ {"cell_type": "markdown", "metadata": {}, "source": ["---\n", "title: a: b\n", "---\n", "# Title\n"]}
+]}"###;
+
+#[test]
+fn front_matter_error_in_a_notebook_cell() {
+    // The cell is named once, in the location.
+    let err = frontend_error("talk.ipynb", SourceKind::Notebook, NOTEBOOK_FRONT_MATTER);
+    insta::assert_snapshot!(printed(
+        &err,
+        Some("talk.ipynb"),
+        "talk.ipynb",
+        NOTEBOOK_FRONT_MATTER
+    ));
+}
+
+/// The error of building `deck` (a file in `dir`) in serve mode, as `presenter serve` does.
+fn serve_build_error(deck: &Path) -> Error {
+    let options = BuildOptions {
+        output: OutputMode::Serve,
+        build: BuildInfo::serve(1),
+        missing_asset_is_error: false,
+        ..BuildOptions::new(deck)
+    };
+    match try_build_deck(&options) {
+        Ok(_) => panic!("{} must not build", deck.display()),
+        Err(failure) => failure.error,
+    }
+}
+
+#[test]
+fn serve_overlays_locate_front_matter_errors_in_the_deck() {
+    let dir = project(&[
+        ("slides.md", "---\ntitle: a: b\n---\n\n# One\n"),
+        ("talk.ipynb", NOTEBOOK_FRONT_MATTER),
+    ]);
+    let base = Some(dir.path());
+    let deck = dir.path().join("slides.md");
+    let payload = ErrorPayload::new(&serve_build_error(&deck), base, Some(&deck));
+    assert_eq!(
+        serde_json::to_value(&payload).unwrap(),
+        json!({"message": "slides.md:2: front matter: mapping values are not allowed in this \
+                           context at line 2 column 9",
+               "file": "slides.md", "line": 2, "kind": "front-matter",
+               "excerpt": "title: a: b"})
+    );
+    let notebook = dir.path().join("talk.ipynb");
+    let payload = ErrorPayload::new(&serve_build_error(&notebook), base, Some(&notebook));
+    assert!(
+        payload
+            .message
+            .starts_with("talk.ipynb: cell 0, line 2: front matter: mapping values "),
+        "{payload:?}"
+    );
+    assert_eq!(
+        (
+            payload.file.as_deref(),
+            payload.line,
+            payload.excerpt.as_deref()
+        ),
+        (Some("talk.ipynb"), None, Some("title: a: b"))
+    );
 }
 
 /// A child theme's layout with a syntax error on line 3.
@@ -172,6 +274,10 @@ fn a_failed_build_prints_the_location_and_the_line() {
     let dir = project(&[
         ("slides.md", DECK),
         ("missing.md", "# One\n\n![x](img/nope.png)\n"),
+        (
+            "flow.md",
+            "---\ntitle: T\ntags: [a, b\nauthor: me\n---\n\n# One\n",
+        ),
     ]);
     assert_eq!(
         failed_build(dir.path(), "slides.md", &[]),
@@ -183,6 +289,13 @@ fn a_failed_build_prints_the_location_and_the_line() {
         failed_build(dir.path(), "missing.md", &[]),
         "error: asset not found: img/nope.png\n --> missing.md:3\n  |\n\
          3 | ![x](img/nope.png)\n  |      ^^^^^^^^^^^^\n"
+    );
+    // An unclosed flow sequence: the problem's position (line 4), not its context's.
+    assert_eq!(
+        failed_build(dir.path(), "flow.md", &[]),
+        "error: front matter: did not find expected ',' or ']' at line 4 column 7, while \
+         parsing a flow sequence at line 3 column 7\n --> flow.md:4:7\n  |\n\
+         4 | author: me\n  |       ^\n"
     );
 }
 

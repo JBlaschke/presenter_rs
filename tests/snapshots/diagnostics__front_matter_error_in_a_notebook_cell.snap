@@ -1,0 +1,9 @@
+---
+source: tests/diagnostics.rs
+expression: "printed(&err, Some(\"talk.ipynb\"), \"talk.ipynb\", NOTEBOOK_FRONT_MATTER)"
+---
+error: front matter: mapping values are not allowed in this context at line 2 column 9 (a `---` block at the start of the first markdown cell is read as YAML front matter)
+ --> talk.ipynb: cell 0, line 2, column 9
+  |
+2 | title: a: b
+  |         ^

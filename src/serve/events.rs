@@ -17,7 +17,10 @@
 //!
 //! When the latest build failed, `hello` carries the same `error` object as a failed
 //! `build` event (§2 addition, 2026-10-08). The error's `excerpt` (T44, additive) is the
-//! offending source line, shown by the client's overlay; it is left out when unknown.
+//! offending source line, shown by the client's overlay; it is left out when unknown. A
+//! missing asset or front matter error does not name the deck source it is located in:
+//! [`ErrorPayload::for_input`] (with [`crate::serve::server::apply_error_payload`]) locates
+//! and quotes it there, as the terminal report does.
 
 use std::path::{Path, PathBuf};
 
@@ -65,10 +68,12 @@ impl BuildEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ErrorPayload {
     /// The full error message: for a parse error `file:line: message` (live-reload.md §2),
-    /// for every other error its `Display` form.
+    /// and so for a missing asset or front matter error located in the deck source
+    /// ([`ErrorPayload::for_input`]); for every other error its `Display` form.
     pub message: String,
-    /// The file the error is located in (source file, template or stylesheet), if known.
-    /// A source file is relative to the current directory when it is below it.
+    /// The file the error is located in (source file, template or stylesheet; the deck
+    /// source of a missing asset or front matter error made [`ErrorPayload::for_input`]),
+    /// if known. A source file is relative to the current directory when it is below it.
     pub file: Option<String>,
     /// 1-based line in `file`, if known.
     pub line: Option<usize>,
@@ -76,43 +81,69 @@ pub struct ErrorPayload {
     /// `template`, `style`, `missing-asset`, `io`, `json` or `other`.
     pub kind: String,
     /// The offending source line as the overlay shows it (T44): for a parse error the line
-    /// of the source file (of the cell's source for a notebook cell), read when the payload
-    /// is made ([`Error::excerpt`]: tabs expanded, a long line cut around the error); else
-    /// the line the message quotes ([`Error::quoted_line`]: a template error's minijinja
-    /// debug info in serve mode, a `toml` or `grass` excerpt). Left out of the JSON when
-    /// unknown.
+    /// of the source file (of the cell's source for a notebook cell), and for a missing
+    /// asset or front matter error the line of the deck source when the payload is made
+    /// [`ErrorPayload::for_input`], read when the payload is made ([`Error::excerpt`]: tabs
+    /// expanded, a long line cut around the error); else the line the message quotes
+    /// ([`Error::quoted_line`]: a template error's minijinja debug info in serve mode, a
+    /// `toml` or `grass` excerpt). Left out of the JSON when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
 }
 
 /// The overlay payload of a library error, with the source file of a parse error relative
-/// to the current directory (as the terminal shows it): [`ErrorPayload::relative_to`]`(err,
-/// current_dir)`.
+/// to the current directory (as the terminal shows it): [`ErrorPayload::new`]`(err,
+/// current_dir, None)`. A missing asset or front matter error is not located in the deck
+/// source this way: use [`ErrorPayload::for_input`].
 impl From<&Error> for ErrorPayload {
     fn from(err: &Error) -> Self {
         let cwd = std::env::current_dir().ok();
-        ErrorPayload::relative_to(err, cwd.as_deref())
+        ErrorPayload::new(err, cwd.as_deref(), None)
     }
 }
 
 impl ErrorPayload {
-    /// The overlay payload of `err`. `file`/`line` locate the error where it says where: the
-    /// source file of [`Error::Parse`] (relative to `base` when it is below it, also when
-    /// only one of the two is spelled through a symlink), the template of
-    /// [`Error::Template`] and the stylesheet of [`Error::Style`]. A
-    /// [`Error::MissingAsset`] has no `file` (its path is the missing asset, named in the
-    /// message) and keeps the Markdown line of its span in `line`.
+    /// The overlay payload of `err` from a build of the deck source `input`, with paths
+    /// relative to the current directory: [`ErrorPayload::new`]`(err, current_dir,
+    /// Some(input))`. What the rebuild loop of `presenter serve` stores, so that a missing
+    /// asset or a front matter error (a YAML typo while editing) is located and quoted in
+    /// the overlay as in the terminal.
+    pub fn for_input(err: &Error, input: &Path) -> Self {
+        let cwd = std::env::current_dir().ok();
+        ErrorPayload::new(err, cwd.as_deref(), Some(input))
+    }
+
+    /// The overlay payload of `err` without a deck source: [`ErrorPayload::new`]`(err,
+    /// base, None)`.
+    pub fn relative_to(err: &Error, base: Option<&Path>) -> Self {
+        ErrorPayload::new(err, base, None)
+    }
+
+    /// The overlay payload of `err`, from a build of the deck source `input` when given.
+    /// `file`/`line` locate the error where it says where: the source file of
+    /// [`Error::Parse`] (relative to `base` when it is below it, also when only one of the
+    /// two is spelled through a symlink), the template of [`Error::Template`] and the
+    /// stylesheet of [`Error::Style`]. A [`Error::MissingAsset`] or [`Error::FrontMatter`]
+    /// is located in `input` (relative to `base` likewise); without `input` it has no
+    /// `file` (a missing asset's path is the missing file, named in the message). `line` is
+    /// left out for a line of a notebook cell (it is not a line of the `.ipynb` file).
     ///
     /// `message` of a parse error is `file:line: message` (`file: message` without a line),
-    /// as in live-reload.md §2; every other error's is its `Display` form. `excerpt` is the
-    /// offending line, see [`ErrorPayload::excerpt`].
-    pub fn relative_to(err: &Error, base: Option<&Path>) -> Self {
-        let (file, line, message) = match err {
-            Error::Parse {
-                path,
-                line,
-                message,
-            } => {
+    /// as in live-reload.md §2; a missing asset or front matter error located in `input`
+    /// gets the same prefix (`slides.md:12: …`, `talk.ipynb: cell 3, line 2: …`, or
+    /// `slides.md: …` without a line); every other error's is its `Display` form, with a
+    /// missing asset's path relative to `base`. `excerpt` is the offending line, see
+    /// [`ErrorPayload::excerpt`].
+    pub fn new(err: &Error, base: Option<&Path>, input: Option<&Path>) -> Self {
+        let (file, line, message) = match (err, input) {
+            (
+                Error::Parse {
+                    path,
+                    line,
+                    message,
+                },
+                _,
+            ) => {
                 let file = display_relative(path, base);
                 let message = match line {
                     Some(line) => format!("{file}:{line}: {message}"),
@@ -120,17 +151,16 @@ impl ErrorPayload {
                 };
                 (Some(file), *line, message)
             }
-            Error::Template { template, line, .. } => {
+            (Error::Template { template, line, .. }, _) => {
                 (Some(template.clone()), *line, err.to_string())
             }
-            Error::Style { file, .. } => (Some(file.clone()), None, err.to_string()),
-            Error::MissingAsset { span, .. } => (
-                None,
-                span.as_ref()
-                    .filter(|span| span.cell.is_none())
-                    .map(|span| span.start_line),
-                err.to_string(),
-            ),
+            (Error::Style { file, .. }, _) => (Some(file.clone()), None, err.to_string()),
+            (Error::MissingAsset { .. } | Error::FrontMatter(_), Some(input)) => {
+                let file = display_relative(input, base);
+                let message = format!("{}: {}", in_input(&file, err), deck_message(err, base));
+                (Some(file), file_line(err), message)
+            }
+            (Error::MissingAsset { .. }, None) => (None, file_line(err), deck_message(err, base)),
             _ => (None, None, err.to_string()),
         };
         ErrorPayload {
@@ -138,18 +168,53 @@ impl ErrorPayload {
             file,
             line,
             kind: error_kind(err).to_string(),
-            excerpt: excerpt(err),
+            excerpt: excerpt(err, input),
         }
     }
 }
 
-/// The offending line of `err` for [`ErrorPayload::excerpt`]: read from the file it names,
-/// else quoted in its message.
-fn excerpt(err: &Error) -> Option<String> {
+/// The message of a missing asset (its path relative to `base`) or a front matter error
+/// (without a cell prefix when its span names the cell, [`Error::message`]).
+fn deck_message(err: &Error, base: Option<&Path>) -> String {
+    match err {
+        Error::MissingAsset { path, .. } => {
+            format!("asset not found: {}", display_relative(path, base))
+        }
+        _ => err.message().into_owned(),
+    }
+}
+
+/// The line of `err`'s span when it is a line of the file (not of a notebook cell).
+fn file_line(err: &Error) -> Option<usize> {
+    err.span()
+        .filter(|span| span.cell.is_none())
+        .map(|span| span.start_line)
+}
+
+/// The location of `err` in the deck source shown as `file`: `file:line`,
+/// `file: cell C, line L`, or `file` without a span.
+fn in_input(file: &str, err: &Error) -> String {
+    match err.span() {
+        Some(span) => match span.cell {
+            Some(cell) => format!("{file}: cell {cell}, line {}", span.start_line),
+            None => format!("{file}:{}", span.start_line),
+        },
+        None => file.to_string(),
+    }
+}
+
+/// The offending line of `err` for [`ErrorPayload::excerpt`]: read from the file it names
+/// (or from `input` for a missing asset or front matter error), else quoted in its message.
+/// A blank line is no excerpt.
+fn excerpt(err: &Error, input: Option<&Path>) -> Option<String> {
     let read = |path: &Path| std::fs::read_to_string(path).ok();
-    err.path()
-        .and_then(|file| err.excerpt(file, &read))
+    let file = match err {
+        Error::MissingAsset { .. } | Error::FrontMatter(_) => input,
+        _ => err.path(),
+    };
+    file.and_then(|file| err.excerpt(file, &read))
         .map(|excerpt| excerpt.text)
+        .filter(|text| !text.trim().is_empty())
         .or_else(|| err.quoted_line().map(|line| line.trim_end().to_string()))
 }
 
@@ -402,12 +467,108 @@ mod tests {
             (Some("slide.html"), Some(2))
         );
         assert_eq!(template.excerpt.as_deref(), Some("{{ x </a>"));
+        // A blank line is no excerpt.
+        std::fs::write(&deck, "# A\n\n   \n").unwrap();
+        assert_eq!(
+            ErrorPayload::relative_to(&parse, Some(tmp.path())).excerpt,
+            None
+        );
         // No line known (or the file is gone): no `excerpt` key.
         std::fs::remove_file(&deck).unwrap();
         let gone = ErrorPayload::relative_to(&parse, Some(tmp.path()));
         assert_eq!(gone.excerpt, None);
         let json = serde_json::to_value(&gone).unwrap();
         assert!(json.get("excerpt").is_none(), "{json}");
+    }
+
+    #[test]
+    fn deck_errors_are_located_and_quoted_in_the_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deck = tmp.path().join("slides.md");
+        std::fs::write(&deck, "---\ntitle: a: b\n---\n\n![x](img/x.png)\n").unwrap();
+        let base = Some(tmp.path());
+        // A YAML typo while editing: the file, the line and the line itself.
+        let front = Error::FrontMatter(
+            "mapping values are not allowed in this context at line 2 column 9".into(),
+        );
+        let payload = ErrorPayload::new(&front, base, Some(&deck));
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            json!({"message": "slides.md:2: front matter: mapping values are not allowed in \
+                               this context at line 2 column 9",
+                   "file": "slides.md", "line": 2, "kind": "front-matter",
+                   "excerpt": "title: a: b"})
+        );
+        // Without the input: as before, the message only.
+        let bare = ErrorPayload::relative_to(&front, base);
+        assert_eq!(
+            (bare.file, bare.line, bare.excerpt),
+            (None, None, None),
+            "no input"
+        );
+        // A missing asset: its path relative to the base, the reference's line.
+        let missing = Error::MissingAsset {
+            path: tmp.path().join("img/x.png"),
+            span: Some(SourceSpan {
+                start_line: 5,
+                end_line: 5,
+                cell: None,
+            }),
+        };
+        let payload = ErrorPayload::new(&missing, base, Some(&deck));
+        assert_eq!(payload.message, "slides.md:5: asset not found: img/x.png");
+        assert_eq!(
+            (payload.file.as_deref(), payload.line),
+            (Some("slides.md"), Some(5))
+        );
+        assert_eq!(payload.excerpt.as_deref(), Some("![x](img/x.png)"));
+        let bare = ErrorPayload::relative_to(&missing, base);
+        assert_eq!(bare.message, "asset not found: img/x.png");
+        assert_eq!((bare.file, bare.line), (None, Some(5)));
+        // An error without a position names the file.
+        let unplaced = Error::FrontMatter("math: unknown field `enable`".into());
+        let payload = ErrorPayload::new(&unplaced, base, Some(&deck));
+        assert_eq!(
+            payload.message,
+            "slides.md: front matter: math: unknown field `enable`"
+        );
+        assert_eq!(
+            (payload.file.as_deref(), payload.line, payload.excerpt),
+            (Some("slides.md"), None, None)
+        );
+        // `for_input` is relative to the current directory.
+        assert_eq!(
+            ErrorPayload::for_input(&front, &deck),
+            ErrorPayload::new(&front, std::env::current_dir().ok().as_deref(), Some(&deck))
+        );
+    }
+
+    #[test]
+    fn notebook_front_matter_errors_name_the_cell_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let notebook = tmp.path().join("talk.ipynb");
+        std::fs::write(
+            &notebook,
+            r##"{"cells": [{"cell_type": "markdown", "source": ["---\n", "title: a: b\n", "---\n"]}]}"##,
+        )
+        .unwrap();
+        let err = Error::FrontMatter(
+            "cell 0: mapping values are not allowed in this context at line 2 column 9 \
+             (a `---` block …)"
+                .into(),
+        );
+        let payload = ErrorPayload::new(&err, Some(tmp.path()), Some(&notebook));
+        assert_eq!(
+            payload.message,
+            "talk.ipynb: cell 0, line 2: front matter: mapping values are not allowed in this \
+             context at line 2 column 9 (a `---` block …)"
+        );
+        // A cell's line is not a line of the file.
+        assert_eq!(
+            (payload.file.as_deref(), payload.line),
+            (Some("talk.ipynb"), None)
+        );
+        assert_eq!(payload.excerpt.as_deref(), Some("title: a: b"));
     }
 
     #[test]

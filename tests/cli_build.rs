@@ -22,13 +22,14 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The binary, run from the crate root, without the developer's `RUST_LOG` / `NO_COLOR`
-/// (stderr assertions must not depend on them).
+/// The binary, run from the crate root, without the developer's `RUST_LOG` / `NO_COLOR` /
+/// `CLICOLOR_FORCE` (stderr assertions must not depend on them).
 fn presenter() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_presenter"));
     cmd.current_dir(root())
         .env_remove("RUST_LOG")
-        .env_remove("NO_COLOR");
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE");
     cmd
 }
 

@@ -22,13 +22,14 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The binary, run from `dir`, without the developer's `RUST_LOG` / `NO_COLOR`, with a
-/// generous safety timeout (the command's own limit is 120 s).
+/// The binary, run from `dir`, without the developer's `RUST_LOG` / `NO_COLOR` /
+/// `CLICOLOR_FORCE`, with a generous safety timeout (the command's own limit is 120 s).
 fn presenter(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_presenter"));
     cmd.current_dir(dir)
         .env_remove("RUST_LOG")
         .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .timeout(Duration::from_secs(180));
     cmd
 }

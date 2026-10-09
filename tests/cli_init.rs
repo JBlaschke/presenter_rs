@@ -34,12 +34,14 @@ const PLACEHOLDERS: [&str; 5] = [
     "{{child_theme}}",
 ];
 
-/// The binary, run in `dir`, without the developer's `RUST_LOG` / `NO_COLOR`.
+/// The binary, run in `dir`, without the developer's `RUST_LOG` / `NO_COLOR` /
+/// `CLICOLOR_FORCE`.
 fn presenter(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_presenter"));
     cmd.current_dir(dir)
         .env_remove("RUST_LOG")
-        .env_remove("NO_COLOR");
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE");
     cmd
 }
 

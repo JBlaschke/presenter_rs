@@ -138,7 +138,11 @@ impl Error {
     }
 
     /// The 1-based column on the [`span`](Self::span)'s line, when the message gives one:
-    /// `at line L column C` of a front matter (YAML) or notebook JSON parse error.
+    /// `at line L column C` of a front matter (YAML) or notebook JSON parse error, counted
+    /// as the parser counts it: in characters for YAML, in bytes for JSON (`serde_json`;
+    /// [`Error::excerpt`] converts it to a character). A message with two positions (YAML's
+    /// `… at line 4 column 7, while parsing a flow sequence at line 3 column 7`) is located
+    /// at the first, the problem; the second is its context.
     pub fn column(&self) -> Option<usize> {
         let message = match self {
             Error::Parse { message, .. } | Error::FrontMatter(message) => message,
@@ -150,13 +154,20 @@ impl Error {
 
     /// What went wrong without the location that [`path`](Self::path) and
     /// [`span`](Self::span) give: a parse error's message without its file, line or
-    /// `cell N, line M: ` prefix. Every other error's `Display` form (a template error keeps
-    /// its name and line, a missing asset names the missing file).
+    /// `cell N, line M: ` prefix; a front matter error located in a notebook cell without
+    /// its `cell N: ` prefix (`front matter: …`). Every other error's `Display` form (a
+    /// template error keeps its name and line, a missing asset names the missing file).
     pub fn message(&self) -> Cow<'_, str> {
         match self {
             Error::Parse { message, .. } => match cell_location(message) {
                 Some((_, Some(_), rest)) => Cow::Borrowed(rest),
                 _ => Cow::Borrowed(message),
+            },
+            Error::FrontMatter(message) => match (cell_location(message), self.span()) {
+                (Some((_, None, rest)), Some(SourceSpan { cell: Some(_), .. })) => {
+                    Cow::Owned(format!("front matter: {rest}"))
+                }
+                _ => Cow::Owned(self.to_string()),
             },
             other => Cow::Owned(other.to_string()),
         }
@@ -165,11 +176,15 @@ impl Error {
     /// The offending line of the source `file`, cut for display: the line of
     /// [`span`](Self::span) (of the cell's source when the span names a cell: `file` is
     /// then the notebook), read through `source_cache`, with the part to underline: the
-    /// [`column`](Self::column), the reference to the missing file of a
-    /// [`Error::MissingAsset`] when the line contains it, else the line's text.
+    /// character at the [`column`](Self::column) (a notebook JSON error's byte column is
+    /// converted), the reference to the missing file of a [`Error::MissingAsset`] when the
+    /// line contains it, else the line's text.
     ///
-    /// `file` is the file the span is in: [`path`](Self::path), the deck source for a
-    /// missing asset or front matter error, the template's source for a template error.
+    /// `file` is the file the span is in: [`path`](Self::path), or the deck source for a
+    /// missing asset or front matter error, which the caller knows (`cli::locate`,
+    /// `serve::events::ErrorPayload::for_input`). A template error's span is a line of the
+    /// template, whose file only a caller that resolves the theme chain can name; the CLI's
+    /// report and the overlay payload do not, and use [`quoted_line`](Self::quoted_line).
     /// `None` without a span, when `source_cache` has no text for `file`, or when the line
     /// does not exist (the file changed).
     pub fn excerpt(
@@ -180,6 +195,11 @@ impl Error {
         let span = self.span()?;
         let line = source_line(&source_cache(file)?, &span)?;
         let target = match (self, self.column()) {
+            // serde_json counts bytes (notebook JSON); YAML counts characters.
+            (Error::Parse { .. }, Some(column)) => {
+                let start = char_index(&line, column - 1);
+                Some((start, start + 1))
+            }
             (_, Some(column)) => Some((column - 1, column)),
             (Error::MissingAsset { path, .. }, None) => {
                 reference_range(path, &line).or_else(|| text_range(&line))
@@ -306,14 +326,40 @@ fn cell_location(message: &str) -> Option<(usize, Option<usize>, &str)> {
     }
 }
 
-/// The last `at line L column C` in `message` (how serde_norway and serde_json locate
-/// their errors; both count from 1).
+/// The position of the problem in `message`, as serde_norway and serde_json locate their
+/// errors (`at line L column C`, both counting from 1): the first such position that ends
+/// the message or a clause (followed by `,`, as libyaml's problem position is by
+/// `, while parsing … at line …`, its context; by ` (` and a frontend's hint; or by a line
+/// break), else the first one. (A quoted value that reads `at line 1 column 1` is followed
+/// by its closing quote and skipped.)
 fn line_column(message: &str) -> Option<(usize, usize)> {
     const AT: &str = "at line ";
-    let start = message.rfind(AT)? + AT.len();
-    let (line, rest) = leading_number(&message[start..])?;
-    let (column, _) = leading_number(rest.strip_prefix(" column ")?)?;
-    Some((line, column))
+    let mut first = None;
+    for (at, _) in message.match_indices(AT) {
+        let Some((line, rest)) = leading_number(&message[at + AT.len()..]) else {
+            continue;
+        };
+        let Some((column, rest)) = rest.strip_prefix(" column ").and_then(leading_number) else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with([',', '\n']) || rest.starts_with(" (") {
+            return Some((line, column));
+        }
+        first.get_or_insert((line, column));
+    }
+    first
+}
+
+/// The index of the character of `line` that contains byte `offset`; the number of
+/// characters when `offset` is past the end.
+fn char_index(line: &str, offset: usize) -> usize {
+    if offset >= line.len() {
+        return line.chars().count();
+    }
+    line.char_indices()
+        .take_while(|&(at, _)| at <= offset)
+        .count()
+        .saturating_sub(1)
 }
 
 /// The decimal number at the start of `text`, and the rest of `text`.
@@ -993,8 +1039,20 @@ mod tests {
             (in_cell.span(), in_cell.column()),
             (Some(cell_span(3, 0)), Some(1))
         );
+        // The cell is in the span: the message does not repeat it.
+        assert_eq!(
+            in_cell.message(),
+            "front matter: bad at line 3 column 1 (a `---` block at the start of …)"
+        );
         let no_position = Error::FrontMatter("math: unknown field `enable`".into());
         assert_eq!((no_position.span(), no_position.column()), (None, None));
+        // Without a line the cell prefix is the only location: it stays.
+        let cell_only = Error::FrontMatter("cell 2: math: unknown field `enable`".into());
+        assert_eq!(cell_only.span(), None);
+        assert_eq!(
+            cell_only.message(),
+            "front matter: cell 2: math: unknown field `enable`"
+        );
 
         let template = Error::Template {
             template: "layouts/title.html".into(),
@@ -1015,6 +1073,65 @@ mod tests {
                 (None, None, None)
             );
         }
+    }
+
+    #[test]
+    fn errors_with_two_positions_are_located_at_the_problem() {
+        // libyaml: the problem's position, then its context's.
+        let front = |message: &str| Error::FrontMatter(message.into());
+        let two = front(
+            "did not find expected key at line 2 column 16, while parsing a block mapping at \
+             line 2 column 1",
+        );
+        assert_eq!((two.span(), two.column()), (Some(span(2)), Some(16)));
+        let flow = front(
+            "did not find expected ',' or ']' at line 4 column 7, while parsing a flow \
+             sequence at line 3 column 7",
+        );
+        assert_eq!((flow.span(), flow.column()), (Some(span(4)), Some(7)));
+        // A quoted value that reads like a position is not one.
+        let quoted = front(
+            "title: invalid type: string \"at line 9 column 9\", expected a mapping at line 3 \
+             column 8",
+        );
+        assert_eq!((quoted.span(), quoted.column()), (Some(span(3)), Some(8)));
+        // A notebook's hint follows the position.
+        let hinted = front("cell 0: bad at line 3 column 2 (a `---` block …)");
+        assert_eq!(hinted.column(), Some(2));
+        // Nothing ends a clause: the first position.
+        let odd = front("x at line 5 column 1 y at line 6 column 2 z");
+        assert_eq!(odd.span(), Some(span(5)));
+        assert_eq!(front("at line x column 1").span(), None);
+    }
+
+    #[test]
+    fn json_byte_columns_mark_the_character() {
+        // serde_json counts bytes: `é` is two, `世` three.
+        let line = "  {\"source\": \"Grüße, 世界\", , }";
+        let byte = line.rfind(", }").unwrap() + 1;
+        let json = parse_error(
+            "talk.ipynb",
+            Some(1),
+            &format!("invalid notebook JSON: expected value at line 1 column {byte}"),
+        );
+        let excerpt = excerpt_of(&json, line).unwrap();
+        let (column, width) = excerpt.marker.unwrap();
+        assert_eq!(
+            (excerpt.text.chars().nth(column), width),
+            (Some(','), 1),
+            "{excerpt:?}"
+        );
+        assert_eq!(column, line.chars().count() - 3);
+        // YAML counts characters: no conversion.
+        let yaml = "title: \"éééééé\": b";
+        let front = Error::FrontMatter("mapping values are not allowed at line 1 column 16".into());
+        let (column, _) = excerpt_of(&front, yaml).unwrap().marker.unwrap();
+        assert_eq!(yaml.chars().nth(column), Some(':'));
+        // A byte inside a character marks that character; past the end, the end.
+        assert_eq!(char_index("aéb", 2), 1);
+        assert_eq!(char_index("aéb", 3), 2);
+        assert_eq!(char_index("aéb", 9), 3);
+        assert_eq!(char_index("", 0), 0);
     }
 
     #[test]

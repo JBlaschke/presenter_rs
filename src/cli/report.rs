@@ -26,22 +26,27 @@
 //!
 //! The location comes from the error ([`Error::path`], [`Error::span`]); for a missing
 //! asset or a front matter error, which do not name the deck source, from the context that
-//! [`super::locate`] adds. Template errors carry minijinja's debug info (the source around
-//! the line, the referenced variables) in serve mode and for syntax errors converted with
-//! `?` ([`crate::error::template_error`]); `build` renders without it, so a template error
-//! there names the template and line only. Paths are relative to the current directory when
-//! they are below it. Errors that are not library errors print `error: outer: inner`.
+//! [`super::locate`] adds. A YAML message with two positions is located at the first (the
+//! problem; the second, its context, stays in the message). Template errors carry
+//! minijinja's debug info (the source around the line, the referenced variables) in serve
+//! mode and for syntax errors converted with `?` ([`crate::error::template_error`]); `build`
+//! renders without it, so a template error there names the template and line only (the
+//! source cache is never asked for a template: its name is not a path the report could
+//! read). Paths are relative to the current directory when they are below it. Errors that
+//! are not library errors print `error: outer: inner`.
 //!
-//! [`print_error`] prints one library error the same way (`presenter serve` can pass a
-//! source cache that reads templates through the theme chain), [`format_error`] returns the
-//! text.
+//! [`print_error_in`] prints one library error the same way, given the deck source;
+//! [`print_error`] without it (a missing asset or front matter error is then located by
+//! its line alone, ` --> line 3`, without an excerpt); [`format_error`] returns the text.
 //!
 //! # Colors
 //!
-//! Labels, the message, the gutter and the underline are colored when stderr is a terminal,
-//! or `CLICOLOR_FORCE` is set (non-empty and not `0`); `NO_COLOR` (non-empty) turns colors
-//! off in every case ([`stderr_color`], also used for log lines). cli.md has no `--no-color`
-//! flag, so there is none: use `NO_COLOR=1`.
+//! Labels, the message, the gutter and the underline are colored by the rules clap's own
+//! output (anstream) follows in the same binary ([`stderr_color`], also used for log
+//! lines): never with `NO_COLOR` (non-empty); always with `CLICOLOR_FORCE` (non-empty);
+//! never with `CLICOLOR=0`; else when stderr is a terminal whose `TERM` is set and not
+//! `dumb` (or `CLICOLOR` or `CI` is set). cli.md has no `--no-color` flag, so there is
+//! none: use `NO_COLOR=1`.
 //!
 //! # Panics
 //!
@@ -55,7 +60,7 @@
 //! and [`install_panic_hook`] (called once by `cli::run`). The signatures of those three
 //! functions are the contract; [`stderr_color`] is also used by the logging setup.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -82,13 +87,23 @@ pub fn report_error(err: &anyhow::Error) {
 
 /// Prints `err` on stderr with its location and the offending line from `source_cache`
 /// (module docs), in color per [`stderr_color`].
+///
+/// A missing asset or a front matter error does not name the deck source its span is in:
+/// this prints its line alone (` --> line 3`) and no excerpt. Use [`print_error_in`] with
+/// the deck source (or [`report_error`] with [`super::locate`]'s context) for those.
 pub fn print_error(err: &Error, source_cache: SourceCache<'_>) {
-    write_stderr(&format_error(err, None, source_cache, stderr_color()));
+    print_error_in(err, None, source_cache);
 }
 
-/// The text [`print_error`] prints (without the final line break), with ANSI colors when
-/// `color`. `input` is the deck source, for the errors that do not name it themselves (a
-/// missing asset, front matter); `source_cache` gives the text of a file to quote.
+/// [`print_error`] for an error of a build of the deck source `input`: a missing asset or
+/// front matter error is located in it and quoted from it.
+pub fn print_error_in(err: &Error, input: Option<&Path>, source_cache: SourceCache<'_>) {
+    write_stderr(&format_error(err, input, source_cache, stderr_color()));
+}
+
+/// The text [`print_error_in`] prints (without the final line break), with ANSI colors
+/// when `color`. `input` is the deck source, for the errors that do not name it themselves
+/// (a missing asset, front matter); `source_cache` gives the text of a file to quote.
 pub fn format_error(
     err: &Error,
     input: Option<&Path>,
@@ -153,27 +168,33 @@ pub fn install_panic_hook() {
     });
 }
 
-/// Whether stderr gets ANSI colors: `NO_COLOR` unset or empty, and stderr a terminal or
-/// `CLICOLOR_FORCE` set (non-empty, not `0`).
+/// Whether stderr gets ANSI colors, by the rules of clap's colors (anstream's
+/// `AutoStream::choice`): not with `NO_COLOR` (non-empty); with `CLICOLOR_FORCE`
+/// (non-empty); not with `CLICOLOR=0`; else when stderr is a terminal and `TERM` is set and
+/// not `dumb` (unset counts as set on Windows), `CLICOLOR` is set, or `CI` is.
 pub fn stderr_color() -> bool {
     use_color(
-        std::env::var_os("NO_COLOR").as_deref(),
-        std::env::var_os("CLICOLOR_FORCE").as_deref(),
+        |name| std::env::var_os(name),
         || std::io::stderr().is_terminal(),
     )
 }
 
-/// [`stderr_color`] for the given variables: `NO_COLOR` wins over `CLICOLOR_FORCE`, which
-/// wins over the terminal test.
-fn use_color(
-    no_color: Option<&OsStr>,
-    force: Option<&OsStr>,
-    terminal: impl FnOnce() -> bool,
-) -> bool {
-    if no_color.is_some_and(|value| !value.is_empty()) {
+/// [`stderr_color`] with the environment variables read by `var` and the terminal test
+/// `terminal` (asked only when the variables do not decide).
+fn use_color(var: impl Fn(&str) -> Option<OsString>, terminal: impl FnOnce() -> bool) -> bool {
+    let set = |name: &str| var(name).is_some_and(|value| !value.is_empty());
+    if set("NO_COLOR") {
         return false;
     }
-    force.is_some_and(|value| !value.is_empty() && value != "0") || terminal()
+    if set("CLICOLOR_FORCE") {
+        return true;
+    }
+    let clicolor = var("CLICOLOR").map(|value| value != "0");
+    if clicolor == Some(false) {
+        return false;
+    }
+    let term = var("TERM").map_or(cfg!(windows), |term| term != "dumb");
+    terminal() && (term || clicolor == Some(true) || var("CI").is_some())
 }
 
 /// Whether `RUST_BACKTRACE` (its value) asks for a backtrace, as the standard hook reads it.
@@ -679,20 +700,45 @@ mod tests {
         assert_eq!(report.message, "config: presenter.toml: TOML parse error");
     }
 
+    /// [`use_color`] with exactly the variables `vars` (name, value) set.
+    fn color_with(vars: &[(&str, &str)], terminal: bool) -> bool {
+        let var = |name: &str| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        };
+        use_color(var, || terminal)
+    }
+
     #[test]
-    fn colors_follow_no_color_clicolor_force_and_the_terminal() {
-        let os = |value: &'static str| Some(OsStr::new(value));
-        assert!(use_color(None, None, || true));
-        assert!(!use_color(None, None, || false));
-        assert!(!use_color(os("1"), None, || true));
+    fn colors_follow_the_rules_of_clap() {
+        let term = ("TERM", "xterm-256color");
+        // A terminal with a TERM that has colors; a pipe never by itself.
+        assert!(color_with(&[term], true));
+        assert!(!color_with(&[term], false));
+        assert!(!color_with(&[("TERM", "dumb")], true));
+        assert_eq!(color_with(&[], true), cfg!(windows), "TERM unset");
+        // CLICOLOR or CI vouch for a terminal without a TERM; CLICOLOR=0 turns colors off.
+        assert!(color_with(&[("CLICOLOR", "1")], true));
+        assert!(color_with(&[("CI", "true"), ("TERM", "dumb")], true));
+        assert!(!color_with(&[("CLICOLOR", "0"), term], true));
+        assert!(!color_with(&[("CLICOLOR", "1")], false));
+        // NO_COLOR (non-empty) always wins; CLICOLOR_FORCE (non-empty) colors a pipe.
+        assert!(!color_with(&[("NO_COLOR", "1"), term], true));
         assert!(
-            use_color(os(""), None, || true),
+            color_with(&[("NO_COLOR", ""), term], true),
             "an empty NO_COLOR is unset"
         );
-        assert!(use_color(None, os("1"), || false));
-        assert!(!use_color(None, os("0"), || false));
-        assert!(!use_color(None, os(""), || false));
-        assert!(!use_color(os("1"), os("1"), || true), "NO_COLOR wins");
+        assert!(color_with(&[("CLICOLOR_FORCE", "1")], false));
+        assert!(color_with(
+            &[("CLICOLOR_FORCE", "1"), ("CLICOLOR", "0")],
+            false
+        ));
+        assert!(!color_with(&[("CLICOLOR_FORCE", "")], false));
+        assert!(
+            !color_with(&[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")], true),
+            "NO_COLOR wins"
+        );
     }
 
     #[test]
