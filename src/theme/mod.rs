@@ -185,15 +185,18 @@ impl ThemeDir {
         }
     }
 
-    /// Notes the file at `rel` (same path rules as [`ThemeDir::read`]) as read for
-    /// [`recording_reads`], when this is a disk theme and the file is there: for a file
-    /// read on another thread or in another process (a Sass compilation's).
-    pub(crate) fn note_read(&self, rel: &str) {
+    /// Notes the file at `rel` as read for [`recording_reads`] when this is a disk theme: a
+    /// file that [`ThemeDir::read`] of this theme read on another thread or in another
+    /// process (a Sass compilation's), so it passed the path rules there. Its path is noted
+    /// as that read found it (`rel` normalized, in the theme directory), without looking at
+    /// the disk again: a compilation reads many files, and each check lists the directories
+    /// of the path (wave-8 review of W8FIX). Nothing happens when nothing is recording.
+    pub(crate) fn note_read_elsewhere(&self, rel: &str) {
         if let ThemeSource::Disk { dir } = &self.source
+            && recording()
             && let Some(rel) = normalize_rel(rel).filter(|r| !r.is_empty())
-            && let Some(path) = disk_file(dir, &rel)
         {
-            note_read(&path);
+            note_read(&dir.join(rel));
         }
     }
 
@@ -332,6 +335,11 @@ pub fn recording_reads<R>(f: impl FnOnce() -> R) -> (R, BTreeSet<PathBuf>) {
     (result, read)
 }
 
+/// True while [`recording_reads`] runs on this thread.
+pub(crate) fn recording() -> bool {
+    READS.with_borrow(Option::is_some)
+}
+
 /// Notes that `path`, a file of a disk theme, was read ([`recording_reads`]).
 fn note_read(path: &Path) {
     READS.with_borrow_mut(|reads| {
@@ -421,6 +429,8 @@ fn inside(dir: &Path, path: &Path) -> bool {
 fn exact_names(dir: &Path, rel: &str) -> bool {
     let mut parent = dir.to_path_buf();
     for segment in rel.split('/').filter(|s| !s.is_empty()) {
+        #[cfg(test)]
+        LISTINGS.set(LISTINGS.get() + 1);
         let Ok(entries) = std::fs::read_dir(&parent) else {
             return false;
         };
@@ -433,6 +443,18 @@ fn exact_names(dir: &Path, rel: &str) -> bool {
         parent.push(segment);
     }
     true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many directories [`exact_names`] listed on this thread (tests count them).
+    static LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many directories the checks of theme paths listed on this thread so far.
+#[cfg(test)]
+pub(crate) fn directory_listings() -> usize {
+    LISTINGS.get()
 }
 
 /// Files below `dir/rel_dir` on disk, relative to `dir`, following symlinks that stay inside
@@ -1185,9 +1207,11 @@ mod tests {
         let ((), outer) = recording_reads(|| {
             dir.read("a.css").unwrap();
             assert_eq!(dir.read("missing.css").unwrap(), None);
-            let ((), inner) = recording_reads(|| dir.note_read("img/./x.png"));
+            let ((), inner) = recording_reads(|| dir.note_read_elsewhere("img/./x.png"));
             assert_eq!(inner, BTreeSet::from([root.join("img/x.png")]));
-            dir.note_read("nothing/here.png");
+            // A path that would leave the theme is never noted.
+            dir.note_read_elsewhere("../outside.png");
+            dir.note_read_elsewhere("img/..");
         });
         assert_eq!(
             outer,
@@ -1197,6 +1221,7 @@ mod tests {
         let panicked = std::panic::catch_unwind(|| recording_reads(|| panic!("boom")));
         assert!(panicked.is_err());
         assert!(READS.with_borrow(Option::is_none));
+        assert!(!recording());
         // Built-in themes have no files on disk.
         let builtin = resolve("default", &[]).unwrap();
         let ((), none) = recording_reads(|| {

@@ -197,8 +197,7 @@ impl Error {
         source_cache: &dyn Fn(&Path) -> Option<String>,
     ) -> Option<Excerpt> {
         let span = self.span()?;
-        let text = source_cache(file)?;
-        let line = source_line(&text, &span)?;
+        let (line, cell_type) = located_line(&source_cache(file)?, &span)?;
         let target = match (self, self.column()) {
             // serde_json counts bytes (notebook JSON); YAML counts characters.
             (Error::Parse { .. }, Some(column)) => {
@@ -211,7 +210,7 @@ impl Error {
                 // In a notebook code cell, a missing file that its line does not mention is
                 // named by an output of the cell (whose span is the whole cell): the cell's
                 // source line is unrelated, so none is quoted (audit F38).
-                None if span.cell.is_some_and(|cell| is_code_cell(&text, cell)) => return None,
+                None if cell_type.as_deref() == Some("code") => return None,
                 None => text_range(&line),
             },
             _ => text_range(&line),
@@ -309,16 +308,28 @@ impl Excerpt {
 /// (cell indices count every cell of the notebook, as in [`SourceSpan`]). `None` when the
 /// line (or the cell) does not exist.
 pub fn source_line(text: &str, span: &SourceSpan) -> Option<String> {
+    located_line(text, span).map(|(line, _)| line)
+}
+
+/// [`source_line`], with the `cell_type` of the cell when `span.cell` is set (the notebook
+/// is parsed once: an excerpt is made for each missing file of a failed build).
+fn located_line(text: &str, span: &SourceSpan) -> Option<(String, Option<String>)> {
     let index = span.start_line.checked_sub(1)?;
     let Some(cell) = span.cell else {
-        return without_bom(text).lines().nth(index).map(str::to_string);
+        let line = without_bom(text).lines().nth(index)?;
+        return Some((line.to_string(), None));
     };
-    let source: String = match notebook_cell(text, cell)?.get("source")? {
+    let cell = notebook_cell(text, cell)?;
+    let source: String = match cell.get("source")? {
         serde_json::Value::String(source) => source.clone(),
         serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p.as_str()).collect(),
         _ => return None,
     };
-    source.lines().nth(index).map(str::to_string)
+    let cell_type = cell
+        .get("cell_type")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    Some((source.lines().nth(index)?.to_string(), cell_type))
 }
 
 /// `text` without one leading byte order mark, which the frontends ignore (audit F43).
@@ -328,14 +339,16 @@ fn without_bom(text: &str) -> &str {
 
 /// Cell `cell` of the notebook JSON `text`; `None` when it is not there.
 fn notebook_cell(text: &str, cell: usize) -> Option<serde_json::Value> {
+    #[cfg(test)]
+    NOTEBOOK_PARSES.set(NOTEBOOK_PARSES.get() + 1);
     let mut notebook: serde_json::Value = serde_json::from_str(without_bom(text)).ok()?;
     Some(notebook.get_mut("cells")?.get_mut(cell)?.take())
 }
 
-/// True when cell `cell` of the notebook JSON `text` is a code cell.
-fn is_code_cell(text: &str, cell: usize) -> bool {
-    notebook_cell(text, cell)
-        .is_some_and(|cell| cell.get("cell_type").and_then(|t| t.as_str()) == Some("code"))
+#[cfg(test)]
+thread_local! {
+    /// How many notebooks [`notebook_cell`] parsed on this thread (tests count them).
+    static NOTEBOOK_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `cell N, line M: rest` or `cell N: rest` at the start of `message` (the notebook
@@ -1228,7 +1241,10 @@ mod tests {
         assert_eq!(excerpt.marker, Some((0, 18)));
         let excerpt = excerpt_of(&missing("/nb/a&b.png", 1, 1), notebook).unwrap();
         assert_eq!(excerpt.text, "<img src=\"a&amp;b.png\">");
+        // The notebook is parsed once for each excerpt (wave-8 review of W8FIX).
+        let before = NOTEBOOK_PARSES.get();
         assert_eq!(excerpt_of(&missing("/nb/out.png", 1, 2), notebook), None);
+        assert_eq!(NOTEBOOK_PARSES.get() - before, 1);
         // With a byte order mark too (audit F43).
         let bom = format!("\u{feff}{notebook}");
         assert!(excerpt_of(&missing("/nb/my pic.png", 3, 0), &bom).is_some());

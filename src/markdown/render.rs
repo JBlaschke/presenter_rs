@@ -822,7 +822,9 @@ fn local_asset(
 /// system (macOS, Windows) accepts and a case-sensitive one (Linux) does not: each segment
 /// is compared exactly with the names `read_dir` lists, as theme files are (A3). `.` is
 /// skipped and `..` goes up unchecked. `None` when every segment matches exactly (or a
-/// directory cannot be listed). Listings are cached while a [`DirListings`] guard is open.
+/// directory cannot be listed). A directory that finds a name by its exact spelling only
+/// (case-sensitive) is not listed ([`exact_lookup`]). Listings are cached while a
+/// [`DirListings`] guard is open.
 fn case_mismatch(base: &Path, relative: &str) -> Option<String> {
     let mut dir = base.to_path_buf();
     let mut on_disk: Vec<String> = Vec::new();
@@ -847,6 +849,50 @@ fn case_mismatch(base: &Path, relative: &str) -> Option<String> {
 /// `name` in lowercase, for comparisons that ignore letter case.
 fn folded(name: &OsStr) -> String {
     name.to_string_lossy().to_lowercase()
+}
+
+/// What a lookup of `name` in `dir` tells without listing `dir` ([`case_mismatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    /// `name` has no letter case (`2024`): a name it matches only by letter case would be
+    /// itself, so it is spelled as on disk.
+    Uncased,
+    /// `dir` has `name`, and not `name` with its ASCII letters in the other case: `dir`
+    /// finds names by their exact spelling (a case-sensitive file system, Linux), so every
+    /// name it has is spelled as on disk.
+    ExactOnly,
+    /// Only a listing tells (a case-insensitive file system, macOS; or `dir` has both
+    /// spellings, or `name` is not there).
+    Unknown,
+}
+
+/// [`Lookup`] of `name` in `dir`, with at most two `lstat` calls: on a case-sensitive file
+/// system the check of a reference needs no listing (wave-8 review of the A3 fixes: a
+/// `figures/` folder of thousands of files was listed for each build).
+fn exact_lookup(dir: &Path, name: &OsStr) -> Lookup {
+    let Some(text) = name.to_str() else {
+        return Lookup::Unknown;
+    };
+    if text.to_lowercase() == text && text.to_uppercase() == text {
+        return Lookup::Uncased;
+    }
+    if !text.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        return Lookup::Unknown;
+    }
+    // Swapping ASCII letters gives a name every case-insensitive file system takes for
+    // `name`: there a lookup of it always succeeds.
+    let swapped: String = text
+        .chars()
+        .map(|c| match c.is_ascii_uppercase() {
+            true => c.to_ascii_lowercase(),
+            false => c.to_ascii_uppercase(),
+        })
+        .collect();
+    let has = |name: &str| std::fs::symlink_metadata(dir.join(name)).is_ok();
+    match has(text) && !has(&swapped) {
+        true => Lookup::ExactOnly,
+        false => Lookup::Unknown,
+    }
 }
 
 /// The entry names of a directory, for [`case_mismatch`].
@@ -929,9 +975,17 @@ pub(crate) fn directory_reads() -> usize {
     DIRECTORY_READS.get()
 }
 
-/// The open [`DirListings`] guards on a thread and the listings read meanwhile (`None`: the
-/// directory cannot be listed).
-type ListingCache = (usize, HashMap<PathBuf, Option<Rc<Listing>>>);
+/// What the open [`DirListings`] guards keep of a directory.
+#[derive(Clone)]
+enum Known {
+    /// It finds names by their exact spelling ([`Lookup::ExactOnly`]): not listed.
+    ExactOnly,
+    /// Its listing (`None`: it cannot be listed).
+    Listed(Option<Rc<Listing>>),
+}
+
+/// The open [`DirListings`] guards on a thread and what they know of each directory.
+type ListingCache = (usize, HashMap<PathBuf, Known>);
 
 thread_local! {
     /// This thread's [`ListingCache`].
@@ -940,10 +994,12 @@ thread_local! {
 
 /// While a guard is alive, [`case_mismatch`] lists each directory once on this thread
 /// instead of once per reference and path segment (a deck next to a large `figures/`
-/// folder would otherwise list it for every image). The outermost guard forgets the
-/// listings when dropped, so a rebuild sees the files as they are then. A deck parse and a
-/// notebook parse hold one for the whole deck, and each rendered slide or fragment one of
-/// its own. Without a guard, each lookup scans the directory up to an exact match.
+/// folder would otherwise list it for every image), and a directory that finds names by
+/// their exact spelling ([`exact_lookup`]) is probed once and never listed. The outermost
+/// guard forgets what it learnt when dropped, so a rebuild sees the files as they are then.
+/// A deck parse and a notebook parse hold one for the whole deck, and each rendered slide
+/// or fragment one of its own. Without a guard, each lookup probes the directory and, when
+/// that does not tell, scans it up to an exact match.
 pub(crate) struct DirListings(());
 
 impl DirListings {
@@ -953,23 +1009,40 @@ impl DirListings {
         DirListings(())
     }
 
-    /// The name in `dir` that `name` names ([`Listing::spelling`]): from the listing cached
-    /// while a guard is open (read now if it is not yet), else from a scan of `dir`. `None`
-    /// when there is none or the directory cannot be listed.
+    /// The name in `dir` that `name` names ([`Listing::spelling`]): `name` itself when a
+    /// lookup tells ([`exact_lookup`]), else from the listing cached while a guard is open
+    /// (read now if it is not yet), else from a scan of `dir`. `None` when there is none or
+    /// the directory cannot be listed.
     fn spelling(dir: &Path, name: &OsStr) -> Option<OsString> {
         let (open, cached) =
             LISTINGS.with_borrow(|(open, listings)| (*open > 0, listings.get(dir).cloned()));
-        if !open {
-            return Listing::scan(dir, name);
-        }
-        let listing = cached.unwrap_or_else(|| {
-            let listing = Listing::read(dir).map(Rc::new);
-            LISTINGS.with_borrow_mut(|(_, listings)| {
-                listings.insert(dir.to_path_buf(), listing.clone());
-            });
-            listing
-        });
+        let listing = match cached {
+            Some(Known::ExactOnly) => return Some(name.to_os_string()),
+            Some(Known::Listed(listing)) => listing,
+            None => {
+                let lookup = exact_lookup(dir, name);
+                if lookup != Lookup::Unknown {
+                    if open && lookup == Lookup::ExactOnly {
+                        Self::remember(dir, Known::ExactOnly);
+                    }
+                    return Some(name.to_os_string());
+                }
+                if !open {
+                    return Listing::scan(dir, name);
+                }
+                let listing = Listing::read(dir).map(Rc::new);
+                Self::remember(dir, Known::Listed(listing.clone()));
+                listing
+            }
+        };
         listing?.spelling(name)
+    }
+
+    /// Keeps `known` for `dir` until the outermost guard is dropped.
+    fn remember(dir: &Path, known: Known) {
+        LISTINGS.with_borrow_mut(|(_, listings)| {
+            listings.insert(dir.to_path_buf(), known);
+        });
     }
 }
 
@@ -2044,12 +2117,23 @@ After inner.
     }
 
     /// A3 fix round: directory listings for `asset-case-mismatch` are read once while a
-    /// guard is open, and read again after the outermost guard is dropped (a rebuild).
+    /// guard is open, and read again after the outermost guard is dropped (a rebuild). A
+    /// case-sensitive file system lists nothing ([`exact_lookups_need_no_listing`]).
     #[test]
     fn case_listings_are_cached_while_a_guard_is_open() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("Figs")).unwrap();
         std::fs::write(dir.path().join("Figs/a.png"), b"x").unwrap();
+        if !dir.path().join("FIGS/A.PNG").exists() {
+            // Case-sensitive: names are found by their exact spelling (`figs/a.png` is not
+            // there), so the check of a file that exists needs no listing.
+            let _deck = DirListings::enter();
+            let before = directory_reads();
+            assert_eq!(case_mismatch(dir.path(), "Figs/./a.png"), None);
+            assert_eq!(case_mismatch(dir.path(), "Figs/a.png"), None);
+            assert_eq!(directory_reads() - before, 0);
+            return;
+        }
         assert_eq!(
             case_mismatch(dir.path(), "figs/./a.png").as_deref(),
             Some("Figs/a.png")
@@ -2082,6 +2166,57 @@ After inner.
             Some("Figs/B.png")
         );
         assert_eq!(case_mismatch(dir.path(), "Figs/../Figs/B.png"), None);
+    }
+
+    /// Wave-8 review of the A3 fixes: a name without letter case, and every name of a
+    /// directory that finds names by their exact spelling (a case-sensitive file system),
+    /// is checked without listing the directory; on a case-insensitive file system each
+    /// directory is listed once (per guard).
+    #[test]
+    fn exact_lookups_need_no_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let year = dir.path().join("2024");
+        std::fs::create_dir_all(year.join("Figs")).unwrap();
+        std::fs::write(year.join("01"), b"x").unwrap();
+        std::fs::write(year.join("Figs/a.png"), b"x").unwrap();
+        let insensitive = year.join("FIGS/A.PNG").exists();
+        assert_eq!(
+            exact_lookup(dir.path(), OsStr::new("2024")),
+            Lookup::Uncased
+        );
+        assert_eq!(exact_lookup(&year, OsStr::new("01")), Lookup::Uncased);
+        let expected = match insensitive {
+            true => Lookup::Unknown,
+            false => Lookup::ExactOnly,
+        };
+        assert_eq!(exact_lookup(&year, OsStr::new("Figs")), expected);
+        // A name that is not there is never taken for exact; nor one without ASCII letters.
+        assert_eq!(exact_lookup(&year, OsStr::new("gone")), Lookup::Unknown);
+        assert_eq!(exact_lookup(&year, OsStr::new("é")), Lookup::Unknown);
+        {
+            let _deck = DirListings::enter();
+            let before = directory_reads();
+            assert_eq!(case_mismatch(dir.path(), "2024/01"), None);
+            assert_eq!(directory_reads() - before, 0, "names without letter case");
+            for _ in 0..3 {
+                assert_eq!(case_mismatch(dir.path(), "2024/./Figs/a.png"), None);
+            }
+            let listed = directory_reads() - before;
+            assert_eq!(
+                listed,
+                if insensitive { 2 } else { 0 },
+                "2024/ and Figs/, once"
+            );
+        }
+        if !insensitive {
+            // Both spellings in one directory: only its listing tells them apart.
+            std::fs::write(year.join("Figs/A.PNG"), b"x").unwrap();
+            let figs = year.join("Figs");
+            assert_eq!(exact_lookup(&figs, OsStr::new("a.png")), Lookup::Unknown);
+            let before = directory_reads();
+            assert_eq!(case_mismatch(dir.path(), "2024/Figs/A.PNG"), None);
+            assert_eq!(directory_reads() - before, 1);
+        }
     }
 
     /// A3 (F14): only a non-negative integer is a fragment index.

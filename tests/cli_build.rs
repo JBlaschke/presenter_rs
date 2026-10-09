@@ -1615,4 +1615,47 @@ fn a_path_with_dot_dot_keeps_its_last_name_as_typed() {
         stdout.starts_with("Wrote ../site/current.html (1 slide, "),
         "{stdout}"
     );
+    // Wave-8 review of W8FIX: so are the directories after the last `..`, a symbolic link
+    // to a directory included; build and check show the same path, and `Wrote` the one
+    // given.
+    std::os::unix::fs::symlink("decks", tmp.path().join("decks-link")).unwrap();
+    let output = presenter()
+        .current_dir(&sib)
+        .args(["build", "../decks-link/talk-v2.md"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.starts_with("error: asset not found: ../decks-link/missing.png\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\n --> ../decks-link/talk-v2.md:3\n"),
+        "{stderr}"
+    );
+    let output = presenter()
+        .current_dir(&sib)
+        .args(["check", "../decks-link/talk-v2.md"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.starts_with("../decks-link/talk-v2.md:3: warning: "),
+        "{stderr}"
+    );
+    let stdout = stdout_of(presenter().current_dir(&sib).args([
+        "build",
+        "s.md",
+        "-o",
+        "../decks-link/out.html",
+    ]));
+    assert!(
+        stdout.starts_with("Wrote ../decks-link/out.html (1 slide, "),
+        "{stdout}"
+    );
+    assert!(tmp.path().join("decks/out.html").is_file());
 }

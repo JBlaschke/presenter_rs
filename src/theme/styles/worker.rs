@@ -283,7 +283,7 @@ pub(super) fn compile(
     // The worker has answered or closed its stdout: it is ending.
     let status = child.wait();
     let stderr = pipes.close();
-    note_reads(theme, &reads);
+    note_reads(theme, key, &reads);
     Ok(match (result, status) {
         (Some(result), _) => Outcome::Finished(result),
         (None, Ok(status)) => crashed(theme, key, source, reads, status, &stderr),

@@ -112,9 +112,10 @@ mod tests {
     use crate::markdown::render::directory_reads;
 
     /// Wave-8 review of the A3 fixes: the `asset-case-mismatch` check lists each directory
-    /// once per notebook, not once per cell (every cell renders on its own). Each cell names
-    /// a file as it is spelled on disk and, on a case-insensitive file system, one in
-    /// another letter case (missing on a case-sensitive one).
+    /// once per notebook, not once per cell (every cell renders on its own), and not at all
+    /// on a case-sensitive file system. Each cell names a file as it is spelled on disk
+    /// and, on a case-insensitive file system, one in another letter case (missing on a
+    /// case-sensitive one).
     #[test]
     fn a_notebook_lists_each_directory_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -138,8 +139,9 @@ mod tests {
         let insensitive = dir.path().join("figures/odd0.png").exists();
         let before = directory_reads();
         let parsed = parse(&source, &notebook.to_string(), &Config::default()).unwrap();
-        // The notebook's directory and figures/, once each.
-        assert_eq!(directory_reads() - before, 2);
+        // The notebook's directory and figures/, once each (case-sensitive: none).
+        let listed = if insensitive { 2 } else { 0 };
+        assert_eq!(directory_reads() - before, listed);
         assert_eq!(parsed.deck.slides.len(), 6);
         let codes: Vec<&str> = parsed.diagnostics.iter().map(|d| d.code).collect();
         let expected = match insensitive {
@@ -149,6 +151,6 @@ mod tests {
         assert_eq!(codes, [expected; 6], "the check still runs");
         // A second parse lists them again (a rebuild sees the files as they are then).
         parse(&source, &notebook.to_string(), &Config::default()).unwrap();
-        assert_eq!(directory_reads() - before, 4);
+        assert_eq!(directory_reads() - before, 2 * listed);
     }
 }

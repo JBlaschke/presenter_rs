@@ -33,8 +33,9 @@ presenter build <INPUT> [-o/--out PATH] [--theme NAME|PATH] [--standalone|--site
   directory in use (its `theme.toml` and its other top-level files except `.html`, `.htm` and
   `.pdf` files, which may be earlier outputs; everything in its `templates/`, `styles/`, `assets/`
   and `scripts/`; the files its `theme.toml` names; and every other file of it that the build
-  read, such as an image its stylesheet reaches with `url("../img/x.png")`, a file a template
-  names with `asset()` or a Sass partial outside `styles/`), so a symbolic or hard link and another
+  read (contract change, W8FIX 2026-10-09), such as an image its stylesheet reaches with
+  `url("../img/x.png")`, a file a template names with `asset()` or a Sass partial outside
+  `styles/`), so a symbolic or hard link and another
   spelling of the name on a case-insensitive file system count too, and so does a path that
   reaches the file once its missing directories are created (`new/../link/../x.md`). A clash
   exits 2 with `error: refusing to write <out>: it is the input file <input>; choose another
@@ -138,6 +139,9 @@ presenter export pdf <INPUT> [-o FILE] [--chrome PATH] [--theme …]
   are relative to the current directory, with `..` for a path outside it when that is no longer
   than the absolute path; a symbolic link in a path's prefix does not keep it absolute, and a `..`
   in a path is resolved as the file system resolves it (after a link it leaves the directory the
-  link points to), so the message names the file really read or written (audit F39). The last
-  name of a path is shown as typed: a final symbolic link is not replaced by its target, and
-  its letter case is kept (`-o ../w/alias.html` is `alias.html` from `w/`).
+  link points to), so the message names the file really read or written (audit F39). Contract
+  change (W8FIX, 2026-10-09): a path is resolved only up to its last `..`; the names after it are
+  shown as typed, so a final symbolic link is not replaced by its target and the letter case is
+  kept (`-o ../w/alias.html` is `alias.html` from `w/`), and a symbolic link to a directory
+  among them is kept too (`../decks-link/talk.md`, as `check` shows it), unless resolving it
+  gives a shorter relative path (the rule for a link in a path's prefix).

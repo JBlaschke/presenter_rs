@@ -415,7 +415,11 @@ fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -
         Ok(result) => {
             // It has sent its result: the thread is ending, and its stack is freed.
             let _ = thread.join();
-            note_reads(theme, &reads.lock().unwrap_or_else(PoisonError::into_inner));
+            note_reads(
+                theme,
+                key,
+                &reads.lock().unwrap_or_else(PoisonError::into_inner),
+            );
             Outcome::Finished(result)
         }
         Err(RecvTimeoutError::Timeout) => Outcome::Abandoned {
@@ -434,14 +438,20 @@ fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -
 /// of their contents, in the order read.
 type Reads = Vec<(String, blake3::Hash)>;
 
-/// Notes the files of disk themes among `reads` as read on this thread
-/// ([`crate::theme::recording_reads`]): the compilation read them on its own thread or in
-/// its worker process.
-fn note_reads(theme: &Theme, reads: &Reads) {
+/// Notes the files of disk themes among `reads`, the files the compilation of `key` read
+/// on its own thread or in its worker process, as read on this thread
+/// ([`crate::theme::recording_reads`]); nothing when nothing is recording. They were read
+/// through [`crate::theme::ThemeDir::read`], so their paths are noted as they are
+/// ([`crate::theme::ThemeDir::note_read_elsewhere`]); `key` itself was given (its caller
+/// read it).
+fn note_reads(theme: &Theme, key: &str, reads: &Reads) {
+    if !crate::theme::recording() {
+        return;
+    }
     let fs = VirtualFs::new(theme);
-    for (key, _) in reads {
-        if let Some(Location::Theme(dir, rel)) = fs.locate(key) {
-            dir.note_read(rel);
+    for (read, _) in reads.iter().filter(|(read, _)| read != key) {
+        if let Some(Location::Theme(dir, rel)) = fs.locate(read) {
+            dir.note_read_elsewhere(rel);
         }
     }
 }
@@ -1538,6 +1548,58 @@ a::before { content: "@import url(string.css);" }
             key(&format!("{}/../x.scss", "@t/styles\u{1}")).as_deref(),
             Some("@t/x.scss")
         );
+    }
+
+    /// Wave-8 review of W8FIX: the files a Sass compilation read (on its thread or in its
+    /// worker) are noted as read for `recording_reads` without checking them on disk again,
+    /// which listed their directories once per file (a theme with many partials built
+    /// 13-18 % slower), and not at all when nothing is recording (`check`).
+    #[test]
+    fn the_files_sass_read_are_noted_without_listing_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("styles/parts")).unwrap();
+        let mut entry = String::new();
+        let mut expected = BTreeSet::from([root.join("styles/theme.scss")]);
+        for i in 0..40 {
+            let partial = root.join(format!("styles/parts/_p{i}.scss"));
+            std::fs::write(&partial, format!(".p{i} {{ width: {i}px; }}\n")).unwrap();
+            entry.push_str(&format!("@use \"parts/p{i}\";\n"));
+            expected.insert(partial);
+        }
+        std::fs::write(root.join("styles/theme.scss"), entry).unwrap();
+        std::fs::write(root.join("theme.toml"), "").unwrap();
+        let theme = Theme {
+            chain: vec![ThemeDir {
+                name: "t".into(),
+                source: ThemeSource::Disk { dir: root.clone() },
+                manifest: crate::theme::ThemeManifest::default(),
+            }],
+        };
+        let before = crate::theme::directory_listings();
+        let (css, read) =
+            crate::theme::recording_reads(|| compile_scss(&theme, "@t/styles/theme.scss"));
+        assert!(css.unwrap().contains(".p39"));
+        assert_eq!(read, expected, "the entry and every partial");
+        // This thread listed the directories of the entry only (styles/ and the theme
+        // directory): the partials were read on the compilation's thread.
+        assert_eq!(crate::theme::directory_listings() - before, 2);
+        // Reads reported elsewhere: noted as they are, the given entry skipped, nothing
+        // outside the theme; nothing at all when nothing is recording.
+        let hash = blake3::hash(b"");
+        let reads: Reads = [
+            "@t/styles/theme.scss",
+            "@t/styles/parts/_p1.scss",
+            "@t/../x.scss",
+        ]
+        .map(|key| (key.to_string(), hash))
+        .into();
+        let before = crate::theme::directory_listings();
+        note_reads(&theme, "@t/styles/theme.scss", &reads);
+        let ((), read) =
+            crate::theme::recording_reads(|| note_reads(&theme, "@t/styles/theme.scss", &reads));
+        assert_eq!(read, BTreeSet::from([root.join("styles/parts/_p1.scss")]));
+        assert_eq!(crate::theme::directory_listings() - before, 0);
     }
 
     #[test]

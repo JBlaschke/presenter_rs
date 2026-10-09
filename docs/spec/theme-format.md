@@ -142,7 +142,7 @@ Helper functions (registered on the environment by T15; all return HTML marked s
 |---|---|---|---|
 | `style(path)` | `<style>…contents…</style>` with `url()` assets inlined as `data:` | `<link rel="stylesheet" href="assets/<hashed>">` and file copied | `<link rel="stylesheet" href="/__presenter/asset/<path>">` |
 | `script(path)` | `<script>…</script>` | `<script src="assets/<hashed>"></script>` | `<script src="/__presenter/asset/<path>"></script>` |
-| `asset(path)` | `data:` URI string | `assets/<hashed>` string | `/__presenter/asset/<path>` string |
+| `asset(path)` | `data:` URI string | `assets/<hashed>` string | `/__presenter/asset/<path>` string (`?v=<content version>` after a theme file's, see the contract change below) |
 | `theme_style()` | `<style id="presenter-theme">…compiled theme CSS…</style>` | `<link id="presenter-theme" rel="stylesheet" href="assets/theme-<hash>.css">` | `<link id="presenter-theme" rel="stylesheet" href="/__presenter/theme.css?v=<build id>">` |
 | `reveal_init()` | `<script>Reveal.initialize(Object.assign(<config_json>, { plugins: [<plugins>] }));</script>` | same | same |
 | `live_reload()` | empty | empty | `<script src="/__presenter/live-reload.js"></script>` |
@@ -151,7 +151,7 @@ Helper functions (registered on the environment by T15; all return HTML marked s
 (`docs/spec/vendored-assets.md`); `presenter/…` → `assets/presenter/` (our JS);
 anything else → theme chain `assets/` directories (child first). Unknown path → `Error::Template`.
 
-> **Clarification (W8FIX, 2026-10-09, records audit F03 as built by A2):** in serve mode,
+> **Contract change (W8FIX, 2026-10-09, records audit F03 as built by A2):** in serve mode,
 > `asset(path)` of a file of the theme chain (the `@<theme>/…` form or the chain's `assets/`)
 > returns `/__presenter/asset/<path>?v=<content version>`, and so does a relative `url()` of
 > the theme stylesheet that names such a file (live-reload.md §4): the version is a number
