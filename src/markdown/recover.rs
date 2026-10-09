@@ -13,16 +13,21 @@
 //! - **headings, links, images and inline code** ([`recover_attr_blocks`]): the block is
 //!   found in the source text, at the end of a heading's content (after whitespace, inside
 //!   the heading's own text) or right after a link's or image's `)`/`]` or inline code's
-//!   closing backtick. Each block that reads as attributes is removed from the text, the
-//!   text is parsed again and the attributes are put on the node, as if comrak had read them
-//!   (lines stay where they were, so spans and slide boundaries do not change). Only the
-//!   columns after a removed block on its line move;
+//!   closing backtick. Each block that reads as attributes is rewritten in the text in the
+//!   form comrak reads itself, every value double-quoted (`{background='#222' .dark}` →
+//!   `{."dark" background="#222"}`), and the text is parsed again, so comrak sets the
+//!   attributes exactly as for that form: the result is what the double-quoted block gives
+//!   (also next to other inlines and other blocks: `# H {.a} {k='v'}` keeps `{.a}` as text,
+//!   as `# H {.a} {k="v"}` does). Lines stay where they were, so spans and slide boundaries
+//!   do not change; only the columns after a rewritten block on its line move. A block
+//!   comrak still does not read in its place is put back and reported;
 //! - **fenced code** ([`fence_attrs`], called by the renderer): the block is the end of the
 //!   info string comrak left (`python {lines=1|3}`), so no source text is needed.
 //!
 //! A block that is not attributes stays text. When it was meant as attributes
 //! ([`ElementAttrs::Invalid`]: a key without a value, an unbalanced quote, an invalid key
-//! name next to valid items) it is reported as an [`UNPARSED_ATTR_BLOCK`] warning.
+//! name next to valid items, items separated by commas) it is reported as an
+//! [`UNPARSED_ATTR_BLOCK`] warning.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -32,7 +37,7 @@ use comrak::{Arena, Options, parse_document};
 
 use crate::error::{Diagnostic, Diagnostics};
 use crate::ir::SourceSpan;
-use crate::markdown::attrs::{ElementAttrs, ParsedAttrs, read_element_attrs};
+use crate::markdown::attrs::{ElementAttrs, read_element_attrs};
 
 /// Diagnostic code of an attribute block that is left as text although it was meant as
 /// attributes (warning).
@@ -73,35 +78,55 @@ impl Kind {
 struct Found<'s> {
     /// 1-based line of the block.
     line: usize,
-    /// Byte range in that line to remove when the block is read as attributes (for a
-    /// heading, the whitespace before it too).
-    remove: Range<usize>,
+    /// Byte range of the block in that line.
+    range: Range<usize>,
     /// The block as written.
     block: &'s str,
     /// How it reads.
     reading: ElementAttrs,
 }
 
-/// A block to remove and the node to give its attributes to.
-struct Fix {
+/// A block to rewrite in comrak's own form, and the node that must then have its attributes.
+struct Fix<'t> {
     kind: Kind,
-    /// The node's first line and column (byte, 1-based), in the text the block is removed from.
+    /// The node's first line and column (byte, 1-based).
     start: (usize, usize),
     /// Byte range of the block in the whole text.
     range: Range<usize>,
-    attrs: ParsedAttrs,
+    /// The block as written and its line, for the warning when it cannot be applied.
+    block: &'t str,
+    line: usize,
+    /// The attributes it reads as, and the block comrak reads as them ([`native_block`]).
+    attrs: Attributes,
+    native: String,
 }
+
+/// Where a fix's node must be in the rewritten text and the attributes it must have.
+struct Target<'f> {
+    kind: Kind,
+    start: (usize, usize),
+    attrs: &'f Attributes,
+}
+
+/// How many times [`recover_attr_blocks`] parses a rewritten text before it gives up.
+const MAX_ROUNDS: usize = 3;
+
+/// Why a block is not recovered when comrak does not read its rewritten form either.
+const NOT_READ_THERE: &str = "comrak does not read it in this place, even with every value \
+     in double quotes";
 
 /// Recovers the attribute blocks comrak left as text after headings, links, images and
 /// inline code of `root`, the document comrak parsed from `text` with `opts` (module docs).
 ///
-/// Returns `root` and `text` unchanged when there is nothing to recover. Otherwise the
-/// recovered blocks are removed from `text`, the result is parsed again (into `arena`, with
-/// `opts`) and the attributes are set on the new tree's nodes (merged after any that comrak
-/// then reads itself); the new root and text are returned, and the caller must use both
-/// from then on (the splitter reads separators from the text). Blocks that were meant as
-/// attributes but are not valid are reported in `diagnostics` (`unparsed-attr-block`, span
-/// on the block's line, no path).
+/// Returns `root` and `text` unchanged when there is nothing to recover. Otherwise each
+/// block that reads as attributes is rewritten in comrak's own syntax, every value
+/// double-quoted (`{."dark" background="#222"}`), the result is parsed again (into `arena`,
+/// with `opts`) and the new root and text are returned; the caller must use both from then
+/// on (the splitter reads separators from the text). Each node must then carry exactly the
+/// block's attributes; a block for which that is not so is put back as written and
+/// reported, and the text is parsed again without it (at most three times, then
+/// nothing is recovered). Blocks that were meant as attributes but are not read are reported
+/// in `diagnostics` (`unparsed-attr-block`, span on the block's line, no path).
 pub fn recover_attr_blocks<'a, 't>(
     arena: &'a Arena<'a>,
     root: &'a AstNode<'a>,
@@ -110,56 +135,148 @@ pub fn recover_attr_blocks<'a, 't>(
     diagnostics: &mut Diagnostics,
 ) -> (&'a AstNode<'a>, Cow<'t, str>) {
     let (starts, lines) = split_lines(text);
-    let mut fixes = Vec::new();
+    let mut fixes = find_fixes(root, &starts, &lines, diagnostics);
+    for _ in 0..MAX_ROUNDS {
+        if fixes.is_empty() {
+            return (root, Cow::Borrowed(text));
+        }
+        let (edited, targets) = rewrite_blocks(text, &fixes, &starts);
+        let new_root = parse_document(arena, &edited, opts);
+        let read = read_by_comrak(new_root, &targets);
+        if read.iter().all(|&read| read) {
+            return (new_root, Cow::Owned(edited));
+        }
+        let (kept, missed): (Vec<_>, Vec<_>) =
+            fixes.into_iter().zip(read).partition(|&(_, read)| read);
+        report_missed(missed.into_iter().map(|(fix, _)| fix), diagnostics);
+        fixes = kept.into_iter().map(|(fix, _)| fix).collect();
+    }
+    report_missed(fixes, diagnostics);
+    (root, Cow::Borrowed(text))
+}
+
+/// The blocks after `root`'s headings, links, images and inline code that read as
+/// attributes, without overlaps, ordered by position; blocks meant as attributes that are
+/// not valid are reported in `diagnostics`.
+fn find_fixes<'a, 't>(
+    root: &'a AstNode<'a>,
+    starts: &[usize],
+    lines: &[&'t str],
+    diagnostics: &mut Diagnostics,
+) -> Vec<Fix<'t>> {
+    let mut fixes: Vec<Fix<'t>> = Vec::new();
     for node in root.descendants() {
         let (kind, start) = {
             let data = node.data();
+            let pos = data.sourcepos.start;
             match Kind::of(&data.value) {
-                Some(kind) if data.attrs.is_none() => (
-                    kind,
-                    (data.sourcepos.start.line, data.sourcepos.start.column),
-                ),
+                Some(kind) if data.attrs.is_none() => (kind, (pos.line, pos.column)),
                 _ => continue,
             }
         };
         let found = match kind {
-            Kind::Heading => heading_block(node, &lines),
-            _ => inline_block(node, kind, &lines),
+            Kind::Heading => heading_block(node, lines),
+            _ => inline_block(node, kind, lines),
         };
         let Some(found) = found else {
             continue;
         };
         match found.reading {
-            ElementAttrs::Attrs(attrs) => {
+            ElementAttrs::Attrs(parsed) => {
                 let Some(&line_start) = starts.get(found.line - 1) else {
                     continue;
                 };
-                let range = line_start + found.remove.start..line_start + found.remove.end;
+                let attrs = Attributes {
+                    id: parsed.id,
+                    classes: parsed.classes,
+                    pairs: parsed.pairs,
+                };
                 fixes.push(Fix {
                     kind,
                     start,
-                    range,
+                    range: line_start + found.range.start..line_start + found.range.end,
+                    block: found.block,
+                    line: found.line,
+                    native: native_block(&attrs),
                     attrs,
                 });
             }
             ElementAttrs::Invalid(reason) => {
-                let span = SourceSpan {
-                    start_line: found.line,
-                    end_line: found.line,
-                    cell: None,
-                };
-                diagnostics.push(unparsed(kind.name(), found.block, &reason).with_span(span));
+                diagnostics.push(unparsed_at(kind, found.block, &reason, found.line));
             }
             ElementAttrs::Text => {}
         }
     }
-    if fixes.is_empty() {
-        return (root, Cow::Borrowed(text));
+    fixes.sort_by_key(|fix| fix.range.start);
+    let mut kept: Vec<Fix<'t>> = Vec::with_capacity(fixes.len());
+    for fix in fixes {
+        if kept
+            .last()
+            .is_some_and(|last| fix.range.start < last.range.end)
+        {
+            tracing::debug!(
+                "overlapping attribute blocks at {:?}; one is kept",
+                fix.range
+            );
+            continue;
+        }
+        kept.push(fix);
     }
-    let (edited, fixes) = remove_blocks(text, fixes, &starts);
-    let new_root = parse_document(arena, &edited, opts);
-    apply_fixes(new_root, fixes);
-    (new_root, Cow::Owned(edited))
+    kept
+}
+
+/// `attrs` as an attribute block comrak reads itself: `#id`, `.class` and `key=value` items
+/// separated by spaces, every value double-quoted with `\` and `"` escaped (comrak takes any
+/// character there; keys are valid attribute names, which is comrak's key grammar).
+fn native_block(attrs: &Attributes) -> String {
+    let mut out = String::from("{");
+    let mut item = |prefix: &str, value: &str| {
+        if out.len() > 1 {
+            out.push(' ');
+        }
+        out.push_str(prefix);
+        out.push('"');
+        for c in value.chars() {
+            if matches!(c, '\\' | '"') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+    };
+    if let Some(id) = &attrs.id {
+        item("#", id);
+    }
+    for class in &attrs.classes {
+        item(".", class);
+    }
+    for (key, value) in &attrs.pairs {
+        item(&format!("{key}="), value);
+    }
+    out.push('}');
+    out
+}
+
+/// The `unparsed-attr-block` warning for `block` after a node of `kind`, on `line`.
+fn unparsed_at(kind: Kind, block: &str, reason: &str, line: usize) -> Diagnostic {
+    unparsed(kind.name(), block, reason).with_span(SourceSpan {
+        start_line: line,
+        end_line: line,
+        cell: None,
+    })
+}
+
+/// Reports fixes whose rewritten block comrak did not read as their attributes.
+fn report_missed<'t>(fixes: impl IntoIterator<Item = Fix<'t>>, diagnostics: &mut Diagnostics) {
+    for fix in fixes {
+        tracing::debug!(
+            "attribute block for the {} at {:?} not recovered: comrak does not read {}",
+            fix.kind.name(),
+            fix.start,
+            fix.native
+        );
+        diagnostics.push(unparsed_at(fix.kind, fix.block, NOT_READ_THERE, fix.line));
+    }
 }
 
 /// The attribute block at the end of a heading's content: the last `{` in one of the
@@ -193,20 +310,20 @@ fn heading_block<'a, 's>(heading: &'a AstNode<'a>, lines: &[&'s str]) -> Option<
     let content = &line[..=close];
     let mut invalid = None;
     for (at, _) in content.match_indices('{').rev() {
-        let separated = Some(at) == content_start
-            || at
-                .checked_sub(1)
-                .is_some_and(|before| matches!(line.as_bytes()[before], b' ' | b'\t'));
+        // as comrak: the block starts the content or follows whitespace (the first child of
+        // `# \{…}` starts at the escaped `{`, which is not the content's start)
+        let before = at.checked_sub(1).map(|before| line.as_bytes()[before]);
+        let separated = matches!(before, None | Some(b' ' | b'\t'))
+            || (Some(at) == content_start && before != Some(b'\\'));
         if !separated || !texts.iter().any(|text| text.contains(&at)) {
             continue;
         }
         let block = &content[at..];
         match read_element_attrs(block) {
             ElementAttrs::Attrs(attrs) => {
-                let from = line[..at].trim_end_matches([' ', '\t']).len();
                 return Some(Found {
                     line: end.line,
-                    remove: from..close + 1,
+                    range: at..close + 1,
                     block,
                     reading: ElementAttrs::Attrs(attrs),
                 });
@@ -214,7 +331,7 @@ fn heading_block<'a, 's>(heading: &'a AstNode<'a>, lines: &[&'s str]) -> Option<
             ElementAttrs::Invalid(reason) if invalid.is_none() => {
                 invalid = Some(Found {
                     line: end.line,
-                    remove: at..close + 1,
+                    range: at..close + 1,
                     block,
                     reading: ElementAttrs::Invalid(reason),
                 });
@@ -228,7 +345,9 @@ fn heading_block<'a, 's>(heading: &'a AstNode<'a>, lines: &[&'s str]) -> Option<
 /// The attribute block right after a link's or image's `)`/`]` or inline code's closing
 /// backtick, on the same line: a `{` that starts the next `Text` sibling, up to the first
 /// `}` outside quotes. Without such a `}` (an unbalanced quote) the block runs to the first
-/// `}` and is returned only when it reads as [`ElementAttrs::Invalid`].
+/// `}` and is returned only when it reads as [`ElementAttrs::Invalid`]. A block that runs
+/// past the end of the node's parent (a table cell ended by a `|` in the block, an emphasis
+/// closed inside it) is [`ElementAttrs::Invalid`] too.
 fn inline_block<'a, 's>(node: &'a AstNode<'a>, kind: Kind, lines: &[&'s str]) -> Option<Found<'s>> {
     let end = node.data().sourcepos.end;
     let line = *lines.get(end.line.checked_sub(1)?)?;
@@ -253,7 +372,7 @@ fn inline_block<'a, 's>(node: &'a AstNode<'a>, kind: Kind, lines: &[&'s str]) ->
         }
     }
     let rest = &line[at..];
-    let (len, reading) = match block_len(rest) {
+    let (len, mut reading) = match block_len(rest) {
         Some(len) => (len, read_element_attrs(&rest[..len])),
         None => {
             let len = rest.find('}')? + 1;
@@ -263,9 +382,20 @@ fn inline_block<'a, 's>(node: &'a AstNode<'a>, kind: Kind, lines: &[&'s str]) ->
             }
         }
     };
+    // the block must end inside the node's parent (a `|` in it may end a table cell, a `*`
+    // an emphasis), or the element would not be where the block is
+    let parent_end = node.parent().map(|parent| parent.data().sourcepos.end);
+    let crosses =
+        parent_end.is_some_and(|parent| parent.line == end.line && at + len > parent.column);
+    if crosses && matches!(reading, ElementAttrs::Attrs(_)) {
+        reading = ElementAttrs::Invalid(
+            "it runs past the end of the table cell, emphasis or link the element is in"
+                .to_string(),
+        );
+    }
     Some(Found {
         line: end.line,
-        remove: at..at + len,
+        range: at..at + len,
         block: &rest[..len],
         reading,
     })
@@ -293,78 +423,63 @@ fn block_len(text: &str) -> Option<usize> {
     None
 }
 
-/// The text with the fixes' ranges removed (a fix overlapping an earlier one is dropped),
-/// and the kept fixes with their node's start column moved left by what was removed before
-/// it on its line.
-fn remove_blocks(text: &str, mut fixes: Vec<Fix>, starts: &[usize]) -> (String, Vec<Fix>) {
-    fixes.sort_by_key(|fix| fix.range.start);
-    let mut edited = String::with_capacity(text.len());
-    let mut kept: Vec<Fix> = Vec::with_capacity(fixes.len());
+/// The text with each fix's block replaced by its [`native_block`] (the fixes are ordered and
+/// do not overlap), and where each fix's node must start in it: moved along its line by
+/// what the rewritten blocks before it on that line added or removed.
+fn rewrite_blocks<'f>(
+    text: &str,
+    fixes: &'f [Fix<'_>],
+    starts: &[usize],
+) -> (String, Vec<Target<'f>>) {
+    let mut edited = String::with_capacity(text.len() + fixes.len() * 8);
     let mut copied = 0;
     for fix in fixes {
-        if fix.range.start < copied {
-            tracing::debug!(
-                "overlapping attribute blocks at {:?}; one is kept",
-                fix.range
-            );
-            continue;
-        }
         edited.push_str(&text[copied..fix.range.start]);
+        edited.push_str(&fix.native);
         copied = fix.range.end;
-        kept.push(fix);
     }
     edited.push_str(&text[copied..]);
-    let removed: Vec<Range<usize>> = kept.iter().map(|fix| fix.range.clone()).collect();
-    for fix in &mut kept {
-        let (line, column) = fix.start;
-        let Some(&line_start) = starts.get(line - 1) else {
-            continue;
-        };
-        let offset = line_start + column - 1;
-        let shift: usize = removed
-            .iter()
-            .filter(|range| range.start >= line_start && range.end <= offset)
-            .map(|range| range.len())
-            .sum();
-        fix.start = (line, column - shift);
-    }
-    (edited, kept)
+    let targets = fixes
+        .iter()
+        .map(|fix| {
+            let (line, column) = fix.start;
+            let line_start = starts.get(line - 1).copied().unwrap_or_default();
+            let offset = line_start + column - 1;
+            let (added, removed) = fixes
+                .iter()
+                .filter(|other| other.range.start >= line_start && other.range.end <= offset)
+                .fold((0, 0), |(added, removed), other| {
+                    (added + other.native.len(), removed + other.range.len())
+                });
+            Target {
+                kind: fix.kind,
+                start: (line, column + added - removed),
+                attrs: &fix.attrs,
+            }
+        })
+        .collect();
+    (edited, targets)
 }
 
-/// Sets each fix's attributes on the node of its kind that starts where the fix says.
-fn apply_fixes<'a>(root: &'a AstNode<'a>, mut fixes: Vec<Fix>) {
+/// For each target, whether `root` has a node of its kind that starts where it says and
+/// carries exactly its attributes (comrak read the rewritten block).
+fn read_by_comrak<'a>(root: &'a AstNode<'a>, targets: &[Target<'_>]) -> Vec<bool> {
+    let mut read = vec![false; targets.len()];
     for node in root.descendants() {
-        let mut data = node.data_mut();
+        let data = node.data();
         let Some(kind) = Kind::of(&data.value) else {
             continue;
         };
         let start = (data.sourcepos.start.line, data.sourcepos.start.column);
-        let Some(at) = fixes
+        let Some(at) = targets
             .iter()
-            .position(|fix| fix.kind == kind && fix.start == start)
+            .position(|target| target.kind == kind && target.start == start)
         else {
             continue;
         };
-        let fix = fixes.swap_remove(at);
-        let attrs = data.attrs.get_or_insert_with(Default::default);
-        merge_into(attrs, fix.attrs);
+        read[at] = data.attrs.as_deref() == Some(targets[at].attrs);
     }
-    for fix in fixes {
-        tracing::debug!(
-            "attribute block for the {} at {:?} not applied: node not found",
-            fix.kind.name(),
-            fix.start
-        );
-    }
-}
-
-/// Appends `later` to comrak's attributes (its id wins when set).
-fn merge_into(attrs: &mut Attributes, later: ParsedAttrs) {
-    if later.id.is_some() {
-        attrs.id = later.id;
-    }
-    attrs.classes.extend(later.classes);
-    attrs.pairs.extend(later.pairs);
+    read
 }
 
 /// The lines of `text` as comrak numbers lines and columns: `\n`, `\r\n` and a lone `\r`
@@ -445,6 +560,7 @@ pub fn fence_attrs(info: &str) -> Option<(&str, &str, ElementAttrs)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::attrs::ParsedAttrs;
     use crate::markdown::split::dialect_options;
 
     /// What [`recover`] returns: every node with attributes as `(kind, attrs)`, the edited
@@ -489,53 +605,68 @@ mod tests {
         let cases: &[(&str, &str, Attributes)] = &[
             (
                 "# Title {background=figures/bg.png}\n",
-                "# Title\n",
+                "# Title {background=\"figures/bg.png\"}\n",
                 attrs(None, &[], &[("background", "figures/bg.png")]),
             ),
             (
                 "# T3 {.dark background=#222}\n",
-                "# T3\n",
+                "# T3 {.\"dark\" background=\"#222\"}\n",
                 attrs(None, &["dark"], &[("background", "#222")]),
             ),
             // autolinked by comrak: the block is found in the source, not in the inlines
             (
                 "# W {background=https://ex.com/a.png}\n",
-                "# W\n",
+                "# W {background=\"https://ex.com/a.png\"}\n",
                 attrs(None, &[], &[("background", "https://ex.com/a.png")]),
             ),
             // single quotes, a closing sequence, a block quote, a setext heading
             (
                 "# Q {#q .x data-k='a b'} ##\n",
-                "# Q ##\n",
+                "# Q {#\"q\" .\"x\" data-k=\"a b\"} ##\n",
                 attrs(Some("q"), &["x"], &[("data-k", "a b")]),
             ),
             (
-                "> # Q é {title='it\\'s'}\n",
-                "> # Q é\n",
-                attrs(None, &[], &[("title", "it's")]),
+                "> # Q é {title='it\\'s \"x\" \\\\'}\n",
+                "> # Q é {title=\"it's \\\"x\\\" \\\\\"}\n",
+                attrs(None, &[], &[("title", "it's \"x\" \\")]),
             ),
             (
                 "Setext {k='v'}\n===\n",
-                "Setext\n===\n",
+                "Setext {k=\"v\"}\n===\n",
                 attrs(None, &[], &[("k", "v")]),
             ),
             // `}` inside a quoted value, a `{` in the value
             (
                 "# B {data-x='a {b}'}\n",
-                "# B\n",
+                "# B {data-x=\"a {b}\"}\n",
                 attrs(None, &[], &[("data-x", "a {b}")]),
             ),
-            // the block alone
-            ("# {k='v'}\n", "#\n", attrs(None, &[], &[("k", "v")])),
+            // the block alone, also as a setext heading's only line
+            (
+                "# {k='v'}\n",
+                "# {k=\"v\"}\n",
+                attrs(None, &[], &[("k", "v")]),
+            ),
+            (
+                "Intro\n\n{k='v'}\n===\n",
+                "Intro\n\n{k=\"v\"}\n===\n",
+                attrs(None, &[], &[("k", "v")]),
+            ),
+            // the last line of a multi-line setext heading
+            (
+                "Line one\n {k='v'}\n===\n",
+                "Line one\n {k=\"v\"}\n===\n",
+                attrs(None, &[], &[("k", "v")]),
+            ),
             // CRLF line breaks and a byte-order mark
             (
                 "# T {k='v'}\r\n\r\ntext\r\n",
-                "# T\r\n\r\ntext\r\n",
+                "# T {k=\"v\"}\r\n\r\ntext\r\n",
                 attrs(None, &[], &[("k", "v")]),
             ),
             (
                 "\u{feff}# T {k='v'}\n",
-                "\u{feff}# T\n",
+                "\u{feff}# T {k=\"v\"}\n",
                 attrs(None, &[], &[("k", "v")]),
             ),
         ];
@@ -563,29 +694,107 @@ mod tests {
             ]
         );
         assert!(edited.starts_with(
-            "- ![a](img.png) and `c` [l](https://x.org).\n\n| ![t](t.png) | [r][ref] |\n"
+            "- ![a](img.png){width=\"50%\"} and `c`{data-x=\"y z\"} \
+             [l](https://x.org){data-x=\"a/b\"}.\n\n\
+             | ![t](t.png){width=\"5\"} | [r][ref]{k=\"v\"} |\n"
         ));
         assert!(codes.is_empty(), "{codes:?}");
     }
 
+    /// A3 fix round: the result is what comrak gives for the block with double-quoted
+    /// values, also where the text around the block matters.
     #[test]
-    fn comrak_attributes_are_kept_and_merged() {
-        // comrak reads the earlier block once the rejected one is removed
-        let (found, edited, _) = recover("![a](x.png){width='5'}{.b}\n\n# H {.a} {k='v'}\n");
-        assert_eq!(edited, "![a](x.png){.b}\n\n# H {.a}\n");
+    fn recovered_blocks_read_as_their_double_quoted_form() {
+        let cases = [
+            // two blocks on a heading: comrak reads the last one, the first stays text
+            "# H {.a} {k='v'}\n",
+            "![a](x.png){width='5'}{.b}\n",
+            // adjacent code spans stay two code spans
+            "Keys `Ctrl`{data-k='a'}`C`{data-k='b'} copy\n",
+            "Keys `Ctrl`{data-k='a/b'}`C` copy\n",
+            // a reference link keeps its target
+            "[ref]{data-x='y'}(note)\n\n[ref]: https://r.org\n",
+            "[a]{k='v'}[b]\n\n[a]: https://a.org\n[b]: https://b.org\n",
+            // a setext heading whose only line is the block
+            "Intro\n\n{k='v'}\n===\n",
+        ];
+        for text in cases {
+            let quoted = text.replace('\'', "\"");
+            let (found, edited, codes) = recover(text);
+            assert_eq!(edited, quoted, "{text}");
+            assert!(codes.is_empty(), "{text}: {codes:?}");
+            let arena = Arena::new();
+            let opts = dialect_options();
+            let root = parse_document(&arena, &quoted, &opts);
+            let native: Vec<_> = root
+                .descendants()
+                .filter_map(|node| {
+                    let data = node.data();
+                    Some((Kind::of(&data.value)?, data.attrs.as_deref()?.clone()))
+                })
+                .collect();
+            assert_eq!(found, native, "{text}");
+            let recovered = {
+                let arena = Arena::new();
+                let root = parse_document(&arena, text, &opts);
+                let mut diagnostics = Diagnostics::new();
+                let (root, _) = recover_attr_blocks(&arena, root, text, &opts, &mut diagnostics);
+                html(root, &opts)
+            };
+            assert_eq!(recovered, html(root, &opts), "{text}");
+        }
+        let (_, edited, _) = recover("Keys `Ctrl`{data-k=a/b}`C` copy\n");
+        assert_eq!(edited, "Keys `Ctrl`{data-k=\"a/b\"}`C` copy\n");
+        let (found, _, _) = recover("Keys `Ctrl`{data-k='a'}`C`{data-k='b'} copy\n");
         assert_eq!(
             found,
             [
-                (Kind::Image, attrs(None, &["b"], &[("width", "5")])),
-                (Kind::Heading, attrs(None, &["a"], &[("k", "v")])),
+                (Kind::Code, attrs(None, &[], &[("data-k", "a")])),
+                (Kind::Code, attrs(None, &[], &[("data-k", "b")])),
             ]
         );
-        // what comrak reads itself is not touched
+        let (found, _, _) = recover("# H {.a} {k='v'}\n");
+        assert_eq!(found, [(Kind::Heading, attrs(None, &[], &[("k", "v")]))]);
+    }
+
+    fn html<'a>(root: &'a AstNode<'a>, opts: &Options) -> String {
+        let mut out = String::new();
+        comrak::format_html(root, opts, &mut out).unwrap();
+        out
+    }
+
+    /// A block that would end a table cell or an emphasis early is reported, not read.
+    #[test]
+    fn blocks_crossing_their_parent_are_reported() {
+        for (text, line) in [
+            ("| a | b |\n|---|---|\n| `c`{lines=1|3} | d |\n", 3),
+            ("*[l](u){k='v*'}\n", 1),
+        ] {
+            let (found, edited, codes) = recover(text);
+            assert!(found.is_empty(), "{text}: {found:?}");
+            assert_eq!(edited, text);
+            assert_eq!(codes, [(UNPARSED_ATTR_BLOCK, line)], "{text}");
+        }
+    }
+
+    #[test]
+    fn what_comrak_reads_itself_is_not_touched() {
         let text = "# H {.a k=v}\n\n![a](x.png){width=50%}\n";
         let (found, edited, codes) = recover(text);
         assert_eq!(edited, text);
         assert_eq!(found.len(), 2);
         assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn native_blocks_escape_quotes_and_backslashes() {
+        let block = native_block(&attrs(
+            Some("a b"),
+            &["c", "d\"e"],
+            &[("k", "x\\y"), ("data-z", "")],
+        ));
+        assert_eq!(block, r#"{#"a b" ."c" ."d\"e" k="x\\y" data-z=""}"#);
+        assert_eq!(native_block(&attrs(None, &[], &[])), "{}");
     }
 
     #[test]
@@ -647,7 +856,7 @@ mod tests {
     fn several_blocks_on_one_line_keep_their_nodes() {
         let text = "![a](a.png){w='1'} ![b](b.png){w='2'} `c`{k='3'}\n";
         let (found, edited, _) = recover(text);
-        assert_eq!(edited, "![a](a.png) ![b](b.png) `c`\n");
+        assert_eq!(edited, text.replace('\'', "\""));
         let values: Vec<_> = found
             .iter()
             .map(|(kind, attrs)| (*kind, attrs.pairs[0].1.as_str()))
@@ -708,5 +917,70 @@ mod tests {
             read("python {numbered lines=1|3}"),
             Some((rest, ElementAttrs::Invalid(_))) if rest == "python {numbered lines=1|3}"
         ));
+    }
+
+    /// Random texts around attribute blocks: recovery never panics and keeps every line; a
+    /// block comrak does not read even rewritten is reported on a line of the text.
+    #[test]
+    fn random_texts_keep_their_lines() {
+        struct Lcg(u64);
+        impl Lcg {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((self.0 >> 33) % n as u64) as usize
+            }
+        }
+        let pieces = [
+            "`c`",
+            "`",
+            "{k='v'}",
+            "{k=a/b}",
+            "{.x}",
+            "{k=v}",
+            "[r]",
+            "(u)",
+            "![i](p.png)",
+            "[l](u)",
+            "# ",
+            "\n",
+            "\n\n",
+            "===",
+            "---",
+            " ",
+            "*",
+            "|",
+            "{",
+            "}",
+            "'",
+            "\"",
+            "a",
+            "\\",
+            "{k='v}'}",
+            "[r]: https://r.org\n",
+            "> ",
+            "- ",
+            "{#i}",
+            "{lines=1|3}",
+        ];
+        let mut rng = Lcg(0xa3);
+        let mut rewritten = 0;
+        for _ in 0..20_000 {
+            let text: String = (0..1 + rng.below(10))
+                .map(|_| pieces[rng.below(pieces.len())])
+                .collect();
+            let (_, edited, codes) = recover(&text);
+            let lines = crate::markdown::split::source_lines(&text).len();
+            assert_eq!(
+                crate::markdown::split::source_lines(&edited).len(),
+                lines,
+                "{text:?}"
+            );
+            assert!(codes.iter().all(|&(_, line)| (1..=lines).contains(&line)));
+            rewritten += usize::from(edited != text);
+        }
+        assert!(rewritten > 500, "only {rewritten} texts rewritten");
     }
 }

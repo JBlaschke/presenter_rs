@@ -98,7 +98,9 @@ pub enum ElementAttrs {
 /// work, but stricter in what an item may be. Each item must be `#id`, `.class` (both
 /// non-empty or quoted) or `key=value` with an unquoted key that [`is_valid_attr_name`]
 /// accepts; a bare key (`{auto-animate}`) needs a value there (`auto-animate=""`), as §3.2
-/// says. The strictness keeps ordinary text in braces as text.
+/// says, and no item may end with an unquoted comma (`{debug=true, verbose=false}` is prose
+/// or another tool's syntax: items are separated by spaces). The strictness keeps ordinary
+/// text in braces as text.
 ///
 /// [`ElementAttrs::Invalid`] when the block has an unbalanced quote and starts like
 /// attributes (`#x`, `.x` or `key=`), or when some item is invalid while another one is
@@ -163,22 +165,32 @@ struct Token {
     started: bool,
     /// Whether the item contained a quoted run (so `#""` is an empty id, not a bare `#`).
     quoted: bool,
+    /// Whether the item's last character was inside quotes.
+    ends_quoted: bool,
 }
 
 impl Token {
     /// Why this item is not a valid element attribute ([`read_element_attrs`]); `None` when
     /// it is one.
     fn element_problem(&self) -> Option<String> {
+        let comma = (self.text.ends_with(',') && !self.ends_quoted).then(|| {
+            format!(
+                "`{}` ends with a comma: items are separated by spaces, not commas",
+                self.text
+            )
+        });
         match (self.lead, self.eq) {
             (Some(marker @ ('#' | '.')), _) => {
                 let rest = &self.text[marker.len_utf8()..];
                 (rest.is_empty() && !self.quoted)
                     .then(|| format!("`{marker}` without a name after it"))
+                    .or(comma)
             }
             (lead, Some(at)) => {
                 let key = &self.text[..at];
                 (lead.is_none() || !is_valid_attr_name(key))
                     .then(|| format!("`{key}` is not a valid attribute name"))
+                    .or(comma)
             }
             (_, None) if is_valid_attr_name(&self.text) => Some(format!(
                 "`{key}` has no value: write `{key}=\"\"` (a key without a value works only in \
@@ -257,6 +269,7 @@ fn tokenize(s: &str) -> std::result::Result<Vec<Token>, char> {
                 token.text.push(c);
             }
         }
+        token.ends_quoted = matches!(c, '"' | '\'');
         token.started = true;
     }
     tokens.extend(current);
@@ -741,6 +754,21 @@ mod tests {
         assert_eq!(invalid("{.a 1x=2}"), "`1x` is not a valid attribute name");
         assert_eq!(invalid("{.a \"k\"=v}"), "`k` is not a valid attribute name");
         assert_eq!(invalid("{# .a}"), "`#` without a name after it");
+        // items separated by commas are prose or another tool's syntax, not attributes
+        assert_eq!(
+            invalid("{debug=true, verbose=false}"),
+            "`debug=true,` ends with a comma: items are separated by spaces, not commas"
+        );
+        assert!(invalid("{.a, .b}").starts_with("`.a,` ends with a comma"));
+        assert!(invalid("{#a, .b}").starts_with("`#a,` ends with a comma"));
+        assert_eq!(read_element_attrs("{a, b}"), ElementAttrs::Text);
+        // a comma inside a value or quoted is fine
+        for block in ["{lines=1,3}", "{k=\"a,\"}", "{k='a,' j=b}", "{.\"a,\"}"] {
+            assert!(
+                matches!(read_element_attrs(block), ElementAttrs::Attrs(_)),
+                "{block}"
+            );
+        }
     }
 
     /// Every block comrak accepts on a heading reads the same with `read_element_attrs`.

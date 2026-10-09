@@ -241,6 +241,24 @@ fn split_impl<'a>(
     builder.finish()
 }
 
+/// The heading whose `{…}` attributes the splitter lifts onto the slide that the start of
+/// `root`'s document belongs to (the slide before any separator): the first top-level node
+/// that is not front matter, a footnote definition (the splitter moves those to the end of
+/// the slide) or invisible ([`compat::is_invisible`]: HTML comments, `:::notes`), when it is
+/// a heading. A notebook markdown cell split by separators (`split_markdown_cells`) takes the
+/// attributes off this heading before splitting when they must stay on it because the
+/// current slide is not empty (notebook-mapping §2, A3).
+pub fn lifted_heading<'a>(root: &'a AstNode<'a>) -> Option<&'a AstNode<'a>> {
+    root.children()
+        .find(|node| {
+            !matches!(
+                node.data().value,
+                NodeValue::FrontMatter(_) | NodeValue::FootnoteDefinition(_)
+            ) && !compat::is_invisible(node)
+        })
+        .filter(|node| matches!(node.data().value, NodeValue::Heading(_)))
+}
+
 /// If `nodes[0]` is a Heading with attributes, remove them from the node and return them.
 pub fn lift_heading_attrs<'a>(nodes: &[&'a AstNode<'a>]) -> Option<ParsedAttrs> {
     let mut data = nodes.first()?.data_mut();
@@ -2192,6 +2210,32 @@ mod tests {
             SplitMode::Rules,
         );
         assert!(deck.slides[0].0.attrs.classes.is_empty());
+    }
+
+    /// A3 fix round: the heading the splitter lifts at the start of a document, for notebook
+    /// cells that must keep its attributes.
+    #[test]
+    fn lifted_heading_skips_what_the_splitter_skips() {
+        let opts = dialect_options();
+        for (text, expected) in [
+            (
+                ":::notes\nn\n:::\n\n<!-- c -->\n\n[^1]: f\n\n## H {.x}\n",
+                Some(2),
+            ),
+            ("# H {.x}\n", Some(1)),
+            ("text\n\n# H {.x}\n", None),
+            ("---\n\n# H {.x}\n", None),
+            ("<!-- c -->\n\n:::center\n# H\n:::\n", None),
+            ("", None),
+        ] {
+            let arena = Arena::new();
+            let root = parse_document(&arena, text, &opts);
+            let level = lifted_heading(root).map(|node| match &node.data().value {
+                NodeValue::Heading(heading) => heading.level,
+                _ => 0,
+            });
+            assert_eq!(level, expected, "{text:?}");
+        }
     }
 
     #[test]

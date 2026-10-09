@@ -496,6 +496,57 @@ fn attribute_recovery_md() {
     assert_eq!(parsed.deck.assets.len(), 1);
 }
 
+/// A3 fix round: a recovered block gives what its double-quoted form gives comrak, also
+/// where the text around it matters (adjacent code spans, reference links, a setext
+/// heading's only line, two blocks on a heading), and items separated by commas are not
+/// attributes.
+#[test]
+fn recovered_blocks_render_like_their_double_quoted_form() {
+    for text in [
+        "Keys `Ctrl`{data-k='a'}`C`{data-k='b'} copy\n",
+        "Keys `Ctrl`{data-k='a/b'}`C` copy\n",
+        "[ref]{data-x='y'}(note)\n\n[ref]: https://r.org\n",
+        "Intro\n\n{k='v'}\n===\n",
+        "# H {.a} {k='v'}\n",
+        "![a](images/ok.png){width='5'}{.b}\n",
+    ] {
+        let single = parse_text(text).unwrap();
+        let double = parse_text(&text.replace('\'', "\"")).unwrap();
+        assert_eq!(
+            stable_json(&single.deck)["slides"],
+            stable_json(&double.deck)["slides"],
+            "{text}"
+        );
+        assert_eq!(
+            codes(&single.diagnostics),
+            codes(&double.diagnostics),
+            "{text}"
+        );
+    }
+    let parsed = parse_text("Keys `Ctrl`{data-k='a'}`C`{data-k='b'} copy\n").unwrap();
+    assert_eq!(
+        html(&parsed.deck.slides[0]),
+        "<p>Keys <code data-k=\"a\">Ctrl</code><code data-k=\"b\">C</code> copy</p>\n"
+    );
+    let parsed = parse_text("[ref]{data-x='y'}(note)\n\n[ref]: https://r.org\n").unwrap();
+    assert_eq!(
+        html(&parsed.deck.slides[0]),
+        "<p><a href=\"https://r.org\" data-x=\"y\">ref</a>(note)</p>\n"
+    );
+    let parsed = parse_text("# H {.a} {k='v'}\n").unwrap();
+    assert_eq!(parsed.deck.slides[0].title.as_deref(), Some("H {.a}"));
+    // prose in braces after a heading that is not lifted is kept, with a warning
+    let parsed =
+        parse_text("# Intro\n\nSome text.\n\n## Config {debug=true, verbose=false}\n").unwrap();
+    assert!(
+        html(&parsed.deck.slides[0]).ends_with("<h2>Config {debug=true, verbose=false}</h2>\n")
+    );
+    assert_eq!(codes(&parsed.diagnostics), [("unparsed-attr-block", 5)]);
+    // a block that would end a table cell early stays text, with a warning
+    let parsed = parse_text("| a | b |\n|---|---|\n| `c`{lines=1|3} | d |\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("unparsed-attr-block", 3)]);
+}
+
 /// A3 (F26, F14): pandoc's `::: {.class}` directives and the fragment index.
 #[test]
 fn pandoc_directives_md() {
@@ -707,6 +758,21 @@ fn front_matter_that_swallows_slides_is_reported() {
          matter runs from line 1 to the `---` on line 7. Is its closing `---` missing (before \
          line 5)?"
     );
+    // A3 fix round: valid front matter is no false alarm: options all commented out
+    // (values or whole keys), or a closing remark right on the closing `---`
+    for text in [
+        "---\nreveal:\n  # transition: fade\n  # controls: false\n---\n\n# Hello\n",
+        "---\n# title: My talk\n# author: Me\n---\n\n# Real title\n",
+        "---\ntitle: X\nauthor: Y\n\n# More options live in presenter.toml\n---\n\n# Hello\n",
+        "---\ntitle: Talk\nauthor: Me\n\n# Remember to update the abstract before the conference\n---\n\n# Hello\n",
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{text:?}: {:?}",
+            parsed.diagnostics
+        );
+    }
     // with body text it is a YAML error: located, with the same question
     let with_body = "---\ntitle: T\n\n# Title\n\nSome text\n\n---\n\n## Next\n";
     match parse_text(with_body) {
@@ -777,6 +843,38 @@ fn dashes_on_lines_one_and_two_are_empty_front_matter() {
     assert!(parsed.diagnostics.is_empty());
     // a `***` rule or `---` later in the deck is still a separator
     let parsed = parse_text("***\n---\n\n# x\n").unwrap();
+    assert_eq!(parsed.deck.slides.len(), 2);
+    // A3 fix round: later separators are not taken for the closing `---` (comrak would
+    // pair line 1 with the first of them and swallow slide 1 as YAML)
+    let jekyll = "---\n---\n\n# A\n\ntext\n\n---\n\n# B\n";
+    for text in [
+        jekyll.to_string(),
+        jekyll.replace('\n', "\r\n"),
+        format!("\u{feff}{jekyll}"),
+        "---\n---\n\n# A\n\n---\n\n# B\n".to_string(),
+        "---\n---\n\n# A\n\nWelcome to the talk.\n\n---\n\n# B\n\nMore.\n".to_string(),
+    ] {
+        let parsed = parse_text(&text).unwrap();
+        let titles: Vec<_> = parsed
+            .deck
+            .slides
+            .iter()
+            .map(|s| s.title.as_deref())
+            .collect();
+        assert_eq!(titles, [Some("A"), Some("B")], "{text:?}");
+        assert_eq!(parsed.deck.meta, Default::default(), "{text:?}");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{text:?}: {:?}",
+            parsed.diagnostics
+        );
+    }
+    let parsed = parse(&source("inline"), jekyll, &headings_config()).unwrap();
+    assert_eq!(parsed.deck.slides.len(), 2);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    // `---` with something on line 2 is still ordinary front matter
+    let parsed = parse_text("---\ntitle: T\n---\n\n# A\n\n---\n\n# B\n").unwrap();
+    assert_eq!(parsed.deck.meta.title.as_deref(), Some("T"));
     assert_eq!(parsed.deck.slides.len(), 2);
 }
 
@@ -860,6 +958,61 @@ fn notebook_cells_lift_a_heading_after_notes() {
     assert!(diagnostics.is_empty());
 }
 
+/// A3 fix round: with `split_markdown_cells`, a continuing cell's heading after `:::notes`
+/// or a comment keeps its attributes when the current slide is not empty
+/// (notebook-mapping §2); the splitter now looks past those nodes for the heading to lift.
+#[test]
+fn split_notebook_cells_lift_a_heading_only_onto_an_empty_slide() {
+    let cell = |source: &str, slide: Option<&str>| {
+        let mut metadata = serde_json::json!({});
+        if let Some(kind) = slide {
+            metadata["slideshow"] = serde_json::json!({ "slide_type": kind });
+        }
+        serde_json::json!({ "cell_type": "markdown", "metadata": metadata, "source": source })
+    };
+    let notebook = serde_json::json!({
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "metadata": {},
+        "cells": [
+            cell("# Results\n\nSome text", Some("slide")),
+            cell(":::notes\nthe caveat\n:::\n\n## Details {layout=section .x data-k=v}\n\nmore", None),
+            cell("<!-- c -->\n\n## Again {layout=section}\n\nx", None),
+            cell(":::notes\nhello\n:::\n\n# New {layout=title .t}\n\nbody", Some("slide")),
+        ],
+    });
+    let dir = fixture_dir();
+    let source = SourceInfo {
+        path: dir.join("split.ipynb"),
+        kind: SourceKind::Notebook,
+        base_dir: dir,
+    };
+    let config = Config::from_toml_str("[notebook]\nsplit_markdown_cells = true\n").unwrap();
+    let parsed = presenter::notebook::parse(&source, &notebook.to_string(), &config).unwrap();
+    let slides = &parsed.deck.slides;
+    assert_eq!(slides.len(), 2);
+    assert_eq!(slides[0].layout, "default");
+    assert!(slides[0].classes.is_empty() && slides[0].attrs.is_empty());
+    let body: String = slides[0]
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Html { html } => Some(html.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        body.contains("<h2 class=\"x\" layout=\"section\" data-k=\"v\">Details</h2>"),
+        "{body}"
+    );
+    assert!(body.contains("<h2 layout=\"section\">Again</h2>"), "{body}");
+    // a cell that opens a slide lifts its heading past the notes
+    assert_eq!(slides[1].layout, "title");
+    assert_eq!(slides[1].classes, ["t"]);
+    let found: Vec<_> = parsed.diagnostics.iter().map(|d| d.code).collect();
+    assert_eq!(found, ["unlifted-slide-attr", "unlifted-slide-attr"]);
+}
+
 /// A3 (F13): same-length nested directive fences are reported in both split modes.
 #[test]
 fn same_length_nested_directives_are_reported() {
@@ -883,6 +1036,46 @@ fn same_length_nested_directives_are_reported() {
     let parsed = parse_text(&fixed).unwrap();
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     assert_eq!(parsed.deck.slides.len(), 3);
+    // the warning says how far the unnamed directive runs
+    assert!(
+        message.contains("to the end of the document (or notebook cell), and `---` lines inside it start no slides"),
+        "{message}"
+    );
+}
+
+/// A3 fix round: a `:::name a:b` line comrak did not open is reported once, with the fix,
+/// also when paragraphs come between it and its closing `:::`, and in pandoc's form.
+#[test]
+fn unopened_directives_name_the_fix() {
+    let text = "# T\n\n:::note title=\"Note: read\"\n\nFirst paragraph.\n\nSecond paragraph.\n\n:::\n\n---\n\n# Next\n";
+    let parsed = parse_text(text).unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 3)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(message.ends_with("write the colon as `&#58;`"), "{message}");
+    // the fix works: the entity is the colon
+    let fixed = text.replace("Note: read", "Note&#58; read");
+    let parsed = parse_text(&fixed).unwrap();
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    assert!(
+        html(&parsed.deck.slides[0]).contains("<div class=\"note\" data-title=\"Note: read\">")
+    );
+    // pandoc's form, with a colon in the block or closing colons after it
+    let parsed = parse_text("# T\n\n::: {.callout title=\"Note: x\"}\nBody\n:::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 3)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.starts_with("`::: {.callout …}` is not a directive"),
+        "{message}"
+    );
+    assert!(message.ends_with("write the colon as `&#58;`"), "{message}");
+    let parsed = parse_text("# T\n\n::: {.notes} :::\nSecret notes\n:::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 3)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.contains("remove the `:::` after the attribute block")
+            && message.ends_with("the speaker notes in it are shown on the slide"),
+        "{message}"
+    );
 }
 
 /// A3 (F22): a deck image found only by letter case is reported (on a case-insensitive

@@ -15,9 +15,10 @@
 //!    detached; its children (and the footnote definitions written inside it, which comrak
 //!    moved to the end of the document) are rendered through a second synthetic document with
 //!    the same passes and appended to [`Rendered::notes`] in document order;
-//! 3. **checks**: a paragraph that starts like a directive (`:::name …`) but is not one is an
-//!    `invalid-directive` warning: comrak does not open a directive whose line has a `:`
-//!    after the fence (`title="a:b"`, a URL); `&#58;` is the way to write that colon;
+//! 3. **checks**: a paragraph that starts like a directive (`:::name …`, `::: {.name …}`) but
+//!    is not one is an `invalid-directive` warning: comrak does not open a directive whose
+//!    line has a `:` after the fence (`title="a:b"`, a URL, pandoc's closing `:::`); `&#58;`
+//!    is the way to write that colon;
 //! 4. **assets** (§6): relative image URLs and relative `src` / `poster` attributes of raw
 //!    HTML start tags ([`rewrite_html_assets`]) are resolved against [`RenderCtx::base_dir`]:
 //!    an existing file is registered ([`AssetRegistry::register_file`]) and the URL becomes
@@ -71,12 +72,16 @@
 //! (an element with a `data-math-style` attribute in the HTML or notes, see
 //! [`has_math_markup`]; the text `data-math-style` in inline code does not count) and `notes`.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
 use std::collections::btree_map::Entry;
+use std::collections::hash_map::Entry as HashEntry;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
+use std::ffi::OsString;
 use std::fmt::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use comrak::html::{
     ChildRendering, Context, dangerous_url, format_document_with_formatter, format_node_default,
@@ -589,6 +594,7 @@ fn render_document<'a>(
 ) -> Result<Rendered> {
     let (notes, mut features) = extract_notes(arena, doc, opts, ctx)?;
     check_unopened_directives(doc, ctx);
+    let _listings = DirListings::enter();
     rewrite_assets(doc, ctx)?;
     let footnotes = prepare_footnotes(doc, ctx);
     features.code |= doc.descendants().any(|node| {
@@ -656,17 +662,33 @@ fn is_notes(node: &AstNode<'_>) -> bool {
         NodeValue::BlockDirective(directive) if is_notes_info(&directive.info))
 }
 
-/// Pass 3: a paragraph whose text starts with `:::name` is a directive comrak did not open
-/// (module docs): an `invalid-directive` warning on its first line.
+/// Pass 3: a paragraph whose text starts with `:::name` (or pandoc's `::: {.name …}`) is a
+/// directive comrak did not open (module docs): an `invalid-directive` warning on its first
+/// line, which names the fix (`&#58;` for a colon; no closing `:::` after a pandoc block)
+/// and, for `:::notes`, says that the speaker notes show on the slide.
 fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
     for node in doc.descendants() {
-        let Some(name) = unopened_directive(node) else {
+        let Some(unopened) = unopened_directive(node) else {
             continue;
         };
-        let message = format!(
-            "`:::{name} …` is not a directive: comrak does not open one when the line has a \
-             `:` after the fence (a URL, `title=\"a:b\"`); write the colon as `&#58;`"
+        let name = &unopened.name;
+        let shown = if unopened.pandoc {
+            format!("::: {{.{name} …}}")
+        } else {
+            format!(":::{name} …")
+        };
+        let fix = if unopened.closing_colons {
+            "remove the `:::` after the attribute block (pandoc allows it, comrak does not)"
+        } else {
+            "write the colon as `&#58;`"
+        };
+        let mut message = format!(
+            "`{shown}` is not a directive: comrak does not open one when the line has a `:` \
+             after the fence (a URL, `title=\"a:b\"`); {fix}"
         );
+        if name == "notes" {
+            message.push_str(". Until then the speaker notes in it are shown on the slide");
+        }
         let span = node_span(node).map(|span| SourceSpan {
             end_line: span.start_line,
             ..span
@@ -675,9 +697,19 @@ fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
     }
 }
 
-/// The name of the directive a paragraph starts like (`:::name …` on its first line) but is
-/// not, for pass 3; `None` for any other node.
-fn unopened_directive<'a>(node: &'a AstNode<'a>) -> Option<String> {
+/// A paragraph that starts like a directive comrak did not open (see [`unopened_directive`]).
+struct Unopened {
+    /// The directive's name: the word after the fence, or the first class of a pandoc block.
+    name: String,
+    /// Written as pandoc's `::: {.name …}`.
+    pandoc: bool,
+    /// A pandoc block followed by closing colons (`::: {.notes} :::`).
+    closing_colons: bool,
+}
+
+/// The directive a paragraph starts like (`:::name …` or `::: {.name …}` on its first line,
+/// the name starting with a letter) but is not, for pass 3; `None` for any other node.
+fn unopened_directive<'a>(node: &'a AstNode<'a>) -> Option<Unopened> {
     if !matches!(node.data().value, NodeValue::Paragraph) {
         return None;
     }
@@ -691,12 +723,33 @@ fn unopened_directive<'a>(node: &'a AstNode<'a>) -> Option<String> {
     if line.len() - rest.len() < 3 {
         return None;
     }
-    let name: String = rest
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
-        .collect();
-    name.starts_with(char::is_alphabetic).then_some(name)
+    let rest = rest.trim_start();
+    let word = |text: &str| -> String {
+        text.chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+            .collect()
+    };
+    let unopened = match rest.strip_prefix('{') {
+        // the first `.class`; the text may stop early (an autolink or HTML in the block)
+        Some(block) => Unopened {
+            name: block
+                .split_whitespace()
+                .find_map(|token| token.strip_prefix('.'))
+                .map(word)
+                .unwrap_or_default(),
+            pandoc: true,
+            closing_colons: rest.trim_end().ends_with(':'),
+        },
+        None => Unopened {
+            name: word(rest),
+            pandoc: false,
+            closing_colons: false,
+        },
+    };
+    unopened
+        .name
+        .starts_with(char::is_alphabetic)
+        .then_some(unopened)
 }
 
 /// Pass 4: images and raw HTML `src`/`poster` (module docs).
@@ -769,7 +822,7 @@ fn local_asset(
 /// system (macOS, Windows) accepts and a case-sensitive one (Linux) does not: each segment
 /// is compared exactly with the names `read_dir` lists, as theme files are (A3). `.` is
 /// skipped and `..` goes up unchecked. `None` when every segment matches exactly (or a
-/// directory cannot be listed).
+/// directory cannot be listed). Listings are cached while a [`DirListings`] guard is open.
 fn case_mismatch(base: &Path, relative: &str) -> Option<String> {
     let mut dir = base.to_path_buf();
     let mut on_disk: Vec<String> = Vec::new();
@@ -777,27 +830,17 @@ fn case_mismatch(base: &Path, relative: &str) -> Option<String> {
     for component in Path::new(relative).components() {
         let name = match component {
             std::path::Component::CurDir => continue,
-            std::path::Component::ParentDir => std::ffi::OsString::from(".."),
+            std::path::Component::ParentDir => OsString::from(".."),
             std::path::Component::Normal(name) => {
-                let mut folded = None;
-                let mut exact = false;
-                for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-                    let entry_name = entry.file_name();
-                    if entry_name == name {
-                        exact = true;
-                        break;
-                    }
-                    let same = entry_name.to_string_lossy().to_lowercase()
-                        == name.to_string_lossy().to_lowercase();
-                    if same && folded.is_none() {
-                        folded = Some(entry_name);
-                    }
-                }
-                if exact {
+                let listing = DirListings::get(&dir)?;
+                if listing.exact.contains(name) {
                     name.to_os_string()
                 } else {
                     mismatch = true;
-                    folded?
+                    listing
+                        .folded
+                        .get(&name.to_string_lossy().to_lowercase())?
+                        .clone()
                 }
             }
             _ => return None,
@@ -806,6 +849,91 @@ fn case_mismatch(base: &Path, relative: &str) -> Option<String> {
         dir.push(name);
     }
     mismatch.then(|| on_disk.join("/"))
+}
+
+/// The entry names of a directory, for [`case_mismatch`].
+struct Listing {
+    /// Every name as listed.
+    exact: HashSet<OsString>,
+    /// Lowercased name → the smallest listed name with that lowercase form.
+    folded: HashMap<String, OsString>,
+}
+
+impl Listing {
+    fn read(dir: &Path) -> Option<Listing> {
+        let mut listing = Listing {
+            exact: HashSet::new(),
+            folded: HashMap::new(),
+        };
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let name = entry.file_name();
+            let folded = name.to_string_lossy().to_lowercase();
+            match listing.folded.entry(folded) {
+                HashEntry::Occupied(mut kept) if name < *kept.get() => {
+                    kept.insert(name.clone());
+                }
+                HashEntry::Occupied(_) => {}
+                HashEntry::Vacant(slot) => {
+                    slot.insert(name.clone());
+                }
+            }
+            listing.exact.insert(name);
+        }
+        Some(listing)
+    }
+}
+
+/// The open [`DirListings`] guards on a thread and the listings read meanwhile (`None`: the
+/// directory cannot be listed).
+type ListingCache = (usize, HashMap<PathBuf, Option<Rc<Listing>>>);
+
+thread_local! {
+    /// This thread's [`ListingCache`].
+    static LISTINGS: RefCell<ListingCache> = RefCell::new((0, HashMap::new()));
+}
+
+/// While a guard is alive, [`case_mismatch`] lists each directory once on this thread
+/// instead of once per reference and path segment (a deck next to a large `figures/`
+/// folder would otherwise list it for every image). The outermost guard forgets the
+/// listings when dropped, so a rebuild sees the files as they are then. A deck parse holds
+/// one for the whole deck, and each rendered slide or fragment one of its own.
+pub(crate) struct DirListings(());
+
+impl DirListings {
+    /// Opens a guard (nested guards share the outermost one's listings).
+    pub(crate) fn enter() -> DirListings {
+        LISTINGS.with_borrow_mut(|(open, _)| *open += 1);
+        DirListings(())
+    }
+
+    /// The listing of `dir`: cached while a guard is open, else read now. `None` when the
+    /// directory cannot be listed.
+    fn get(dir: &Path) -> Option<Rc<Listing>> {
+        let cached = LISTINGS.with_borrow(|(open, listings)| {
+            (*open > 0).then(|| listings.get(dir).cloned()).flatten()
+        });
+        if let Some(listing) = cached {
+            return listing;
+        }
+        let listing = Listing::read(dir).map(Rc::new);
+        LISTINGS.with_borrow_mut(|(open, listings)| {
+            if *open > 0 {
+                listings.insert(dir.to_path_buf(), listing.clone());
+            }
+        });
+        listing
+    }
+}
+
+impl Drop for DirListings {
+    fn drop(&mut self) {
+        LISTINGS.with_borrow_mut(|(open, listings)| {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                listings.clear();
+            }
+        });
+    }
 }
 
 /// A local reference: not empty, no URL scheme (`https:`, `data:`, `asset:`, …), not
@@ -1158,8 +1286,8 @@ fn write_backrefs(
 /// `<div class="name classes…" data-…>` … `</div>` (dialect §4). A directive without a
 /// name (a bare `:::` line opened it) is an `invalid-directive` warning: it is nearly always
 /// the closing fence of a nested directive written as long as the outer one's (A3), unless
-/// it directly follows a `:::name` paragraph that pass 3 reports (then it is that one's
-/// closing fence).
+/// a `:::name` paragraph that pass 3 reports comes before it among its siblings, after any
+/// other directive (then it is that one's closing fence).
 fn write_directive<'a>(
     context: &mut Context<'_, '_, FormatState>,
     node: &'a AstNode<'a>,
@@ -1179,9 +1307,15 @@ fn write_directive<'a>(
         diagnostic.span = span.clone();
         context.user.diagnostics.push(diagnostic);
     }
-    // right after a `:::name` line comrak did not open, that line's warning says it all
-    let unopened = node.previous_sibling().and_then(unopened_directive);
-    if info.trim().is_empty() && unopened.is_none() {
+    // after a `:::name` line comrak did not open (since the last directive), this is that
+    // one's closing fence and the line's own warning says it all
+    let after_unopened = || {
+        node.preceding_siblings()
+            .skip(1)
+            .take_while(|sibling| !matches!(sibling.data().value, NodeValue::BlockDirective(_)))
+            .any(|sibling| unopened_directive(sibling).is_some())
+    };
+    if info.trim().is_empty() && !after_unopened() {
         let mut diagnostic = Diagnostic::warning("invalid-directive", UNNAMED_DIRECTIVE);
         diagnostic.span = span.map(|span| SourceSpan {
             end_line: span.start_line,
@@ -1198,10 +1332,11 @@ fn write_directive<'a>(
 }
 
 /// The warning for a directive opened by a bare `:::` line (see [`write_directive`]).
-const UNNAMED_DIRECTIVE: &str = "a bare `:::` line here opens an unnamed directive (an empty \
-     `<div>` that runs to its closing fence or to the end of the slide): an earlier `:::` \
-     probably closed the directive this line was meant to close. Nested directives need a \
-     longer outer fence, e.g. `::::columns` … `:::column` … `:::` … `::::`";
+const UNNAMED_DIRECTIVE: &str = "a bare `:::` line here opens an unnamed directive: an empty \
+     `<div>` that runs to the next `:::` line or, without one, to the end of the document (or \
+     notebook cell), and `---` lines inside it start no slides. An earlier `:::` probably \
+     closed the directive this line was meant to close. Nested directives need a longer outer \
+     fence, e.g. `::::columns` … `:::column` … `:::` … `::::`";
 
 /// A directive's info string, read as dialect §4 writes it (`name class… key=value…`) or as
 /// pandoc does (`{.name .class #id key=value}`, A3 contract note).
@@ -1858,6 +1993,33 @@ After inner.
              <div id=\"c\" class=\"column\">\n<p>y</p>\n</div>\n</div>\n"
         );
         assert_eq!(html.notes.as_deref(), Some("<p>n</p>\n"));
+    }
+
+    /// A3 fix round: directory listings for `asset-case-mismatch` are read once while a
+    /// guard is open, and read again after the outermost guard is dropped (a rebuild).
+    #[test]
+    fn case_listings_are_cached_while_a_guard_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Figs")).unwrap();
+        std::fs::write(dir.path().join("Figs/a.png"), b"x").unwrap();
+        assert_eq!(
+            case_mismatch(dir.path(), "figs/./a.png").as_deref(),
+            Some("Figs/a.png")
+        );
+        {
+            let _deck = DirListings::enter();
+            assert_eq!(case_mismatch(dir.path(), "Figs/a.png"), None);
+            std::fs::write(dir.path().join("Figs/B.png"), b"x").unwrap();
+            // the listing read above is reused, and it has no `B.png`
+            assert_eq!(case_mismatch(dir.path(), "Figs/b.png"), None);
+            drop(DirListings::enter());
+            assert_eq!(case_mismatch(dir.path(), "Figs/b.png"), None);
+        }
+        assert_eq!(
+            case_mismatch(dir.path(), "Figs/b.png").as_deref(),
+            Some("Figs/B.png")
+        );
+        assert_eq!(case_mismatch(dir.path(), "Figs/../Figs/B.png"), None);
     }
 
     /// A3 (F14): only a non-negative integer is a fragment index.

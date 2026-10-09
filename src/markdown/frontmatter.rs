@@ -234,11 +234,15 @@ fn yaml_hint(yaml: &str, message: &str, line: usize) -> Option<String> {
 /// content because a deck started with a `---` rule or the closing `---` is missing.
 /// Markdown headings are YAML comments, so such content vanishes without an error.
 ///
-/// - YAML that sets nothing (comments only) but has `#` lines: a
-///   [`FRONT_MATTER_EMPTY`] warning (lines 1 to `closing`), as for a notebook's first cell;
-/// - otherwise a Markdown heading (`# Title`, not a commented-out key such as `# date: …`)
-///   after a blank line, with only blank lines and comments after it, as
-///   [`swallowed_heading`] finds it: a [`FRONT_MATTER_UNCLOSED`] warning on its line;
+/// - YAML without any key (only comments and blank lines) with a comment that is a Markdown
+///   heading (`# Title`; not a commented-out key such as `# title: Draft`, nor a label
+///   ending with `:`): a [`FRONT_MATTER_EMPTY`] warning (lines 1 to `closing`), as for a
+///   notebook's first cell. YAML with keys whose values are all commented out
+///   (`reveal:` over `#   transition: fade`) is fine;
+/// - otherwise a Markdown heading after a blank line, with only blank lines and comments
+///   after it, one of them blank (a slide's heading is followed by a blank line before the
+///   separator; a closing remark sits right on the `---`), as [`swallowed_heading`] finds
+///   it: a [`FRONT_MATTER_UNCLOSED`] warning on its line;
 /// - a root that is not a mapping: `expected a mapping at line L column C (…)` with the
 ///   position of the root value and the front matter's extent, asking whether line 1 was
 ///   meant as a slide separator or the closing `---` is missing; any other error gets that
@@ -271,8 +275,12 @@ pub fn parse_deck_front_matter(
         end_line: closing,
         cell: None,
     };
-    if meta == DeckMeta::default() {
-        if yaml.lines().any(|line| line.trim_start().starts_with('#')) {
+    let keyless = yaml.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with('#')
+    });
+    if keyless {
+        if yaml.lines().any(is_markdown_heading) {
             let message = format!(
                 "{extent} and sets nothing: its `# …` lines are YAML comments and are not shown. \
                  Was line 1 meant as a slide separator? The first slide needs none"
@@ -356,8 +364,9 @@ fn is_commented_key(line: &str) -> bool {
 /// A Markdown heading that front matter swallowed (`# Title`, after a blank line; not a
 /// label ending with `:` or a commented-out key such as `# date: …`), after the last YAML line
 /// (not blank, not a comment), with only blank lines and comments after it, none of them a
-/// commented-out key; `(source line, text)`, the YAML's first line being line 2. See
-/// [`parse_deck_front_matter`].
+/// commented-out key and one of them blank (counting the blank line before the closing
+/// `---`, which [`strip_delimiters`] leaves as a final line break); `(source line, text)`,
+/// the YAML's first line being line 2. See [`parse_deck_front_matter`].
 pub fn swallowed_heading(yaml: &str) -> Option<(usize, &str)> {
     let lines: Vec<&str> = yaml.lines().collect();
     let is_yaml = |line: &&str| {
@@ -368,10 +377,10 @@ pub fn swallowed_heading(yaml: &str) -> Option<(usize, &str)> {
     let (line, text) = headings_after_blank(yaml)
         .into_iter()
         .find(|&(line, _)| line > last_yaml)?;
-    let keys_after = lines[line - 1..]
-        .iter()
-        .any(|later| is_commented_key(later));
-    (!keys_after).then_some((line, text))
+    let after = &lines[line - 1..];
+    let keys_after = after.iter().any(|later| is_commented_key(later));
+    let blank_after = after.iter().any(|later| later.trim().is_empty()) || yaml.ends_with('\n');
+    (!keys_after && blank_after).then_some((line, text))
 }
 
 /// Deck metadata from a JSON value, with the key rules of [`parse_front_matter`]: for a
@@ -1021,6 +1030,26 @@ alpha: [1, 2]
             swallowed_heading("a: 1\n\n## Agenda\n\n"),
             Some((4, "## Agenda"))
         );
+        // A3 fix round: valid front matter is no false alarm: options all commented out
+        // (keys or values), and a closing remark right on the closing `---` (as
+        // `strip_delimiters` returns it: no final line break)
+        for yaml in [
+            "reveal:\n  # transition: fade\n  # controls: false",
+            "# title: My talk\n# author: Me",
+            "# title: Draft\n\n# author: Me\n",
+            "title: X\nauthor: Y\n\n# More options live in presenter.toml",
+            "title: Talk\n\n# Remember to update the abstract\n# before the conference",
+        ] {
+            assert_eq!(deck_front_matter(yaml, 9).1, [], "{yaml:?}");
+        }
+        // the same remark followed by a blank line before the `---` is a swallowed slide
+        let (_, found) = deck_front_matter("title: X\n\n# Slide two\n", 6);
+        assert_eq!(found, [(FRONT_MATTER_UNCLOSED, 4, 6)]);
+        let (_, found) = deck_front_matter("title: X\n\n# Slide two\n\n# (more to say here)", 8);
+        assert_eq!(found, [(FRONT_MATTER_UNCLOSED, 4, 8)]);
+        // a heading among commented-out keys still says the deck lost its first slide
+        let (_, found) = deck_front_matter("# date: 2026\n\n# Welcome\n", 6);
+        assert_eq!(found, [(FRONT_MATTER_EMPTY, 1, 6)]);
         // not a mapping: located at the root value, with the question
         let (meta, _) = deck_front_matter("\n# Real\n\nSome paragraph\n", 6);
         let Err(Error::FrontMatter(message)) = meta else {
