@@ -9,8 +9,11 @@
 //! session), enables its `Page`, `Runtime`, `Inspector` and `Log` domains and turns on its
 //! lifecycle events. [`Page::navigate`] loads a URL and waits for the `load` event of the
 //! document that navigation created (the `load` lifecycle event with the navigation's
-//! `loaderId`, so the load of a document the page navigated to by itself in the meantime
-//! does not count). [`Page::evaluate`] evaluates a JavaScript expression in the page,
+//! `loaderId`, so the load of a document the page navigated to by itself before does not
+//! count), or, when that document navigates its frame again before its own `load` (a script
+//! that sets `location`, a live-reload client reloading on `hello`), of the document that
+//! replaced it: a newer document of the same frame that starts (`init`) after the awaited
+//! one did is awaited instead. [`Page::evaluate`] evaluates a JavaScript expression in the page,
 //! awaits it when it is a promise and returns its JSON value. Each call must finish within
 //! the page's timeout, counted from the start of that call.
 //!
@@ -142,19 +145,22 @@ impl Page {
         Ok(page)
     }
 
-    /// Loads `url` in the page and waits for the `load` event of the document it creates
-    /// (module docs). When `url` differs from the current page's only in its fragment
-    /// (`#/2`), Chrome stays on the page and fires no `load` event: then this returns as
-    /// soon as Chrome has accepted the navigation.
+    /// Loads `url` in the page and waits for the `load` event of the document it creates,
+    /// or of the document that replaced it before its `load` (module docs). When `url`
+    /// differs from the current page's only in its fragment (`#/2`), Chrome stays on the
+    /// page and fires no `load` event: then this returns as soon as Chrome has accepted the
+    /// navigation.
     ///
     /// Errors: Chrome cannot load it (`net::ERR_…`; for a `file://` URL with a hint about
     /// [`readable_temp_dir`]), the page crashes, Chrome exits or the timeout passes.
     pub fn navigate(&mut self, url: &str) -> Result<()> {
         self.run("loading a page", |cdp, session| {
-            let mut loads = Vec::new();
+            // Every lifecycle event from the request on, in order: those that arrive before
+            // the reply are judged once the reply names the loader.
+            let mut events = Vec::new();
             let params = json!({ "url": url });
             let navigation = call(cdp, session, "Page.navigate", params, &mut |message| {
-                note_load(message, &mut loads);
+                events.extend(Lifecycle::of(message));
             })?;
             if let Some(error) = navigation.get("errorText").and_then(Value::as_str) {
                 return Err(CallError::Refused(load_error(url, error)));
@@ -163,12 +169,20 @@ impl Page {
             let Some(loader) = navigation.get("loaderId").and_then(Value::as_str) else {
                 return Ok(());
             };
-            while !loads.iter().any(|done| done == loader) {
+            let frame = navigation.get("frameId").and_then(Value::as_str);
+            let mut awaited = LoadWait::new(frame, loader);
+            let mut judged = 0;
+            loop {
+                for event in &events[judged..] {
+                    if awaited.loaded(event) {
+                        return Ok(());
+                    }
+                }
+                judged = events.len();
                 let message = cdp.next_message()?;
-                note_load(&message, &mut loads);
+                events.extend(Lifecycle::of(&message));
                 cdp.handle_event(&message)?;
             }
-            Ok(())
         })
     }
 
@@ -328,15 +342,74 @@ fn call(
     }
 }
 
-/// Adds the loader id of a `Page.lifecycleEvent` that reports a document's `load` event to
-/// `loads`; other messages are ignored.
-fn note_load(message: &Value, loads: &mut Vec<String>) {
-    let params = &message["params"];
-    if message["method"] == "Page.lifecycleEvent"
-        && params["name"] == "load"
-        && let Some(loader) = params["loaderId"].as_str()
-    {
-        loads.push(loader.to_string());
+/// One `Page.lifecycleEvent`: a document (`loader`) of a frame reached a stage (`name`:
+/// `init` when it starts, `DOMContentLoaded`, `load`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lifecycle {
+    /// The frame's id.
+    frame: String,
+    /// The document's loader id.
+    loader: String,
+    /// The stage.
+    name: String,
+}
+
+impl Lifecycle {
+    /// The lifecycle event `message` reports, if it is one.
+    fn of(message: &Value) -> Option<Lifecycle> {
+        if message["method"] != "Page.lifecycleEvent" {
+            return None;
+        }
+        let params = &message["params"];
+        let field = |name: &str| params[name].as_str().map(str::to_string);
+        Some(Lifecycle {
+            frame: field("frameId")?,
+            loader: field("loaderId")?,
+            name: field("name")?,
+        })
+    }
+}
+
+/// The document [`Page::navigate`] waits for (module docs): at first the one its navigation
+/// created; when a newer document of the same frame starts after that one did, that one.
+#[derive(Debug)]
+struct LoadWait {
+    /// The navigated frame, if Chrome named it (else every frame counts).
+    frame: Option<String>,
+    /// The awaited document's loader.
+    loader: String,
+    /// Whether the awaited document has started (its `init` event came).
+    started: bool,
+}
+
+impl LoadWait {
+    /// Waits for the document `loader` of `frame`.
+    fn new(frame: Option<&str>, loader: &str) -> LoadWait {
+        LoadWait {
+            frame: frame.map(str::to_string),
+            loader: loader.to_string(),
+            started: false,
+        }
+    }
+
+    /// Takes the page's next lifecycle event (in the order Chrome sent them); true once
+    /// the awaited document has fired `load`. Events of a document that started before
+    /// the awaited one (a navigation the page made by itself earlier) do not count.
+    fn loaded(&mut self, event: &Lifecycle) -> bool {
+        if self
+            .frame
+            .as_ref()
+            .is_some_and(|frame| *frame != event.frame)
+        {
+            return false;
+        }
+        match event.name.as_str() {
+            "init" if event.loader == self.loader => self.started = true,
+            "init" if self.started => self.loader.clone_from(&event.loader),
+            "load" => return event.loader == self.loader,
+            _ => {}
+        }
+        false
     }
 }
 
@@ -405,22 +478,81 @@ mod tests {
         );
     }
 
+    /// The lifecycle event `name` of document `loader` in frame `frame`, as Chrome sends it.
+    fn event(frame: &str, loader: &str, name: &str) -> Value {
+        json!({
+            "method": "Page.lifecycleEvent",
+            "params": { "frameId": frame, "loaderId": loader, "name": name, "timestamp": 1.0 },
+        })
+    }
+
     #[test]
-    fn only_load_lifecycle_events_count_as_loads() {
-        let mut loads = Vec::new();
-        let event = |name: &str, loader: &str| {
-            json!({
-                "method": "Page.lifecycleEvent",
-                "params": { "frameId": "F", "loaderId": loader, "name": name },
+    fn lifecycle_events_are_read_from_their_messages() {
+        assert_eq!(
+            Lifecycle::of(&event("F", "B", "load")),
+            Some(Lifecycle {
+                frame: "F".into(),
+                loader: "B".into(),
+                name: "load".into()
             })
-        };
-        note_load(&event("DOMContentLoaded", "A"), &mut loads);
-        note_load(&event("load", "B"), &mut loads);
-        note_load(
-            &json!({ "method": "Page.loadEventFired", "params": {} }),
-            &mut loads,
         );
-        note_load(&json!({ "id": 3, "result": {} }), &mut loads);
-        assert_eq!(loads, ["B"]);
+        let fired = json!({ "method": "Page.loadEventFired", "params": {} });
+        assert_eq!(Lifecycle::of(&fired), None);
+        assert_eq!(Lifecycle::of(&json!({ "id": 3, "result": {} })), None);
+    }
+
+    /// Runs `events` (frame, loader, name) through a [`LoadWait`] for loader `A` of frame
+    /// `F`; returns the index of the event it finished on.
+    fn finishes_at(events: &[(&str, &str, &str)]) -> Option<usize> {
+        let mut wait = LoadWait::new(Some("F"), "A");
+        events.iter().position(|(frame, loader, name)| {
+            wait.loaded(&Lifecycle::of(&event(frame, loader, name)).unwrap())
+        })
+    }
+
+    #[test]
+    fn navigate_waits_for_its_document_or_the_one_that_replaced_it() {
+        // Its own document.
+        let own = [
+            ("F", "A", "init"),
+            ("F", "A", "DOMContentLoaded"),
+            ("F", "A", "load"),
+        ];
+        assert_eq!(finishes_at(&own), Some(2));
+        // The page navigated by itself before: those events do not count.
+        let stale = [
+            ("F", "S", "init"),
+            ("F", "S", "load"),
+            ("F", "A", "init"),
+            ("F", "A", "load"),
+        ];
+        assert_eq!(finishes_at(&stale), Some(3));
+        // A script in the new document navigates again before its load (L-T24-1): the
+        // replacing document's load counts, then also a further replacement's.
+        let redirect = [("F", "A", "init"), ("F", "B", "init"), ("F", "B", "load")];
+        assert_eq!(finishes_at(&redirect), Some(2));
+        let twice = [
+            ("F", "A", "init"),
+            ("F", "B", "init"),
+            ("F", "C", "init"),
+            ("F", "B", "load"),
+            ("F", "C", "load"),
+        ];
+        assert_eq!(finishes_at(&twice), Some(4));
+        // Another frame (an iframe) does not count.
+        let iframe = [
+            ("F", "A", "init"),
+            ("I", "X", "init"),
+            ("I", "X", "load"),
+            ("F", "A", "load"),
+        ];
+        assert_eq!(finishes_at(&iframe), Some(3));
+        assert_eq!(
+            finishes_at(&[("F", "A", "init"), ("F", "A", "DOMContentLoaded")]),
+            None
+        );
+        // Without a frame id from Chrome, every frame counts.
+        let mut any = LoadWait::new(None, "A");
+        assert!(any.loaded(&Lifecycle::of(&event("G", "A", "load")).unwrap()));
     }
 }

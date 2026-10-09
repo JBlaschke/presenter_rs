@@ -5,7 +5,8 @@
 //! pushes one `build` event per rebuild to every connected browser through a
 //! [`broadcast`] channel ([`event_channel`]). The rebuild loop (T20/T23) renders with
 //! `OutputMode::Serve` and `BuildInfo::serve(`[`next_build_id`]`(&state))`, stores the result
-//! with [`apply_build`] or [`apply_error`] and then [`publish`]es the matching
+//! with [`apply_build`] or [`apply_error_payload`] (with `ErrorPayload::for_input`, so a front
+//! matter error is located in the deck source) and then [`publish`]es the matching
 //! [`BuildEvent`].
 //!
 //! | route | response |
@@ -26,16 +27,37 @@
 //! Both asset routes answer single byte-range requests (`206 Partial Content`, which media
 //! elements rely on; Safari plays no video without it), and a file-backed deck asset is
 //! streamed from disk rather than read into memory as a whole.
+//!
+//! A stylesheet of the theme chain that the asset route serves (one a template links with
+//! `style()`) has its relative `url()`s rewritten to the absolute, versioned URLs of the
+//! files they name (`/__presenter/asset/<path>?v=<content version>`,
+//! [`crate::render::html::serve_stylesheet`]), so an edited image shows up after the
+//! client re-requests the stylesheet (live-reload.md §4, audit F03).
+//!
+//! **Host check (live-reload.md §4, audit F07).** [`serve_until`] answers only requests
+//! whose `Host` header names this server: the address it listens on, `localhost`,
+//! `127.0.0.1` or `[::1]`, or a name it was given ([`AllowedHosts::with_name`], the
+//! `--host` of `presenter serve`), with the port it listens on (no port for port 80). A
+//! server that listens on every address (`0.0.0.0`, `[::]`) listens on each of the
+//! machine's addresses, so it takes any IP address (another device reaches it at the
+//! machine's LAN address; a DNS rebinding attack needs a name). An IPv4-mapped IPv6 address
+//! (`[::ffff:127.0.0.1]`) is the IPv4 address. Any other request, on every route, gets
+//! `403 Forbidden`: a web page that rebinds its own name to `127.0.0.1` cannot read the
+//! deck, its assets, the theme files or the build events. A request without a `Host`
+//! header (HTTP/1.0; browsers always send one) passes.
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::{Future, IntoFuture};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -51,7 +73,9 @@ use crate::assets::emit::SERVE_ASSET_PREFIX;
 use crate::assets::registry::{AssetData, AssetRegistry};
 use crate::error::{Error, Result};
 use crate::pipeline::Build;
-use crate::render::html::{SERVE_HELPER_PREFIX, SERVE_LIVE_RELOAD_JS, SERVE_THEME_CSS};
+use crate::render::html::{
+    SERVE_HELPER_PREFIX, SERVE_LIVE_RELOAD_JS, SERVE_THEME_CSS, serve_stylesheet,
+};
 use crate::render::{normalize_helper_path, resolve_helper_path};
 use crate::serve::events::{BuildEvent, ErrorPayload, Hello, Status};
 use crate::serve::files::{bytes_response, file_response, whole_response};
@@ -208,15 +232,36 @@ pub async fn serve(listener: TcpListener, router: Router) -> Result<()> {
 /// the remaining requests have finished (at most [`SHUTDOWN_GRACE`] later; a client that
 /// never completes its request would otherwise hold the server).
 ///
-/// `router` is normally [`router`]`(…)`, possibly merged with more routes. Errors: an I/O
-/// error of the server ([`Error::Io`]); axum 0.8 handles accept errors itself and never
-/// returns one, so in practice this returns `Ok(())` after the shutdown.
+/// Only requests for the listener's address pass the Host check (module docs): exactly
+/// [`serve_until_allowing`] with [`AllowedHosts::new`] of that address.
+///
+/// `router` is normally [`router`]`(…)`, possibly merged with more routes. Errors: the
+/// listener's address cannot be read, or an I/O error of the server ([`Error::Io`]); axum
+/// 0.8 handles accept errors itself and never returns one, so in practice this returns
+/// `Ok(())` after the shutdown.
 pub async fn serve_until<F>(listener: TcpListener, router: Router, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let hosts = AllowedHosts::new(listener.local_addr()?);
+    serve_until_allowing(listener, router, shutdown, hosts).await
+}
+
+/// [`serve_until`] answering the requests whose `Host` header `hosts` allows (module docs);
+/// every other request gets `403 Forbidden`.
+pub async fn serve_until_allowing<F>(
+    listener: TcpListener,
+    router: Router,
+    shutdown: F,
+    hosts: AllowedHosts,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let (down_tx, down_rx) = watch::channel(false);
-    let app = router.layer(Extension(ShutdownSignal(down_rx.clone())));
+    let app = router
+        .layer(Extension(ShutdownSignal(down_rx.clone())))
+        .layer(middleware::from_fn_with_state(Arc::new(hosts), check_host));
     let signal = async move {
         shutdown.await;
         tracing::info!("dev server shutting down");
@@ -245,6 +290,136 @@ async fn ctrl_c() {
         tracing::warn!("cannot listen for ctrl-c: {err}");
         std::future::pending::<()>().await;
     }
+}
+
+/// The `Host` headers the dev server answers (module docs, "Host check"): the address it
+/// listens on (any IP address when that is unspecified), `localhost`, `127.0.0.1`,
+/// `[::1]` and the names added with [`AllowedHosts::with_name`], each with the port the
+/// server listens on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedHosts {
+    /// The port the server listens on.
+    port: u16,
+    /// The host names allowed, lowercase.
+    names: BTreeSet<String>,
+    /// The IP addresses allowed (canonical: an IPv4-mapped IPv6 address is the IPv4 one).
+    addresses: BTreeSet<IpAddr>,
+    /// True when the server listens on every address: any IP address is allowed.
+    any_address: bool,
+}
+
+impl AllowedHosts {
+    /// The hosts of a server listening on `addr`: `addr`'s address, `localhost`,
+    /// `127.0.0.1` and `[::1]`, with `addr`'s port (the bound one: not 0).
+    pub fn new(addr: SocketAddr) -> Self {
+        let loopback = [
+            IpAddr::from([127, 0, 0, 1]),
+            IpAddr::from(Ipv6Addr::LOCALHOST),
+        ];
+        let mut hosts = AllowedHosts {
+            port: addr.port(),
+            names: BTreeSet::from(["localhost".to_string()]),
+            addresses: BTreeSet::from(loopback),
+            any_address: false,
+        };
+        hosts.add_address(addr.ip());
+        hosts
+    }
+
+    /// The same hosts and `name` (the `--host` the server was started with: a name,
+    /// compared ignoring ASCII case, or an IP address, `[…]` for IPv6).
+    pub fn with_name(mut self, name: &str) -> Self {
+        let name = name.trim().to_ascii_lowercase();
+        let bare = name.strip_prefix('[').and_then(|n| n.strip_suffix(']'));
+        match bare.unwrap_or(&name).parse::<IpAddr>() {
+            Ok(ip) => self.add_address(ip),
+            Err(_) if !name.is_empty() => {
+                self.names.insert(name);
+            }
+            Err(_) => {}
+        }
+        self
+    }
+
+    /// Allows the address `ip`: every address if it is unspecified (`0.0.0.0`, `::`).
+    fn add_address(&mut self, ip: IpAddr) {
+        match ip.is_unspecified() {
+            true => self.any_address = true,
+            false => {
+                self.addresses.insert(ip.to_canonical());
+            }
+        }
+    }
+
+    /// True if a request whose `Host` header is `host` (`None`: it has none) is for this
+    /// server: an allowed name or IP address (IPv6 in brackets), with the server's port,
+    /// or without a port when that is 80.
+    pub fn allows(&self, host: Option<&str>) -> bool {
+        let Some(host) = host else {
+            return true;
+        };
+        let Some((name, port)) = split_host(host) else {
+            return false;
+        };
+        let allowed = match name.parse::<IpAddr>() {
+            Ok(ip) => self.any_address || self.addresses.contains(&ip.to_canonical()),
+            Err(_) => self.names.contains(&name.to_ascii_lowercase()),
+        };
+        allowed && port.unwrap_or(80) == self.port
+    }
+}
+
+/// The name and port of a `Host` header value (`name`, `name:port`, `[v6]`, `[v6]:port`),
+/// without the brackets of an IPv6 address; `None` when it is malformed.
+fn split_host(host: &str) -> Option<(&str, Option<u16>)> {
+    let (name, port) = match host.strip_prefix('[') {
+        Some(rest) => {
+            let (address, after) = rest.split_once(']')?;
+            address.parse::<std::net::Ipv6Addr>().ok()?;
+            match after {
+                "" => (address, None),
+                _ => (address, Some(after.strip_prefix(':')?)),
+            }
+        }
+        None => match host.rsplit_once(':') {
+            Some((name, port)) => (name, Some(port)),
+            None => (host, None),
+        },
+    };
+    let port = match port {
+        Some(port) => Some(port.parse::<u16>().ok()?),
+        None => None,
+    };
+    (!name.is_empty()).then_some((name, port))
+}
+
+/// The Host check (module docs): passes a request that `hosts` allows to `next`, answers
+/// any other with `403 Forbidden`.
+async fn check_host(
+    State(hosts): State<Arc<AllowedHosts>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let host = match request.headers().get(header::HOST) {
+        // A value that is not visible ASCII is no host this server has.
+        Some(value) => Some(value.to_str().unwrap_or_default()),
+        None => request
+            .uri()
+            .authority()
+            .map(|authority| authority.as_str()),
+    };
+    if hosts.allows(host) {
+        return next.run(request).await;
+    }
+    let host = host.unwrap_or_default().to_string();
+    tracing::info!("refused a request for host {host:?} (not this server)");
+    let message = format!(
+        "presenter serve answers requests for the address it listens on, localhost or its \
+         --host name on port {}, not for host {host:?} (a protection against DNS \
+         rebinding): open the address it printed\n",
+        hosts.port
+    );
+    (StatusCode::FORBIDDEN, message).into_response()
 }
 
 /// The server's shutdown flag, given to the handlers by [`serve_until`].
@@ -454,8 +629,15 @@ fn helper_asset_response(theme: Option<&Theme>, path: &str, request: &HeaderMap)
     };
     match found {
         Ok(Some((bytes, mime))) => {
-            let vendor = normalize_helper_path(path).is_some_and(|key| key.starts_with("vendor/"));
+            let key = normalize_helper_path(path).unwrap_or_default();
+            let vendor = key.starts_with("vendor/");
             let cache = if vendor { VENDOR_CACHE } else { NO_STORE };
+            let bytes = match theme {
+                Some(theme) if mime == "text/css" && !is_builtin_key(&key) => {
+                    theme_stylesheet(theme, &key, bytes)
+                }
+                _ => bytes,
+            };
             bytes_response(bytes, &mime, cache, request)
         }
         Ok(None) => not_found(&format!("{SERVE_HELPER_PREFIX}{path}")),
@@ -463,10 +645,31 @@ fn helper_asset_response(theme: Option<&Theme>, path: &str, request: &HeaderMap)
     }
 }
 
+/// True for a normalized helper path of the embedded tree (`vendor/…`, `presenter/…`).
+fn is_builtin_key(key: &str) -> bool {
+    key.starts_with("vendor/") || key.starts_with("presenter/")
+}
+
+/// The stylesheet at helper path `key` of `theme`'s chain (`bytes`) as served: its relative
+/// `url()`s rewritten to versioned URLs ([`serve_stylesheet`], module docs); as it is when
+/// it is not UTF-8 or cannot be rewritten (the browser then resolves it as written).
+fn theme_stylesheet(theme: &Theme, key: &str, bytes: Vec<u8>) -> Vec<u8> {
+    let Ok(css) = std::str::from_utf8(&bytes) else {
+        return bytes;
+    };
+    match serve_stylesheet(theme, key, css) {
+        Ok(css) => css.into_bytes(),
+        Err(err) => {
+            tracing::debug!("serving {key} as written: {err}");
+            bytes
+        }
+    }
+}
+
 /// A `vendor/…` or `presenter/…` helper path's bytes and MIME type.
 fn builtin_file(path: &str) -> Option<(Vec<u8>, String)> {
     let key = normalize_helper_path(path)?;
-    if !(key.starts_with("vendor/") || key.starts_with("presenter/")) {
+    if !is_builtin_key(&key) {
         return None;
     }
     let bytes = crate::vendor::get(&key)?.into_owned();
@@ -861,6 +1064,83 @@ mod tests {
             "event: build\ndata: {\"status\":\"ok\",\"build_id\":2,\"kind\":\"content\",\
              \"duration_ms\":1}\n\n"
         );
+    }
+
+    #[test]
+    fn hosts_are_this_server_by_name_or_address_and_port() {
+        let hosts = AllowedHosts::new(SocketAddr::from(([127, 0, 0, 1], 4321)));
+        for host in [
+            "localhost:4321",
+            "LocalHost:4321",
+            "127.0.0.1:4321",
+            "[::1]:4321",
+            "[::ffff:127.0.0.1]:4321",
+        ] {
+            assert!(hosts.allows(Some(host)), "{host}");
+        }
+        // No Host header at all (HTTP/1.0): browsers always send one.
+        assert!(hosts.allows(None));
+        for host in [
+            // Addresses this server does not listen on (audit review: the contract's list).
+            "192.168.1.5:4321",
+            "[fe80::1]:4321",
+            "127.0.0.2:4321",
+            "0.0.0.0:4321",
+            "evil.example:4321",
+            "evil.example",
+            "localhost.evil.example:4321",
+            "127.0.0.1.nip.io:4321",
+            "localhost:80",
+            "localhost:3000",
+            "localhost",
+            "127.0.0.1",
+            "localhost:",
+            "localhost:x",
+            ":4321",
+            "[::1",
+            "[evil]:4321",
+            "[::1]4321",
+            "",
+        ] {
+            assert!(!hosts.allows(Some(host)), "{host}");
+        }
+        // A configured name; port 80 may be left out.
+        let named =
+            AllowedHosts::new(SocketAddr::from(([192, 168, 1, 5], 80))).with_name("MyMac.local");
+        for host in [
+            "mymac.local",
+            "MYMAC.LOCAL:80",
+            "localhost",
+            "192.168.1.5",
+            "[::1]",
+        ] {
+            assert!(named.allows(Some(host)), "{host}");
+        }
+        for host in ["other.local", "mymac.local:8080", "10.0.0.2", "[fe80::1]"] {
+            assert!(!named.allows(Some(host)), "{host}");
+        }
+        // Every address (`--host 0.0.0.0`): any IP address is one of the machine's; names
+        // stay limited.
+        let every = AllowedHosts::new(SocketAddr::from(([0, 0, 0, 0], 3000))).with_name("0.0.0.0");
+        for host in [
+            "10.0.0.2:3000",
+            "[fe80::1]:3000",
+            "localhost:3000",
+            "127.0.0.1:3000",
+        ] {
+            assert!(every.allows(Some(host)), "{host}");
+        }
+        for host in ["evil.example:3000", "10.0.0.2:3001"] {
+            assert!(!every.allows(Some(host)), "{host}");
+        }
+        // An IPv6 `--host`, written in brackets or not.
+        let v6 = AllowedHosts::new(SocketAddr::from(([127, 0, 0, 1], 3000)))
+            .with_name("[2001:db8::1]")
+            .with_name("2001:db8::2");
+        for host in ["[2001:db8::1]:3000", "[2001:DB8::2]:3000"] {
+            assert!(v6.allows(Some(host)), "{host}");
+        }
+        assert!(!v6.allows(Some("[2001:db8::3]:3000")));
     }
 
     #[test]

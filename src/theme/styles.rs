@@ -26,6 +26,36 @@
 //! (grass 0.13.4 would panic on it, so [`VirtualFs`] never reports a read failure to grass;
 //! as a backstop, a panic inside grass is caught and becomes an [`Error::Style`] as well).
 //!
+//! **Isolation (live-reload.md §4, audit F02/F06).** grass has no limit on recursion or
+//! loop iterations and cannot be stopped, and a stack overflow cannot be caught: it aborts
+//! the process. So in the presenter binary every Sass compilation runs in a **worker
+//! process** (the binary itself, [`isolate_in_worker`]; protocol in the `worker` module),
+//! on a thread with a [`SASS_STACK_SIZE`] stack (deep but finite nesting and recursion
+//! compile), and the caller waits at most [`SASS_TIME_LIMIT`] for it:
+//! - a compilation that takes longer (an endless `@while`, a huge `@for`) is an
+//!   [`Error::Style`] saying so; the worker is killed, which frees the CPU and memory it
+//!   used;
+//! - a recursion that never ends (a `@mixin` that includes itself, a `@function` that
+//!   calls itself, whether a condition that is never met guards it or not, in one file or
+//!   several) overflows the worker's stack and ends the worker only: an [`Error::Style`]
+//!   that names the recursion when the SCSS files read show one (`recursion` module),
+//!   else says what happened.
+//!
+//! A library user without a worker (a test binary is no presenter; [`with_worker`] names
+//! one) compiles on a thread of its own process with the same stack and time limit, which
+//! cannot be stopped: a compilation that times out **keeps running** (a CPU core, and
+//! memory when it emits CSS) until it ends by itself. To keep the process alive, each SCSS
+//! file is checked before grass reads it ([`unconditional_recursion`], with the references
+//! of the files loaded before): a `@mixin` that always includes itself or a `@function`
+//! that always calls itself before any `@return`, directly or through others of the file,
+//! is an [`Error::Style`] pointing at the call. Recursion that only a condition guards,
+//! that goes through several files, or that is written in the indented `.sass` syntax is
+//! left to grass, and overflows that process's stack if it never ends.
+//!
+//! After a compilation timed out or overflowed its stack, presenter remembers the files it
+//! read: compiling the same entry of the same theme chain again with those files unchanged
+//! fails at once with the same error instead of waiting again; any edit compiles anew.
+//!
 //! **Local `@import`s ([`inline_imports`]).** Sass passes CSS imports (`@import url(…)`,
 //! `@import "x.css"`) through verbatim, and a standalone document cannot load a relative
 //! stylesheet, so after compiling, every top-level `@import` of a relative URL is replaced
@@ -45,7 +75,11 @@
 //! font next to that CSS file and no text is processed twice.
 //!
 //! **Logging.** grass's `@debug` and `@warn` output goes to `tracing` (debug and warn;
-//! not to the build's diagnostics); each compilation logs its duration at debug level.
+//! not to the build's diagnostics), forwarded by the worker; each compilation logs its
+//! duration at debug level.
+
+mod recursion;
+mod worker;
 
 use std::any::Any;
 use std::cell::{OnceCell, RefCell};
@@ -54,10 +88,14 @@ use std::fmt::Write as _;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use std::time::Instant;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, LazyLock, Mutex, Once, PoisonError};
+use std::time::{Duration, Instant};
 
 use regex::{Captures, Regex};
+
+pub use recursion::{Recursion, RecursionKind, unconditional_recursion};
+pub use worker::{WORKER_ARG, WORKER_GRACE, isolate_in_worker, run_worker, with_worker};
 
 use super::{Theme, ThemeDir, ThemeFile, ThemeSource, exact_names, normalize_rel};
 use crate::error::{Error, Result};
@@ -65,6 +103,15 @@ use crate::error::{Error, Result};
 /// Where reveal.js's Sass sources live in the embedded tree (`reveal/<path>` names
 /// `vendor/reveal/css/<path>`).
 pub const REVEAL_CSS_DIR: &str = "vendor/reveal/css/";
+
+/// How long one Sass compilation may run before it is an [`Error::Style`] (module docs,
+/// "Isolation"; live-reload.md §4).
+pub const SASS_TIME_LIMIT: Duration = Duration::from_secs(10);
+
+/// The stack size of the thread each Sass compilation runs on (module docs, "Isolation"):
+/// 256 MiB, reserved but only used as deep as grass recurses. It holds tens of thousands
+/// of nested blocks or `@include`s, where the 2 MiB of a worker thread holds a few hundred.
+pub const SASS_STACK_SIZE: usize = 256 << 20;
 
 /// How deeply local `@import`s may nest below a stylesheet ([`inline_imports`]).
 pub const MAX_IMPORT_DEPTH: usize = 5;
@@ -145,39 +192,349 @@ pub fn compile_scss(theme: &Theme, path: &str) -> Result<String> {
 }
 
 /// Compiles `source`, the Sass file at the canonical key `key` (an entry or an imported
-/// file whose bytes are already read).
+/// file whose bytes are already read), isolated within [`SASS_TIME_LIMIT`].
 fn compile_sass_source(theme: &Theme, key: &str, source: &[u8]) -> Result<String> {
-    // grass's own UTF-8 error names neither the file nor the offending byte.
-    if let Err(e) = std::str::from_utf8(source) {
-        return Err(Error::Style {
-            file: key.to_string(),
-            message: format!("not valid UTF-8: {e}"),
-        });
-    }
-    compile_sass(&VirtualFs::new(theme).with_file(key, source), key)
+    compile_sass_within(theme, key, source, SASS_TIME_LIMIT)
 }
 
-/// Runs grass on the file `key` of `fs`, logging the time it took.
+/// [`compile_sass_source`] with the time limit `limit` (module docs, "Isolation"): in the
+/// worker process if there is one, else on a thread of this process.
+fn compile_sass_within(theme: &Theme, key: &str, source: &[u8], limit: Duration) -> Result<String> {
+    // grass's own UTF-8 error names neither the file nor the offending byte.
+    let text = std::str::from_utf8(source).map_err(|e| Error::Style {
+        file: key.to_string(),
+        message: format!("not valid UTF-8: {e}"),
+    })?;
+    if let Some(err) = remembered_failure(theme, key, source) {
+        return Err(err);
+    }
+    let started = Instant::now();
+    let outcome = match worker::configured() {
+        Some(exe) => worker::compile(&exe, theme, key, text, limit).unwrap_or_else(|err| {
+            worker_unavailable(&exe, &err);
+            compile_in_thread(theme, key, source, limit)
+        }),
+        None => compile_in_thread(theme, key, source, limit),
+    };
+    tracing::debug!(
+        stylesheet = key,
+        elapsed_ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1000.0),
+        "compiled Sass"
+    );
+    match outcome {
+        Outcome::Finished(result) => result,
+        Outcome::Abandoned {
+            error,
+            reads,
+            again,
+        } => {
+            if let Some(again) = again {
+                remember_failure(theme, key, reads, &error, again);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Warns (once per process) that the worker `exe` cannot be used.
+fn worker_unavailable(exe: &Path, err: &io::Error) {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "cannot compile Sass in a worker process ({}: {err}); compiling in this process, \
+             which a Sass recursion that never ends aborts",
+            exe.display()
+        );
+    });
+}
+
+/// How a compilation ended (module docs, "Isolation").
+enum Outcome {
+    /// It finished: the CSS or its error.
+    Finished(Result<String>),
+    /// It did not finish (it timed out or crashed): `error`, after reading `reads`.
+    /// `again` is the message for compiling the same unchanged files again, which would end
+    /// the same way (`None`: not remembered).
+    Abandoned {
+        error: Error,
+        reads: Reads,
+        again: Option<String>,
+    },
+}
+
+/// Where a compilation runs (module docs, "Isolation").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Isolation {
+    /// In a worker process, which can be killed.
+    Worker,
+    /// On a thread of this process, which cannot be stopped.
+    Thread,
+}
+
+/// The message of a compilation that did not finish within `limit` (`again`: one with the
+/// same inputs as a compilation that timed out before).
+fn timeout_message(limit: Duration, isolation: Isolation, again: bool) -> String {
+    let when = match again {
+        true => "an earlier compilation of the same files did not finish within",
+        false => "the Sass compilation did not finish within",
+    };
+    let after = match (isolation, again) {
+        (Isolation::Worker, false) => " and was stopped",
+        (Isolation::Worker, true) => {
+            " and was stopped; they are unchanged, so they were not \
+                                       compiled again"
+        }
+        (Isolation::Thread, _) => {
+            ". It cannot be stopped and runs on in the background (a CPU core, and memory \
+             if it emits CSS) until the process exits: fix the stylesheet, and restart the \
+             process to free them"
+        }
+    };
+    format!(
+        "{when} {} s (an endless @while or @for loop?){after}",
+        limit.as_secs_f64()
+    )
+}
+
+/// The [`Error::Style`] of a compilation of `key` that did not finish within `limit`.
+fn timeout_error(key: &str, limit: Duration, isolation: Isolation) -> Error {
+    Error::Style {
+        file: key.to_string(),
+        message: timeout_message(limit, isolation, false),
+    }
+}
+
+/// The message of an [`Error::Style`], or the text of another error.
+fn style_message(error: &Error) -> String {
+    match error {
+        Error::Style { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The [`Error::Style`] for a stack overflow while compiling `key` (`source`) for `theme`
+/// after reading `reads`: the recursion that the SCSS files read show
+/// ([`recursion::recursion_hint`]), at its call; `None` when they show none.
+fn overflow_error(theme: &Theme, key: &str, source: &str, reads: &Reads) -> Option<Error> {
+    let fs = VirtualFs::new(theme);
+    let mut files: Vec<(String, String)> = Vec::new();
+    for (file, _) in reads {
+        if !is_scss(file) || files.iter().any(|(seen, _)| seen == file) {
+            continue;
+        }
+        let text = match file == key {
+            true => Some(source.to_string()),
+            false => fs
+                .read_key(file)
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok()),
+        };
+        if let Some(text) = text {
+            files.push((file.clone(), text));
+        }
+    }
+    let (at, found) = recursion::recursion_hint(&files)?;
+    let (file, text) = &files[at];
+    let error = Error::Style {
+        file: file.clone(),
+        message: found.message(text),
+    };
+    Some(naming_entry(error, key))
+}
+
+/// True for the key of an `.scss` file (any case).
+fn is_scss(key: &str) -> bool {
+    key.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("scss"))
+}
+
+/// Compiles `source`, the file `key` of `theme`, on a new thread of this process with a
+/// [`SASS_STACK_SIZE`] stack, its SCSS files checked for recursion as grass reads them
+/// (module docs, "Isolation"). After `limit` the thread is left running.
+fn compile_in_thread(theme: &Theme, key: &str, source: &[u8], limit: Duration) -> Outcome {
+    let reads = Arc::new(Mutex::new(Reads::new()));
+    let (tx, rx) = mpsc::channel();
+    // The caller's subscriber (a test's, or the CLI's global one) gets grass's logs.
+    let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+    let recorded = Arc::clone(&reads);
+    let report = Reporter::new(move |report| match report {
+        Report::Read(key, hash) => recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((key, hash)),
+        Report::Debug(text) => tracing::debug!("{text}"),
+        Report::Warn(text) => tracing::warn!("{text}"),
+    });
+    let job = (theme.clone(), key.to_string(), source.to_vec(), report);
+    let spawned = std::thread::Builder::new()
+        .name("presenter-sass".into())
+        .stack_size(SASS_STACK_SIZE)
+        .spawn(move || {
+            let (theme, key, source, report) = job;
+            let result = tracing::dispatcher::with_default(&dispatch, || {
+                let fs = VirtualFs::new(&theme)
+                    .with_file(&key, &source)
+                    .reporting(report)
+                    .guarded();
+                compile_sass(&fs, &key)
+            });
+            // The caller may have stopped waiting (timed out): nobody to tell then.
+            let _ = tx.send(result);
+        });
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(err) => {
+            return Outcome::Finished(Err(Error::Style {
+                file: key.to_string(),
+                message: format!("cannot start a thread for the Sass compiler: {err}"),
+            }));
+        }
+    };
+    match rx.recv_timeout(limit) {
+        Ok(result) => {
+            // It has sent its result: the thread is ending, and its stack is freed.
+            let _ = thread.join();
+            Outcome::Finished(result)
+        }
+        Err(RecvTimeoutError::Timeout) => Outcome::Abandoned {
+            error: timeout_error(key, limit, Isolation::Thread),
+            reads: reads.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            again: Some(timeout_message(limit, Isolation::Thread, true)),
+        },
+        Err(RecvTimeoutError::Disconnected) => Outcome::Finished(Err(Error::Style {
+            file: key.to_string(),
+            message: "the Sass compiler (grass) stopped unexpectedly".into(),
+        })),
+    }
+}
+
+/// The files a compilation read through its [`VirtualFs`], by canonical key, with a hash
+/// of their contents, in the order read.
+type Reads = Vec<(String, blake3::Hash)>;
+
+/// What a compilation reports while it runs ([`Reporter`]).
+enum Report {
+    /// grass read the file with this canonical key and contents hash.
+    Read(String, blake3::Hash),
+    /// A `@debug` line, as it is logged.
+    Debug(String),
+    /// A `@warn` line, as it is logged.
+    Warn(String),
+}
+
+/// Where a compilation reports the files grass reads and its `@debug`/`@warn` output: to
+/// `tracing` and the caller's [`Reads`] on a thread, to the caller's pipe in a worker.
+#[derive(Clone)]
+struct Reporter(Arc<dyn Fn(Report) + Send + Sync>);
+
+impl Reporter {
+    fn new(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
+        Reporter(Arc::new(report))
+    }
+
+    fn send(&self, report: Report) {
+        (self.0)(report);
+    }
+}
+
+impl std::fmt::Debug for Reporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reporter")
+    }
+}
+
+/// A compilation that did not finish (module docs, "Isolation").
+struct Failed {
+    /// The locations of its theme chain, child first: which theme it compiled for.
+    chain: Vec<String>,
+    /// Its entry's canonical key.
+    key: String,
+    /// What it had read.
+    reads: Reads,
+    /// The file of its error.
+    file: String,
+    /// The message for compiling the same files again.
+    again: String,
+}
+
+/// The compilations that did not finish, for [`remembered_failure`]; the latest
+/// [`REMEMBERED`].
+static FAILED: Mutex<Vec<Failed>> = Mutex::new(Vec::new());
+
+/// How many failed compilations [`FAILED`] keeps.
+const REMEMBERED: usize = 16;
+
+/// The locations of `theme`'s chain, child first.
+fn chain_locations(theme: &Theme) -> Vec<String> {
+    theme.chain.iter().map(ThemeDir::location).collect()
+}
+
+/// Records a compilation of `key` for `theme` that did not finish after reading `reads`,
+/// with `error` and the message `again` for compiling the same files again.
+fn remember_failure(theme: &Theme, key: &str, reads: Reads, error: &Error, again: String) {
+    let Error::Style { file, .. } = error else {
+        return;
+    };
+    if reads.is_empty() {
+        return;
+    }
+    let chain = chain_locations(theme);
+    let mut failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+    failed.retain(|run| run.key != key || run.chain != chain);
+    if failed.len() >= REMEMBERED {
+        failed.remove(0);
+    }
+    failed.push(Failed {
+        chain,
+        key: key.to_string(),
+        reads,
+        file: file.clone(),
+        again,
+    });
+}
+
+/// The error of a compilation of `key` (whose contents are now `source`) for the chain of
+/// `theme` that did not finish, when every file it read is unchanged: compiling again
+/// would end the same way.
+fn remembered_failure(theme: &Theme, key: &str, source: &[u8]) -> Option<Error> {
+    let failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+    if failed.is_empty() {
+        return None;
+    }
+    let chain = chain_locations(theme);
+    let fs = VirtualFs::new(theme);
+    let unchanged = |(file, hash): &(String, blake3::Hash)| {
+        let now = match file == key {
+            true => Some(source.to_vec()),
+            false => fs.read_key(file).ok().flatten(),
+        };
+        now.is_some_and(|bytes| blake3::hash(&bytes) == *hash)
+    };
+    let run = failed
+        .iter()
+        .find(|run| run.key == key && run.chain == chain && run.reads.iter().all(unchanged))?;
+    Some(Error::Style {
+        file: run.file.clone(),
+        message: run.again.clone(),
+    })
+}
+
+/// Runs grass on the file `key` of `fs`.
 fn compile_sass(fs: &VirtualFs<'_>, key: &str) -> Result<String> {
     let load_paths: Vec<PathBuf> = fs.load_paths().into_iter().map(PathBuf::from).collect();
+    let logger = ReportLogger(fs.report.as_ref());
     let options = grass::Options::default()
         .fs(fs)
-        .logger(&TracingLogger)
+        .logger(&logger)
         .load_paths(&load_paths)
         // The result is concatenated into one stylesheet, where a `@charset` would be
         // misplaced; it is UTF-8 in every output mode anyway.
         .allows_charset(false);
     let entry = VirtualFs::marked(key);
-    let started = Instant::now();
     // A backstop: grass has internal panics (`unreachable!`, `todo!`) that user input may
     // reach; a theme must not take `build` or `serve` down with it.
     let result = catch_unwind(AssertUnwindSafe(|| grass::from_path(&entry, &options)));
-    let elapsed = started.elapsed();
-    tracing::debug!(
-        stylesheet = key,
-        elapsed_ms = format_args!("{:.1}", elapsed.as_secs_f64() * 1000.0),
-        "compiled Sass"
-    );
     // A file that could not be loaded was read as empty: its error comes first.
     if let Some(err) = fs.failure.take() {
         return Err(naming_entry(err, key));
@@ -194,14 +551,17 @@ fn compile_sass(fs: &VirtualFs<'_>, key: &str) -> Result<String> {
     }
 }
 
-/// `err` with `(compiling '<entry>')` added when it is an [`Error::Style`] about another
-/// file than `entry`.
+/// `err` with `(compiling '<entry>')` added to its first line (before a quoted source
+/// line) when it is an [`Error::Style`] about another file than `entry`.
 fn naming_entry(err: Error, entry: &str) -> Error {
     match err {
-        Error::Style { file, message } if file != entry => Error::Style {
-            message: format!("{message} (compiling '{entry}')"),
-            file,
-        },
+        Error::Style { file, message } if file != entry => {
+            let (first, rest) = message.split_at(message.find('\n').unwrap_or(message.len()));
+            Error::Style {
+                message: format!("{first} (compiling '{entry}'){rest}"),
+                file,
+            }
+        }
         other => other,
     }
 }
@@ -283,7 +643,9 @@ fn decode(key: &str, bytes: Vec<u8>) -> Result<String> {
 /// [`grass::Fs::read`] never fails: grass 0.13.4 panics when reading a file it loads fails
 /// or gives invalid UTF-8, so the first such problem is recorded instead (an
 /// [`Error::Style`] naming the file), the file reads as empty, and the compilation reports
-/// the recorded error.
+/// the recorded error. In a compilation on a thread of the calling process, an `.scss`
+/// file that recurses unconditionally ([`unconditional_recursion`]) is such a problem too:
+/// grass would overflow the process's stack (module docs, "Isolation").
 #[derive(Debug)]
 pub struct VirtualFs<'t> {
     theme: &'t Theme,
@@ -294,6 +656,11 @@ pub struct VirtualFs<'t> {
     embedded: OnceCell<BTreeSet<String>>,
     /// The first file grass could not read (see the type docs).
     failure: RefCell<Option<Error>>,
+    /// Where the files grass reads and its log output are reported, if anywhere.
+    report: Option<Reporter>,
+    /// When the SCSS files grass reads are checked for recursion: the references of the
+    /// files read so far.
+    guard: Option<RefCell<recursion::Refs>>,
 }
 
 /// Where a key of the [`VirtualFs`] lives.
@@ -312,6 +679,8 @@ impl<'t> VirtualFs<'t> {
             file: None,
             embedded: OnceCell::new(),
             failure: RefCell::new(None),
+            report: None,
+            guard: None,
         }
     }
 
@@ -319,6 +688,19 @@ impl<'t> VirtualFs<'t> {
     /// (normalized as in [`VirtualFs::key`]).
     pub fn with_file(mut self, key: &'t str, bytes: &'t [u8]) -> Self {
         self.file = Some((key, bytes));
+        self
+    }
+
+    /// The same tree, reporting each file grass reads and grass's log output to `report`.
+    fn reporting(mut self, report: Reporter) -> Self {
+        self.report = Some(report);
+        self
+    }
+
+    /// The same tree, checking each SCSS file grass reads for unconditional recursion
+    /// (module docs, "Isolation").
+    fn guarded(mut self) -> Self {
+        self.guard = Some(RefCell::default());
         self
     }
 
@@ -456,8 +838,34 @@ impl<'t> VirtualFs<'t> {
         })
     }
 
-    /// The UTF-8 contents of the file at `path`; [`Error::Style`] naming it otherwise.
+    /// The UTF-8 contents of the file at `path`, reported when [`VirtualFs::reporting`];
+    /// [`Error::Style`] naming it otherwise, and, when [`VirtualFs::guarded`], for an
+    /// `.scss` file that recurses unconditionally ([`unconditional_recursion`], its
+    /// definitions reached from the files read before, too).
     fn read_text(&self, path: &Path) -> Result<Vec<u8>> {
+        let (key, bytes) = self.read_utf8(path)?;
+        if let Some(report) = &self.report {
+            report.send(Report::Read(key.clone(), blake3::hash(&bytes)));
+        }
+        let Some(guard) = self.guard.as_ref().filter(|_| is_scss(&key)) else {
+            return Ok(bytes);
+        };
+        // `read_utf8` checked the bytes.
+        let text = std::str::from_utf8(&bytes).unwrap_or_default();
+        let (found, refs) = recursion::always_recursion(text, &guard.borrow());
+        guard.borrow_mut().extend(refs);
+        match found {
+            Some(found) => Err(Error::Style {
+                file: key,
+                message: found.message(text),
+            }),
+            None => Ok(bytes),
+        }
+    }
+
+    /// The canonical key and UTF-8 contents of the file at `path`; [`Error::Style`] naming
+    /// it otherwise.
+    fn read_utf8(&self, path: &Path) -> Result<(String, Vec<u8>)> {
         let Some(key) = Self::key(path) else {
             return Err(Error::Style {
                 file: path.to_string_lossy().replace(DIR_MARK, ""),
@@ -475,7 +883,7 @@ impl<'t> VirtualFs<'t> {
             Err(other) => return Err(error(format!("cannot read: {other}"))),
         };
         match std::str::from_utf8(&bytes) {
-            Ok(_) => Ok(bytes),
+            Ok(_) => Ok((key, bytes)),
             Err(e) => Err(error(format!("not valid UTF-8: {e}"))),
         }
     }
@@ -527,26 +935,34 @@ impl grass::Fs for VirtualFs<'_> {
     }
 }
 
-/// Sends grass's `@debug` and `@warn` output to `tracing`.
+/// Sends grass's `@debug` and `@warn` output to a [`Reporter`], else to `tracing`.
 #[derive(Debug)]
-struct TracingLogger;
+struct ReportLogger<'r>(Option<&'r Reporter>);
 
-impl grass::Logger for TracingLogger {
+impl grass::Logger for ReportLogger<'_> {
     fn debug(&self, location: codemap::SpanLoc, message: &str) {
-        tracing::debug!(
+        let text = format!(
             "{}:{}: @debug: {message}",
             location_name(&location),
             location.begin.line + 1
         );
+        match self.0 {
+            Some(report) => report.send(Report::Debug(text)),
+            None => tracing::debug!("{text}"),
+        }
     }
 
     fn warn(&self, location: codemap::SpanLoc, message: &str) {
-        tracing::warn!(
+        let text = format!(
             "{}:{}:{}: Sass warning: {message}",
             location_name(&location),
             location.begin.line + 1,
             location.begin.column + 1
         );
+        match self.0 {
+            Some(report) => report.send(Report::Warn(text)),
+            None => tracing::warn!("{text}"),
+        }
     }
 }
 
@@ -1089,6 +1505,104 @@ a::before { content: "@import url(string.css);" }
             key(&format!("{}/../x.scss", "@t/styles\u{1}")).as_deref(),
             Some("@t/x.scss")
         );
+    }
+
+    #[test]
+    fn a_long_loop_times_out_and_the_same_files_fail_at_once() {
+        // On a thread of this process (no worker here): the thread left behind cannot be
+        // stopped, so the loop ends by itself, some seconds after the limit in a debug
+        // build (it emits nothing: it only keeps a CPU core busy meanwhile).
+        let theme = crate::theme::resolve("default", &[]).unwrap();
+        let key = "@default/styles/long-loop-test.scss";
+        let long = b"@for $i from 1 through 4000000 { $x: $i; }\n";
+        let limit = Duration::from_millis(50);
+        let start = Instant::now();
+        let err = compile_sass_within(&theme, key, long, limit).unwrap_err();
+        let took = start.elapsed();
+        assert!(took >= limit && took < Duration::from_secs(5), "{took:?}");
+        let Error::Style { file, message } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(file, key);
+        assert!(
+            message.starts_with(
+                "the Sass compilation did not finish within 0.05 s (an endless @while or @for \
+                 loop?). It cannot be stopped and runs on in the background"
+            ),
+            "{message}"
+        );
+        // The same inputs again: at once, without another thread.
+        let start = Instant::now();
+        let again = compile_sass_within(&theme, key, long, limit).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(
+            again
+                .to_string()
+                .contains("an earlier compilation of the same files did not finish"),
+            "{again}"
+        );
+        // Edited: compiled anew.
+        let fixed = compile_sass_within(&theme, key, b"a { b: c; }", limit).unwrap();
+        assert!(fixed.contains("b: c;"), "{fixed}");
+    }
+
+    #[test]
+    fn errors_in_other_files_name_the_entry_on_their_first_line() {
+        let error = Error::Style {
+            file: "@t/styles/_p.scss".into(),
+            message: "line 2: x\n 2 | y".into(),
+        };
+        let Error::Style { message, .. } = naming_entry(error, "@t/styles/theme.scss") else {
+            unreachable!()
+        };
+        assert_eq!(
+            message,
+            "line 2: x (compiling '@t/styles/theme.scss')\n 2 | y"
+        );
+        let same = Error::Style {
+            file: "@t/a.scss".into(),
+            message: "m".into(),
+        };
+        assert_eq!(style_message(&naming_entry(same, "@t/a.scss")), "m");
+    }
+
+    #[test]
+    fn a_compilation_without_a_worker_rejects_unconditional_recursion() {
+        let theme = crate::theme::resolve("default", &[]).unwrap();
+        let key = "@default/styles/recursion-test.scss";
+        let scss =
+            b"@mixin pad($n) { padding: $n; @include pad($n - 1); }\nbody { @include pad(3px); }\n";
+        let err = compile_sass_source(&theme, key, scss).unwrap_err();
+        assert!(
+            style_message(&err).starts_with("line 1: @mixin pad always includes itself, so Sass"),
+            "{err}"
+        );
+        // Valid ones that the check used to reject compile (audit review): `@elseif`, the
+        // right-hand side of `or`, an unused mixin.
+        let valid = "@mixin unused { @include unused; }\n\
+                     @function f($n) { @return $n <= 0 or f($n - 1); }\n\
+                     @mixin pad($n) { @if $n <= 0 { padding: 0; } @elseif $n > 0 { margin: $n; @include pad($n - 1); } }\n\
+                     h1 { x: f(3); @include pad(2); }\n";
+        let css = compile_sass_source(&theme, key, valid.as_bytes()).unwrap();
+        assert!(
+            css.contains("x: true;") && css.contains("padding: 0;"),
+            "{css}"
+        );
+    }
+
+    #[test]
+    fn deep_recursion_compiles_on_the_big_stack() {
+        // About 2000 nested @include calls: far beyond a 2 MiB thread's stack.
+        let theme = crate::theme::resolve("default", &[]).unwrap();
+        let scss = "@mixin pad($n) { @if $n > 0 { @include pad($n - 1); } @else { a { b: c; } } }\n\
+                    @include pad(2000);\n";
+        let css =
+            compile_sass_source(&theme, "@default/styles/deep.scss", scss.as_bytes()).unwrap();
+        assert_eq!(css.trim(), "a {\n  b: c;\n}");
     }
 
     #[test]

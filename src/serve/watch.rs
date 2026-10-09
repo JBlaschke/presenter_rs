@@ -16,8 +16,11 @@
 //! save by writing a temporary file and renaming it over the original (vim, VS Code "safe
 //! write") replace the file, and a watch on the file itself would be lost. Events in those
 //! directories count only for the listed files. Theme directories are watched recursively
-//! and every path below them counts, except the [ignore list](is_ignored) (`.git/`,
-//! `target/`, `dist/`, editor backup, swap and auto-save files).
+//! and every path below them counts, except the [ignore list](is_ignored) (`.git/`, editor
+//! backup, swap and auto-save files). A theme's `dist/` or `target/` directory counts like
+//! any other (audit F18): it may hold inputs of the build, such as a bundled script entry
+//! or a vendored library's stylesheet, and the build's own output is not mistaken for a
+//! change (`build --watch` drops it, `serve` writes nothing).
 //!
 //! A directory to watch that does not exist (the parent of a missing image, a theme not
 //! created yet, the deck's own directory while a `git checkout` or a generator replaces
@@ -61,14 +64,14 @@
 //! [`Watcher::start`] starts the backend's thread (FSEvents run loop or inotify) and the
 //! coalescing thread `presenter-watch`; batches are sent from the latter on the `Sender`
 //! given to [`Watcher::start`] (and from [`Watcher::update`], as above). The receiving side
-//! decides where to rebuild: `presenter build --watch` blocks on it ([`run_build_watch`]);
-//! an async server should receive on a dedicated thread (or `spawn_blocking`) and forward
-//! to its rebuild task. [`Watcher`] is `Send`; keep it alive as long as changes are wanted
-//! (dropping it stops both threads; the coalescing thread then flushes what it holds and
-//! drops its `Sender`, so the channel closes) and call [`Watcher::update`] with the inputs
-//! of every build, from the thread that owns it. Start it **before** the first build (on
-//! [`watch_set_before_build`]), so that a change saved while that build runs is not lost
-//! ([`run_build_watch_with`] does).
+//! decides where to rebuild: `presenter build --watch` blocks on it
+//! ([`run_build_watch_with`]); an async server should receive on a dedicated thread (or
+//! `spawn_blocking`) and forward to its rebuild task. [`Watcher`] is `Send`; keep it alive
+//! as long as changes are wanted (dropping it stops both threads; the coalescing thread
+//! then flushes what it holds and drops its `Sender`, so the channel closes) and call
+//! [`Watcher::update`] with the inputs of every build, from the thread that owns it. Start
+//! it **before** the first build (on [`watch_set_before_build`]), so that a change saved
+//! while that build runs is not lost ([`run_build_watch_with`] does).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
@@ -464,12 +467,13 @@ fn is_style_path(path: &Path, theme_dirs: &[PathBuf]) -> bool {
 }
 
 /// Directory names whose contents never count below a recursively watched directory.
-const IGNORED_DIRS: [&str; 3] = [".git", "target", "dist"];
+/// (`dist` and `target` are not among them: a theme may keep inputs there, audit F18.)
+const IGNORED_DIRS: [&str; 1] = [".git"];
 
 /// Whether `rel` (a path relative to a recursively watched directory) is on the ignore
-/// list: anything inside `.git/`, `target/` or `dist/`, and editor files: backups (`*~`),
-/// Emacs lock and auto-save files (`.#*`, `#*#`), vim swap files (`*.swp`, `*.swx`, and
-/// `.*.swa` … `.*.swo` for further sessions) and vim's `4913` probe, and `.DS_Store`.
+/// list: anything inside `.git/`, and editor files: backups (`*~`), Emacs lock and
+/// auto-save files (`.#*`, `#*#`), vim swap files (`*.swp`, `*.swx`, and `.*.swa` …
+/// `.*.swo` for further sessions) and vim's `4913` probe, and `.DS_Store`.
 pub fn is_ignored(rel: &Path) -> bool {
     let in_ignored_dir = rel.components().any(|component| match component {
         Component::Normal(name) => IGNORED_DIRS.iter().any(|dir| name == *dir),
@@ -1019,22 +1023,12 @@ pub enum WatchStatus<'a> {
     Changed(&'a ChangeBatch),
 }
 
-/// Blocking loop used by `build --watch`: builds `opts` and writes it to `out`, then
-/// rebuilds and rewrites on every [`ChangeBatch`] (a `Css` batch rebuilds too, since the
-/// output embeds the stylesheet). Status goes to `tracing` (info: builds and changes;
-/// error: failures); the CLI uses [`run_build_watch_with`] to print it instead.
-///
-/// Runs until the process ends; returns only when the watcher cannot be started (or,
-/// with `Ok`, if its thread stops).
-pub fn run_build_watch(opts: BuildOptions, out: PathBuf) -> Result<()> {
-    run_build_watch_with(&opts, &out, |status| {
-        log_status(status);
-        ControlFlow::Continue(())
-    })
-}
-
-/// [`run_build_watch`] that hands every [`WatchStatus`] to `report`; the loop ends (with
-/// `Ok`) as soon as `report` returns [`ControlFlow::Break`].
+/// The blocking loop of `presenter build --watch`: builds `opts` and writes it to `out`,
+/// then rebuilds and rewrites on every [`ChangeBatch`] (a `Css` batch rebuilds too, since
+/// the output embeds the stylesheet), handing every [`WatchStatus`] to `report` (the CLI
+/// prints them); the loop ends (with `Ok`) as soon as `report` returns
+/// [`ControlFlow::Break`], or when the watcher's thread stops. Errors only when the watcher
+/// cannot be started.
 ///
 /// The watcher starts before the first build, on [`watch_set_before_build`], so that a
 /// change saved while that build runs triggers a rebuild, and it watches the inputs of each
@@ -1152,40 +1146,6 @@ fn is_output_path(path: &Path, out: &Path, roots: &[&PathBuf]) -> bool {
                 .any(|root| path != root.as_path() && path.starts_with(root)))
 }
 
-/// The status of [`run_build_watch`], logged.
-fn log_status(status: WatchStatus<'_>) {
-    match status {
-        WatchStatus::Built { build, written } => {
-            for diagnostic in build.diagnostics.iter() {
-                tracing::warn!("{diagnostic}");
-            }
-            if let Some(document) = written.first() {
-                tracing::info!(
-                    "wrote {} ({} slides)",
-                    document.display(),
-                    build.document.slide_count
-                );
-            }
-        }
-        WatchStatus::Failed(BuildFailure { error, diagnostics }) => {
-            for diagnostic in diagnostics.iter() {
-                tracing::warn!("{diagnostic}");
-            }
-            tracing::error!("{error}");
-        }
-        WatchStatus::Watching(set) => {
-            tracing::info!(
-                "watching {} files and {} theme directories",
-                set.files.len(),
-                set.dirs_recursive.len()
-            );
-        }
-        WatchStatus::Changed(batch) => {
-            tracing::info!(kind = ?batch.kind, "changed: {:?}", batch.paths);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,9 +1242,7 @@ mod tests {
         for rel in [
             ".git/index",
             ".git",
-            "target/debug/x.css",
-            "dist/slides.html",
-            "styles/sub/dist/x.css",
+            "assets/lib/.git/HEAD",
             "styles/x.css~",
             "styles/.#x.css",
             "styles/.x.css.swp",
@@ -1306,6 +1264,12 @@ mod tests {
             "templates/deck.html",
             "theme.toml",
             "assets/distant.png",
+            // A theme's own dist/ and target/ may hold inputs (audit F18).
+            "target/debug/x.css",
+            "dist/slides.html",
+            "scripts/dist/lib.js",
+            "assets/lib/dist/lib.css",
+            "styles/sub/target/x.css",
             "styles/x.swp.css",
             "styles/x.swo",
             "styles/.x.css.swq",

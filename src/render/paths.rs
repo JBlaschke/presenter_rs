@@ -6,13 +6,22 @@
 //! then resolved by its first segment: `vendor/…` and `presenter/…` in the embedded tree,
 //! `@<theme>/<path>` relative to that theme's root directory, anything else in the chain's
 //! `assets/` directories.
+//!
+//! In serve mode, the URLs of theme-chain files that a page loads through `asset()` or
+//! that a stylesheet's `url()` names carry the file's content version
+//! ([`versioned_serve_url`]; live-reload.md §4, audit F03), remembered while the file's
+//! size and modification time stay the same.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::SystemTime;
 
 use super::html::SERVE_HELPER_PREFIX;
-use crate::error::Result;
-use crate::theme::{Theme, normalize_rel};
+use crate::error::{Error, Result};
+use crate::theme::{Theme, ThemeDir, ThemeSource, normalize_rel};
 
 /// Resolves a helper path (`style()`, `script()`, `asset()`, and the dev server's
 /// `/__presenter/asset/{*path}` route) to its bytes and MIME type, or `Ok(None)` if nothing
@@ -158,6 +167,99 @@ pub(super) fn unknown_reason(theme: &Theme, path: &str) -> String {
     }
 }
 
+/// The content version of a file in serve-mode URLs (`?v=<version>`; live-reload.md §4,
+/// audit F03): the first 8 bytes of the BLAKE3 hash of `bytes`, as a decimal number. It
+/// changes whenever the file's bytes do, so a browser that swaps a stylesheet or the slides
+/// in place loads an edited image instead of reusing the one it has for the old URL; and it
+/// is digits only, which the live-reload client disregards when it compares pages.
+pub(super) fn content_version(bytes: &[u8]) -> u64 {
+    let hash = blake3::hash(bytes);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first)
+}
+
+/// The dev server URL a page or stylesheet uses for the file at the normalized helper path
+/// `key`: [`serve_url`], plus `?v=<`[`content_version`]`>` for a file of the theme chain
+/// (`@<theme>/…` or the `assets/` form; the files of the embedded `vendor/…` and
+/// `presenter/…` trees do not change while presenter runs). `Ok(None)` when no file is
+/// there; errors only when an existing file cannot be read.
+///
+/// The version of a file on disk is remembered with the file's size and modification
+/// time, and computed again only when they change ([`VERSIONS`]): a rebuild stats the
+/// files it names instead of reading and hashing them, however often a template names one
+/// (a logo on every slide). An edit that keeps both (within the file system's timestamp
+/// granularity) keeps the old version, as for deck assets.
+pub(super) fn versioned_serve_url(theme: &Theme, key: &str) -> Result<Option<String>> {
+    if is_builtin(key) {
+        return Ok(helper_path_exists(theme, key).then(|| serve_url(key)));
+    }
+    let Some((dir, rel)) = theme_file(theme, key) else {
+        return Ok(None);
+    };
+    let version = match &dir.source {
+        ThemeSource::Disk { dir: root } => disk_version(dir, &root.join(&rel))?,
+        // Debug builds read the built-in themes from disk: never remembered.
+        ThemeSource::Embedded { .. } => dir.read(&rel)?.map(|bytes| content_version(&bytes)),
+    };
+    Ok(version.map(|version| format!("{}?v={version}", serve_url(key))))
+}
+
+/// The theme of the chain that has the file of the theme-chain helper path `key` (the
+/// `@<theme>/…` or the `assets/` form, [`resolve_helper_path`]), with the file's path
+/// relative to that theme's root, normalized.
+fn theme_file<'t>(theme: &'t Theme, key: &str) -> Option<(&'t ThemeDir, String)> {
+    let (dir, rel) = match path_form(key) {
+        PathForm::Builtin => return None,
+        PathForm::Theme { name, rel } => (theme.dir(name)?, rel.to_string()),
+        PathForm::Asset => {
+            let rel = format!("assets/{}", normalize_helper_path(key)?);
+            (theme.chain.iter().find(|dir| dir.exists(&rel))?, rel)
+        }
+    };
+    let rel = normalize_helper_path(&rel)?;
+    dir.exists(&rel).then_some((dir, rel))
+}
+
+/// A file's size and modification time, with its [`content_version`] ([`VERSIONS`]).
+type Stamped = (u64, SystemTime, u64);
+
+/// The content versions of the theme files on disk that serve-mode URLs named, by path
+/// ([`versioned_serve_url`]).
+static VERSIONS: Mutex<BTreeMap<PathBuf, Stamped>> = Mutex::new(BTreeMap::new());
+
+/// The [`content_version`] of the file at `path` of the theme `dir`: remembered while its
+/// size and modification time stay the same. `Ok(None)` if it is gone.
+fn disk_version(dir: &ThemeDir, path: &Path) -> Result<Option<u64>> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(None);
+    };
+    let stamp = meta.modified().ok().map(|time| (meta.len(), time));
+    let versions = || VERSIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((len, time)) = stamp
+        && let Some(&(old_len, old_time, version)) = versions().get(path)
+        && (old_len, old_time) == (len, time)
+    {
+        return Ok(Some(version));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(Error::Theme {
+                name: dir.name.clone(),
+                message: format!("cannot read {}: {err}", path.display()),
+            });
+        }
+    };
+    let version = content_version(&bytes);
+    // Stamped before reading: a write in between gives a new stamp next time.
+    if let Some((len, time)) = stamp {
+        versions().insert(path.to_path_buf(), (len, time, version));
+    }
+    Ok(Some(version))
+}
+
 /// The dev server URL of helper path `key`: [`SERVE_HELPER_PREFIX`] + `key`, with every byte
 /// other than ASCII letters, digits and `-._~/@` percent-encoded.
 pub(super) fn serve_url(key: &str) -> String {
@@ -174,6 +276,8 @@ pub(super) fn serve_url(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -227,6 +331,69 @@ mod tests {
                 "{base} + {rel}"
             );
         }
+    }
+
+    #[test]
+    fn theme_files_get_a_content_version_and_builtin_files_none() {
+        let theme = crate::theme::resolve("default", &[]).unwrap();
+        let css = "@default/styles/theme.css";
+        let bytes = theme.chain[0].read("styles/theme.css").unwrap().unwrap();
+        assert_eq!(
+            versioned_serve_url(&theme, css).unwrap(),
+            Some(format!(
+                "/__presenter/asset/{css}?v={}",
+                content_version(&bytes)
+            ))
+        );
+        let reveal = "vendor/reveal/dist/reveal.js";
+        assert_eq!(
+            versioned_serve_url(&theme, reveal).unwrap(),
+            Some(format!("/__presenter/asset/{reveal}"))
+        );
+        assert_eq!(versioned_serve_url(&theme, "nope.png").unwrap(), None);
+        assert_eq!(versioned_serve_url(&theme, "vendor/nope.js").unwrap(), None);
+        assert_ne!(content_version(b"a"), content_version(b"b"));
+        assert_eq!(content_version(b"a"), content_version(b"a"));
+    }
+
+    #[test]
+    fn disk_versions_are_remembered_while_size_and_time_stay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("v");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(
+            dir.join("theme.toml"),
+            "name = \"v\"\nextends = \"default\"\n",
+        )
+        .unwrap();
+        let file = dir.join("assets/a.png");
+        std::fs::write(&file, b"aaaa").unwrap();
+        let theme = crate::theme::resolve(dir.to_str().unwrap(), &[]).unwrap();
+        let url = |key: &str| versioned_serve_url(&theme, key).unwrap();
+        let first = format!("/__presenter/asset/a.png?v={}", content_version(b"aaaa"));
+        assert_eq!(url("a.png"), Some(first.clone()));
+        assert_eq!(
+            url("@v/assets/a.png"),
+            Some(format!(
+                "/__presenter/asset/@v/assets/a.png?v={}",
+                content_version(b"aaaa")
+            ))
+        );
+        let set_time = |time| {
+            let handle = std::fs::File::options().write(true).open(&file).unwrap();
+            handle.set_modified(time).unwrap();
+        };
+        let time = std::fs::metadata(&file).unwrap().modified().unwrap();
+        // Same size and time, other bytes: the remembered version (the file is not read).
+        std::fs::write(&file, b"bbbb").unwrap();
+        set_time(time);
+        assert_eq!(url("a.png"), Some(first));
+        // Another time: read again.
+        set_time(time + Duration::from_secs(2));
+        let second = format!("/__presenter/asset/a.png?v={}", content_version(b"bbbb"));
+        assert_eq!(url("a.png"), Some(second));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(url("a.png"), None);
     }
 
     #[test]

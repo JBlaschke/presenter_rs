@@ -20,7 +20,9 @@
 //! offending source line, shown by the client's overlay; it is left out when unknown. A
 //! missing asset or front matter error does not name the deck source it is located in:
 //! [`ErrorPayload::for_input`] (with [`crate::serve::server::apply_error_payload`]) locates
-//! and quotes it there, as the terminal report does.
+//! and quotes it there, as the terminal report does; `presenter serve` stores every failed
+//! build's error this way (audit F11). A `presenter.toml` error is located in that file
+//! (audit F33).
 
 use std::path::{Path, PathBuf};
 
@@ -69,11 +71,13 @@ impl BuildEvent {
 pub struct ErrorPayload {
     /// The full error message: for a parse error `file:line: message` (live-reload.md §2),
     /// and so for a missing asset or front matter error located in the deck source
-    /// ([`ErrorPayload::for_input`]); for every other error its `Display` form.
+    /// ([`ErrorPayload::for_input`]) and a configuration error located in its `.toml` file;
+    /// for every other error its `Display` form.
     pub message: String,
-    /// The file the error is located in (source file, template or stylesheet; the deck
-    /// source of a missing asset or front matter error made [`ErrorPayload::for_input`]),
-    /// if known. A source file is relative to the current directory when it is below it.
+    /// The file the error is located in (source file, template, stylesheet or configuration
+    /// file; the deck source of a missing asset or front matter error made
+    /// [`ErrorPayload::for_input`]), if known. A source or configuration file is relative to
+    /// the current directory when it is below it.
     pub file: Option<String>,
     /// 1-based line in `file`, if known.
     pub line: Option<usize>,
@@ -134,6 +138,12 @@ impl ErrorPayload {
     /// `slides.md: …` without a line); every other error's is its `Display` form, with a
     /// missing asset's path relative to `base`. `excerpt` is the offending line, see
     /// [`ErrorPayload::excerpt`].
+    ///
+    /// A configuration error that names its `.toml` file (`presenter.toml`, `--config`) is
+    /// located there too (audit F33): `file` is that file relative to `base`, and for a TOML
+    /// parse error `line` is its line and `message` `presenter.toml:23: <what is wrong>`,
+    /// without the source lines `toml` quotes (the offending one is the `excerpt`);
+    /// `presenter.toml: …` for another error about the file.
     pub fn new(err: &Error, base: Option<&Path>, input: Option<&Path>) -> Self {
         let (file, line, message) = match (err, input) {
             (
@@ -161,6 +171,10 @@ impl ErrorPayload {
                 (Some(file), file_line(err), message)
             }
             (Error::MissingAsset { .. }, None) => (None, file_line(err), deck_message(err, base)),
+            (Error::Config(message), _) => match config_location(message, base) {
+                Some((file, line, message)) => (Some(file), line, message),
+                None => (None, None, err.to_string()),
+            },
             _ => (None, None, err.to_string()),
         };
         ErrorPayload {
@@ -182,6 +196,38 @@ fn deck_message(err: &Error, base: Option<&Path>) -> String {
         }
         _ => err.message().into_owned(),
     }
+}
+
+/// The file (relative to `base`), line and overlay message of a configuration error whose
+/// `message` names an existing `.toml` file (`<path>: …`, as `Config::load` writes it), see
+/// [`ErrorPayload::new`]; `None` when it names none.
+fn config_location(message: &str, base: Option<&Path>) -> Option<(String, Option<usize>, String)> {
+    let at = message.find(".toml: ")? + ".toml".len();
+    let (path, rest) = (&message[..at], &message[at + ": ".len()..]);
+    if !Path::new(path).is_file() {
+        return None; // e.g. `cannot read <path>: …`
+    }
+    let file = display_relative(Path::new(path), base);
+    Some(match toml_parse_error(rest) {
+        Some((line, text)) => (file.clone(), Some(line), format!("{file}:{line}: {text}")),
+        None => (file.clone(), None, format!("{file}: {rest}")),
+    })
+}
+
+/// The line and the explanation of a `toml` parse error (`TOML parse error at line L,
+/// column C`, the source lines it quotes, then what is wrong); `None` for another message.
+fn toml_parse_error(text: &str) -> Option<(usize, String)> {
+    let rest = text.strip_prefix("TOML parse error at line ")?;
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    let line = digits.parse().ok()?;
+    let quoted = |line: &&str| {
+        let unnumbered = line
+            .trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit());
+        unnumbered.trim_start().starts_with('|')
+    };
+    let explanation: Vec<&str> = text.lines().skip(1).filter(|line| !quoted(line)).collect();
+    Some((line, explanation.join("\n").trim().to_string()))
 }
 
 /// The line of `err`'s span when it is a line of the file (not of a notebook cell).
@@ -541,6 +587,57 @@ mod tests {
             ErrorPayload::for_input(&front, &deck),
             ErrorPayload::new(&front, std::env::current_dir().ok().as_deref(), Some(&deck))
         );
+    }
+
+    #[test]
+    fn config_errors_are_located_in_their_file_without_the_quoted_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("presenter.toml");
+        std::fs::write(
+            &path,
+            "[deck]\ntitle = \"x\"\n\n[slides]\nsplt = \"rules\"\n",
+        )
+        .unwrap();
+        let err = crate::config::Config::load(&path).unwrap_err();
+        let payload = ErrorPayload::relative_to(&err, Some(tmp.path()));
+        assert_eq!(payload.file.as_deref(), Some("presenter.toml"));
+        assert_eq!(payload.line, Some(5));
+        assert_eq!(payload.kind, "config");
+        assert!(
+            payload
+                .message
+                .starts_with("presenter.toml:5: unknown field `splt`, expected one of `split`"),
+            "{}",
+            payload.message
+        );
+        assert!(
+            payload.message.ends_with("(did you mean 'split'?)"),
+            "{}",
+            payload.message
+        );
+        assert!(!payload.message.contains('|'), "{}", payload.message);
+        assert_eq!(payload.excerpt.as_deref(), Some("splt = \"rules\""));
+
+        // Another error about the file: its name, no line; an unrelated one as it is.
+        let plugins = Error::Config(format!(
+            "{}: [reveal] plugins: unknown plugin",
+            path.display()
+        ));
+        let payload = ErrorPayload::relative_to(&plugins, Some(tmp.path()));
+        assert_eq!(
+            payload.message,
+            "presenter.toml: [reveal] plugins: unknown plugin"
+        );
+        assert_eq!(
+            (payload.file.as_deref(), payload.line),
+            (Some("presenter.toml"), None)
+        );
+        let unreadable = Error::Config(format!("cannot read {}: denied", path.display()));
+        let payload = ErrorPayload::relative_to(&unreadable, Some(tmp.path()));
+        assert_eq!(payload.message, unreadable.to_string());
+        assert_eq!((payload.file, payload.line), (None, None));
+        let bare = Error::Config("bad".into());
+        assert_eq!(ErrorPayload::from(&bare).message, "config: bad");
     }
 
     #[test]

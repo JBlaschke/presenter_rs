@@ -86,6 +86,21 @@ async function swapCss(id) {
   return ok.every(Boolean);
 }
 
+// Theme files loaded outside the slides (an asset() in deck.html), not scripts (they would
+// not run again) nor stylesheets (swapCss re-requests them).
+const outside = (doc) => Array.from(doc.querySelectorAll('[src^="/__presenter/asset/"]:not(script),' +
+  'link[href^="/__presenter/asset/"]:not([rel~=stylesheet])')).filter((el) => !el.closest('.slides'));
+// Equal signatures: the elements correspond in order; take their new ?v= URLs (audit F03).
+function refreshOutside(next) {
+  const now = outside(document);
+  const fresh = outside(next);
+  if (now.length !== fresh.length) return;
+  now.forEach((el, i) => ['src', 'href'].forEach((name) => {
+    const url = fresh[i].getAttribute(name);
+    if (url !== null && url !== el.getAttribute(name)) el.setAttribute(name, url);
+  }));
+}
+
 // The old slide by id (as a reload would), else the old indices clamped to the new counts.
 function restore(R, s, id) {
   const el = id && document.getElementById(id);
@@ -135,6 +150,7 @@ async function swapContent(id) {
   } catch (e) {
     return fullReload('in-place update failed: ' + e, id);
   }
+  refreshOutside(next);
   if (next.title) document.title = next.title;
   assets = sig;
   log('slides updated, build', id);
