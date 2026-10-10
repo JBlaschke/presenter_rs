@@ -23,7 +23,11 @@
 //!    depend on the current directory. Chrome starts headless with a quiet throwaway
 //!    configuration (no first-run UI, sync, extensions or keychain access; plus
 //!    `--no-sandbox` when running as root on Linux, which Chrome requires); `/bin/sh` moves
-//!    presenter's pipes to descriptors 3 and 4 and `exec`s it.
+//!    presenter's pipes to descriptors 3 and 4 and `exec`s it. Chrome's own temporary files
+//!    go into a `tmp` directory there as well (`TMPDIR` in its environment: on Linux, Chrome
+//!    leaves some of them behind), so an export leaves nothing in the system's temporary
+//!    directory. A served deck's browser keeps its own `TMPDIR`: it cannot read the
+//!    directory.
 //! 2. `Target.createTarget` (about:blank) and `Target.attachToTarget {flatten: true}` open a
 //!    page; `Page.enable`, `Runtime.enable`, `Inspector.enable`; `Page.navigate` to
 //!    `file://<dir>/deck.html?print-pdf`, the same kind of page as the output of
@@ -450,8 +454,10 @@ fn run_in<T>(
     }
     let mut dir = TempDir::new(base, "presenter-pdf")?;
     let deck = Deck::new(&dir, html, source)?;
+    let scratch = chrome_scratch_dir(&dir, source)?;
     tracing::info!("opening {} with {}", deck.url, executable.display());
-    let mut browser = Browser::launch(&executable, &dir.path().join("profile"))?;
+    let mut browser =
+        Browser::launch(&executable, &dir.path().join("profile"), scratch.as_deref())?;
     dir.watch(browser.pid());
     let result = drive(&mut browser, &deck, deadline, timeout, job);
     browser.stop(if result.is_ok() {
@@ -465,6 +471,19 @@ fn run_in<T>(
     drop(browser);
     drop(dir);
     result
+}
+
+/// Where Chrome's own temporary files go (module docs, step 1): `<dir>/tmp`, created here,
+/// when the browser can read `dir` (a `file://` deck); `None` for a served deck, whose
+/// browser cannot, so it keeps the system's.
+fn chrome_scratch_dir(dir: &TempDir, source: DeckSource) -> Result<Option<PathBuf>> {
+    if source != DeckSource::File {
+        return Ok(None);
+    }
+    let scratch = dir.path().join("tmp");
+    std::fs::create_dir(&scratch)
+        .map_err(|e| Error::Other(format!("cannot create {}: {e}", scratch.display())))?;
+    Ok(Some(scratch))
 }
 
 /// The deck as Chrome gets it: the URL to open, and the HTML to answer for it when it is
@@ -1231,13 +1250,17 @@ struct Browser {
 }
 
 impl Browser {
-    /// Starts `chrome` (module docs, step 1) with its profile in `profile`, and the threads
-    /// for its pipes.
-    fn launch(chrome: &Path, profile: &Path) -> Result<Browser> {
+    /// Starts `chrome` (module docs, step 1) with its profile in `profile`, its own
+    /// temporary files in `scratch` when given (`TMPDIR` in its environment), and the
+    /// threads for its pipes.
+    fn launch(chrome: &Path, profile: &Path, scratch: Option<&Path>) -> Result<Browser> {
         let mut user_data_dir = OsString::from("--user-data-dir=");
         user_data_dir.push(profile);
         tracing::debug!("starting {} {}", chrome.display(), CHROME_FLAGS.join(" "));
         let mut command = Command::new("/bin/sh");
+        if let Some(scratch) = scratch {
+            command.env("TMPDIR", scratch);
+        }
         command
             .arg("-c")
             .arg(LAUNCH_SCRIPT)
@@ -2175,6 +2198,30 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chrome_gets_a_temporary_directory_inside_the_exports() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = script(dir.path(), "chrome", "echo \"tmpdir=$TMPDIR\" >&2\nexit 7");
+        let reported = |source: DeckSource| {
+            let (message, _) =
+                print_deck_with(&fake, "<p>deck</p>", source, Duration::from_secs(20));
+            message
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("tmpdir="))
+                .unwrap_or_else(|| panic!("no tmpdir line in {message}"))
+                .to_string()
+        };
+        // A file deck: Chrome's own temporary files go into the export's directory.
+        let tmpdir = reported(DeckSource::File);
+        assert!(tmpdir.contains("/presenter-pdf-"), "{tmpdir}");
+        assert!(tmpdir.ends_with("/tmp"), "{tmpdir}");
+        // A served deck's browser cannot read that directory: its TMPDIR stays as it is.
+        let tmpdir = reported(DeckSource::Served);
+        assert!(!tmpdir.contains("/presenter-pdf-"), "{tmpdir}");
     }
 
     #[cfg(unix)]

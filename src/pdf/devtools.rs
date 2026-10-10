@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::{
-    Browser, CLOSE_GRACE, Cdp, Deck, DeckSource, Failure, TempDir, exception_text, placement,
-    resolve_executable, string_field, system_temp_dir,
+    Browser, CLOSE_GRACE, Cdp, Deck, DeckSource, Failure, TempDir, chrome_scratch_dir,
+    exception_text, placement, resolve_executable, string_field, system_temp_dir,
 };
 use crate::error::{Error, Result};
 
@@ -120,10 +120,15 @@ impl Page {
             ))
         })?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let (base, _) = placement(chrome, home.as_deref());
+        let (base, source) = placement(chrome, home.as_deref());
         let base = base.unwrap_or_else(|| system_temp_dir(std::env::temp_dir()));
         let mut profile = TempDir::new(&base, "presenter-devtools")?;
-        let browser = Browser::launch(&executable, &profile.path().join("profile"))?;
+        let scratch = chrome_scratch_dir(&profile, source)?;
+        let browser = Browser::launch(
+            &executable,
+            &profile.path().join("profile"),
+            scratch.as_deref(),
+        )?;
         profile.watch(browser.pid());
         tracing::debug!("started {} for a DevTools page", executable.display());
         let mut page = Page {
