@@ -115,7 +115,12 @@ fn assert_wrote(stdout: &str, path_suffix: &str) {
     let caps = line
         .captures(stdout)
         .unwrap_or_else(|| panic!("unexpected stdout: {stdout:?}"));
-    assert!(caps[1].ends_with(path_suffix), "{stdout}");
+    // (A relative path is `/`-separated everywhere; an absolute one, shown when the output
+    // is on another drive than the current directory on Windows, is native.)
+    assert!(
+        caps[1].replace('\\', "/").ends_with(path_suffix),
+        "{stdout}"
+    );
 }
 
 #[test]

@@ -596,7 +596,12 @@ fn percent_encoded_references_cannot_escape_the_relative_path_rules() {
     std::fs::write(theme_dir.join("img/bg.png"), GIF).unwrap();
 
     let absolute = secret.to_str().unwrap().to_string();
-    let encoded = absolute.replace('/', "%2F").replace('\\', "%5C");
+    // (The colon of a Windows drive too: `C:%5C…` would read as a URL with the scheme `c`,
+    // which is left alone like an `https:` reference, so nothing would reach the resolver.)
+    let encoded = absolute
+        .replace('/', "%2F")
+        .replace('\\', "%5C")
+        .replace(':', "%3A");
     // What the resolver gets for these: the reference as written.
     let literal = [
         encoded.as_str(),

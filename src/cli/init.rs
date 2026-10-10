@@ -372,7 +372,11 @@ fn resolve_target(dir: &Path) -> anyhow::Result<(PathBuf, Found)> {
     let mut given = PathBuf::new();
     for component in dir.components() {
         if found == Found::NotDir {
-            return Err(UsageError(format!("{} is not a directory", given.display())).into());
+            return Err(UsageError(format!(
+                "{} is not a directory",
+                super::slashed(&given).display()
+            ))
+            .into());
         }
         let previous = given.clone();
         given.push(component);
@@ -387,7 +391,7 @@ fn resolve_target(dir: &Path) -> anyhow::Result<(PathBuf, Found)> {
                 return Err(UsageError(format!(
                     "invalid directory {}: `..` follows {}, which does not exist",
                     dir.display(),
-                    previous.display()
+                    super::slashed(&previous).display()
                 ))
                 .into());
             }
@@ -411,14 +415,14 @@ fn inspect(path: PathBuf, given: &Path) -> anyhow::Result<(PathBuf, Found)> {
             return Ok((path, Found::Missing));
         }
         Err(err) => {
-            let message = format!("cannot read {}", given.display());
+            let message = format!("cannot read {}", super::slashed(given).display());
             return Err(anyhow::Error::new(err).context(message));
         }
     };
     let (path, metadata) = if metadata.file_type().is_symlink() {
         let target = std::fs::canonicalize(&path).map_err(|err| broken_link(err, given))?;
         let metadata = std::fs::metadata(&target)
-            .with_context(|| format!("cannot read {}", given.display()))?;
+            .with_context(|| format!("cannot read {}", super::slashed(given).display()))?;
         (target, metadata)
     } else {
         (path, metadata)
@@ -436,6 +440,7 @@ fn inspect(path: PathBuf, given: &Path) -> anyhow::Result<(PathBuf, Found)> {
 /// through a file, or loops), so it is reported like the other target problems; a plain
 /// I/O error (exit 1) when the target may be fine but cannot be read (permission denied).
 fn broken_link(err: std::io::Error, given: &Path) -> anyhow::Error {
+    let given = super::slashed(given);
     let given = given.display();
     match err.kind() {
         std::io::ErrorKind::PermissionDenied => {

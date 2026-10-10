@@ -938,10 +938,13 @@ fn theme_problems_find_what_a_build_fails_on() {
         .iter()
         .map(|d| {
             let file = d.path.as_ref().map(|p| {
+                // Joined with `/` (the path is native, `t\theme.toml` on Windows).
                 p.strip_prefix(tmp.path().canonicalize().unwrap())
                     .unwrap()
-                    .display()
-                    .to_string()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
             });
             (d.code, file, d.span.as_ref().map(|s| s.start_line))
         })

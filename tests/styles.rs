@@ -376,7 +376,8 @@ fn sass_cannot_reach_files_outside_the_tree() {
     let secret = tmp.path().join("_secret.scss");
     for url in [
         "../../secret".to_string(),
-        secret.to_string_lossy().into_owned(),
+        // (With `/`: a `\` is an escape in a Sass string, and `C:/…` is as absolute.)
+        secret.to_string_lossy().replace('\\', "/"),
         "/etc/hosts".to_string(),
     ] {
         let theme = scss_theme(

@@ -1029,7 +1029,10 @@ fn collect(
     for path in event.paths.iter().map(|path| canonical(path)) {
         if structural && shared.is_structural(&path) {
             shared.recreated.insert(path.clone());
-        } else if !shared.filter.matches(&path) {
+        } else if (!structural && path.is_dir()) || !shared.filter.matches(&path) {
+            // A directory reported as modified (Windows does that when an entry in it is
+            // written, renamed or removed) is no change by itself: the entry has its own
+            // event. A created, removed or renamed directory still counts.
             continue;
         }
         pending.insert(path);

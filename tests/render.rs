@@ -1381,7 +1381,11 @@ entries = ["scripts/bom.js"]
             let hl = doc
                 .files
                 .iter()
-                .find(|f| f.path.to_string_lossy().contains("/hl-"))
+                .find(|f| {
+                    f.path
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("hl-"))
+                })
                 .unwrap();
             assert_eq!(hl.bytes, b".hljs { color: red; }");
         }
@@ -1447,7 +1451,11 @@ fn style_urls_resolve_to_the_same_files_in_every_mode() {
     let hl = doc
         .files
         .iter()
-        .find(|f| f.path.to_string_lossy().contains("/hl-"))
+        .find(|f| {
+            f.path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("hl-"))
+        })
         .unwrap();
     let hl = String::from_utf8(hl.bytes.clone()).unwrap();
     let name = Regex::new(r"url\((x-[0-9a-f]{12}\.png)\)")

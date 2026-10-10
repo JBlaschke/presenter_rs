@@ -301,12 +301,17 @@ fn display_relative(path: &Path, base: Option<&Path>) -> String {
         let relative = path.strip_prefix(base).ok()?;
         (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
     };
-    base.and_then(|base| {
+    match base.and_then(|base| {
         below(path, base).or_else(|| below(&path.canonicalize().ok()?, &base.canonicalize().ok()?))
-    })
-    .unwrap_or_else(|| path.to_path_buf())
-    .display()
-    .to_string()
+    }) {
+        // `/`-separated on every platform, as paths in messages are shown.
+        Some(relative) => relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        None => path.display().to_string(),
+    }
 }
 
 /// The `kind` of [`ErrorPayload`] for `err`.

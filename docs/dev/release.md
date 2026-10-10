@@ -360,3 +360,18 @@ commit 93e6e89), on a Mac, without a Windows machine:
   starting with `-` is spelled `./name` on every platform (it was `'.\name'` on Windows).
   The integration tests had not run yet (the unit tests failed first); CI runs with
   `--no-fail-fast` now, so one run shows every test binary.
+- The second run reached the integration tests: 47 failures in 14 test binaries, again
+  none a build problem. Most showed relative paths with `\`, where the tests, the decks,
+  the guide and the HTML spell `/`: `display_path` and the few other sites that show a
+  relative path join it with `/` on every platform now, and an absolute path keeps its
+  native spelling. The watcher took Windows' "directory modified" events (one for every
+  entry written, renamed or removed inside a directory) as changes, which turned a
+  stylesheet edit into a content rebuild and the build's own output into a change; those
+  events are ignored now, while a created, removed or renamed directory still counts. The
+  usage lines said `presenter.exe`, so clap's `bin_name` pins `presenter`. A `--config`
+  error names the file as typed instead of its absolute path. `theme new a/..` lost its
+  "(that is …)", because `std::path::absolute` resolves `..` on Windows; the message looks
+  for the `..` itself. The remaining tests compared OS-native text (`\\?\` canonical paths,
+  mixed separators, the compiler's `tests\…` panic location, a `\`-separated Sass URL, a
+  percent-encoded `C:…` reference that reads as a URL scheme) and compare paths, or
+  `/`-normalized text, now.

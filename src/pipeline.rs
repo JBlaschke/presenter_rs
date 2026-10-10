@@ -441,8 +441,8 @@ fn try_parse_with_includes(
 pub fn load_config(opts: &BuildOptions) -> Result<(Config, Option<PathBuf>)> {
     let (mut config, path) = match &opts.config_path {
         Some(path) => {
-            let path = absolute(path)?;
-            (Config::load(&path)?, Some(path))
+            // Read as given, so that an error names the file as the user typed it.
+            (Config::load(path)?, Some(absolute(path)?))
         }
         None => {
             let input = absolute(&opts.input)?;

@@ -1885,22 +1885,25 @@ mod tests {
         assert_eq!(config.code, codes::CONFIG_ERROR);
         let other = error_diagnostic(&Error::Other("x".into()), Path::new("/x/a.txt"));
         assert_eq!(other.code, codes::ERROR);
-        // A missing asset of an included file is in that file (T48).
-        let span = SourceSpan {
-            start_line: 3,
-            end_line: 3,
-            cell: None,
-            file: Some(PathBuf::from("/x/parts/p.md")),
-        };
-        let missing = Error::MissingAsset {
-            path: PathBuf::from("/x/parts/y.png"),
-            span: Some(span),
-        };
-        let diagnostic = error_diagnostic(&missing, Path::new("/x/deck.md"));
-        assert_eq!(
-            diagnostic.to_string(),
-            "/x/parts/p.md:3: error: asset not found: /x/parts/y.png"
-        );
+        // A missing asset of an included file is in that file (T48). (POSIX paths, as above.)
+        #[cfg(unix)]
+        {
+            let span = SourceSpan {
+                start_line: 3,
+                end_line: 3,
+                cell: None,
+                file: Some(PathBuf::from("/x/parts/p.md")),
+            };
+            let missing = Error::MissingAsset {
+                path: PathBuf::from("/x/parts/y.png"),
+                span: Some(span),
+            };
+            let diagnostic = error_diagnostic(&missing, Path::new("/x/deck.md"));
+            assert_eq!(
+                diagnostic.to_string(),
+                "/x/parts/p.md:3: error: asset not found: /x/parts/y.png"
+            );
+        }
     }
 
     #[test]

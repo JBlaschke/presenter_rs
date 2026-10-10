@@ -13,8 +13,9 @@ publishes that section as the GitHub Release notes (see
 
 ### Added
 - Release archives for Windows (x64 and arm64): `.zip` files with `presenter.exe`. The C
-  runtime is linked statically, so no redistributable is needed. `export pdf` and
-  `export pptx` are not available on Windows yet.
+  runtime is linked statically, so no redistributable is needed. Paths in messages are
+  `/`-separated there too, as in decks and the guide. `export pdf` and `export pptx` are
+  not available on Windows yet.
 - A project website, built by CI from `main` and on every release
   ([`docs/dev/site.md`](docs/dev/site.md)): the downloads of the latest release, the
   guide's pages and every example deck, rendered.
