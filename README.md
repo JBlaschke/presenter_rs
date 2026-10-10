@@ -66,7 +66,9 @@ df = pl.read_csv("data.csv")
   SCSS compiles in the binary and can build on reveal.js's own theme template.
 - **Checks.** `presenter check` finds separators that did not split, missing images,
   unknown layouts and notebooks that were never run, with `--deny-warnings` for CI.
-- **PDF export** through headless Chrome or Chromium.
+- **PDF and PowerPoint export** through headless Chrome or Chromium. The `.pptx` has one
+  editable slide per slide and fragment step: text boxes, tables, images and backgrounds
+  where the theme put them, with the speaker notes in the notes pane.
 - **Deterministic builds.** The same inputs give the same HTML, byte for byte.
 
 | Code with line steps | A notebook cell with its plot |
@@ -86,8 +88,8 @@ macOS's quarantine.
 cargo install --path .
 ```
 
-Either way, the binary needs nothing else at run time; `presenter export pdf` also needs
-Chrome or Chromium.
+Either way, the binary needs nothing else at run time; `presenter export pdf` and
+`presenter export pptx` also need Chrome or Chromium.
 
 ## Documentation
 
@@ -95,7 +97,8 @@ The [user guide](docs/guide/README.md) is in the repository's `docs/guide/` dire
 release archives do not include it or the pictures, so this README's links work on the
 project's GitHub page or in a checkout:
 
-- [Getting started](docs/guide/getting-started.md): install, create, preview, build, export.
+- [Getting started](docs/guide/getting-started.md): install, create, preview, build, export
+  to PDF or PowerPoint.
 - [Writing slides](docs/guide/authoring.md): the Markdown dialect, and `presenter check`.
 - [Notebooks](docs/guide/notebooks.md): slide types, tags, outputs, running the notebook.
 - [Themes](docs/guide/themes.md): tokens, layouts, templates, SCSS, the live-reload loop.

@@ -250,7 +250,8 @@ of your own. To wrap the default markup instead of replacing it:
 ## Print and PDF
 
 `?print-pdf` (and `presenter export pdf`) prints one slide per page, or one page per
-fragment step with reveal's default `pdfSeparateFragments: true`. The theme keeps backgrounds,
+fragment step with reveal's default `pdfSeparateFragments: true`; `presenter export pptx`
+converts each of these pages into an editable slide, so the print rules shape it too. The theme keeps backgrounds,
 code blocks and fills (`print-color-adjust: exact`), keeps the slide padding that reveal's
 print view would reset, and keeps slides one slide high so top-aligned slides stay top-aligned
 and title and section slides stay centred on the page.

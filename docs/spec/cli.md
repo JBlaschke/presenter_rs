@@ -12,7 +12,7 @@ Commands:
   theme    Inspect, eject or create themes
   dump     Print the IR or the template context as JSON
   check    Lint a deck without building
-  export   Export to other formats (pdf)
+  export   Export to other formats (pdf, pptx)
 ```
 
 ## build
@@ -127,6 +127,41 @@ presenter export pdf <INPUT> [-o FILE] [--chrome PATH] [--theme …]
   warning once every check has passed, just before Chrome starts.
 - The PDF is not byte-for-byte reproducible: Chrome stamps the export time and its version into
   it (the PLAN goal 7 exception, audit F21). `export pdf --help` lists this under Limitations.
+
+```
+presenter export pptx <INPUT> [-o FILE] [--chrome PATH] [--theme …] [--scale N]
+```
+- (T49, 2026-10-10.) Builds the deck and opens it in headless Chrome exactly as `export pdf`
+  does, then converts every page of reveal's print view (`?print-pdf`) into shapes instead
+  of printing (`src/pdf/scene.js`, run in the page): the PDF's pages, as editable slides, so
+  one slide per deck slide, per fragment step (`pdfSeparateFragments`, reveal's default) and
+  per page of a slide taller than a page (`pdfMaxPagesPerSlide`). Headings, paragraphs,
+  lists (one text box per list, a paragraph per item with its bullet or number), code (a
+  paragraph per line, highlighting as run colours), quotes and any other block of text are
+  text boxes with the computed font, size, weight, style, decorations, colour, highlight,
+  hyperlink and letter spacing of each run, placed and sized as the browser laid them out;
+  the first heading fills the title placeholder. Tables are tables, images are the deck's
+  image files (PNG, JPEG, GIF, with `object-fit` as a crop or inset), box backgrounds and
+  borders are rectangles (per side when they differ), `::before`/`::after` decorations
+  (rules, logos) are rectangles or pictures, and the slide background is a colour and a
+  picture (CSS `background-size`/`-position` as a crop or inset). What PowerPoint cannot
+  hold natively (SVG, canvases, videos, iframes, display math, gradient backgrounds) is
+  photographed with a transparent background; inline math becomes text (its MathML
+  linearised). Hidden elements, fragments not shown on the page, reveal's slide number and
+  the notes are left out. Writes the `.pptx` (`src/pptx.rs`, no library): the slide named
+  after the deck slide's heading (`Heading, step 2 of 3, part 1 of 2`), the deck's speaker
+  notes as text in the notes pane (one paragraph per line), and the deck's title and author
+  in the document properties. The slide size keeps the deck's aspect ratio at a height of
+  7.5 in (16:9 → PowerPoint's Widescreen, 4:3 → its Standard size); lengths and font sizes
+  scale with it (a 1280 px slide: 1 px = 0.75 pt).
+- `--scale N` (1–4, default 2): device pixels per slide pixel of the photographs.
+- Default output `<out_dir>/<stem>.pptx`; `-o`, the input-overwrite checks, exit 3 without
+  Chrome and exit 1 on a Chrome failure as for `export pdf`; a `-o` that does not end in
+  `.pptx` gets a warning. Stdout: `Wrote <path> (<n> slides, <size>)`.
+- Chrome gets 120 s to load the deck and lay the pages out, plus 3 s per page.
+- The file is reproducible for a given Chrome version: ZIP entries are stored with a fixed
+  timestamp and the properties carry no dates, so the bytes depend only on the deck and on
+  what Chrome draws.
 
 > **Clarification (W8FIX, 2026-10-09; audit F15 as A5 resolved it):** a slide taller than a page
 > continues on extra pages. The default theme sets the lines of code blocks and notebook outputs
