@@ -339,8 +339,8 @@ mod tests {
             rebuilding_line(&batch(&["t/a.css", "t/b.css"], ChangeKind::Css)),
             format!(
                 "Rebuilding (css): {}, {}",
-                Path::new("t/a.css").display(),
-                Path::new("t/b.css").display()
+                Path::new("t").join("a.css").display(),
+                Path::new("t").join("b.css").display()
             )
         );
         let many = rebuilding_line(&batch(&["a", "b", "c", "d", "e"], ChangeKind::Content));

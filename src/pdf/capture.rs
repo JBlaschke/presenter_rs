@@ -760,10 +760,13 @@ mod tests {
             9,
         )
         .unwrap_err();
-        assert_eq!(
-            err.to_string(),
+        // (On Windows the export stops earlier: it needs macOS or Linux.)
+        let expected = if cfg!(unix) {
             "cannot start /nonexistent/chrome: not an executable file"
-        );
+        } else {
+            "the export needs macOS or Linux (Chrome is started through /bin/sh)"
+        };
+        assert_eq!(err.to_string(), expected);
         assert_eq!(9u8.clamp(1, MAX_SCALE), 4);
         assert_eq!(0u8.clamp(1, MAX_SCALE), 1);
     }

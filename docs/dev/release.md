@@ -348,3 +348,15 @@ commit 93e6e89), on a Mac, without a Windows machine:
 - The labels `windows-2025`, `windows-11-arm` and `macos-15` were checked against
   actions/runner-images. Both Windows images ship Rustup, Python, jq, 7-Zip and Git Bash,
   and the arm64 image has Visual Studio's ARM64 build tools.
+- The first CI run on `windows-latest` (pull request #5): `cargo fmt` and `cargo clippy`
+  passed; `cargo test` failed 16 unit tests, none a build problem. Twelve asserted POSIX
+  paths (`/abs/…` spellings, `/` separators, canonical paths without `\\?\`) and are gated
+  with `#[cfg(unix)]` or compare `Path::join` output now. Two expected the "not an
+  executable" error, which the platform guard precedes on Windows. One joined `new/..` onto
+  a canonical path, which `PathBuf::push` resolves itself on Windows; the test joins as
+  text now. One found a real difference: Windows refuses to open a directory (permission
+  denied) where Unix opens it, so `serve` answered a directory URL with an error other
+  than 404; `open_range` maps that to not found now. Also, the `init` hint for a name
+  starting with `-` is spelled `./name` on every platform (it was `'.\name'` on Windows).
+  The integration tests had not run yet (the unit tests failed first); CI runs with
+  `--no-fail-fast` now, so one run shows every test binary.

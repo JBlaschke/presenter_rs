@@ -1388,27 +1388,29 @@ mod tests {
             theme_dirs: paths(&["/w/theme", "/w/other"]),
         };
         let filter = Filter::new(&set);
-        let targets: Vec<(&str, bool)> = filter
+        // The filter holds canonical paths (on Windows: `\\?\D:\w`, on the current drive).
+        let c = |path: &str| canonical(Path::new(path));
+        let targets: Vec<(PathBuf, bool)> = filter
             .targets
             .iter()
-            .map(|(dir, mode)| (dir.to_str().unwrap(), *mode == RecursiveMode::Recursive))
+            .map(|(dir, mode)| (dir.clone(), *mode == RecursiveMode::Recursive))
             .collect();
         assert_eq!(
             targets,
             vec![
-                ("/w", false),
-                ("/w/img", false),
-                ("/w/other", true),
-                ("/w/theme", true)
+                (c("/w"), false),
+                (c("/w/img"), false),
+                (c("/w/other"), true),
+                (c("/w/theme"), true)
             ]
         );
-        assert!(filter.matches(Path::new("/w/slides.md")));
-        assert!(filter.matches(Path::new("/w/theme/styles/x.css")));
-        assert!(filter.matches(Path::new("/w/theme/extra.toml")));
-        assert!(!filter.matches(Path::new("/w/notes.txt")));
-        assert!(!filter.matches(Path::new("/w/img/unrelated.png")));
-        assert!(!filter.matches(Path::new("/w/theme/.git/HEAD")));
-        assert!(!filter.matches(Path::new("/w/theme/styles/x.css~")));
+        assert!(filter.matches(&c("/w/slides.md")));
+        assert!(filter.matches(&c("/w/theme/styles/x.css")));
+        assert!(filter.matches(&c("/w/theme/extra.toml")));
+        assert!(!filter.matches(&c("/w/notes.txt")));
+        assert!(!filter.matches(&c("/w/img/unrelated.png")));
+        assert!(!filter.matches(&c("/w/theme/.git/HEAD")));
+        assert!(!filter.matches(&c("/w/theme/styles/x.css~")));
     }
 
     #[test]

@@ -86,10 +86,19 @@ pub(crate) async fn file_response(
 
 /// Opens `path`, resolves `spec` against its length and seeks to the range's start.
 fn open_range(path: &Path, spec: Option<RangeSpec>) -> io::Result<(File, u64, ByteRange)> {
-    let mut file = File::open(path)?;
+    let not_a_file = || io::Error::new(io::ErrorKind::NotFound, "not a file");
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        // Windows refuses to open a directory (permission denied); Unix opens it, and the
+        // metadata below says what it is. The same answer on both: not found.
+        Err(_) if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) => {
+            return Err(not_a_file());
+        }
+        Err(err) => return Err(err),
+    };
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "not a file"));
+        return Err(not_a_file());
     }
     let len = metadata.len();
     let range = ByteRange::resolve(spec, len);

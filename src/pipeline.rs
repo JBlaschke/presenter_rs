@@ -1146,10 +1146,12 @@ mod tests {
             out_of("proj/talk/slides.md", Some("cfg/other.toml")),
             root.join("built/slides.html")
         );
-        assert_eq!(
-            out_of("proj/talk/slides.md", Some("cfg/abs.toml")),
-            PathBuf::from("/abs/out/slides.html")
-        );
+        // An absolute out_dir is taken as it is: joining it replaces `root` on Unix, and on
+        // Windows a rooted `/abs/out` lands on the config file's drive, as it does in
+        // `default_output_path`.
+        #[allow(clippy::join_absolute_paths)]
+        let abs_out = root.join("/abs/out/slides.html");
+        assert_eq!(out_of("proj/talk/slides.md", Some("cfg/abs.toml")), abs_out);
         assert_eq!(
             out_of("proj/talk/slides.md", Some("cfg/plain.toml")),
             root.join("proj/talk/dist/slides.html")

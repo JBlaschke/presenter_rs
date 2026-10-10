@@ -669,7 +669,9 @@ fn described(dir: &Path) -> String {
 fn cd_argument(dir: &Path) -> String {
     let text = dir.display().to_string();
     if text.starts_with('-') {
-        shell_word(&Path::new(".").join(dir))
+        // Spelled `./`, which every shell takes, also on Windows, where `Path::join`
+        // would write `.\` and then need quotes.
+        shell_word_of(&format!("./{text}"))
     } else {
         shell_word(dir)
     }
@@ -678,13 +680,17 @@ fn cd_argument(dir: &Path) -> String {
 /// `path` as one shell word: as is when it only has characters no shell treats specially,
 /// else single-quoted.
 fn shell_word(path: &Path) -> String {
-    let text = path.display().to_string();
+    shell_word_of(&path.display().to_string())
+}
+
+/// [`shell_word`] of a path's text.
+fn shell_word_of(text: &str) -> String {
     let plain = !text.is_empty()
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c));
     if plain {
-        text
+        text.to_string()
     } else {
         format!("'{}'", text.replace('\'', r"'\''"))
     }
@@ -929,8 +935,14 @@ mod tests {
     }
 
     /// `resolve_target` of `rel` below `root`: Ok(what it is) or Err(the usage message).
+    /// The path is joined as text: `root` is canonical, and on Windows `PathBuf::push` onto
+    /// a canonical (`\\?\`) path resolves `.` and `..` itself, which the tests want
+    /// `resolve_target` to see.
     fn resolve(root: &Path, rel: &str) -> Result<(PathBuf, Found), String> {
-        resolve_target(&root.join(rel)).map_err(|err| {
+        let mut target = root.as_os_str().to_os_string();
+        target.push(std::path::MAIN_SEPARATOR_STR);
+        target.push(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        resolve_target(Path::new(&target)).map_err(|err| {
             assert!(err.is::<UsageError>(), "{rel}: {err:#}");
             err.to_string()
         })

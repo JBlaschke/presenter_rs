@@ -261,6 +261,11 @@ mod tests {
         id.len() == ID_LEN && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     }
 
+    // The four tests on POSIX paths: `/abs/…` is absolute, `/` is the separator, and the
+    // hashed and shown paths are the spellings below. On Windows `/abs` is relative to the
+    // current drive and the normalized path uses `\`; the integration tests cover it with
+    // real paths.
+    #[cfg(unix)]
     #[test]
     fn file_ids_hash_the_path_and_are_idempotent() {
         let mut reg = AssetRegistry::new();
@@ -328,6 +333,7 @@ mod tests {
         assert!(reg.get("000000000000").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn iteration_and_infos_are_ordered_by_id() {
         let mut reg = AssetRegistry::new();
@@ -355,6 +361,7 @@ mod tests {
         assert_eq!(info.mime, "image/png");
     }
 
+    #[cfg(unix)]
     #[test]
     fn equivalent_spellings_of_one_file_share_an_id() {
         let mut reg = AssetRegistry::new();
@@ -386,6 +393,7 @@ mod tests {
         assert_eq!(infos[0].origin, "file:images/ok.png");
     }
 
+    #[cfg(unix)]
     #[test]
     fn parent_relative_paths_outside_base_get_the_absolute_origin() {
         let mut reg = AssetRegistry::new();

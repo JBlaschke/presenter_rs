@@ -123,8 +123,9 @@ jobs:
             exit 1
           fi
       # Release profile, so the tests run against embedded assets, as shipped.
+      # --no-fail-fast: one run shows every failing test binary, not just the first.
       - name: cargo test
-        run: cargo test --release --locked
+        run: cargo test --release --locked --no-fail-fast
       - name: cargo build
         run: cargo build --release --locked
       - name: smoke test

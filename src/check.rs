@@ -1862,20 +1862,25 @@ mod tests {
             "{diagnostic}"
         );
 
-        let parse = Error::Parse {
-            path: PathBuf::from("/x/deck.md"),
-            line: Some(7),
-            message: "unbalanced quote".into(),
-        };
-        let diagnostic = error_diagnostic(&parse, Path::new("/x/deck.md"));
-        assert_eq!(
-            diagnostic.to_string(),
-            "/x/deck.md:7: error: unbalanced quote"
-        );
-        assert_eq!(diagnostic.code, codes::PARSE_ERROR);
-        let front = error_diagnostic(&Error::FrontMatter("bad".into()), Path::new("/x/a.md"));
-        assert_eq!(front.to_string(), "/x/a.md: error: front matter: bad");
-        assert_eq!(front.code, codes::FRONT_MATTER_ERROR);
+        // POSIX absolute paths: on Windows `/x` is relative to the current drive and the
+        // diagnostic prints it as `D:\x\…`.
+        #[cfg(unix)]
+        {
+            let parse = Error::Parse {
+                path: PathBuf::from("/x/deck.md"),
+                line: Some(7),
+                message: "unbalanced quote".into(),
+            };
+            let diagnostic = error_diagnostic(&parse, Path::new("/x/deck.md"));
+            assert_eq!(
+                diagnostic.to_string(),
+                "/x/deck.md:7: error: unbalanced quote"
+            );
+            assert_eq!(diagnostic.code, codes::PARSE_ERROR);
+            let front = error_diagnostic(&Error::FrontMatter("bad".into()), Path::new("/x/a.md"));
+            assert_eq!(front.to_string(), "/x/a.md: error: front matter: bad");
+            assert_eq!(front.code, codes::FRONT_MATTER_ERROR);
+        }
         let config = error_diagnostic(&Error::Config("bad".into()), Path::new("/x/a.md"));
         assert_eq!(config.code, codes::CONFIG_ERROR);
         let other = error_diagnostic(&Error::Other("x".into()), Path::new("/x/a.txt"));
