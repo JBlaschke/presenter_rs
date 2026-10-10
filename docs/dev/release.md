@@ -383,3 +383,9 @@ commit 93e6e89), on a Mac, without a Windows machine:
   platform. (The same run also saw the browser smoke test time out while Chrome started on
   the loaded runner: that test gives the start-up its own time now and keeps its short
   timeout for the navigation it measures.)
+- The fifth run was the first to pass the debug tests on Windows; the release-mode tests
+  then hit the same limitation one level up: removing the deck's own directory, the only
+  watched one. Windows reports nothing when a watched directory itself is removed (the
+  parent's watch would), so on Windows the watcher now also watches the parent of every
+  watched directory, non-recursively (`guard_watches`); `watched_dirs()` leaves these out,
+  so the tests' expectations hold on every platform.

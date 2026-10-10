@@ -43,7 +43,10 @@
 //! opens its inputs. When the backend lost events (a rescan), the batch lists every
 //! watched file. A watched directory that is created or removed (deleted and recreated,
 //! e.g. by `git checkout`) counts as a change too, and the next [`Watcher::update`]
-//! watches it again.
+//! watches it again. So does the removal or renaming of a directory above a watched one.
+//! On Windows the parent of every watched directory is watched as well, non-recursively
+//! (`guard_watches`): there, a watched directory's own removal is reported only by its
+//! parent's watch, the directory's handle dies with it.
 //!
 //! The events are not passed through `notify-debouncer-full` (which live-reload.md §5
 //! names): it drops a creation followed by a removal of the same path, and everything it
@@ -669,6 +672,22 @@ fn covers(watched: &BTreeMap<PathBuf, RecursiveMode>, dir: &Path) -> bool {
             .any(|(root, mode)| *mode == RecursiveMode::Recursive && dir.starts_with(root))
 }
 
+/// The parents to watch next to `wanted` on Windows, non-recursively: there, a watched
+/// directory's own removal (and its creation again) is reported only by its parent's
+/// watch, the directory's own handle dies with it. Parents that `wanted` covers already
+/// are left out. Empty elsewhere: inotify and FSEvents report the removal of a watched
+/// directory themselves.
+fn guard_watches(wanted: &BTreeMap<PathBuf, RecursiveMode>) -> BTreeSet<PathBuf> {
+    if !cfg!(windows) {
+        return BTreeSet::new();
+    }
+    wanted
+        .keys()
+        .filter_map(|dir| dir.parent().map(Path::to_path_buf))
+        .filter(|parent| !covers(wanted, parent))
+        .collect()
+}
+
 /// The nearest proper ancestor of `path` that is an existing directory.
 fn existing_ancestor(path: &Path) -> Option<PathBuf> {
     path.ancestors()
@@ -720,6 +739,9 @@ pub struct Watcher {
     shared: Arc<Mutex<Shared>>,
     /// The directories currently watched, and how.
     watched: BTreeMap<PathBuf, RecursiveMode>,
+    /// Of `watched`, the parents watched only to see a watched directory removed or
+    /// created again ([`guard_watches`]; Windows); [`Watcher::watched_dirs`] leaves them out.
+    guards: BTreeSet<PathBuf>,
     /// Where [`Watcher::update`] sends its catch-up batches.
     tx: Sender<ChangeBatch>,
 }
@@ -768,6 +790,7 @@ impl Watcher {
             backend,
             shared,
             watched: BTreeMap::new(),
+            guards: BTreeSet::new(),
             tx,
         };
         watcher.update(set)?;
@@ -783,7 +806,11 @@ impl Watcher {
     /// Errors: as [`Watcher::start`]; the other directories are still updated.
     pub fn update(&mut self, set: &WatchSet) -> Result<()> {
         let filter = Filter::new(set);
-        let (wanted, missing) = plan_watches(&filter.targets);
+        let (mut wanted, missing) = plan_watches(&filter.targets);
+        self.guards = guard_watches(&wanted);
+        for parent in &self.guards {
+            wanted.insert(parent.clone(), RecursiveMode::NonRecursive);
+        }
         let (files, recursive) = (filter.files.clone(), filter.recursive.clone());
         // Swap the filter first, so that events of newly watched directories count.
         let (recreated, since, old_files) = {
@@ -896,10 +923,12 @@ impl Watcher {
     }
 
     /// The directories currently watched (canonical), recursive ones flagged `true`. This
-    /// includes the ancestors watched for missing directories.
+    /// includes the ancestors watched for missing directories, not the parents watched on
+    /// Windows for a watched directory's removal (`guard_watches`).
     pub fn watched_dirs(&self) -> Vec<(PathBuf, bool)> {
         self.watched
             .iter()
+            .filter(|(dir, _)| !self.guards.contains(*dir))
             .map(|(dir, mode)| (dir.clone(), *mode == RecursiveMode::Recursive))
             .collect()
     }
