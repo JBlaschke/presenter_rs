@@ -6,7 +6,7 @@ browser and updates it on every save of the deck, its images or its theme.
 
 | Page | What it covers |
 |---|---|
-| [Getting started](getting-started.md) | Install, create a deck with `presenter init`, preview it, build it, export a PDF |
+| [Getting started](getting-started.md) | Install, create a deck with `presenter init`, preview it, build it, export a PDF or a PowerPoint file |
 | [Writing slides](authoring.md) | The Markdown dialect: separators, attributes, directives, code, math, images, notes, including files, headings mode, `presenter check` |
 | [Notebooks](notebooks.md) | Slide types and tags from Jupyter, front matter in the first cell, which outputs render, running the notebook first |
 | [Themes](themes.md) | Theme directories, tokens, layouts, extending and ejecting, SCSS, templates and their context, the live-reload loop |

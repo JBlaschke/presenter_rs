@@ -38,6 +38,19 @@ publishes that section as the GitHub Release notes (see
   print slightly closer than on screen; so a slide whose content ends just past a page
   boundary can end with a page that is empty but for the slide's background (about one in
   ten to twenty of the slides that run onto more pages).
+- `presenter export pptx` writes a PowerPoint file with the same headless Chrome: every
+  page of the PDF export becomes one editable slide, so a slide with fragments builds up
+  step by step over several slides, and a slide taller than a page continues on further
+  slides. Headings, paragraphs, lists, code and quotes are text boxes with the theme's
+  fonts, sizes, colours and bullets (code keeps its highlighting, a paragraph per line),
+  tables are tables, images are the deck's own image files, backgrounds are colours or
+  pictures, and themes' decorations (rules, logos) are kept; everything sits where the
+  browser laid it out. What PowerPoint cannot hold as native content (SVG, iframes,
+  display math, gradients) becomes a picture with a transparent background. The speaker
+  notes go into the notes pane, the slides are named after their headings, and the slide
+  size follows the deck's (a 16:9 deck gives PowerPoint's Widescreen size). `--scale` sets
+  the resolution of the pictures (2 by default). The file depends on nothing but the deck
+  and the Chrome version, so the same deck gives the same file.
 - `presenter dump` prints a deck's intermediate representation as JSON, or with
   `--context` the template context. `presenter dump --default-config` lists every
   `presenter.toml` setting with its built-in default, commented out.

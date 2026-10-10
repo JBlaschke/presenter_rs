@@ -67,6 +67,7 @@ presenter theme eject default ./theme   # copy the built-in theme to hack on it
 presenter dump slides.md --context      # print the JSON the templates receive (template debugging)
 presenter check slides.md               # lint: missing images, unknown layouts, bad separators
 presenter export pdf slides.md          # (stretch) headless Chrome → PDF
+presenter export pptx slides.md         # headless Chrome → PowerPoint, one editable slide per PDF page (T49)
 ```
 
 Authoring syntax in one screen (full spec: `docs/spec/markdown-dialect.md`):
@@ -208,6 +209,7 @@ presenter_rs/
 │   ├── serve/{mod,server,watch,events,files}.rs
 │   ├── check.rs               lint rules
 │   ├── pdf.rs, pdf/devtools.rs  headless-Chrome PDF export (T45); the DevTools client of the browser tests (T24)
+│   ├── pdf/capture.rs, pdf/scene.js, pptx.rs  the print view's pages as shapes, written as a PowerPoint file (T49)
 │   └── cli/{mod,build,serve,init,theme,dump,check,export,report}.rs
 └── tests/                     integration tests (+ insta snapshots in tests/snapshots/)
                                and fixtures/{md,ipynb,ir,themes,config,live-reload}
