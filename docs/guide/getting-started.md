@@ -10,8 +10,8 @@ inside it, so it needs no Node.js, Python or network access.
 
 ### From a release archive
 
-Each release on GitHub has an archive for macOS (Apple silicon and Intel) and Linux
-(x86_64 and arm64, glibc):
+Each release on GitHub has an archive for macOS (Apple silicon and Intel), Linux (x86_64
+and arm64, glibc) and Windows (x64 and arm64):
 
 | Platform | Archive |
 |---|---|
@@ -19,10 +19,12 @@ Each release on GitHub has an archive for macOS (Apple silicon and Intel) and Li
 | macOS, Intel | `presenter-v0.1.0-x86_64-apple-darwin.tar.gz` |
 | Linux x86_64 | `presenter-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux arm64 | `presenter-v0.1.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `presenter-v0.1.0-x86_64-pc-windows-msvc.zip` |
+| Windows arm64 | `presenter-v0.1.0-aarch64-pc-windows-msvc.zip` |
 
-Download yours and `SHA256SUMS` from the project's GitHub Releases page (the names carry
-the version, here 0.1.0), then check, unpack and install it; here for Apple silicon, into
-`~/.local/bin`:
+Download yours and `SHA256SUMS` from the project's GitHub Releases page or from the
+[project website](https://jblaschke.github.io/presenter_rs/) (the names carry the version,
+here 0.1.0), then check, unpack and install it; here for Apple silicon, into `~/.local/bin`:
 
 ```sh
 shasum -a 256 -c --ignore-missing SHA256SUMS      # Linux: sha256sum -c --ignore-missing SHA256SUMS
@@ -44,6 +46,13 @@ xattr -d com.apple.quarantine ~/.local/bin/presenter
 ```
 
 Files downloaded with `curl` are not quarantined.
+
+On Windows, check the download with `Get-FileHash presenter-v0.1.0-x86_64-pc-windows-msvc.zip`
+in PowerShell against the line in `SHA256SUMS`, unpack the `.zip` (Explorer's "Extract
+All…", or `tar -xf` in a terminal) and put the directory that holds `presenter.exe` on your
+`PATH`, or copy the file into a directory that is. The binary needs no runtime installed.
+`presenter export pdf` and `export pptx` are not available on Windows yet; everything else
+works the same.
 
 ### From source
 

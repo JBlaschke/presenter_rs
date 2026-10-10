@@ -1512,6 +1512,8 @@ impl Drop for TempDir {
 fn create_private_dir(base: &Path, prefix: &str) -> Result<PathBuf> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
+    // Only Unix sets the mode, so the binding is never mutated elsewhere.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -1594,7 +1596,7 @@ impl Janitor {
     }
 
     /// Closes the watchdog's stdin without `done`, as presenter's death would.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn abandon(&mut self) {
         self.input = None;
     }
@@ -1612,6 +1614,7 @@ impl Drop for Janitor {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use std::collections::BTreeMap;
 
     /// Writes an executable shell script `name` with `body` into `dir`.
@@ -1625,6 +1628,7 @@ mod tests {
     }
 
     /// A fake environment for [`find_chrome_in`].
+    #[cfg(unix)]
     fn env(vars: &[(&str, &OsString)]) -> impl Fn(&str) -> Option<OsString> + use<> {
         let vars: BTreeMap<String, OsString> = vars
             .iter()
@@ -1659,12 +1663,14 @@ mod tests {
     /// flag only after it is created, so a process started meanwhile by another test thread
     /// can inherit it, and hold it open for as long as that process (or a `sleep` it left
     /// behind) runs: an exit or a closed pipe would then go unnoticed.
+    #[cfg(unix)]
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         static PROCESSES: Mutex<()> = Mutex::new(());
         PROCESSES.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The names in `dir`.
+    #[cfg(unix)]
     fn entries(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .unwrap()
@@ -2133,6 +2139,7 @@ mod tests {
 
     /// Prints `html` like [`html_to_pdf`], with the temporary directory in `base` and the
     /// deck handed over as `source` says.
+    #[cfg(unix)]
     fn print_in(
         chrome: &Path,
         html: &str,
@@ -2400,6 +2407,7 @@ mod tests {
 
     /// A real browser for the tests that print, or `None` after saying why the test is
     /// skipped.
+    #[cfg(unix)]
     fn real_chrome() -> Option<PathBuf> {
         let found = find_chrome(None);
         if found.is_none() {
@@ -2409,6 +2417,7 @@ mod tests {
     }
 
     /// A deck built from `markdown` like `presenter export pdf` builds it (standalone).
+    #[cfg(unix)]
     fn standalone_deck(markdown: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("deck.md");

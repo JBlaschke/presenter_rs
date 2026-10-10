@@ -1,0 +1,94 @@
+# The project website (docs/dev/site.md): https://jblaschke.github.io/presenter_rs/
+#
+# Builds `presenter` in release mode, runs scripts/site.py (the landing page with the latest
+# release's downloads, and every committed example rendered to one HTML file each) and
+# deploys the result to GitHub Pages. Deploys on every push to `main`, when a release is
+# published (so the download table shows it) and on "Run workflow"; a pull request only
+# builds, and the site is the run's `github-pages` artifact.
+#
+# One-time setup: Settings → Pages → Source: "GitHub Actions" (docs/dev/site.md).
+name: Site
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time (a later one waits; none is cancelled). Pull requests build in
+# their own group, so they never queue behind a deployment or each other.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('site-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Release profile: embedded assets, as the shipped binary renders them.
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The download table: the latest published release (drafts and pre-releases are
+          # not "latest"). Before the first release the API answers 404, and the page says so.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/release.json" 2> "$RUNNER_TEMP/release.err"; then
+            jq -r '"latest release: " + .tag_name + " (" + (.assets | length | tostring) + " assets)"' "$RUNNER_TEMP/release.json"
+          else
+            cat "$RUNNER_TEMP/release.err"
+            echo "no published release yet"
+            rm -f "$RUNNER_TEMP/release.json"
+          fi
+      - name: scripts/site.py
+        run: |
+          args=(--presenter target/release/presenter --out dist/site --repo "$GITHUB_REPOSITORY" \
+                --sha "$GITHUB_SHA" --ref "$GITHUB_REF_NAME")
+          if [[ -f "$RUNNER_TEMP/release.json" ]]; then
+            args+=(--release-json "$RUNNER_TEMP/release.json")
+          fi
+          scripts/site.py "${args[@]}"
+          du -sh dist/site
+      # Fails early with a clear message when Pages is not set to deploy from Actions.
+      - name: configure pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist/site
+
+  deploy:
+    name: deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

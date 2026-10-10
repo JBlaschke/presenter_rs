@@ -11,8 +11,12 @@
 //! browser is always stopped and its profile removed, also when presenter is interrupted.
 
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Output;
+#[cfg(unix)]
+use std::process::Stdio;
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use assert_cmd::Command;
 use presenter::pdf::{find_chrome, page_count};
@@ -71,6 +75,7 @@ fn assert_wrote(output: &Output, path_suffix: &str) -> usize {
 }
 
 /// The names in `dir` (none when it cannot be read).
+#[cfg(unix)]
 fn entries(dir: &Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .map(|entries| {
@@ -300,6 +305,7 @@ fn quiet_exports_print_nothing() {
 
 /// A deck that opens JavaScript dialogs, with a title and an image description that
 /// mention `/Type /Page` (Chrome writes both into the PDF as strings).
+#[cfg(unix)]
 const DIALOG_DECK: &str = "\
 ---
 title: Inside /Type /Page dictionaries
@@ -384,6 +390,7 @@ fn a_failed_print_stops_the_browser_and_cleans_up() {
 }
 
 /// Tiny PNGs with sizes no other image in a deck has: (width, height, base64).
+#[cfg(unix)]
 const PICTURES: [(u32, u32, &str); 3] = [
     (
         7,
@@ -403,6 +410,7 @@ const PICTURES: [(u32, u32, &str); 3] = [
 ];
 
 /// The `(width, height)` of every image in a PDF written by Chrome.
+#[cfg(unix)]
 fn pdf_image_sizes(pdf: &[u8]) -> std::collections::BTreeSet<(u32, u32)> {
     let size =
         regex::bytes::Regex::new(r"/Subtype\s*/Image\s*/Width\s+(\d+)\s*/Height\s+(\d+)").unwrap();
@@ -490,6 +498,7 @@ fn decks_larger_than_one_devtools_message_are_printed() {
 }
 
 /// A deck that never gets ready to print, so that an export of it runs until its deadline.
+#[cfg(unix)]
 const STALLED_DECK: &str = "\
 # Never ready
 

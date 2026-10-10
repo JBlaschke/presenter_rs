@@ -440,6 +440,8 @@ prints the speaker notes, and pdfSeparateFragments = false gives one page per sl
 - Chrome is looked for with `--chrome`, then `CHROME_PATH`, then the usual install
   locations on macOS and Linux. Without one, the command explains how to install it and
   exits 3.
+- Not available on Windows yet (Chrome is started through `/bin/sh`): the command says so
+  and exits 1.
 - A `-o` that does not end in `.pdf` gets a warning.
 
 ## export pptx
@@ -513,6 +515,7 @@ gives one slide per slide; --scale sets the resolution of the pictures.
 - `--scale N` sets the resolution of the pictures: `1` is their size on the slide, `2`
   (the default) twice that in each direction, up to `4`.
 - Chrome is looked for as for `export pdf`; without one the command exits 3. It gets 120 s
-  to load the deck, plus one second per picture.
+  to load the deck, plus one second per picture. Like `export pdf`, not available on
+  Windows yet.
 - A `-o` that does not end in `.pptx` gets a warning.
 - The same deck and Chrome version give the same file, byte for byte.

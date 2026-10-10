@@ -1,0 +1,10 @@
+# Windows builds link the C runtime statically (`/MT`), so that the .exe runs on a machine
+# without the Visual C++ Redistributable installed; the release archives are built with this
+# (docs/dev/release.md). A RUSTFLAGS environment variable replaces these flags, so leave it
+# unset when building for Windows. The other targets keep Cargo's defaults.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

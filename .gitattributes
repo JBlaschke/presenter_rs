@@ -1,0 +1,4 @@
+# Every text file is LF in every checkout, Windows included: the Windows runners' Git would
+# otherwise convert to CRLF on checkout, and the tests compare rendered output and snapshots
+# byte for byte. Binary files are detected and left alone.
+* text=auto eol=lf

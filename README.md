@@ -77,10 +77,11 @@ df = pl.read_csv("data.csv")
 
 ## Install
 
-**Release binaries:** each release on GitHub has archives for macOS (Apple silicon, Intel)
-and Linux (x86_64, arm64). Unpack yours and put `presenter` on your `PATH`; see
-[Getting started](docs/guide/getting-started.md#install) for the details, including
-macOS's quarantine.
+**Release binaries:** each release on GitHub has archives for macOS (Apple silicon, Intel),
+Linux (x86_64, arm64) and Windows (x64, arm64). Unpack yours and put `presenter` on your
+`PATH`; see [Getting started](docs/guide/getting-started.md#install) for the details,
+including macOS's quarantine. The [project website](https://jblaschke.github.io/presenter_rs/)
+links the latest release and shows the examples below, rendered.
 
 **From source**, with Rust 1.89 or newer, in a checkout:
 
@@ -89,7 +90,7 @@ cargo install --path .
 ```
 
 Either way, the binary needs nothing else at run time; `presenter export pdf` and
-`presenter export pptx` also need Chrome or Chromium.
+`presenter export pptx` also need Chrome or Chromium, and are not available on Windows yet.
 
 ## Documentation
 
@@ -110,11 +111,13 @@ Examples: [`examples/basic`](examples/basic/README.md) (the Markdown features),
 [`examples/headings-mode`](examples/headings-mode/slides.md) and
 [`examples/custom-theme-scss`](examples/custom-theme-scss/README.md). The built-in theme's
 tokens and markup are documented in
-[`assets/themes/default/README.md`](assets/themes/default/README.md).
+[`assets/themes/default/README.md`](assets/themes/default/README.md). Every example is
+also rendered on the [project website](https://jblaschke.github.io/presenter_rs/).
 
 Changes are listed in the [changelog](CHANGELOG.md). Contributors: the design is in
 [PLAN.md](PLAN.md), the contracts between modules in [`docs/spec/`](docs/spec/),
-and the release process in [`docs/dev/release.md`](docs/dev/release.md).
+the release process in [`docs/dev/release.md`](docs/dev/release.md), and the website in
+[`docs/dev/site.md`](docs/dev/site.md).
 
 ## License
 

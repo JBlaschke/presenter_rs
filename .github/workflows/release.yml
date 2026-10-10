@@ -2,9 +2,9 @@
 #
 # Pushing a tag `v<version>` (the version in Cargo.toml, e.g. `v0.1.0` or `v0.2.0-rc.1`)
 # tests and builds `presenter` natively on one runner per target, packages each binary as
-# `presenter-<tag>-<target>.tar.gz` (the binary, LICENSE, README.md and the
-# THIRD-PARTY-LICENSES of what it embeds and links, in a directory of the same name) and
-# publishes a GitHub Release with the four archives and `SHA256SUMS`.
+# `presenter-<tag>-<target>.tar.gz` (`.zip` on Windows; the binary, LICENSE, README.md and
+# the THIRD-PARTY-LICENSES of what it embeds and links, in a directory of the same name) and
+# publishes a GitHub Release with the six archives and `SHA256SUMS`.
 #
 # Running the workflow by hand ("Run workflow", any branch) builds the same archives,
 # named `presenter-v<version>-dev.<sha>-<target>`, as artifacts of the run and publishes
@@ -57,7 +57,7 @@ jobs:
               echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version (expected v$version)"
               exit 1
             fi
-            # Fail before four builds: `git describe`, and so --version, ignores
+            # Fail before six builds: `git describe`, and so --version, ignores
             # lightweight tags, and the build jobs' smoke test would reject them.
             if [[ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" != tag ]]; then
               echo "::error::tag $GITHUB_REF_NAME is not annotated; push one made with git tag -a (see docs/dev/release.md)"
@@ -77,19 +77,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The macOS 14 runners retire in November 2026 (actions/runner-images#13518).
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-apple-darwin
             runner: macos-15-intel
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
+          # Windows: a .zip with presenter.exe. The C runtime is linked statically
+          # (.cargo/config.toml), so the binary needs no redistributable. The steps below run
+          # in the runner's Git Bash (`defaults.run.shell`).
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            exe: .exe
+            format: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            exe: .exe
+            format: zip
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
       TARGET: ${{ matrix.target }}
       RUNNER_LABEL: ${{ matrix.runner }}
+      # `.exe` on Windows, empty elsewhere.
+      EXE: ${{ matrix.exe }}
+      # The archive format: `tar.gz`, or `zip` on Windows.
+      FORMAT: ${{ matrix.format || 'tar.gz' }}
       ARCHIVE: presenter-${{ needs.label.outputs.label }}-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
@@ -113,7 +129,7 @@ jobs:
         run: cargo build --release --locked
       - name: smoke test
         run: |
-          bin=target/release/presenter
+          bin=target/release/presenter$EXE
           if command -v file >/dev/null; then file "$bin"; fi
           ls -l "$bin"
           "$bin" --version
@@ -150,10 +166,11 @@ jobs:
           # and source in crates.txt, and their license files.
           cargo tree --locked -e normal,no-proc-macro --target "$TARGET" --prefix none --format '{p}' \
             | sed -E 's/ \(.*$//' | sort -u > "$RUNNER_TEMP/linked.txt"
+          # (The manifest path ends in /Cargo.toml, or \Cargo.toml on Windows.)
           cargo metadata --locked --format-version 1 --filter-platform "$TARGET" \
             | jq -r '.resolve.root as $root | .packages[] | select(.id != $root)
                 | [.name, .version, (.license // "see the license files"), (.source // "path"),
-                   (.manifest_path | rtrimstr("/Cargo.toml")),
+                   (.manifest_path | sub("[/\\\\]Cargo\\.toml$"; "")),
                    (.authors | join(", ") | if . == "" then "the authors" else . end)]
                 | @tsv' \
             | sort > "$RUNNER_TEMP/packages.tsv"
@@ -161,6 +178,8 @@ jobs:
           while IFS=$'\t' read -r name version license source dir authors; do
             grep -qxF "$name v$version" "$RUNNER_TEMP/linked.txt" || continue
             found=$((found + 1))
+            # Windows: cargo prints C:\… paths, and find and ls below are Git Bash's.
+            if command -v cygpath >/dev/null; then dir=$(cygpath -u "$dir"); fi
             if [[ "$source" == *crates.io-index ]]; then
               source="https://crates.io/crates/$name/$version"
             fi
@@ -221,7 +240,43 @@ jobs:
       - name: package
         run: |
           mkdir -p "dist/$ARCHIVE"
-          cp target/release/presenter LICENSE README.md "dist/$ARCHIVE/"
+          cp "target/release/presenter$EXE" LICENSE README.md "dist/$ARCHIVE/"
+          # Python reads each archive back below (and writes the Windows one).
+          if ! py=$(command -v python3 || command -v python); then
+            echo "::error::python is not installed on $RUNNER_LABEL"
+            exit 1
+          fi
+          if [[ "$FORMAT" == zip ]]; then
+            # Windows: a zip, written by Python so that the entry names use `/` and carry
+            # nothing of the build machine (no owner, no attributes). Then read back: the
+            # data checks out, every entry is under the archive's directory, and the binary
+            # is there.
+            "$py" - dist "$ARCHIVE" "presenter$EXE" <<'PY'
+          import os, sys, zipfile
+          root, name, binary = sys.argv[1:4]
+          path = os.path.join(root, name + ".zip")
+          with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+              for dirpath, dirnames, filenames in os.walk(os.path.join(root, name)):
+                  dirnames.sort()
+                  for filename in sorted(filenames):
+                      file = os.path.join(dirpath, filename)
+                      archive.write(file, os.path.relpath(file, root).replace(os.sep, "/"))
+          with zipfile.ZipFile(path) as archive:
+              corrupt = archive.testzip()
+              names = archive.namelist()
+          problems = [f"{corrupt} is corrupt"] if corrupt else []
+          problems += [f"{entry} is not under {name}/" for entry in names
+                       if not entry.startswith(name + "/") or "\\" in entry]
+          if f"{name}/{binary}" not in names:
+              problems.append(f"{name}/{binary} is missing")
+          for problem in problems:
+              print(f"::error::{problem}")
+          print(f"{len(names)} entries, {len(problems)} problems")
+          sys.exit(1 if problems else 0)
+          PY
+            # The contents, without the ~140 crate license directories.
+            "$py" -c 'import sys, zipfile; print("\n".join(e for e in zipfile.ZipFile(sys.argv[1]).namelist() if "/THIRD-PARTY-LICENSES/crates/" not in e))' "dist/$ARCHIVE.zip"
+          else
           # Entries owned by root, without the builder's user and group names. On macOS
           # (bsdtar): no extended attributes such as com.apple.provenance, which bsdtar
           # would store as LIBARCHIVE.xattr.* headers that GNU tar warns about for every
@@ -237,11 +292,7 @@ jobs:
           # Check what the flags above promise (docs/dev/release.md): every entry is owned by
           # root:root (0:0), no ._* entry, and no pax header keyword that POSIX does not
           # define (LIBARCHIVE.xattr.*, SCHILY.xattr.*, ...), which GNU tar warns about.
-          if ! command -v python3 >/dev/null; then
-            echo "::error::python3 is not installed on $RUNNER_LABEL"
-            exit 1
-          fi
-          python3 - "dist/$ARCHIVE.tar.gz" <<'PY'
+          "$py" - "dist/$ARCHIVE.tar.gz" <<'PY'
           import sys, tarfile
           posix = {"atime", "charset", "comment", "ctime", "gid", "gname", "hdrcharset",
                    "linkpath", "mtime", "path", "size", "uid", "uname"}
@@ -261,10 +312,11 @@ jobs:
           print(f"{len(entries)} entries, {len(problems)} problems")
           sys.exit(1 if problems else 0)
           PY
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARCHIVE }}
-          path: dist/${{ env.ARCHIVE }}.tar.gz
+          path: dist/${{ env.ARCHIVE }}.${{ env.FORMAT }}
           if-no-files-found: error
 
   release:
@@ -288,9 +340,10 @@ jobs:
         working-directory: dist
         run: |
           shopt -s nullglob
-          archives=(*.tar.gz)
-          if [[ ${#archives[@]} -ne 4 ]]; then
-            echo "::error::expected 4 archives, found ${#archives[@]}: ${archives[*]}"
+          # One archive per target of the build matrix: four .tar.gz and two .zip.
+          archives=(*.tar.gz *.zip)
+          if [[ ${#archives[@]} -ne 6 ]]; then
+            echo "::error::expected 6 archives, found ${#archives[@]}: ${archives[*]}"
             exit 1
           fi
           sha256sum "${archives[@]}" | tee SHA256SUMS
@@ -320,4 +373,4 @@ jobs:
             --title "presenter $GITHUB_REF_NAME" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             "${flags[@]}" \
-            dist/*.tar.gz dist/SHA256SUMS
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS
