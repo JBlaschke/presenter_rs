@@ -364,7 +364,9 @@ fn panics_print_a_bug_report_line() {
         .lines()
         .find(|line| line.starts_with("error: "))
         .unwrap_or_else(|| panic!("no error line: {stderr}"));
-    // The location of the `panic!` in `panic_child`.
+    // The location of the `panic!` in `panic_child` (as the compiler spells it: with `\`
+    // on Windows).
+    let error = error.replace('\\', "/");
     assert!(
         error.starts_with("error: internal error at tests/diagnostics.rs:")
             && error.ends_with(": boom"),

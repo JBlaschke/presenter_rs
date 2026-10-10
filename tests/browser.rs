@@ -672,8 +672,10 @@ fn navigate_follows_a_page_that_replaces_itself_before_its_load() {
         "<!doctype html><title>b</title>\n",
     )
     .unwrap();
-    // A short timeout: waiting for a.html's `load` would fail the call after 8 s.
-    let mut page = Page::launch(&chrome, Duration::from_secs(8)).unwrap_or_else(|e| panic!("{e}"));
+    // Chrome's start-up gets the time a loaded CI machine needs; the navigation gets a
+    // short timeout: waiting for a.html's `load` would fail the call after 8 s.
+    let mut page = Page::launch(&chrome, Duration::from_secs(60)).unwrap_or_else(|e| panic!("{e}"));
+    page.set_timeout(Duration::from_secs(8));
     let start = Instant::now();
     page.navigate(&file_url(&dir.path().join("a.html")))
         .unwrap_or_else(|e| panic!("{e}"));

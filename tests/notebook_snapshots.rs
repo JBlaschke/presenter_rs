@@ -181,7 +181,12 @@ fn check_fixture(name: &str, config: &Config, snapshot: &str) -> Parsed {
                 let cell = s.cell.map_or("-".to_string(), |c| c.to_string());
                 format!("cell {cell}, lines {}-{}", s.start_line, s.end_line)
             });
-            let message = d.message.replace(&*root().to_string_lossy(), "[root]");
+            // The absolute "looked for" path, with the checkout as `[root]` and `/`
+            // separators (it is native: `\` on Windows).
+            let message = d
+                .message
+                .replace(&*root().to_string_lossy(), "[root]")
+                .replace('\\', "/");
             format!("{at} [{}] {}: {message}", d.code, d.level)
         })
         .collect();

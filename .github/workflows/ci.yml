@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# Bash everywhere, also on the Windows runner (its Git Bash), so the steps below are
+# written once.
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,7 +19,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Windows is a release target (release.yml), so it is tested here before a tag.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -48,12 +55,13 @@ jobs:
           touch assets/vendor/.DS_Store assets/vendor/reveal/dist/theme/.DS_Store \
             assets/themes/default/.DS_Store assets/vendor/katex/._katex.min.js \
             assets/themes/default/Thumbs.db assets/presenter/.math.js.swp assets/presenter/math.js~
+      # --no-fail-fast: one run shows every failing test binary, not just the first.
       - name: cargo test
-        run: cargo test
+        run: cargo test --no-fail-fast
       # Debug builds read assets/ from disk, release builds embed them: test the embedded
       # mode too (docs/spec/vendored-assets.md §4).
       - name: cargo test --release (embedded assets)
-        run: cargo test --release
+        run: cargo test --release --no-fail-fast
 
   # Opt-in headless-browser smoke tests (T24, tests/browser.rs): the example deck runs in
   # Chrome (reveal.js ready, KaTeX and highlight.js ran, it steps through every slide, no

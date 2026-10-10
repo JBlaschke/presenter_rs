@@ -1,0 +1,93 @@
+<!doctype html>
+<!--
+  The template of the project website's landing page. scripts/site.py fills the dollar-brace
+  placeholders (a Python string.Template, so a literal dollar sign is written twice) and
+  copies site.css and the screenshots next to the result. docs/dev/site.md describes the site.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>presenter: Markdown and notebooks to reveal.js slides</title>
+<meta name="description" content="presenter turns Markdown files and Jupyter notebooks into self-contained reveal.js presentations. Downloads and rendered examples.">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="kicker">A command-line tool, one binary</p>
+    <h1>presenter</h1>
+    <p class="tagline">Write slides in Markdown or a Jupyter notebook, and get a
+      <a href="https://revealjs.com">reveal.js</a> presentation in one HTML file that works
+      offline. Live preview while you write, themes as files, PDF and PowerPoint export.</p>
+    <p class="actions">
+      <a class="button primary" href="#download">Download</a>
+      <a class="button" href="#examples">See the examples</a>
+      <a class="button" href="${repo_url}">Source on GitHub</a>
+    </p>
+  </div>
+</header>
+
+<main class="wrap">
+
+<figure class="shot">
+  <img src="${hero}" alt="The title slide of the example deck" width="1280" height="720">
+  <figcaption>The title slide of the basic example, in the built-in theme.</figcaption>
+</figure>
+
+<section id="download">
+  <h2>Download</h2>
+  <p>Each release has one archive per platform: macOS (Apple silicon and Intel), Linux
+    (x86_64 and arm64, glibc) and Windows (x64 and arm64). The binary needs nothing else at
+    run time; reveal.js, KaTeX, the themes and the Sass compiler are inside it.</p>
+  ${download}
+  <p>Or build from source with Rust 1.89 or newer: <code>cargo install --path .</code> in a
+    checkout. The <a href="https://github.com/${repo}/blob/main/docs/guide/getting-started.md#install">installation
+    guide</a> has the details.</p>
+</section>
+
+<section id="start">
+  <h2>In 30 seconds</h2>
+<pre><code>presenter init talk                 # a deck, a presenter.toml and a small theme
+cd talk
+presenter serve slides.md --open    # live preview; edit slides.md and watch
+presenter build slides.md           # Wrote dist/slides.html (6 slides, 1.8 MB)</code></pre>
+  <div class="shots">
+    <figure>
+      <img src="${shot_code}" alt="A code slide with highlighted line steps" loading="lazy" width="1280" height="720">
+      <figcaption>Code with line steps</figcaption>
+    </figure>
+    <figure>
+      <img src="${shot_notebook}" alt="A notebook cell with its plot" loading="lazy" width="1280" height="720">
+      <figcaption>A notebook cell with its plot</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="examples">
+  <h2>Examples</h2>
+  <p>The example decks from the repository, rendered by the current <code>presenter</code>.
+    Each one is a single HTML file: open it, press <kbd>?</kbd> for the keyboard shortcuts
+    and <kbd>S</kbd> for the speaker view.</p>
+  <div class="cards">
+${examples}
+  </div>
+</section>
+
+<section id="docs">
+  <h2>Documentation</h2>
+  <p>The user guide lives in the repository:</p>
+  ${guide}
+  <p>Changes are listed in the
+    <a href="https://github.com/${repo}/blob/main/CHANGELOG.md">changelog</a>.</p>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <p>${stamp} presenter is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

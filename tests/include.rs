@@ -174,9 +174,12 @@ fn included_spans_and_includes_are_serialized_only_when_set() {
     let json = serde_json::to_value(&parsed.deck).unwrap();
     assert_eq!(json["includes"].as_array().unwrap().len(), 3);
     assert!(json["slides"][0]["span"].get("file").is_none());
+    // (Compared as paths: the serialized one is normalized, `\`-separated on Windows.)
     assert_eq!(
-        json["slides"][4]["span"]["file"].as_str(),
-        Some(fixture("parts/part.md").to_str().unwrap())
+        json["slides"][4]["span"]["file"]
+            .as_str()
+            .map(PathBuf::from),
+        Some(fixture("parts/part.md"))
     );
     let plain = parse(&fixture("parts/nested.md")).unwrap();
     let json = serde_json::to_value(&plain.deck).unwrap();

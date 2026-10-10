@@ -150,6 +150,13 @@ impl Page {
         Ok(page)
     }
 
+    /// Sets the timeout of every DevTools call from now on (`launch`'s applies until then):
+    /// a test can give Chrome's start-up the time a loaded machine needs and still expect
+    /// one call to return quickly.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
     /// Loads `url` in the page and waits for the `load` event of the document it creates,
     /// or of the document that replaced it before its `load` (module docs). When `url`
     /// differs from the current page's only in its fragment (`#/2`), Chrome stays on the

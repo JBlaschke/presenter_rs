@@ -751,9 +751,17 @@ fn and_list(items: &[String]) -> String {
     }
 }
 
-/// `path` relative to `dir` when it is below it, else as is.
+/// `path` relative to `dir` when it is below it (`/`-separated on every platform, as paths
+/// in messages are shown), else as is.
 fn shown(path: &Path, dir: &Path) -> String {
-    path.strip_prefix(dir).unwrap_or(path).display().to_string()
+    match path.strip_prefix(dir) {
+        Ok(relative) => relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 /// `path` canonicalized (symbolic links resolved), or as is when that fails.

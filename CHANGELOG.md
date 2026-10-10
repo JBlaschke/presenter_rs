@@ -12,6 +12,13 @@ publishes that section as the GitHub Release notes (see
 ## [Unreleased]
 
 ### Added
+- Release archives for Windows (x64 and arm64): `.zip` files with `presenter.exe`. The C
+  runtime is linked statically, so no redistributable is needed. Paths in messages are
+  `/`-separated there too, as in decks and the guide. `export pdf` and `export pptx` are
+  not available on Windows yet.
+- A project website, built by CI from `main` and on every release
+  ([`docs/dev/site.md`](docs/dev/site.md)): the downloads of the latest release, the
+  guide's pages and every example deck, rendered.
 - `presenter build` renders a Markdown file (`.md`) or a Jupyter notebook (`.ipynb`,
   nbformat 4) into one self-contained HTML file that works offline. reveal.js 6.0.2 and
   KaTeX 0.19.0 are embedded in the binary. `--site` writes a directory with

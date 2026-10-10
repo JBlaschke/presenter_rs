@@ -998,8 +998,13 @@ fn absolute_target(dir: &Path) -> anyhow::Result<PathBuf> {
 /// `dir` (as given) for a message about `target`, the directory it names, with the
 /// directory added when they differ in more than being relative (`a/..`).
 fn describe(dir: &Path, target: &Path) -> String {
+    // (`std::path::absolute` keeps a `..` on Unix and resolves it on Windows, so a `..` in
+    // `dir` is looked for by itself.)
+    let has_parent_dir = dir
+        .components()
+        .any(|component| component == Component::ParentDir);
     match std::path::absolute(dir) {
-        Ok(absolute) if absolute == target => dir.display().to_string(),
+        Ok(absolute) if !has_parent_dir && absolute == target => dir.display().to_string(),
         _ => format!("{} (that is {})", dir.display(), target.display()),
     }
 }

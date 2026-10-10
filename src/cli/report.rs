@@ -595,6 +595,10 @@ fn style(code: &str, text: &str, color: bool) -> String {
 mod tests {
     use super::*;
 
+    // POSIX paths (`/work` is absolute, `/` separates), as in the theme-and-config test
+    // below; `errors_for_other_reports_show_the_same_paths` covers the real current
+    // directory on every platform.
+    #[cfg(unix)]
     #[test]
     fn diagnostics_print_relative_paths_and_color_only_the_level() {
         let diagnostic = Diagnostic::warning("missing-asset", "image `x.png` not found")
@@ -829,6 +833,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn theme_and_config_errors_name_their_file_relative_to_the_current_directory() {
         let err = Error::Theme {
@@ -866,10 +871,8 @@ mod tests {
         ));
         assert_eq!(
             with_display_paths(config).to_string(),
-            format!(
-                "config: {}: unknown field",
-                Path::new("c/presenter.toml").display()
-            )
+            // `/`-separated on every platform (`display_path`).
+            "config: c/presenter.toml: unknown field"
         );
         let theme = Error::Theme {
             name: "t".into(),
@@ -877,7 +880,7 @@ mod tests {
         };
         assert_eq!(
             with_display_paths(theme).to_string(),
-            format!("theme 't': {}: bad", Path::new("t/theme.toml").display())
+            "theme 't': t/theme.toml: bad"
         );
         let missing = Error::MissingAsset {
             path: cwd.join("fig/x.png"),
@@ -885,7 +888,7 @@ mod tests {
         };
         assert_eq!(
             with_display_paths(missing).to_string(),
-            format!("asset not found: {}", Path::new("fig/x.png").display())
+            "asset not found: fig/x.png"
         );
         let other = Error::Other("/abs/thing: as is".into());
         assert_eq!(with_display_paths(other).to_string(), "/abs/thing: as is");

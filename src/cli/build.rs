@@ -335,13 +335,10 @@ mod tests {
             rebuilding_line(&batch(&["slides.md"], ChangeKind::Content)),
             "Rebuilding (content): slides.md"
         );
+        // `/`-separated on every platform (cli::display_path).
         assert_eq!(
             rebuilding_line(&batch(&["t/a.css", "t/b.css"], ChangeKind::Css)),
-            format!(
-                "Rebuilding (css): {}, {}",
-                Path::new("t/a.css").display(),
-                Path::new("t/b.css").display()
-            )
+            "Rebuilding (css): t/a.css, t/b.css"
         );
         let many = rebuilding_line(&batch(&["a", "b", "c", "d", "e"], ChangeKind::Content));
         assert_eq!(many, "Rebuilding (content): a, b, c, and 2 more");

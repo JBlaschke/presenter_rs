@@ -2,25 +2,32 @@
 
 A release is an annotated git tag `v<version>` on `main`. Pushing it runs
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml). The workflow tests
-and builds `presenter` on four native runners and publishes a GitHub Release. The release
+and builds `presenter` on six native runners and publishes a GitHub Release. The release
 holds one archive per platform and a `SHA256SUMS` file.
 
 | target | runner | archive |
 |---|---|---|
-| `aarch64-apple-darwin` (macOS arm64, macOS 11+) | `macos-14` | `presenter-v0.1.0-aarch64-apple-darwin.tar.gz` |
+| `aarch64-apple-darwin` (macOS arm64, macOS 11+) | `macos-15` | `presenter-v0.1.0-aarch64-apple-darwin.tar.gz` |
 | `x86_64-apple-darwin` (macOS Intel, macOS 10.12+) | `macos-15-intel` | `presenter-v0.1.0-x86_64-apple-darwin.tar.gz` |
 | `x86_64-unknown-linux-gnu` (glibc, built on Ubuntu 22.04) | `ubuntu-22.04` | `presenter-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
 | `aarch64-unknown-linux-gnu` (glibc, built on Ubuntu 22.04) | `ubuntu-22.04-arm` | `presenter-v0.1.0-aarch64-unknown-linux-gnu.tar.gz` |
+| `x86_64-pc-windows-msvc` (Windows x64, Windows 10+) | `windows-2025` | `presenter-v0.1.0-x86_64-pc-windows-msvc.zip` |
+| `aarch64-pc-windows-msvc` (Windows arm64, Windows 10+) | `windows-11-arm` | `presenter-v0.1.0-aarch64-pc-windows-msvc.zip` |
 
 Each archive holds one directory with the archive's name. That directory contains the
-`presenter` binary, `LICENSE`, `README.md` and `THIRD-PARTY-LICENSES/` (see
-[Third-party licenses](#third-party-licenses)). Every entry is owned by `root`, and macOS
-archives carry no extended attributes; the workflow fails otherwise (see
+`presenter` binary (`presenter.exe` on Windows), `LICENSE`, `README.md` and
+`THIRD-PARTY-LICENSES/` (see [Third-party licenses](#third-party-licenses)). In the
+tarballs every entry is owned by `root`, and macOS archives carry no extended attributes;
+in the zips every entry name uses `/`; the workflow fails otherwise (see
 [What the workflow checks](#what-the-workflow-checks)).
 The binary is self-contained: the themes, reveal.js and KaTeX are embedded. It needs only
 the system's own libraries. On macOS those are `libSystem`, `libiconv` and the
 CoreFoundation and CoreServices frameworks, which the file watcher uses for FSEvents
 (checked with `otool -L`). On Linux they are glibc and `libgcc_s`, as for any Rust binary.
+On Windows the C runtime is linked statically ([`.cargo/config.toml`](../../.cargo/config.toml)
+sets `-C target-feature=+crt-static` for the two MSVC targets), so the Visual C++
+Redistributable is not needed. `presenter export pdf` and `export pptx` are not available
+on Windows: `src/pdf.rs` starts Chrome through `/bin/sh`, and says so.
 
 ## Checklist
 
@@ -49,7 +56,7 @@ CoreFoundation and CoreServices frameworks, which the file watcher uses for FSEv
    A suffix such as `v0.2.0-rc.1` makes a pre-release. `Cargo.toml` must then say
    `0.2.0-rc.1`.
 6. Watch the "Release" run on the Actions tab. When it succeeds, check the release page:
-   four archives, `SHA256SUMS`, and the notes from the changelog. Then try one binary:
+   six archives, `SHA256SUMS`, and the notes from the changelog. Then try one binary:
 
    ```sh
    curl -LO https://github.com/<owner>/<repo>/releases/download/v0.1.0/presenter-v0.1.0-aarch64-apple-darwin.tar.gz
@@ -68,12 +75,12 @@ CoreFoundation and CoreServices frameworks, which the file watcher uses for FSEv
 | job | checks |
 |---|---|
 | `label` | On a tag push, the tag is exactly `v` + the `Cargo.toml` version, and it is annotated. |
-| `build` (×4) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. The "package" step reads the archive back (Python's `tarfile`) and fails unless every entry belongs to `root:root` (uid and gid 0, so not to the builder's user), no entry is an AppleDouble `._*` file, and no entry has a pax header keyword that POSIX does not define. macOS `tar` would store extended attributes such as `com.apple.provenance` as `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*` headers, and GNU `tar` warns about each of them when it extracts the archive. |
-| `release` | All four archives exist. `gh release create --verify-tag` publishes them with `SHA256SUMS`. |
+| `build` (×6) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. The "package" step reads the archive back (Python's `tarfile`) and fails unless every entry belongs to `root:root` (uid and gid 0, so not to the builder's user), no entry is an AppleDouble `._*` file, and no entry has a pax header keyword that POSIX does not define. macOS `tar` would store extended attributes such as `com.apple.provenance` as `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*` headers, and GNU `tar` warns about each of them when it extracts the archive. On Windows the step writes a zip with Python's `zipfile` instead and reads it back: the data checks out (`testzip`), every entry is under the archive's directory with `/` separators, and `presenter.exe` is there. |
+| `release` | All six archives exist. `gh release create --verify-tag` publishes them with `SHA256SUMS`. |
 
-The release job runs only after all four builds succeed, so a release is never partial.
+The release job runs only after all six builds succeed, so a release is never partial.
 The `label` job checks the tag first, so a wrong or lightweight tag fails in seconds
-instead of after four release builds.
+instead of after six release builds.
 The build jobs use no cache: release binaries start from a clean slate. A cache restored
 from another branch would also be a supply-chain risk.
 
@@ -129,7 +136,9 @@ There are two ways to try the workflow without publishing a real release.
   (`gh release delete v0.1.0`) before re-running the job, or upload the files by hand with
   `gh release upload`.
 - **A runner label is retired.** GitHub retires runner images. For example, the task plan
-  named `macos-13`, which no longer exists, so x86_64 macOS builds on `macos-15-intel`.
+  named `macos-13`, which no longer exists, so x86_64 macOS builds on `macos-15-intel`; and
+  `macos-14` retires in November 2026 (with brownouts through October), so arm64 macOS
+  builds on `macos-15` since 2026-10-10.
   `actionlint` reports unknown labels. When a label moves to another architecture, the
   native target check fails with a clear message.
 
@@ -240,8 +249,8 @@ the same 10,963,392-byte binary.
   them comments and the license step, and it uses only GitHub's own actions,
   `dtolnay/rust-toolchain` and the `gh` CLI that is already on the runners. `cargo-dist`
   generates a longer workflow, adds its own config and installer scripts, and must be
-  re-generated with a pinned `dist` binary whenever it is upgraded. It would not reduce the YAML for four plain tarballs. Reconsider it if
-  installers (shell, Homebrew, MSI) or Windows builds are wanted.
+  re-generated with a pinned `dist` binary whenever it is upgraded. It would not reduce the
+  YAML for six plain archives. Reconsider it if installers (shell, Homebrew, MSI) are wanted.
 - **Native runners, not `cross`.** Every target has a GitHub-hosted runner, so each binary
   is tested on its own platform before it is packaged. `cross` would build Linux arm64 under
   emulation and could not run the macOS tests at all.
@@ -249,6 +258,18 @@ the same 10,963,392-byte binary.
   on the older LTS lets them run on more distributions. Systems with a glibc older than
   Ubuntu 22.04's 2.35 may lack required symbol versions. A static musl build is the next
   step if that becomes a problem.
+- **Windows: native runners, zips, a static C runtime.** `windows-2025` (x64) and
+  `windows-11-arm` (arm64) build natively, so the tests run there too, as on the other
+  platforms. The archives are zips because that is what Windows opens by itself.
+  `.cargo/config.toml` links the C runtime statically for the two MSVC targets, so the
+  binary needs no Visual C++ Redistributable, the usual choice for Rust tools shipped as
+  one file. The workflow's steps run in the runner's Git Bash (`defaults.run.shell`), with
+  two Windows adjustments: `cargo metadata` prints `\`-separated paths, so the jq filter of
+  the license step strips `\Cargo.toml` as well as `/Cargo.toml` and `cygpath` converts
+  the crate directories for `find`; and the zip is written and checked by Python, which is
+  on every runner. `.gitattributes` (`* text=auto eol=lf`) keeps every text file LF in a
+  Windows checkout, so the tests compare the same bytes as on macOS and Linux. `export pdf`
+  and `export pptx` are not available on Windows (above).
 - **`dtolnay/rust-toolchain@stable`**, as in CI. A release is built with the stable Rust
   of the day; `--locked` pins every dependency.
 
@@ -309,3 +330,62 @@ on top of commit b69ace7:
   an archive made without the ownership and `--no-xattrs` flags, with two errors for each of
   its 103 entries: owned by the builder, and `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*`
   headers.
+
+Checks done on 2026-10-10 for the two Windows targets and the runner change (on top of
+commit 93e6e89), on a Mac, without a Windows machine:
+
+- `actionlint` with `shellcheck`: no findings for `release.yml`, `ci.yml` and `site.yml`.
+- The jq filter of the license step strips both `/Cargo.toml` and `\Cargo.toml` (run on a
+  `C:\…` sample path). The zip packaging code, extracted from the YAML and run on a sample
+  directory, wrote the archive, read it back and listed its entries.
+- `cargo clippy --target aarch64-pc-windows-msvc --all-targets --all-features -- -D warnings`
+  passes, with the target's standard library from rustup and stand-in C tools for the build
+  scripts of `blake3` and `ring` (a check links nothing). It had found an `unused_mut` in
+  `create_private_dir` and seven test helpers in `src/pdf.rs` and `tests/cli_export.rs`
+  that only Unix tests use; they are gated with `#[cfg(unix)]` now. The tests themselves
+  have not run on Windows yet: the first CI run on `windows-latest`, or a dry run of this
+  workflow, shows whether they pass there.
+- The labels `windows-2025`, `windows-11-arm` and `macos-15` were checked against
+  actions/runner-images. Both Windows images ship Rustup, Python, jq, 7-Zip and Git Bash,
+  and the arm64 image has Visual Studio's ARM64 build tools.
+- The first CI run on `windows-latest` (pull request #5): `cargo fmt` and `cargo clippy`
+  passed; `cargo test` failed 16 unit tests, none a build problem. Twelve asserted POSIX
+  paths (`/abs/…` spellings, `/` separators, canonical paths without `\\?\`) and are gated
+  with `#[cfg(unix)]` or compare `Path::join` output now. Two expected the "not an
+  executable" error, which the platform guard precedes on Windows. One joined `new/..` onto
+  a canonical path, which `PathBuf::push` resolves itself on Windows; the test joins as
+  text now. One found a real difference: Windows refuses to open a directory (permission
+  denied) where Unix opens it, so `serve` answered a directory URL with an error other
+  than 404; `open_range` maps that to not found now. Also, the `init` hint for a name
+  starting with `-` is spelled `./name` on every platform (it was `'.\name'` on Windows).
+  The integration tests had not run yet (the unit tests failed first); CI runs with
+  `--no-fail-fast` now, so one run shows every test binary.
+- The second run reached the integration tests: 47 failures in 14 test binaries, again
+  none a build problem. Most showed relative paths with `\`, where the tests, the decks,
+  the guide and the HTML spell `/`: `display_path` and the few other sites that show a
+  relative path join it with `/` on every platform now, and an absolute path keeps its
+  native spelling. The watcher took Windows' "directory modified" events (one for every
+  entry written, renamed or removed inside a directory) as changes, which turned a
+  stylesheet edit into a content rebuild and the build's own output into a change; those
+  events are ignored now, while a created, removed or renamed directory still counts. The
+  usage lines said `presenter.exe`, so clap's `bin_name` pins `presenter`. A `--config`
+  error names the file as typed instead of its absolute path. `theme new a/..` lost its
+  "(that is …)", because `std::path::absolute` resolves `..` on Windows; the message looks
+  for the `..` itself. The remaining tests compared OS-native text (`\\?\` canonical paths,
+  mixed separators, the compiler's `tests\…` panic location, a `\`-separated Sass URL, a
+  percent-encoded `C:…` reference that reads as a URL scheme) and compare paths, or
+  `/`-normalized text, now.
+- The fourth run left one watcher test that had passed the run before: removing a
+  directory above a watched one. Windows reports that only through the parent's watch
+  (the watched directory's own handle dies with it), and the watcher ignored the event
+  because the removed directory was neither a target nor on the way to a missing one;
+  removing or renaming a directory above a target is a structural change now, on every
+  platform. (The same run also saw the browser smoke test time out while Chrome started on
+  the loaded runner: that test gives the start-up its own time now and keeps its short
+  timeout for the navigation it measures.)
+- The fifth run was the first to pass the debug tests on Windows; the release-mode tests
+  then hit the same limitation one level up: removing the deck's own directory, the only
+  watched one. Windows reports nothing when a watched directory itself is removed (the
+  parent's watch would), so on Windows the watcher now also watches the parent of every
+  watched directory, non-recursively (`guard_watches`); `watched_dirs()` leaves these out,
+  so the tests' expectations hold on every platform.

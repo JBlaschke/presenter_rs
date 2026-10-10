@@ -43,7 +43,9 @@
 //! command: `Wrote …` lines, `path:line:` diagnostics, error reports, `check --format
 //! json`): relative to the current directory, with `..` when the path is outside it but
 //! shares more than the root with it and the relative form is no longer than the absolute
-//! one; else as given. A path that is not below the current directory as spelled is also
+//! one; else as given. A relative form is `/`-separated on every platform (the separator of
+//! decks, URLs and this documentation, which Windows takes too); an absolute path keeps its
+//! spelling. A path that is not below the current directory as spelled is also
 //! compared in its canonical form, so a symbolic link in its prefix (such as `/tmp` →
 //! `/private/tmp` on macOS) does not keep it absolute. A `..` is resolved as the file
 //! system resolves it, so after a symbolic link it leaves the directory the link points to
@@ -100,7 +102,8 @@ pub const EXIT_USAGE: u8 = 2;
 
 /// Turn Markdown files and Jupyter notebooks into reveal.js presentations.
 #[derive(Debug, Parser)]
-#[command(name = "presenter", version = version(), about)]
+// `bin_name`: the usage lines say `presenter` on Windows too, not `presenter.exe`.
+#[command(name = "presenter", bin_name = "presenter", version = version(), about)]
 pub struct Cli {
     /// Flags that apply to every command.
     #[command(flatten)]
@@ -562,7 +565,7 @@ fn relative_to(path: &Path, cwd: Option<&Path>) -> PathBuf {
         .as_ref()
         .filter(|relative| !relative.starts_with(".."))
     {
-        return below.clone();
+        return slashed(below);
     }
     let canonical = match (canonical_form(&absolute), std::fs::canonicalize(cwd).ok()) {
         (Some(path), Some(cwd)) => relative_path(&path, &cwd),
@@ -571,14 +574,33 @@ fn relative_to(path: &Path, cwd: Option<&Path>) -> PathBuf {
     match (spelled, canonical) {
         (Some(spelled), Some(canonical)) => {
             if canonical.components().count() < spelled.components().count() {
-                canonical
+                slashed(&canonical)
             } else {
-                spelled
+                slashed(&spelled)
             }
         }
-        (Some(relative), None) | (None, Some(relative)) => relative,
+        (Some(relative), None) | (None, Some(relative)) => slashed(&relative),
         (None, None) => path.to_path_buf(),
     }
+}
+
+/// A relative path for a message, `/`-separated on every platform: the separator of decks,
+/// URLs and the documentation, which Windows takes too. A path with a root or a drive
+/// prefix is returned as it is (the module docs' "Paths in messages").
+pub(crate) fn slashed(path: &Path) -> PathBuf {
+    if path.has_root()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return path.to_path_buf();
+    }
+    let text = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    PathBuf::from(text)
 }
 
 /// `path` relative to `base` (both absolute and normalized), with `..` for the components

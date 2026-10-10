@@ -372,7 +372,11 @@ fn resolve_target(dir: &Path) -> anyhow::Result<(PathBuf, Found)> {
     let mut given = PathBuf::new();
     for component in dir.components() {
         if found == Found::NotDir {
-            return Err(UsageError(format!("{} is not a directory", given.display())).into());
+            return Err(UsageError(format!(
+                "{} is not a directory",
+                super::slashed(&given).display()
+            ))
+            .into());
         }
         let previous = given.clone();
         given.push(component);
@@ -387,7 +391,7 @@ fn resolve_target(dir: &Path) -> anyhow::Result<(PathBuf, Found)> {
                 return Err(UsageError(format!(
                     "invalid directory {}: `..` follows {}, which does not exist",
                     dir.display(),
-                    previous.display()
+                    super::slashed(&previous).display()
                 ))
                 .into());
             }
@@ -411,14 +415,14 @@ fn inspect(path: PathBuf, given: &Path) -> anyhow::Result<(PathBuf, Found)> {
             return Ok((path, Found::Missing));
         }
         Err(err) => {
-            let message = format!("cannot read {}", given.display());
+            let message = format!("cannot read {}", super::slashed(given).display());
             return Err(anyhow::Error::new(err).context(message));
         }
     };
     let (path, metadata) = if metadata.file_type().is_symlink() {
         let target = std::fs::canonicalize(&path).map_err(|err| broken_link(err, given))?;
         let metadata = std::fs::metadata(&target)
-            .with_context(|| format!("cannot read {}", given.display()))?;
+            .with_context(|| format!("cannot read {}", super::slashed(given).display()))?;
         (target, metadata)
     } else {
         (path, metadata)
@@ -436,6 +440,7 @@ fn inspect(path: PathBuf, given: &Path) -> anyhow::Result<(PathBuf, Found)> {
 /// through a file, or loops), so it is reported like the other target problems; a plain
 /// I/O error (exit 1) when the target may be fine but cannot be read (permission denied).
 fn broken_link(err: std::io::Error, given: &Path) -> anyhow::Error {
+    let given = super::slashed(given);
     let given = given.display();
     match err.kind() {
         std::io::ErrorKind::PermissionDenied => {
@@ -669,7 +674,9 @@ fn described(dir: &Path) -> String {
 fn cd_argument(dir: &Path) -> String {
     let text = dir.display().to_string();
     if text.starts_with('-') {
-        shell_word(&Path::new(".").join(dir))
+        // Spelled `./`, which every shell takes, also on Windows, where `Path::join`
+        // would write `.\` and then need quotes.
+        shell_word_of(&format!("./{text}"))
     } else {
         shell_word(dir)
     }
@@ -678,13 +685,17 @@ fn cd_argument(dir: &Path) -> String {
 /// `path` as one shell word: as is when it only has characters no shell treats specially,
 /// else single-quoted.
 fn shell_word(path: &Path) -> String {
-    let text = path.display().to_string();
+    shell_word_of(&path.display().to_string())
+}
+
+/// [`shell_word`] of a path's text.
+fn shell_word_of(text: &str) -> String {
     let plain = !text.is_empty()
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c));
     if plain {
-        text
+        text.to_string()
     } else {
         format!("'{}'", text.replace('\'', r"'\''"))
     }
@@ -929,8 +940,14 @@ mod tests {
     }
 
     /// `resolve_target` of `rel` below `root`: Ok(what it is) or Err(the usage message).
+    /// The path is joined as text: `root` is canonical, and on Windows `PathBuf::push` onto
+    /// a canonical (`\\?\`) path resolves `.` and `..` itself, which the tests want
+    /// `resolve_target` to see.
     fn resolve(root: &Path, rel: &str) -> Result<(PathBuf, Found), String> {
-        resolve_target(&root.join(rel)).map_err(|err| {
+        let mut target = root.as_os_str().to_os_string();
+        target.push(std::path::MAIN_SEPARATOR_STR);
+        target.push(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        resolve_target(Path::new(&target)).map_err(|err| {
             assert!(err.is::<UsageError>(), "{rel}: {err:#}");
             err.to_string()
         })
