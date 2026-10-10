@@ -120,7 +120,8 @@ const CSS_SWAPPED: &str = r#"async (old) => {
 /// What the page went through since [`LIVE_READY`]: its markers (`null` once wiped out),
 /// the types of its navigation entries (`navigate`, or `reload` after a reload), how often
 /// it fetched `GET /` (the client does once at start and once per in-place content update),
-/// reveal.js' `transition` setting and the client's build id.
+/// reveal.js' `transition` setting, whether the live-reload client is connected (it has had
+/// its `hello`) and the client's build id (`null` until then).
 const PAGE_STATE: &str = r#"({
   marker: window.__presenterSmokeMarker ?? null,
   slideMarker: document.querySelector('.reveal .slides section')?.__presenterSmokeMarker ?? null,
@@ -128,6 +129,7 @@ const PAGE_STATE: &str = r#"({
   rootFetches: performance.getEntriesByType('resource')
     .filter((entry) => new URL(entry.name).pathname === '/').length,
   transition: typeof Reveal !== 'undefined' && Reveal.isReady() ? Reveal.getConfig().transition : null,
+  connected: window.__presenterLiveReload?.state.connected ?? false,
   buildId: window.__presenterLiveReload?.state.buildId ?? null,
 })"#;
 
@@ -579,8 +581,8 @@ fn serve_swaps_the_theme_css_without_a_reload() {
 
 /// `presenter serve` the example deck, open it, change a reveal.js setting in
 /// `presenter.toml` (the page's `Reveal.initialize` call, outside the slides, changes) and
-/// check that the client reloads the page exactly once and the new setting applies (live
-/// reload QA checklist, item 18).
+/// check that the client reloads the page exactly once, for the one rebuild the change
+/// causes, and that the new setting applies (live reload QA checklist, item 18).
 #[test]
 fn serve_reloads_the_page_once_when_the_reveal_config_changes() {
     let _turn = serial();
@@ -601,13 +603,17 @@ fn serve_reloads_the_page_once_when_the_reveal_config_changes() {
         text.replace("transition = \"slide\"", "transition = \"fade\""),
     )
     .unwrap();
-    // The page goes away while it reloads: calls may fail meanwhile.
+    // The page goes away while it reloads: calls may fail meanwhile. The reloaded page
+    // counts once its client is connected again (its `hello` sets the build id): reveal.js
+    // reports ready on a timer, before the client's script has even been fetched, and a
+    // state read in that window has no build id yet (a CI flake, 2026-10-09).
     let deadline = Instant::now() + Duration::from_secs(20);
     let reloaded = loop {
         let state = page.evaluate(PAGE_STATE);
         if let Ok(state) = &state
             && state["navigations"] == json!(["reload"])
             && state["transition"] == "fade"
+            && state["connected"] == true
         {
             break state.clone();
         }
@@ -619,8 +625,15 @@ fn serve_reloads_the_page_once_when_the_reveal_config_changes() {
         thread::sleep(Duration::from_millis(100));
     };
     assert_eq!(reloaded["marker"], Value::Null, "{reloaded}");
+    // The one change caused one rebuild: the reloaded page connected to the build after
+    // the one the page was opened with.
+    assert_eq!(
+        reloaded["buildId"],
+        theme_version(&before["href"]) + 1,
+        "not the one rebuild after the first build: {reloaded}"
+    );
 
-    // Settled: connected again, and no second reload follows.
+    // Settled: connected again, and no second reload or build follows.
     let again = evaluate(&mut page, LIVE_READY);
     assert!(again.get("error").is_none(), "{again}");
     thread::sleep(Duration::from_millis(1500));
@@ -631,7 +644,10 @@ fn serve_reloads_the_page_once_when_the_reveal_config_changes() {
         "the page reloaded again: {after}"
     );
     assert_eq!(after["navigations"], json!(["reload"]), "{after}");
-    assert_eq!(after["buildId"], reloaded["buildId"], "{after}");
+    assert_eq!(
+        after["buildId"], reloaded["buildId"],
+        "a build followed the reload: {reloaded} -> {after}"
+    );
     assert_no_page_errors(&mut page);
 }
 
