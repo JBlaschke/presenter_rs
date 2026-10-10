@@ -1420,9 +1420,9 @@ fn decks_in_sibling_directories_keep_their_own_default_output() {
                 .current_dir(&course)
                 .args(["build", &format!("{week}/slides.md")]),
         );
-        let expected = Path::new(week).join("dist/slides.html");
+        // (`/`-separated on every platform: cli::display_path.)
         assert!(
-            stdout.starts_with(&format!("Wrote {} (1 slide, ", expected.display())),
+            stdout.starts_with(&format!("Wrote {week}/dist/slides.html (1 slide, ")),
             "{stdout}"
         );
     }

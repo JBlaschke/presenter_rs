@@ -1114,8 +1114,14 @@ fn problem_summary(
     found
         .iter()
         .map(|d| {
+            // Joined with `/` (the path is native, `t\theme.toml` on Windows).
             let path = d.path.as_ref().map_or(String::new(), |p| {
-                p.strip_prefix(&root).unwrap().display().to_string()
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
             });
             (d.code.to_string(), path, d.level)
         })
