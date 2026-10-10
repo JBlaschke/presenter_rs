@@ -80,9 +80,10 @@ notes pane.
 - [x] The file is read by python-pptx and rendered by macOS's QuickLook with the slides
   looking like the deck (the example decks, the notebook example and the private EIT theme
   with its photo background, translucent band, gradient rule and logo; manual checks,
-  2026-10-10). Opened in PowerPoint itself: not yet done by a person. PowerPoint and Keynote
-  could not be scripted into opening it (both stop answering AppleScript on `open`, as
-  sandboxed apps do when asked for a file outside their granted access).
+  2026-10-10). Opened in PowerPoint itself, with the EIT template deck, by the author on the
+  pull request (2026-10-10): looks good. That check stays manual: PowerPoint and Keynote
+  cannot be scripted into opening a file from here (both stop answering AppleScript on
+  `open`, as sandboxed apps do when asked for a file outside their granted access).
 
 ## Known limits
 - Text boxes keep the browser's geometry; PowerPoint reflows the text in its own font
