@@ -11,17 +11,17 @@ use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use presenter::pipeline::{self, BuildOptions};
 use presenter::serve::watch::{
-    ChangeBatch, ChangeKind, DEBOUNCE, WatchSet, WatchStatus, Watcher, canonical,
+    ChangeBatch, ChangeKind, DEBOUNCE, Debounce, WatchSet, WatchStatus, Watcher, canonical,
     run_build_watch_with, try_build_watched, watch_set_before_build, watch_set_for,
     watch_set_for_failed,
 };
+use tracing::subscriber::Interest;
 
 /// How long a batch may take to arrive.
 const BATCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,14 +61,29 @@ fn deck_and_theme() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     (dir, deck, theme, css)
 }
 
-/// Starts a watcher on `set` and waits until it is surely running, discarding anything
-/// it reports for the files just created.
+/// Starts a watcher on `set` coalescing changes with the default window ([`start_with`]).
 fn start(set: &WatchSet) -> (Watcher, Receiver<ChangeBatch>) {
+    start_with(set, Debounce::default())
+}
+
+/// Starts a watcher on `set` coalescing changes with `debounce`, and waits until it is
+/// surely running, discarding anything it reports for the files just created: FSEvents
+/// delivers the events of changes made shortly before its stream was created (inotify does
+/// not), the later the more loaded the machine is.
+fn start_with(set: &WatchSet, debounce: Debounce) -> (Watcher, Receiver<ChangeBatch>) {
     let (tx, rx) = mpsc::channel();
-    let watcher = Watcher::start(set, tx).unwrap();
+    let watcher = Watcher::start_with(set, tx, debounce).unwrap();
     std::thread::sleep(Duration::from_millis(500));
-    drain(&rx, Duration::from_millis(400));
+    drain(&rx, debounce.quiet + Duration::from_millis(400));
     (watcher, rx)
+}
+
+/// Waits until the OS has reported the changes made so far to the inputs of `set`, so that
+/// a watcher started afterwards, such as the rebuild loop's ([`run_loop`] starts it right
+/// away), reports only later changes ([`start_with`]).
+fn settle(set: &WatchSet) {
+    // Started, left to catch up with the changes, dropped.
+    let (_watcher, _rx) = start(set);
 }
 
 /// The next batch; fails the test after [`BATCH_TIMEOUT`].
@@ -92,7 +107,7 @@ fn drain(rx: &Receiver<ChangeBatch>, quiet: Duration) -> Vec<ChangeBatch> {
 }
 
 #[test]
-fn edits_produce_classified_batches_and_bursts_coalesce() {
+fn edits_produce_classified_batches() {
     let (_dir, deck, theme, css) = deck_and_theme();
     let set = WatchSet::new([deck.clone()], [theme]);
     let (_watcher, rx) = start(&set);
@@ -116,6 +131,21 @@ fn edits_produce_classified_batches_and_bursts_coalesce() {
     assert_eq!(batch.kind, ChangeKind::Css);
     assert_eq!(batch.paths, vec![canonical(&css)]);
     assert_eq!(drain(&rx, QUIET), vec![]);
+}
+
+/// Changes made together are one batch. A loaded machine may deliver the events of two
+/// changes made 30 ms apart further apart than the 150 ms window (FSEvents on a busy CI
+/// runner did), which would make them two batches: the watcher coalesces with a wider
+/// window here, so that the check does not depend on how promptly the OS delivers.
+#[test]
+fn a_burst_of_edits_is_one_batch() {
+    let (_dir, deck, theme, css) = deck_and_theme();
+    let set = WatchSet::new([deck.clone()], [theme]);
+    let debounce = Debounce {
+        quiet: Duration::from_secs(1),
+        ..Debounce::default()
+    };
+    let (_watcher, rx) = start_with(&set, debounce);
 
     // Both within 50 ms: one batch, content (one path is not a stylesheet).
     append(&deck, "\neven more\n");
@@ -124,7 +154,11 @@ fn edits_produce_classified_batches_and_bursts_coalesce() {
     let batch = next(&rx, "writing both files");
     assert_eq!(batch.kind, ChangeKind::Content);
     assert_eq!(batch.paths, vec![canonical(&deck), canonical(&css)]);
-    assert_eq!(drain(&rx, QUIET), vec![], "a second batch for the burst");
+    assert_eq!(
+        drain(&rx, QUIET + debounce.quiet),
+        vec![],
+        "a second batch for the burst"
+    );
 }
 
 #[test]
@@ -759,32 +793,26 @@ fn status_text(status: &WatchStatus<'_>) -> String {
     }
 }
 
-/// `run_build_watch_with` on a thread. Every status goes to the returned receiver as
-/// [`status_text`]; `on_status` runs first. The loop stops at the first status that
-/// arrives after `stop` was set (then `done` is sent): the flag is read before the status
-/// is sent, so setting it in reply to one status stops at the next.
+/// `run_build_watch_with` on a thread. Every status goes to `on_status` first, then to the
+/// returned receiver as [`status_text`]; the loop ends with the status for which
+/// `on_status` returns `Break` (then `done` is sent). Deciding there, on the loop's thread,
+/// rather than from the test's thread in reply to a status, cannot lose the race against
+/// the loop's next status.
 fn run_loop(
     opts: BuildOptions,
     out: PathBuf,
-    mut on_status: impl FnMut(&WatchStatus<'_>) + Send + 'static,
-) -> (Receiver<String>, Arc<AtomicBool>) {
+    mut on_status: impl FnMut(&WatchStatus<'_>) -> ControlFlow<()> + Send + 'static,
+) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
     std::thread::spawn(move || {
         let result = run_build_watch_with(&opts, &out, |status| {
-            let stop_now = thread_stop.load(Ordering::SeqCst);
-            on_status(&status);
+            let flow = on_status(&status);
             let _ = tx.send(status_text(&status));
-            if stop_now {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
+            flow
         });
         let _ = tx.send(format!("done {result:?}"));
     });
-    (rx, stop)
+    rx
 }
 
 /// The next status of [`run_loop`], within 30 s (a build is included).
@@ -801,14 +829,18 @@ fn a_change_saved_while_the_first_build_runs_is_rebuilt() {
     let out = dir.path().join("out.html");
     let edited = deck.clone();
     let mut builds = 0;
-    let (rx, stop) = run_loop(BuildOptions::new(&deck), out.clone(), move |status| {
+    let rx = run_loop(BuildOptions::new(&deck), out.clone(), move |status| {
         if matches!(status, WatchStatus::Built { .. }) {
             builds += 1;
             if builds == 1 {
                 // The first build has read the deck: this save must not be lost.
                 append(&edited, "\n---\n\n## Saved during the build\n");
             }
+            if builds == 2 {
+                return ControlFlow::Break(());
+            }
         }
+        ControlFlow::Continue(())
     });
     assert_eq!(next_status(&rx, "the first build"), "built 1");
     assert_eq!(next_status(&rx, "watching"), "watching");
@@ -816,7 +848,6 @@ fn a_change_saved_while_the_first_build_runs_is_rebuilt() {
         next_status(&rx, "the save during the first build"),
         "changed: Content slides.md"
     );
-    stop.store(true, Ordering::SeqCst);
     assert_eq!(next_status(&rx, "the rebuild"), "built 2");
     assert_eq!(next_status(&rx, "the end of the loop"), "done Ok(())");
     assert!(contains(&out, "Saved during the build"));
@@ -833,11 +864,16 @@ fn writing_the_output_inside_a_watched_theme_does_not_rebuild() {
     std::fs::create_dir(theme.join("styles")).unwrap();
     let deck = dir.path().join("slides.md");
     write(&deck, "# One\n");
+    // Or the loop's watcher would report the files just created as a change.
+    settle(&WatchSet::new([deck.clone()], [theme.clone()]));
     let mut opts = BuildOptions::new(&deck);
     opts.cli.theme = Some(theme.display().to_string());
     // The build creates theme/build/sub/ for its output.
     let out = theme.join("build/sub/out.html");
-    let (rx, stop) = run_loop(opts, out.clone(), |_| {});
+    let rx = run_loop(opts, out.clone(), |status| match status {
+        WatchStatus::Changed(_) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    });
     assert_eq!(next_status(&rx, "the first build"), "built 1");
     assert_eq!(next_status(&rx, "watching"), "watching");
     match rx.recv_timeout(Duration::from_secs(2)) {
@@ -847,7 +883,6 @@ fn writing_the_output_inside_a_watched_theme_does_not_rebuild() {
     assert!(out.is_file());
 
     // The theme itself is still watched.
-    stop.store(true, Ordering::SeqCst);
     write(&theme.join("styles/extra.css"), "p { color: red; }\n");
     assert_eq!(
         next_status(&rx, "a stylesheet in the theme"),
@@ -947,9 +982,39 @@ fn build_watch_follows_a_theme_being_created_and_fixed() {
     });
 }
 
+/// A subscriber that records nothing but is undecided about every callsite, the global
+/// default while [`counting_parses`] counts. tracing caches per callsite whether any
+/// subscriber wants it, and while a single subscriber is registered it computes that from
+/// the subscriber of the thread that first hits the callsite. Without a global subscriber,
+/// a `parsed` event first logged by another test's build (on a thread without a
+/// subscriber) while `counting_parses` has installed its own would be cached as unwanted
+/// for every thread, and the count would be 0 (it was, on a CI runner). With this global
+/// one registered too, tracing asks the current thread's subscriber every time instead.
+struct Undecided;
+
+impl tracing::Subscriber for Undecided {
+    fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 /// `f`'s result and how many times it parsed a deck on this thread: the pipeline logs one
 /// `parsed <file>` debug event per parse ([`pipeline::try_parse_only`]), counted here.
 fn counting_parses<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    static GLOBAL: Once = Once::new();
+    GLOBAL.call_once(|| tracing::subscriber::set_global_default(Undecided).unwrap());
+
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for Capture {

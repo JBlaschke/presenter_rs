@@ -35,14 +35,15 @@
 //!
 //! [`Watcher`] hands the backend's events (notify's recommended watcher) to a coalescing
 //! thread, which gathers the relevant paths until none has arrived for [`DEBOUNCE`]
-//! (150 ms; at most [`MAX_BATCH_WAIT`] after the first), so a save touching several files
-//! (or a `git checkout`) becomes **one** [`ChangeBatch`]: its relevant paths, sorted, and
-//! their [`ChangeKind`] ([`classify`]). Any event kind counts as a change (create, modify,
-//! remove, rename, metadata) except a mere access: inotify reports every `open()`, and the
-//! build itself opens its inputs. When the backend lost events (a rescan), the batch lists
-//! every watched file. A watched directory that is created or removed (deleted and
-//! recreated, e.g. by `git checkout`) counts as a change too, and the next
-//! [`Watcher::update`] watches it again.
+//! (150 ms; at most [`MAX_BATCH_WAIT`] after the first; [`Watcher::start_with`] takes
+//! other times, a [`Debounce`]), so a save touching several files (or a `git checkout`)
+//! becomes **one** [`ChangeBatch`]: its relevant paths, sorted, and their [`ChangeKind`]
+//! ([`classify`]). Any event kind counts as a change (create, modify, remove, rename,
+//! metadata) except a mere access: inotify reports every `open()`, and the build itself
+//! opens its inputs. When the backend lost events (a rescan), the batch lists every
+//! watched file. A watched directory that is created or removed (deleted and recreated,
+//! e.g. by `git checkout`) counts as a change too, and the next [`Watcher::update`]
+//! watches it again.
 //!
 //! The events are not passed through `notify-debouncer-full` (which live-reload.md §5
 //! names): it drops a creation followed by a removal of the same path, and everything it
@@ -100,6 +101,30 @@ pub const DEBOUNCE: Duration = Duration::from_millis(150);
 /// A batch is sent at the latest this long after its first path, even while changes keep
 /// arriving.
 pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(2);
+
+/// How a [`Watcher`] coalesces changes into batches (module docs): a batch is sent once no
+/// relevant change has arrived for `quiet`, and at the latest `max_wait` after its first
+/// change. The default is the contract of live-reload.md §5 ([`DEBOUNCE`],
+/// [`MAX_BATCH_WAIT`]), which [`Watcher::start`] uses; a test can widen `quiet` with
+/// [`Watcher::start_with`], so that the time the OS takes to deliver the events of two
+/// changes made together cannot split them into two batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Debounce {
+    /// A batch is sent once no relevant change has arrived for this long.
+    pub quiet: Duration,
+    /// A batch is sent at the latest this long after its first change, even while changes
+    /// keep arriving (so a `quiet` longer than this never waits longer than this).
+    pub max_wait: Duration,
+}
+
+impl Default for Debounce {
+    fn default() -> Debounce {
+        Debounce {
+            quiet: DEBOUNCE,
+            max_wait: MAX_BATCH_WAIT,
+        }
+    }
+}
 
 /// What kind of rebuild a change batch requires (live-reload.md §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -703,12 +728,23 @@ impl std::fmt::Debug for Watcher {
 }
 
 impl Watcher {
-    /// Starts watching `set`; batches go to `tx` until the watcher is dropped.
+    /// Starts watching `set`; batches go to `tx` until the watcher is dropped. Changes are
+    /// coalesced with [`Debounce::default`] (the contract: [`DEBOUNCE`],
+    /// [`MAX_BATCH_WAIT`]).
     ///
     /// Errors: the backend cannot be started, or a directory that exists cannot be watched
     /// (e.g. the inotify watch limit). A directory that does not exist is watched through
     /// its nearest existing ancestor (module docs).
     pub fn start(set: &WatchSet, tx: Sender<ChangeBatch>) -> Result<Watcher> {
+        Watcher::start_with(set, tx, Debounce::default())
+    }
+
+    /// [`Watcher::start`] coalescing changes with `debounce` instead of the default.
+    pub fn start_with(
+        set: &WatchSet,
+        tx: Sender<ChangeBatch>,
+        debounce: Debounce,
+    ) -> Result<Watcher> {
         let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<Event>>();
         let backend =
             notify::recommended_watcher(raw_tx).map_err(|e| watch_error("start", None, e))?;
@@ -722,7 +758,7 @@ impl Watcher {
         let thread_tx = tx.clone();
         std::thread::Builder::new()
             .name("presenter-watch".into())
-            .spawn(move || coalesce(&raw_rx, &thread_tx, &thread_shared))?;
+            .spawn(move || coalesce(&raw_rx, &thread_tx, &thread_shared, debounce))?;
         let mut watcher = Watcher {
             backend,
             shared,
@@ -909,12 +945,14 @@ fn watch_error(what: &str, dir: Option<&Path>, err: notify::Error) -> Error {
     Error::Other(format!("file watcher: cannot {what}{dir}: {err}"))
 }
 
-/// The coalescing thread: gathers the backend's events into batches (module docs) and
-/// sends them on `tx`. Returns when the backend is gone or nobody receives.
+/// The coalescing thread: gathers the backend's events into batches (module docs; the
+/// window is `debounce`) and sends them on `tx`. Returns when the backend is gone or
+/// nobody receives.
 fn coalesce(
     raw: &Receiver<notify::Result<Event>>,
     tx: &Sender<ChangeBatch>,
     shared: &Mutex<Shared>,
+    debounce: Debounce,
 ) {
     let mut pending = BTreeSet::new();
     // When the batch being gathered got its first and its latest relevant change.
@@ -923,9 +961,10 @@ fn coalesce(
         let next = match window {
             None => raw.recv().map_err(|_| RecvTimeoutError::Disconnected),
             Some((first, last)) => raw.recv_timeout(
-                DEBOUNCE
+                debounce
+                    .quiet
                     .saturating_sub(last.elapsed())
-                    .min(MAX_BATCH_WAIT.saturating_sub(first.elapsed())),
+                    .min(debounce.max_wait.saturating_sub(first.elapsed())),
             ),
         };
         match next {
@@ -936,7 +975,7 @@ fn coalesce(
                 }
                 // Irrelevant events keep coming without a timeout: check the clock too.
                 let due = window.is_some_and(|(first, last)| {
-                    last.elapsed() >= DEBOUNCE || first.elapsed() >= MAX_BATCH_WAIT
+                    last.elapsed() >= debounce.quiet || first.elapsed() >= debounce.max_wait
                 });
                 if !due {
                     continue;
