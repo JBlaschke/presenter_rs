@@ -21,6 +21,7 @@ pub mod markdown;
 pub mod notebook;
 pub mod pdf;
 pub mod pipeline;
+pub mod pptx;
 pub mod render;
 pub mod serve;
 pub mod theme;

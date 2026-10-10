@@ -147,6 +147,26 @@ usual places; otherwise name it with `--chrome PATH` or the `CHROME_PATH` enviro
 variable. Each fragment step gets its own page (that is why six slides make nine pages);
 `pdfSeparateFragments = false` under `[reveal]` in `presenter.toml` prints each slide once.
 
+## Export to PowerPoint
+
+```sh
+presenter export pptx slides.md
+```
+
+```text
+Wrote dist/slides.pptx (9 slides, 1.1 MB)
+```
+
+Every page the PDF would have becomes one editable slide of the `.pptx`: headings,
+paragraphs, lists, code and quotes are text boxes with the theme's fonts and colours,
+tables are tables, images are your image files, and everything sits where the browser put
+it. A slide with fragments builds up step by step over several slides, and the speaker
+notes go into the notes pane. What PowerPoint cannot hold as text or shapes (display math,
+SVG, embedded pages) becomes a picture. The slide size follows the deck's: a 16:9 deck gives
+PowerPoint's Widescreen size. `--scale` sets the resolution of those pictures (2 by
+default, up to 4). PowerPoint substitutes fonts the viewer's machine lacks, so a line may
+wrap differently there; a text box grows to fit when it is edited.
+
 ## Find mistakes
 
 ```sh

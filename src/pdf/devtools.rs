@@ -232,7 +232,12 @@ impl Page {
         step: impl FnOnce(&mut Cdp<'_>, &str) -> std::result::Result<T, CallError>,
     ) -> Result<T> {
         let deadline = Instant::now() + self.timeout;
-        let mut cdp = Cdp::new(&mut self.browser, &self.nothing_served, deadline);
+        let mut cdp = Cdp::new(
+            &mut self.browser,
+            &self.nothing_served,
+            deadline,
+            self.timeout,
+        );
         cdp.next_id = self.last_id;
         cdp.stage = stage;
         let result = step(&mut cdp, &self.session);
@@ -285,7 +290,12 @@ impl Drop for Page {
     fn drop(&mut self) {
         {
             let deadline = Instant::now() + CLOSE_GRACE;
-            let mut cdp = Cdp::new(&mut self.browser, &self.nothing_served, deadline);
+            let mut cdp = Cdp::new(
+                &mut self.browser,
+                &self.nothing_served,
+                deadline,
+                CLOSE_GRACE,
+            );
             cdp.next_id = self.last_id;
             cdp.close_browser();
         }

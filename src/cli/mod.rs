@@ -19,7 +19,7 @@
 //! | `theme list/eject/new/check` | [`theme`] |
 //! | `dump` | [`dump`] |
 //! | `check` | [`check`] |
-//! | `export pdf` | [`export`] |
+//! | `export pdf`, `export pptx` | [`export`] |
 //!
 //! `run` returns the exit code for the outcomes it handles itself (e.g.
 //! `check --deny-warnings` → 1, `export` without Chrome → 3) and `Err` for failures, which
@@ -34,7 +34,8 @@
 //!
 //! All printing on stderr goes through [`report`]; `--version` prints [`version`], which
 //! appends ` (<sha>)` when the build script sets `PRESENTER_GIT_SHA`; `presenter export pdf
-//! --help` ends with [`export::PDF_LIMITATIONS`].
+//! --help` ends with [`export::PDF_LIMITATIONS`] and `presenter export pptx --help` with
+//! [`export::PPTX_LIMITATIONS`].
 //!
 //! # Paths in messages
 //!
@@ -139,7 +140,7 @@ pub enum Command {
     Dump(DumpArgs),
     /// Lint a deck without building
     Check(CheckArgs),
-    /// Export to other formats (pdf)
+    /// Export to other formats (pdf, pptx)
     Export(ExportArgs),
 }
 
@@ -362,6 +363,34 @@ pub enum ExportCommand {
     /// Export a deck to PDF with headless Chrome
     #[command(after_help = export::PDF_LIMITATIONS)]
     Pdf(ExportPdfArgs),
+    /// Export a deck to PowerPoint (.pptx) with headless Chrome: an editable slide per slide or fragment step
+    #[command(after_help = export::PPTX_LIMITATIONS)]
+    Pptx(ExportPptxArgs),
+}
+
+/// `presenter export pptx`.
+#[derive(Debug, Clone, Args)]
+pub struct ExportPptxArgs {
+    /// The deck: a .md or .ipynb file
+    pub input: PathBuf,
+    /// PowerPoint file to write [default: next to the HTML output, with .pptx]
+    #[arg(short = 'o', long = "out", value_name = "FILE")]
+    pub out: Option<PathBuf>,
+    /// Chrome or Chromium executable [default: $CHROME_PATH, then well-known locations]
+    #[arg(long, value_name = "PATH")]
+    pub chrome: Option<PathBuf>,
+    /// Theme name or directory (overrides front matter and presenter.toml)
+    #[arg(long, value_name = "NAME|PATH")]
+    pub theme: Option<String>,
+    /// Resolution of the pictures taken of what PowerPoint cannot hold natively (SVG,
+    /// display math, iframes…): device pixels per slide pixel, 1 to 4
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = crate::pdf::capture::DEFAULT_SCALE,
+        value_parser = clap::value_parser!(u8).range(1..=i64::from(crate::pdf::capture::MAX_SCALE)),
+    )]
+    pub scale: u8,
 }
 
 /// `presenter export pdf`.
@@ -865,10 +894,31 @@ mod tests {
                 "--chrome",
                 "/c",
             ],
+            &[
+                "presenter",
+                "export",
+                "pptx",
+                "s.md",
+                "-o",
+                "s.pptx",
+                "--chrome",
+                "/c",
+                "--scale",
+                "4",
+            ],
         ];
         for args in cases {
             parse(args);
         }
+        let cli = parse(&["presenter", "export", "pptx", "s.md"]);
+        let Command::Export(ExportArgs {
+            command: ExportCommand::Pptx(pptx),
+        }) = &cli.command
+        else {
+            panic!("expected export pptx");
+        };
+        assert_eq!(pptx.scale, 2);
+        assert_eq!(pptx.out, None);
         let cli = parse(&["presenter", "-v", "build", "s.md", "--site", "-o", "out"]);
         assert_eq!(cli.global.verbose, 1);
         let Command::Build(build) = &cli.command else {
@@ -898,6 +948,9 @@ mod tests {
             &["presenter", "check"][..],
             &["presenter", "build", "s.md", "--format", "docx"][..],
             &["presenter", "export", "s.md"][..],
+            &["presenter", "export", "pptx", "s.md", "--scale", "0"][..],
+            &["presenter", "export", "pptx", "s.md", "--scale", "5"][..],
+            &["presenter", "export", "pptx", "s.md", "--scale", "1.5"][..],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();
             assert_eq!(err.exit_code(), i32::from(EXIT_USAGE), "{args:?}");

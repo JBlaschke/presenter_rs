@@ -1,8 +1,10 @@
 //! PDF export through headless Chrome (`presenter export pdf`, `docs/spec/cli.md` export).
 //!
 //! [`find_chrome`] locates a Chrome or Chromium executable; [`html_to_pdf`] prints a
-//! standalone deck with it, in reveal.js' print view (`?print-pdf`). macOS and Linux only:
-//! Chrome is started through `/bin/sh`.
+//! standalone deck with it, in reveal.js' print view (`?print-pdf`), and
+//! [`capture::html_to_pages`] converts every page of that view into editable shapes
+//! instead, for `presenter export pptx`. macOS and Linux only: Chrome is started through
+//! `/bin/sh`.
 //!
 //! # How a deck is printed
 //!
@@ -70,10 +72,14 @@
 //!
 //! # Other uses
 //!
+//! [`capture`] runs steps 1–3 and 5 unchanged and, instead of printing, converts each page
+//! of the print view into shapes (`presenter export pptx`).
+//!
 //! With the `browser-tests` feature, `devtools::Page` starts Chrome the same way and opens
 //! one page to navigate and evaluate JavaScript in (the headless-browser smoke tests,
 //! `tests/browser.rs`, use it). Without that feature the module is not compiled.
 
+pub mod capture;
 #[cfg(feature = "browser-tests")]
 pub mod devtools;
 
@@ -370,10 +376,26 @@ fn is_executable(path: &Path) -> bool {
 /// fails (with the browser's path, the page's errors and Chrome's stderr); not macOS or
 /// Linux.
 pub fn html_to_pdf(chrome: &Path, html: &str, timeout: Duration) -> Result<Vec<u8>> {
+    in_print_view(chrome, html, timeout, "print", print_pdf)
+}
+
+/// Opens the standalone deck `html` in reveal.js' print view with `chrome` (module docs,
+/// steps 1–3), runs `job` on the ready page (with the page's DevTools session), stops
+/// Chrome (step 5) and returns what the job returned. `verb` says what the job does in an
+/// error (`Chrome failed to <verb> the deck: …`). Everything, the job included, must finish
+/// within `timeout`, unless the job moves the deadline ([`Cdp::deadline`]). The errors are
+/// those of [`html_to_pdf`].
+fn in_print_view<T>(
+    chrome: &Path,
+    html: &str,
+    timeout: Duration,
+    verb: &'static str,
+    job: impl FnOnce(&mut Cdp<'_>, &str) -> std::result::Result<T, Failure>,
+) -> Result<T> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let (base, source) = placement(chrome, home.as_deref());
     let base = base.unwrap_or_else(|| system_temp_dir(std::env::temp_dir()));
-    print_in(chrome, html, timeout, &base, source)
+    run_in(chrome, html, timeout, &base, source, verb, job)
 }
 
 /// The system's temporary directory, given [`std::env::temp_dir`]: that returns `$TMPDIR`
@@ -399,18 +421,20 @@ enum DeckSource {
     Served,
 }
 
-/// [`html_to_pdf`] with the temporary directory created in `base` and the deck handed over
-/// as `source` says.
-fn print_in(
+/// [`in_print_view`] with the temporary directory created in `base` and the deck handed
+/// over as `source` says.
+fn run_in<T>(
     chrome: &Path,
     html: &str,
     timeout: Duration,
     base: &Path,
     source: DeckSource,
-) -> Result<Vec<u8>> {
+    verb: &'static str,
+    job: impl FnOnce(&mut Cdp<'_>, &str) -> std::result::Result<T, Failure>,
+) -> Result<T> {
     if cfg!(not(unix)) {
         return Err(Error::Other(
-            "PDF export needs macOS or Linux (Chrome is started through /bin/sh)".into(),
+            "the export needs macOS or Linux (Chrome is started through /bin/sh)".into(),
         ));
     }
     let deadline = Instant::now() + timeout;
@@ -426,16 +450,17 @@ fn print_in(
     }
     let mut dir = TempDir::new(base, "presenter-pdf")?;
     let deck = Deck::new(&dir, html, source)?;
-    tracing::info!("printing {} with {}", deck.url, executable.display());
+    tracing::info!("opening {} with {}", deck.url, executable.display());
     let mut browser = Browser::launch(&executable, &dir.path().join("profile"))?;
     dir.watch(browser.pid());
-    let result = drive(&mut browser, &deck, deadline, timeout);
+    let result = drive(&mut browser, &deck, deadline, timeout, job);
     browser.stop(if result.is_ok() {
         CLOSE_GRACE
     } else {
         Duration::ZERO
     });
-    let result = result.map_err(|reason| chrome_error(chrome, &reason, &browser.stderr_tail()));
+    let result =
+        result.map_err(|reason| chrome_error(chrome, verb, &reason, &browser.stderr_tail()));
     // Chrome must be gone before its profile directory is removed.
     drop(browser);
     drop(dir);
@@ -666,22 +691,25 @@ fn is_pdf_delimiter(byte: u8) -> bool {
     )
 }
 
-/// Steps 2–5 of the module docs on a launched browser. The error is the reason, without
-/// the browser's name and stderr ([`chrome_error`] adds those).
-fn drive(
+/// Steps 2, 3 and 5 of the module docs on a launched browser, with `job` as step 4. The
+/// error is the reason, without the browser's name and stderr ([`chrome_error`] adds
+/// those).
+fn drive<T>(
     browser: &mut Browser,
     deck: &Deck<'_>,
     deadline: Instant,
     timeout: Duration,
-) -> std::result::Result<Vec<u8>, String> {
-    let mut cdp = Cdp::new(browser, deck, deadline);
-    match print_page(&mut cdp) {
-        Ok(pdf) => {
+    job: impl FnOnce(&mut Cdp<'_>, &str) -> std::result::Result<T, Failure>,
+) -> std::result::Result<T, String> {
+    let mut cdp = Cdp::new(browser, deck, deadline, timeout);
+    let result = open_deck(&mut cdp).and_then(|page| job(&mut cdp, &page));
+    match result {
+        Ok(value) => {
             cdp.close_browser();
-            Ok(pdf)
+            Ok(value)
         }
         Err(failure) => {
-            let mut reason = failure.describe(timeout);
+            let mut reason = failure.describe(cdp.timeout);
             if !cdp.page_errors.is_empty() {
                 let _ = write!(reason, "\n  page errors:");
                 for error in &cdp.page_errors {
@@ -693,10 +721,11 @@ fn drive(
     }
 }
 
-/// The error for a failed print: the reason, the browser and Chrome's last stderr lines.
-fn chrome_error(chrome: &Path, reason: &str, stderr: &[String]) -> Error {
+/// The error for a failed export (`verb`: `print`, `capture`): the reason, the browser and
+/// Chrome's last stderr lines.
+fn chrome_error(chrome: &Path, verb: &str, reason: &str, stderr: &[String]) -> Error {
     let mut message = format!(
-        "Chrome failed to print the deck: {reason}\n  browser: {}",
+        "Chrome failed to {verb} the deck: {reason}\n  browser: {}",
         chrome.display()
     );
     if stderr.is_empty() {
@@ -714,9 +743,9 @@ fn chrome_error(chrome: &Path, reason: &str, stderr: &[String]) -> Error {
     Error::Other(message)
 }
 
-/// Steps 2–4 of the module docs: open a page, load the deck in print view, wait for
-/// reveal.js and print.
-fn print_page(cdp: &mut Cdp) -> std::result::Result<Vec<u8>, Failure> {
+/// Steps 2 and 3 of the module docs: open a page, load the deck in print view and wait for
+/// reveal.js to lay the pages out. Returns the page's DevTools session.
+fn open_deck(cdp: &mut Cdp) -> std::result::Result<String, Failure> {
     cdp.stage = "starting Chrome";
     let target = cdp.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
     cdp.stage = "opening a page";
@@ -749,7 +778,12 @@ fn print_page(cdp: &mut Cdp) -> std::result::Result<Vec<u8>, Failure> {
 
     cdp.stage = "waiting for reveal.js to lay out the pages";
     wait_until_ready(cdp, page)?;
+    Ok(session)
+}
 
+/// Step 4 of the module docs: prints the page `session` and returns the PDF.
+fn print_pdf(cdp: &mut Cdp, session: &str) -> std::result::Result<Vec<u8>, Failure> {
+    let page = Some(session);
     cdp.stage = "printing";
     let params = json!({
         "preferCSSPageSize": true,
@@ -806,6 +840,29 @@ fn wait_until_ready(cdp: &mut Cdp, page: Option<&str>) -> std::result::Result<()
         "reveal.js print layout ready"
     );
     Ok(())
+}
+
+/// Evaluates the JavaScript `expression` in the page `session`, awaits it when it is a
+/// promise, and returns its value (by value; `undefined` is `null`). An exception is a
+/// failure that quotes it.
+fn evaluate(
+    cdp: &mut Cdp,
+    session: Option<&str>,
+    expression: &str,
+) -> std::result::Result<Value, Failure> {
+    let params = json!({
+        "expression": expression,
+        "awaitPromise": true,
+        "returnByValue": true,
+    });
+    let mut evaluated = cdp.call(session, "Runtime.evaluate", params)?;
+    if let Some(details) = evaluated.get("exceptionDetails") {
+        return Err(Failure::Other(format!(
+            "JavaScript in the page threw: {}",
+            exception_text(details)
+        )));
+    }
+    Ok(evaluated["result"]["value"].take())
 }
 
 /// Reads the `IO` stream `handle` to its end and closes it.
@@ -898,8 +955,10 @@ struct Cdp<'a> {
     browser: &'a mut Browser,
     /// The deck.
     deck: &'a Deck<'a>,
-    /// When everything must be done.
+    /// When everything must be done. A job may move it (and `timeout` with it).
     deadline: Instant,
+    /// How long everything may take, for the timeout message: `deadline` minus the start.
+    timeout: Duration,
     /// The last request id used.
     next_id: u64,
     /// What is going on, for error messages.
@@ -912,12 +971,19 @@ struct Cdp<'a> {
 }
 
 impl<'a> Cdp<'a> {
-    /// A connection to `browser` that prints `deck` and must be done by `deadline`.
-    fn new(browser: &'a mut Browser, deck: &'a Deck<'a>, deadline: Instant) -> Cdp<'a> {
+    /// A connection to `browser` that opens `deck` and must be done by `deadline`
+    /// (`timeout` from now).
+    fn new(
+        browser: &'a mut Browser,
+        deck: &'a Deck<'a>,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Cdp<'a> {
         Cdp {
             browser,
             deck,
             deadline,
+            timeout,
             next_id: 0,
             stage: "starting Chrome",
             loaded: false,
@@ -2040,6 +2106,18 @@ mod tests {
     #[cfg(unix)]
     fn print_with(chrome: &Path, timeout: Duration) -> (String, Duration) {
         print_deck_with(chrome, "<p>deck</p>", DeckSource::File, timeout)
+    }
+
+    /// Prints `html` like [`html_to_pdf`], with the temporary directory in `base` and the
+    /// deck handed over as `source` says.
+    fn print_in(
+        chrome: &Path,
+        html: &str,
+        timeout: Duration,
+        base: &Path,
+        source: DeckSource,
+    ) -> Result<Vec<u8>> {
+        run_in(chrome, html, timeout, base, source, "print", print_pdf)
     }
 
     /// [`print_with`] for the deck `html`, handed over as `source` says.
