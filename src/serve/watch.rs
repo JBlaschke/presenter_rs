@@ -693,9 +693,14 @@ struct Shared {
 
 impl Shared {
     /// Whether a creation, removal or rename of `path` changes what can be watched: it is
-    /// a target, or a directory on the way to a missing one.
+    /// a target, a directory above one (removed or renamed, it takes the target away; on
+    /// Windows the parent's watch is the one that reliably reports this, the target's own
+    /// handle dies with it), or a directory on the way to a missing one.
     fn is_structural(&self, path: &Path) -> bool {
-        self.filter.targets.contains_key(path)
+        self.filter
+            .targets
+            .keys()
+            .any(|target| target.starts_with(path))
             || self.missing.iter().any(|missing| missing.starts_with(path))
     }
 }

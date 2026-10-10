@@ -375,3 +375,11 @@ commit 93e6e89), on a Mac, without a Windows machine:
   mixed separators, the compiler's `tests\…` panic location, a `\`-separated Sass URL, a
   percent-encoded `C:…` reference that reads as a URL scheme) and compare paths, or
   `/`-normalized text, now.
+- The fourth run left one watcher test that had passed the run before: removing a
+  directory above a watched one. Windows reports that only through the parent's watch
+  (the watched directory's own handle dies with it), and the watcher ignored the event
+  because the removed directory was neither a target nor on the way to a missing one;
+  removing or renaming a directory above a target is a structural change now, on every
+  platform. (The same run also saw the browser smoke test time out while Chrome started on
+  the loaded runner: that test gives the start-up its own time now and keeps its short
+  timeout for the navigation it measures.)
