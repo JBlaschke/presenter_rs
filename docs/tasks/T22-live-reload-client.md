@@ -43,6 +43,8 @@ build errors in an overlay, and fall back to a full reload when in doubt.
 - `node --check assets/presenter/live-reload.js` passes (syntax) — add this to CI as a tiny step
   guarded by `node` availability (Node 26 is present locally; ubuntu runners have Node).
 - Script size < 8 KB unminified; no external requests except the SSE endpoint and `/`.
+  (Amendment, 2026-10-10: the A2 audit fixes grew the client to 8986 bytes; the CI budget
+  is 10 KiB since then, see `.github/workflows/ci.yml`.)
 - Every QA item in `docs/dev/live-reload-qa.md` checked manually against the mock server or
   against T23 once available; results recorded in the PR.
 - No exceptions logged in the console during the QA run; all logs prefixed `[presenter]`.

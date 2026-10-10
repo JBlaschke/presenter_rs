@@ -49,6 +49,7 @@ sections it lists. Specs in `../spec/` are contracts: implement them, do not rei
 | T46 | User documentation | M4 | M | M1–M3 | done |
 | T47 | Release builds | M4 | S | T16 | done |
 | T48 | `:::include`: compose decks from Markdown and notebooks | M5 | M | all | done |
+| T49 | PowerPoint export: the PDF's pages as editable `.pptx` slides | M5 | L | T45 | done |
 
 ## Order of execution (suggested waves)
 

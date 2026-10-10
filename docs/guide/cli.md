@@ -14,8 +14,8 @@ sync). `presenter <command> --help` shows the same in your terminal.
 after the command: `presenter -q check slides.md` and `presenter check slides.md -q` are the
 same. `RUST_LOG` (for example `RUST_LOG=presenter=debug`) adds log filters on top.
 
-**Output.** Standard output carries only a command's result: the `Wrote …` line of `build`
-and `export pdf`, the URL line of `serve`, the JSON of `dump` (TOML with
+**Output.** Standard output carries only a command's result: the `Wrote …` line of `build`,
+`export pdf` and `export pptx`, the URL line of `serve`, the JSON of `dump` (TOML with
 `--default-config`), the findings of `check --format json`, and the reports of `init` and
 the `theme` commands. Warnings, errors and logs go to standard error, as
 `path:line: level: message`, in colour when it is a terminal (`NO_COLOR=1` turns colour
@@ -26,11 +26,11 @@ off). Paths in messages are relative to the current directory.
 | Code | Meaning |
 |---|---|
 | 0 | Success (warnings do not count, except with `check --deny-warnings`) |
-| 1 | The deck or theme has an error: a parse, template or style error, a missing image in `build`, a `check` finding of level error (or any finding, with `--deny-warnings`). Also any other failure while the command runs: a port that is in use, a file that cannot be read or written, Chrome failing during `export pdf` |
+| 1 | The deck or theme has an error: a parse, template or style error, a missing image in `build`, a `check` finding of level error (or any finding, with `--deny-warnings`). Also any other failure while the command runs: a port that is in use, a file that cannot be read or written, Chrome failing during `export pdf` or `export pptx` |
 | 2 | Wrong usage: a bad argument, an unknown file extension, an invalid `presenter.toml`, an output that would overwrite an input, a `theme` argument that names nothing usable |
-| 3 | `export pdf` found no Chrome or Chromium |
+| 3 | `export pdf` or `export pptx` found no Chrome or Chromium |
 
-**Inputs are safe.** `build` and `export pdf` never write over the deck, `presenter.toml`,
+**Inputs are safe.** `build`, `export pdf` and `export pptx` never write over the deck, `presenter.toml`,
 an image the deck uses or a file of a theme directory in use, also not through a symbolic
 link or another spelling of the name. Such an output path is refused before anything is
 written (exit 2):
@@ -54,7 +54,7 @@ Commands:
   theme   Inspect, eject or create themes
   dump    Print the IR or the template context as JSON
   check   Lint a deck without building
-  export  Export to other formats (pdf)
+  export  Export to other formats (pdf, pptx)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -375,12 +375,14 @@ Options:
 
 ```text
 $ presenter export --help
-Export to other formats (pdf)
+Export to other formats (pdf, pptx)
 
 Usage: presenter export [OPTIONS] <COMMAND>
 
 Commands:
   pdf   Export a deck to PDF with headless Chrome
+  pptx  Export a deck to PowerPoint (.pptx) with headless Chrome: an editable slide per slide or
+        fragment step
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -439,3 +441,78 @@ prints the speaker notes, and pdfSeparateFragments = false gives one page per sl
   locations on macOS and Linux. Without one, the command explains how to install it and
   exits 3.
 - A `-o` that does not end in `.pdf` gets a warning.
+
+## export pptx
+
+```text
+$ presenter export pptx --help
+Export a deck to PowerPoint (.pptx) with headless Chrome: an editable slide per slide or fragment
+step
+
+Usage: presenter export pptx [OPTIONS] <INPUT>
+
+Arguments:
+  <INPUT>  The deck: a .md or .ipynb file
+
+Options:
+  -o, --out <FILE>         PowerPoint file to write [default: next to the HTML output, with .pptx]
+  -v, --verbose...         Log more: -v info, -vv debug (RUST_LOG directives apply on top)
+      --chrome <PATH>      Chrome or Chromium executable [default: $CHROME_PATH, then well-known
+                           locations]
+  -q, --quiet              Print only errors (no warnings, no summary line; RUST_LOG is ignored).
+                           `check --deny-warnings` still prints the warnings it fails on
+      --config <PATH>      Use this presenter.toml instead of searching for one next to the input
+      --theme <NAME|PATH>  Theme name or directory (overrides front matter and presenter.toml)
+      --scale <N>          Resolution of the pictures taken of what PowerPoint cannot hold natively
+                           (SVG, display math, iframes…): device pixels per slide pixel, 1 to 4
+                           [default: 2]
+  -h, --help               Print help
+
+What the file holds (from reveal.js' print mode, ?print-pdf):
+  - Every page of the PDF export becomes one editable slide: headings, paragraphs,
+    lists, code and quotes are text boxes with the fonts, sizes, colours and bullets
+    the theme gave them (code keeps its highlighting colours, one paragraph per line),
+    tables are tables, images are the deck's image files, and the slide background
+    is a colour or the background picture. Everything sits where the browser laid it
+    out. The speaker notes are text in the notes pane, one paragraph per line.
+  - What PowerPoint cannot hold as native content becomes a picture with a transparent
+    background: SVG, canvases, videos and iframes (as displayed), display math, and
+    gradient backgrounds. Inline math becomes text (superscripts and subscripts kept,
+    fractions as a/b). Themes' own decorations (rules under headings, logos) are
+    kept when they are boxes or pictures; reveal.js' slide number is left out.
+  - Fragments: with reveal.js' default ([reveal] pdfSeparateFragments = true) every
+    fragment step is a slide of its own, so the slides build the deck's slide up step
+    by step; with pdfSeparateFragments = false each slide is exported once, fully
+    revealed.
+  - Animations, transitions and auto-animate are not exported: every slide is static.
+  - A slide taller than the page continues on extra slides, up to [reveal]
+    pdfMaxPagesPerSlide, with the same pages as the PDF.
+  - Fonts: PowerPoint substitutes a font the viewer's machine does not have, so text
+    may wrap differently there; a text box grows to fit when it is edited.
+  - Needs Chrome or Chromium (Edge and Brave work too); without one the command
+    exits with code 3. Chrome gets 120 s to load the deck, plus 3 s per page.
+  - The file is reproducible for one Chrome version: the same deck gives the same
+    file.
+
+Tips: [reveal] options shape the file: width/height set the slide size (16:9 gives
+PowerPoint's Widescreen size, 4:3 its Standard size) and pdfSeparateFragments = false
+gives one slide per slide; --scale sets the resolution of the pictures.
+```
+
+- Prints `Wrote dist/slides.pptx (9 slides, 1.1 MB)`. Without `-o`, the file goes next to
+  where `build` would write the HTML.
+- The slides are the pages of `export pdf`, as editable slides: one slide per deck slide,
+  per fragment step and per page of a slide taller than a page, so the same `[reveal]`
+  options (`pdfSeparateFragments`, `pdfMaxPagesPerSlide`, `width`, `height`) shape the
+  file. Text is text boxes (the first heading in the title placeholder), tables are tables,
+  images are the deck's image files, backgrounds are colours or pictures; display math,
+  SVG, canvases, videos, iframes and gradients are pictures with transparent backgrounds.
+  Each slide is named after its heading, with its step and part (`Results, step 2 of 3`);
+  the speaker notes are text in the notes pane. The deck's title and author become the
+  file's properties.
+- `--scale N` sets the resolution of the pictures: `1` is their size on the slide, `2`
+  (the default) twice that in each direction, up to `4`.
+- Chrome is looked for as for `export pdf`; without one the command exits 3. It gets 120 s
+  to load the deck, plus one second per picture.
+- A `-o` that does not end in `.pptx` gets a warning.
+- The same deck and Chrome version give the same file, byte for byte.

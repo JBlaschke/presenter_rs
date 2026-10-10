@@ -1,4 +1,5 @@
-//! T45 end to end: `presenter export pdf` (docs/spec/cli.md `export`).
+//! T45 and T49 end to end: `presenter export pdf` and `presenter export pptx` (docs/spec/cli.md
+//! `export`).
 //!
 //! The tests that print with a real browser run only when `presenter::pdf::find_chrome(None)`
 //! finds one (`--chrome`-less search: `$CHROME_PATH`, app bundles, `PATH`); otherwise they
@@ -1077,6 +1078,596 @@ fn help_lists_the_limitations_of_the_pdf() {
         "can end with a page that is empty but for its background (about one in ten to \
          twenty of them). Nothing is lost.",
         "The PDF is not byte-for-byte reproducible",
+    ] {
+        assert!(help.contains(expected), "{expected:?} in {help}");
+    }
+}
+
+// --- `presenter export pptx` ----------------------------------------------------------------
+
+/// The entries of a `.pptx` written by presenter (stored entries only), read through its
+/// central directory: `(name, data)` in directory order.
+fn zip_entries(zip: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let u16_at = |at: usize| u16::from_le_bytes([zip[at], zip[at + 1]]);
+    let u32_at = |at: usize| u32::from_le_bytes(zip[at..at + 4].try_into().unwrap());
+    let end = zip.len() - 22;
+    assert_eq!(u32_at(end), 0x0605_4b50, "end of central directory");
+    let count = usize::from(u16_at(end + 10));
+    let mut at = u32_at(end + 16) as usize;
+    let mut found = Vec::new();
+    for _ in 0..count {
+        assert_eq!(u32_at(at), 0x0201_4b50, "central directory record");
+        let size = u32_at(at + 24) as usize;
+        let name_len = usize::from(u16_at(at + 28));
+        let offset = u32_at(at + 42) as usize;
+        let name = String::from_utf8(zip[at + 46..at + 46 + name_len].to_vec()).unwrap();
+        at += 46 + name_len;
+        assert_eq!(u32_at(offset), 0x0403_4b50, "local header of {name}");
+        let local_name_len = usize::from(u16_at(offset + 26));
+        let extra_len = usize::from(u16_at(offset + 28));
+        let start = offset + 30 + local_name_len + extra_len;
+        found.push((name, zip[start..start + size].to_vec()));
+    }
+    found
+}
+
+/// The entry `name` of `entries`, as text.
+fn entry_text(entries: &[(String, Vec<u8>)], name: &str) -> String {
+    let (_, data) = entries
+        .iter()
+        .find(|(entry, _)| entry == name)
+        .unwrap_or_else(|| panic!("no entry {name}"));
+    String::from_utf8(data.clone()).unwrap()
+}
+
+/// The `(width, height)` of a PNG.
+fn png_size(png: &[u8]) -> (u32, u32) {
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+    let number = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+    (number(16), number(20))
+}
+
+/// Reads a written `.pptx` and checks its signature.
+fn read_pptx(path: &Path) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        bytes.starts_with(b"PK\x03\x04"),
+        "not a ZIP: {}",
+        path.display()
+    );
+    bytes
+}
+
+/// Asserts the `Wrote <path> (<n> slides, <size>)` line and returns `<n>`.
+fn assert_wrote_slides(output: &Output, path_suffix: &str) -> usize {
+    let stdout = text(&output.stdout);
+    let line = Regex::new(r"^Wrote (.+) \((\d+) slides?, \d+(\.\d)? (B|kB|MB)\)\n$").unwrap();
+    let caps = line
+        .captures(&stdout)
+        .unwrap_or_else(|| panic!("unexpected stdout: {stdout:?}"));
+    assert!(caps[1].ends_with(path_suffix), "{stdout}");
+    caps[2].parse().unwrap()
+}
+
+/// The slide names (`p:cSld/@name`) of a `.pptx`, in slide order.
+fn slide_names(entries: &[(String, Vec<u8>)], slides: usize) -> Vec<String> {
+    let name = Regex::new(r#"<p:cSld name="([^"]*)">"#).unwrap();
+    (1..=slides)
+        .map(|n| {
+            let xml = entry_text(entries, &format!("ppt/slides/slide{n}.xml"));
+            name.captures(&xml).unwrap()[1].to_string()
+        })
+        .collect()
+}
+
+/// The XML of slide `n` of `entries`.
+fn slide_xml(entries: &[(String, Vec<u8>)], n: usize) -> String {
+    entry_text(entries, &format!("ppt/slides/slide{n}.xml"))
+}
+
+/// The text of a slide's XML: the runs of each paragraph joined, one line per paragraph.
+fn slide_text(xml: &str) -> String {
+    let paragraph = Regex::new(r"<a:p>(.*?)</a:p>").unwrap();
+    let run = Regex::new(r"<a:t>([^<]*)</a:t>").unwrap();
+    paragraph
+        .captures_iter(xml)
+        .map(|caps| {
+            run.captures_iter(&caps[1])
+                .map(|r| r[1].to_string())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The media parts a slide's relationships reference, as `(target, bytes)`.
+fn slide_media(entries: &[(String, Vec<u8>)], n: usize) -> Vec<(String, Vec<u8>)> {
+    let rels = entry_text(entries, &format!("ppt/slides/_rels/slide{n}.xml.rels"));
+    Regex::new(r#"Target="\.\./media/([^"]+)""#)
+        .unwrap()
+        .captures_iter(&rels)
+        .map(|caps| {
+            let name = format!("ppt/media/{}", &caps[1]);
+            let (_, data) = entries
+                .iter()
+                .find(|(entry, _)| *entry == name)
+                .unwrap_or_else(|| panic!("no entry {name}"));
+            (caps[1].to_string(), data.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn exports_the_example_deck_to_editable_slides() {
+    if chrome().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let private_tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("nested/slides.pptx");
+    let output = presenter(&root())
+        .env("TMPDIR", private_tmp.path())
+        .args(["export", "pptx", "examples/basic/slides.md", "-o"])
+        .arg(&out)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let slides = assert_wrote_slides(&output, "slides.pptx");
+    #[cfg(unix)]
+    assert_cleaned_up(private_tmp.path());
+
+    let pptx = read_pptx(&out);
+    let entries = zip_entries(&pptx);
+    assert_eq!(entries[0].0, "[Content_Types].xml");
+    let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+    for n in 1..=slides {
+        assert!(names.contains(&format!("ppt/slides/slide{n}.xml").as_str()));
+    }
+    assert!(!names.contains(&format!("ppt/slides/slide{}.xml", slides + 1).as_str()));
+
+    // One slide per page of the PDF.
+    let pdf_out = tmp.path().join("slides.pdf");
+    presenter(&root())
+        .args(["-q", "export", "pdf", "examples/basic/slides.md", "-o"])
+        .arg(&pdf_out)
+        .assert()
+        .success();
+    assert_eq!(slides, page_count(&read_pdf(&pdf_out)));
+    let presentation = entry_text(&entries, "ppt/presentation.xml");
+    assert!(
+        presentation.contains(r#"<p:sldSz cx="12192000" cy="6858000"/>"#),
+        "{presentation}"
+    );
+
+    // Slides are named after their headings, with their fragment step.
+    let slide_names = slide_names(&entries, slides);
+    assert_eq!(slide_names[0], "Presenter basics");
+    assert_eq!(slide_names[1], "What this deck shows");
+    assert!(
+        slide_names
+            .iter()
+            .any(|name| name.starts_with("Fragments, step 1 of ")),
+        "{slide_names:?}"
+    );
+    assert!(
+        slide_names
+            .iter()
+            .any(|name| name == "Code with line stepping, step 3 of 3"),
+        "{slide_names:?}"
+    );
+    let find = |heading: &str| {
+        slide_names
+            .iter()
+            .position(|name| name == heading)
+            .unwrap_or_else(|| panic!("no slide {heading}: {slide_names:?}"))
+            + 1
+    };
+
+    // The title slide: the heading in the title placeholder, centred; the subtitle, the
+    // author and the date as text; the notes in its notes slide; no pictures.
+    let title = slide_xml(&entries, 1);
+    assert!(
+        title.contains(r#"<p:nvPr><p:ph type="title"/></p:nvPr>"#),
+        "{title}"
+    );
+    assert!(title.contains(r#"algn="ctr""#), "{title}");
+    let text = slide_text(&title);
+    for expected in [
+        "Presenter basics",
+        "Every Markdown feature of presenter in one deck",
+        "Johannes Blaschke",
+        "2026-10-08",
+    ] {
+        assert!(text.contains(expected), "{expected:?} in {text}");
+    }
+    assert!(!title.contains("<p:pic>"), "{title}");
+    let notes = entry_text(&entries, "ppt/notesSlides/notesSlide1.xml");
+    assert!(
+        notes.contains("The title slide uses layout=title"),
+        "{notes}"
+    );
+    assert!(entry_text(&entries, "ppt/slides/_rels/slide1.xml.rels").contains("notesSlide1.xml"));
+
+    // A bulleted list: one text box, a paragraph per item with a hanging bullet.
+    let list = slide_xml(&entries, 2);
+    assert_eq!(list.matches(r#"<a:buChar char="•"/>"#).count(), 5, "{list}");
+    assert!(
+        Regex::new(r#"<a:pPr marL="\d+" indent="-\d+" lvl="0""#)
+            .unwrap()
+            .is_match(&list),
+        "{list}"
+    );
+    let text = slide_text(&list);
+    assert!(
+        text.contains("title slide") && text.contains("speaker notes"),
+        "{text}"
+    );
+    assert!(list.contains(r#"b="1""#), "{list}");
+
+    // Fragments: the first step shows nothing of the first fragment, the second does.
+    let step1 = slide_text(&slide_xml(&entries, find("Fragments, step 1 of 5")));
+    let step2 = slide_text(&slide_xml(&entries, find("Fragments, step 2 of 5")));
+    assert!(!step1.contains("First click"), "{step1}");
+    assert!(step2.contains("First click"), "{step2}");
+
+    // The figure is the deck's own PNG, byte for byte.
+    let plot = std::fs::read(root().join("examples/basic/figures/plot.png")).unwrap();
+    let media = slide_media(&entries, find("Two columns"));
+    assert!(
+        media.iter().any(|(_, bytes)| *bytes == plot),
+        "{:?}",
+        media.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+
+    // Code: a paragraph per line in a monospace font, the highlighting as run colours.
+    let code = slide_xml(&entries, find("Code with line stepping, step 1 of 3"));
+    assert!(
+        code.contains(r#"<a:latin typeface="Courier New"/>"#),
+        "{code}"
+    );
+    assert!(code.matches("<a:p>").count() >= 9, "{code}");
+    assert!(slide_text(&code).contains("import math"), "{code}");
+    assert!(code.contains(r#"wrap="none""#), "{code}");
+
+    // Math: inline math is text, display math a transparent picture.
+    let math = slide_xml(&entries, find("Math"));
+    assert!(slide_text(&math).contains("circle of radius"), "{math}");
+    let media = slide_media(&entries, find("Math"));
+    assert_eq!(media.len(), 1, "{media:?}");
+    let (width, height) = png_size(&media[0].1);
+    assert!(
+        width > 1000 && height > 100 && height < 400,
+        "{width}×{height}"
+    );
+
+    // A table with three columns and four rows.
+    let table = slide_xml(&entries, find("A table"));
+    assert_eq!(table.matches("<a:gridCol ").count(), 3, "{table}");
+    assert_eq!(table.matches("<a:tr ").count(), 4, "{table}");
+    assert!(slide_text(&table).contains("a horizontal slide"), "{table}");
+
+    // A footnote's links are hyperlinks.
+    let rels = entry_text(
+        &entries,
+        &format!("ppt/slides/_rels/slide{}.xml.rels", find("A footnote")),
+    );
+    assert!(
+        rels.contains(r#"Target="https://revealjs.com" TargetMode="External""#),
+        "{rels}"
+    );
+
+    // Backgrounds: a colour, and a picture at 20 % opacity.
+    let dark = slide_xml(&entries, find("Backgrounds"));
+    assert!(
+        dark.contains(r#"<p:bg><p:bgPr><a:solidFill><a:srgbClr val="0F172A"/>"#),
+        "{dark}"
+    );
+    let image = slide_xml(&entries, find("Background images"));
+    assert!(image.contains(r#"<a:alphaModFix amt="20000"/>"#), "{image}");
+    assert!(
+        slide_media(&entries, find("Background images"))
+            .iter()
+            .any(|(_, bytes)| *bytes == plot)
+    );
+
+    // The deck's title and author are in the properties.
+    let core = entry_text(&entries, "docProps/core.xml");
+    assert!(
+        core.contains("<dc:title>Presenter basics</dc:title>"),
+        "{core}"
+    );
+    assert!(
+        core.contains("<dc:creator>Johannes Blaschke</dc:creator>"),
+        "{core}"
+    );
+    assert!(!core.contains("dcterms:created"), "{core}");
+}
+
+#[test]
+fn powerpoint_slides_follow_pdf_separate_fragments_and_go_next_to_the_html() {
+    if chrome().is_none() {
+        return;
+    }
+    let dir = project(&[
+        ("deck.md", FRAGMENT_DECK),
+        ("presenter.toml", "[reveal]\npdfSeparateFragments = false\n"),
+        ("separate.toml", "[reveal]\npdfSeparateFragments = true\n"),
+    ]);
+
+    // Collapsed fragments: one slide per slide, written to dist/deck.pptx.
+    let output = presenter(dir.path())
+        .args(["export", "pptx", "deck.md"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote_slides(&output, "deck.pptx"), 3);
+    let entries = zip_entries(&read_pptx(&dir.path().join("dist/deck.pptx")));
+    assert_eq!(slide_names(&entries, 3), ["One", "Two", "Three"]);
+    let two = slide_text(&slide_xml(&entries, 2));
+    assert!(
+        two.contains("First step") && two.contains("Second step"),
+        "{two}"
+    );
+
+    // reveal's default: the fragment slide becomes one slide per step.
+    let output = presenter(dir.path())
+        .args(["--config", "separate.toml", "export", "pptx", "deck.md"])
+        .args(["-o", "separate.pptx"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote_slides(&output, "separate.pptx"), 5);
+    let entries = zip_entries(&read_pptx(&dir.path().join("separate.pptx")));
+    assert_eq!(
+        slide_names(&entries, 5),
+        [
+            "One",
+            "Two, step 1 of 3",
+            "Two, step 2 of 3",
+            "Two, step 3 of 3",
+            "Three"
+        ]
+    );
+    let steps: Vec<String> = (2..=4)
+        .map(|n| slide_text(&slide_xml(&entries, n)))
+        .collect();
+    assert!(!steps[0].contains("First step"), "{steps:?}");
+    assert!(
+        steps[1].contains("First step") && !steps[1].contains("Second step"),
+        "{steps:?}"
+    );
+    assert!(steps[2].contains("Second step"), "{steps:?}");
+}
+
+#[test]
+fn powerpoint_scale_sizes_the_photographs_and_the_file_is_reproducible() {
+    if chrome().is_none() {
+        return;
+    }
+    // An inline SVG is photographed: at --scale 1 at its own size, at the default 2 twice.
+    let deck = "# Only slide\n\n<svg width=\"120\" height=\"60\"><rect width=\"120\" height=\"60\" fill=\"teal\"/></svg>\n";
+    let dir = project(&[("deck.md", deck)]);
+    let export = |args: &[&str], out: &str| {
+        presenter(dir.path())
+            .args(["-q", "export", "pptx", "deck.md", "-o", out])
+            .args(args)
+            .assert()
+            .success()
+            .stdout("");
+        read_pptx(&dir.path().join(out))
+    };
+    let first = export(&["--scale", "1"], "one.pptx");
+    let entries = zip_entries(&first);
+    assert_eq!(slide_names(&entries, 1), ["Only slide"]);
+    let media = slide_media(&entries, 1);
+    assert_eq!(media.len(), 1, "{media:?}");
+    assert_eq!(png_size(&media[0].1), (120, 60));
+    let scaled = export(&[], "two.pptx");
+    let media = slide_media(&zip_entries(&scaled), 1);
+    assert_eq!(png_size(&media[0].1), (240, 120));
+    // Only the 1980-01-01 ZIP timestamp and no dates in the properties: the same deck
+    // gives the same file.
+    assert_eq!(export(&["--scale", "1"], "three.pptx"), first);
+}
+
+#[test]
+fn a_missing_browser_exits_3_for_powerpoint_too() {
+    let dir = project(&[("deck.md", "# Slide\n")]);
+    let output = presenter(dir.path())
+        .args([
+            "export",
+            "pptx",
+            "deck.md",
+            "--chrome",
+            "/nonexistent/chrome",
+        ])
+        .assert()
+        .code(3)
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("error: --chrome /nonexistent/chrome: not an executable file\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("brew install --cask google-chrome"),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("dist").exists());
+}
+
+#[test]
+fn powerpoint_output_arguments_are_checked() {
+    let dir = project(&[("d.md", "# Slide\n"), ("presenter.toml", "")]);
+    std::fs::create_dir(dir.path().join("existing")).unwrap();
+    for out in ["out/", "existing", "existing/."] {
+        presenter(dir.path())
+            .args(["export", "pptx", "d.md", "-o", out])
+            .args(["--chrome", "/nonexistent/chrome"])
+            .assert()
+            .code(2)
+            .stderr(format!(
+                "error: -o {out} names a directory; give the PowerPoint file to write\n"
+            ));
+    }
+    // Never over an input: exit 2 before the browser is looked for.
+    for (out, input) in [
+        ("d.md", "input file d.md"),
+        ("presenter.toml", "config file presenter.toml"),
+    ] {
+        let output = presenter(dir.path())
+            .args(["export", "pptx", "d.md", "-o", out])
+            .args(["--chrome", "/nonexistent/chrome"])
+            .assert()
+            .code(2)
+            .stdout("")
+            .get_output()
+            .clone();
+        assert_eq!(
+            text(&output.stderr),
+            format!(
+                "error: refusing to write {out}: it is the {input}; choose another output \
+                 path with -o\n"
+            )
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("d.md")).unwrap(),
+        "# Slide\n"
+    );
+    // An unknown input format is a usage error too.
+    std::fs::write(dir.path().join("deck.txt"), "# Slide\n").unwrap();
+    presenter(dir.path())
+        .args(["export", "pptx", "deck.txt"])
+        .assert()
+        .code(2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_powerpoint_name_without_pptx_is_warned_about_just_before_the_browser_starts() {
+    let dir = project(&[("d.md", "# Slide\n")]);
+    let fake = fake_chrome(
+        dir.path(),
+        "fake-chrome",
+        "echo 'fake chrome: no display' >&2\nexit 4",
+    );
+    let private_tmp = tempfile::tempdir().unwrap();
+    let export = |args: &[&str]| {
+        run_settled(|| {
+            let mut cmd = presenter(dir.path());
+            cmd.env("TMPDIR", private_tmp.path())
+                .args(args)
+                .arg("--chrome")
+                .arg(&fake);
+            cmd
+        })
+    };
+    let output = export(&["export", "pptx", "d.md", "-o", "slides.ppt"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "warning: -o slides.ppt does not end in .pptx; the file will hold a PowerPoint \
+             presentation\nerror: Chrome failed to capture the deck: Chrome exited (exit \
+             status: 4) while starting Chrome\n"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("    fake chrome: no display"), "{stderr}");
+    assert!(!dir.path().join("slides.ppt").exists());
+    // -q hides the warning, not the error; a .pptx name in any case gets no warning.
+    let output = export(&["-q", "export", "pptx", "d.md", "-o", "slides.ppt"]);
+    assert!(
+        text(&output.stderr).starts_with("error: Chrome failed to capture the deck: "),
+        "{output:?}"
+    );
+    let output = export(&["export", "pptx", "d.md", "-o", "slides.PPTX"]);
+    assert!(text(&output.stderr).starts_with("error: "), "{output:?}");
+    assert_cleaned_up(private_tmp.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn powerpoint_build_errors_stop_before_the_browser_starts() {
+    let dir = project(&[("deck.md", "# Slide\n\n![plot](missing.png)\n")]);
+    let marker = dir.path().join("chrome-ran");
+    let fake = fake_chrome(
+        dir.path(),
+        "fake-chrome",
+        &format!("touch '{}'\nexit 1", marker.display()),
+    );
+    let output = run_settled(|| {
+        let mut cmd = presenter(dir.path());
+        cmd.args(["export", "pptx", "deck.md", "--chrome"])
+            .arg(&fake);
+        cmd
+    });
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        text(&output.stderr).contains("asset not found"),
+        "{output:?}"
+    );
+    assert!(!marker.exists(), "the browser ran despite the build error");
+    assert!(!dir.path().join("dist").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_capture_stops_the_browser_and_writes_nothing() {
+    if chrome().is_none() {
+        return;
+    }
+    let deck = "# Not capturable\n\n<script>window.addEventListener('load', () => \
+                { Reveal.isPrintView = () => false; });</script>\n";
+    let dir = project(&[("deck.md", deck)]);
+    let private_tmp = tempfile::tempdir().unwrap();
+    let output = presenter(dir.path())
+        .env("TMPDIR", private_tmp.path())
+        .args(["export", "pptx", "deck.md", "-o", "deck.pptx"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .get_output()
+        .clone();
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with(
+            "error: Chrome failed to capture the deck: reveal.js did not switch to its print \
+             view (?print-pdf)\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!dir.path().join("deck.pptx").exists());
+    assert_cleaned_up(private_tmp.path());
+}
+
+/// The limitations `export pptx --help` lists.
+#[test]
+fn help_lists_what_the_powerpoint_file_holds() {
+    let output = presenter(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .args(["export", "pptx", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = text(&output.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "What the file holds (from reveal.js' print mode, ?print-pdf):",
+        "Every page of the PDF export becomes one editable slide",
+        "tables are tables, images are the deck's image files",
+        "every fragment step is a slide of its own",
+        "continues on extra slides, up to [reveal] pdfMaxPagesPerSlide",
+        "exits with code 3",
+        "--scale <N>",
     ] {
         assert!(help.contains(expected), "{expected:?} in {help}");
     }
