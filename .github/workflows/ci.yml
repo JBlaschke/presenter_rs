@@ -60,11 +60,10 @@ jobs:
   # console errors) and `serve` swaps the theme stylesheet without a reload, and reloads
   # once when the page changes outside the slides. The runner image ships Google Chrome;
   # PRESENTER_REQUIRE_CHROME turns a missing browser into a failure instead of a skip.
-  # Allowed to fail while the job settles in (first week; then drop continue-on-error).
   browser:
     name: headless-browser smoke tests
     runs-on: ubuntu-latest
-    continue-on-error: true
+    continue-on-error: false
     env:
       PRESENTER_REQUIRE_CHROME: "1"
     steps:
