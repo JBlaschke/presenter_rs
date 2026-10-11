@@ -2,3 +2,9 @@
 # otherwise convert to CRLF on checkout, and the tests compare rendered output and snapshots
 # byte for byte. Binary files are detected and left alone.
 * text=auto eol=lf
+
+# Vendored crates are stored byte for byte: Cargo checks every file in vendor/ against the
+# crate's .cargo-checksum.json, and a few crates ship CRLF files, so normalising them to LF
+# breaks the build on a fresh checkout (every CI runner). A `git diff` of a vendor file still
+# works; only line-ending conversion is off.
+vendor/** -text
