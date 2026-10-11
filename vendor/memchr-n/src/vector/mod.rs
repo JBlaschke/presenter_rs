@@ -1,0 +1,715 @@
+pub(crate) mod kernels;
+
+use crate::search::{KernelStorage, ScanOps, StoredKernel};
+use crate::{IterState, MatchedBitset};
+use core::mem::transmute_copy;
+use fearless_simd::prelude::*;
+use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
+use fearless_simd_macros::simd;
+
+const CHUNK_BYTES: usize = 64;
+const _: () = assert!(MatchedBitset::BITS as usize >= CHUNK_BYTES * 2);
+
+const BLOCK_BYTES: usize = 16;
+
+/// Leading bytes probed before staging a sub-vector haystack.
+///
+/// One probe improves front-match latency; additional probes slow misses and later matches.
+const PROBE_BYTES: usize = 1;
+
+/// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
+pub(crate) trait Kernel: StoredKernel {
+    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+        &self,
+        chunk: V,
+    ) -> V::Mask;
+
+    /// Whether the byte set holds `byte`.
+    ///
+    /// This scalar path avoids staging for the leading bytes of short haystacks.
+    fn matches_byte(&self, byte: u8) -> bool;
+}
+
+/// Whether the target has a single-instruction dynamic byte shuffle.
+///
+/// Shuffle-based kernels fall back to [`crate::BitsetLookup`] without one.
+pub(crate) fn has_byte_shuffle(level: Level) -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        // SSE2 lacks `pshufb`; later levels accepted by `as_sse4_2` provide it.
+        level.as_sse4_2().is_some()
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        !level.is_fallback()
+    }
+}
+
+/// Scans from the current position until it finds matches or reaches the end.
+///
+/// Chunk pairs share an [`any_true`](fearless_simd::SimdMask::any_true) check and are returned
+/// together so the second chunk is not rescanned.
+#[inline(always)]
+#[simd]
+fn next_match_batch<S: Simd, K: Kernel>(
+    simd: S,
+    kernel: &K,
+    state: &mut IterState<'_>,
+) -> MatchedBitset {
+    let (haystack, mut offset) = (state.haystack, state.scan_offset);
+    // SAFETY: `state.scan_offset` never exceeds the haystack length.
+    let unscanned = unsafe { haystack.get_unchecked(offset..) };
+    let (chunks, tail) = unscanned.as_chunks::<CHUNK_BYTES>();
+    let (pairs, rest) = chunks.as_chunks::<2>();
+
+    for [first, second] in pairs {
+        let matched_first = kernel.matches(u8x64::load_array_ref(simd, first));
+        let matched_second = kernel.matches(u8x64::load_array_ref(simd, second));
+        if (matched_first | matched_second).any_true() {
+            state.match_base = offset;
+            state.scan_offset = offset + 2 * CHUNK_BYTES;
+            return MatchedBitset::from(matched_first.to_bitmask())
+                | MatchedBitset::from(matched_second.to_bitmask()) << CHUNK_BYTES;
+        }
+        offset += 2 * CHUNK_BYTES;
+    }
+
+    if let [chunk] = rest {
+        let matched = kernel.matches(u8x64::load_array_ref(simd, chunk));
+        if matched.any_true() {
+            state.match_base = offset;
+            state.scan_offset = offset + CHUNK_BYTES;
+            return MatchedBitset::from(matched.to_bitmask());
+        }
+        offset += CHUNK_BYTES;
+    }
+
+    let (blocks, tail) = tail.as_chunks::<BLOCK_BYTES>();
+    for block in blocks {
+        let matched = kernel.matches(u8x16::load_array_ref(simd, block));
+        if matched.any_true() {
+            state.match_base = offset;
+            state.scan_offset = offset + BLOCK_BYTES;
+            return MatchedBitset::from(matched.to_bitmask());
+        }
+        offset += BLOCK_BYTES;
+    }
+    state.match_base = haystack.len() - tail.len();
+    state.scan_offset = haystack.len();
+    if tail.is_empty() {
+        0
+    } else {
+        MatchedBitset::from(tail_bits(simd, kernel, haystack, tail))
+    }
+}
+
+/// Returns the offset of the first matching byte of `haystack`.
+///
+/// Handles short haystacks and the first chunk before entering the paired scan loop.
+#[inline(always)]
+#[simd]
+fn first_match<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Option<usize> {
+    if haystack.len() < CHUNK_BYTES {
+        return first_match_short(simd, haystack, kernel);
+    }
+
+    let (mut chunks, rest) = haystack.as_chunks::<CHUNK_BYTES>();
+
+    // Avoid loading the second chunk before checking the common first-chunk case.
+    let mut offset = 0;
+    if let Some(first) = chunks.split_off_first() {
+        let matched = kernel.matches(u8x64::load_array_ref(simd, first));
+        if matched.any_true() {
+            return first_matching_lane(matched);
+        }
+        offset = CHUNK_BYTES;
+    }
+
+    let (pairs, last_chunk) = chunks.as_chunks::<2>();
+    for [first, second] in pairs {
+        let matched_first = kernel.matches(u8x64::load_array_ref(simd, first));
+        let matched_second = kernel.matches(u8x64::load_array_ref(simd, second));
+        if (matched_first | matched_second).any_true() {
+            if let Some(lane) = first_matching_lane(matched_first) {
+                return Some(offset + lane);
+            }
+            return Some(
+                offset
+                    + CHUNK_BYTES
+                    + first_matching_lane(matched_second).unwrap_or_else(|| {
+                        debug_assert!(false);
+                        0
+                    }),
+            );
+        }
+        offset += 2 * CHUNK_BYTES;
+    }
+
+    if let [chunk] = last_chunk {
+        let matched = kernel.matches(u8x64::load_array_ref(simd, chunk));
+        if matched.any_true() {
+            return first_matching_lane(matched).map(|lane| offset + lane);
+        }
+        offset += CHUNK_BYTES;
+    }
+
+    let native_width = S::u8s::LEN;
+    if native_width < CHUNK_BYTES {
+        for chunk in rest.chunks_exact(native_width) {
+            let matched = kernel.matches(S::u8s::from_slice(simd, chunk));
+            if let Some(lane) = first_matching_lane(matched) {
+                return Some(offset + lane);
+            }
+            offset += native_width;
+        }
+    }
+
+    if offset == haystack.len() {
+        return None;
+    }
+    let offset = haystack.len() - native_width;
+    let matched = kernel.matches(S::u8s::from_slice(simd, &haystack[offset..]));
+    first_matching_lane(matched).map(|lane| offset + lane)
+}
+
+#[inline(always)]
+#[simd]
+fn last_match<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Option<usize> {
+    if haystack.len() < CHUNK_BYTES {
+        return last_match_short(simd, haystack, kernel);
+    }
+
+    let (prefix, chunks) = haystack.as_rchunks::<CHUNK_BYTES>();
+    let (last, chunks) = chunks.split_last().unwrap();
+    let mut end = haystack.len() - CHUNK_BYTES;
+    let matched = kernel.matches(u8x64::load_array_ref(simd, last));
+    if let Some(lane) = last_matching_lane(matched) {
+        return Some(end + lane);
+    }
+
+    let (first_chunk, pairs) = chunks.as_rchunks::<2>();
+    for [left, right] in pairs.iter().rev() {
+        let left = kernel.matches(u8x64::load_array_ref(simd, left));
+        let right = kernel.matches(u8x64::load_array_ref(simd, right));
+        end -= 2 * CHUNK_BYTES;
+        if (left | right).any_true() {
+            if let Some(lane) = last_matching_lane(right) {
+                return Some(end + CHUNK_BYTES + lane);
+            }
+            return Some(end + last_matching_lane(left).unwrap());
+        }
+    }
+    if let [chunk] = first_chunk {
+        end -= CHUNK_BYTES;
+        let matched = kernel.matches(u8x64::load_array_ref(simd, chunk));
+        if let Some(lane) = last_matching_lane(matched) {
+            return Some(end + lane);
+        }
+    }
+
+    let native_width = S::u8s::LEN;
+    if native_width < CHUNK_BYTES {
+        for chunk in prefix.rchunks_exact(native_width) {
+            end -= native_width;
+            let matched = kernel.matches(S::u8s::from_slice(simd, chunk));
+            if let Some(lane) = last_matching_lane(matched) {
+                return Some(end + lane);
+            }
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    // The overlapping suffix was already checked and contains no matches.
+    let matched = kernel.matches(S::u8s::from_slice(simd, &haystack[..native_width]));
+    last_matching_lane(matched)
+}
+
+#[inline(always)]
+fn last_match_short<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Option<usize> {
+    debug_assert!(haystack.len() < CHUNK_BYTES);
+    let len = haystack.len();
+    if let (Some(front), Some(back)) = (
+        haystack.first_chunk::<{ 2 * BLOCK_BYTES }>(),
+        haystack.last_chunk::<{ 2 * BLOCK_BYTES }>(),
+    ) {
+        let matched = kernel.matches(u8x32::load_array_ref(simd, back));
+        if let Some(lane) = last_matching_lane(matched) {
+            return Some(len - 2 * BLOCK_BYTES + lane);
+        }
+        if len == 2 * BLOCK_BYTES {
+            return None;
+        }
+        let matched = kernel.matches(u8x32::load_array_ref(simd, front));
+        return last_matching_lane(matched);
+    }
+    if let (Some(front), Some(back)) = (
+        haystack.first_chunk::<BLOCK_BYTES>(),
+        haystack.last_chunk::<BLOCK_BYTES>(),
+    ) {
+        let matched = kernel.matches(u8x16::load_array_ref(simd, back));
+        if let Some(lane) = last_matching_lane(matched) {
+            return Some(len - BLOCK_BYTES + lane);
+        }
+        if len == BLOCK_BYTES {
+            return None;
+        }
+        let matched = kernel.matches(u8x16::load_array_ref(simd, front));
+        return last_matching_lane(matched);
+    }
+
+    for (offset, &byte) in haystack.iter().enumerate().rev().take(PROBE_BYTES) {
+        if kernel.matches_byte(byte) {
+            return Some(offset);
+        }
+    }
+    if len <= PROBE_BYTES {
+        return None;
+    }
+    let prefix = &haystack[..len - PROBE_BYTES];
+    let bits = short_tail_bits(simd, kernel, prefix);
+    (bits != 0).then(|| 63 - bits.leading_zeros() as usize)
+}
+
+/// [`first_match`] for a haystack shorter than one [`CHUNK_BYTES`].
+///
+/// Overlapping front and back vectors avoid a loop. Sub-vector haystacks use a scalar probe
+/// followed by staged ends.
+#[inline(always)]
+fn first_match_short<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Option<usize> {
+    debug_assert!(haystack.len() < CHUNK_BYTES);
+    let len = haystack.len();
+
+    if let (Some(front), Some(back)) = (
+        haystack.first_chunk::<{ 2 * BLOCK_BYTES }>(),
+        haystack.last_chunk::<{ 2 * BLOCK_BYTES }>(),
+    ) {
+        let matched = kernel.matches(u8x32::load_array_ref(simd, front));
+        if matched.any_true() {
+            return first_matching_lane(matched);
+        }
+        if len == 2 * BLOCK_BYTES {
+            return None;
+        }
+        let matched = kernel.matches(u8x32::load_array_ref(simd, back));
+        if !matched.any_true() {
+            return None;
+        }
+        let base = len - 2 * BLOCK_BYTES;
+        return first_matching_lane(matched).map(|lane| base + lane);
+    }
+
+    if let (Some(front), Some(back)) = (
+        haystack.first_chunk::<BLOCK_BYTES>(),
+        haystack.last_chunk::<BLOCK_BYTES>(),
+    ) {
+        let matched = kernel.matches(u8x16::load_array_ref(simd, front));
+        if let Some(lane) = first_matching_lane(matched) {
+            return Some(lane);
+        }
+        if len == BLOCK_BYTES {
+            return None;
+        }
+        let matched = kernel.matches(u8x16::load_array_ref(simd, back));
+        let base = len - BLOCK_BYTES;
+        return first_matching_lane(matched).map(|lane| base + lane);
+    }
+
+    for (offset, &byte) in haystack.iter().take(PROBE_BYTES).enumerate() {
+        if kernel.matches_byte(byte) {
+            return Some(offset);
+        }
+    }
+    if len <= PROBE_BYTES {
+        return None;
+    }
+
+    // Keep staged ends separate so each half retains its original offset.
+    let rest = &haystack[PROBE_BYTES..];
+    let (bits, staged_len) = staged_ends_bits(simd, kernel, rest);
+    let keep_mask = !(u64::MAX << staged_len);
+    let front = bits & keep_mask;
+    if front != 0 {
+        return Some(PROBE_BYTES + front.trailing_zeros() as usize);
+    }
+    let back = (bits >> staged_len) & keep_mask;
+    (back != 0).then(|| len - staged_len + back.trailing_zeros() as usize)
+}
+
+#[inline(always)]
+fn first_matching_lane<S: Simd, M: SimdMask<S, Element = i8>>(matched: M) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(neon) = matched.token().level().as_neon() {
+        match M::LEN {
+            16 => {
+                let mut lanes = [0; 16];
+                matched.store_slice(&mut lanes);
+                let bits = aarch64_match_nibbles(neon, lanes);
+                return (bits != 0).then(|| bits.trailing_zeros() as usize / 4);
+            }
+            32 => {
+                let mut lanes = [[0; 16]; 2];
+                matched.store_slice(lanes.as_flattened_mut());
+                for (i, &lanes) in lanes.iter().enumerate() {
+                    let bits = aarch64_match_nibbles(neon, lanes);
+                    if bits != 0 {
+                        return Some(i * 16 + bits.trailing_zeros() as usize / 4);
+                    }
+                }
+                return None;
+            }
+            64 => {
+                let mut lanes = [[0; 16]; 4];
+                matched.store_slice(lanes.as_flattened_mut());
+                for (i, &lanes) in lanes.iter().enumerate() {
+                    let bits = aarch64_match_nibbles(neon, lanes);
+                    if bits != 0 {
+                        return Some(i * 16 + bits.trailing_zeros() as usize / 4);
+                    }
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    let bits = matched.to_bitmask();
+    (bits != 0).then(|| bits.trailing_zeros() as usize)
+}
+
+#[inline(always)]
+fn last_matching_lane<S: Simd, M: SimdMask<S, Element = i8>>(matched: M) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(neon) = matched.token().level().as_neon()
+        && (M::LEN == 16 || M::LEN == 32 || M::LEN == 64)
+    {
+        let mut lanes = [[0; 16]; 4];
+        let lanes = &mut lanes[..M::LEN / 16];
+        matched.store_slice(lanes.as_flattened_mut());
+        for (i, &lanes) in lanes.iter().enumerate().rev() {
+            let bits = aarch64_match_nibbles(neon, lanes);
+            if bits != 0 {
+                return Some(i * 16 + (63 - bits.leading_zeros() as usize) / 4);
+            }
+        }
+        return None;
+    }
+    let bits = matched.to_bitmask();
+    (bits != 0).then(|| 63 - bits.leading_zeros() as usize)
+}
+
+kernel! {
+    #[inline(always)]
+    fn aarch64_match_nibbles(simd: Neon, lanes: [i8; 16]) -> u64 {
+        use core::arch::aarch64::*;
+
+        let lanes = i8x16::load_array(simd, lanes);
+        // Four bits per byte preserve lane order without compacting to one bit per byte.
+        let bits = vshrn_n_u16::<4>(vreinterpretq_u16_s8(lanes.into()));
+        vget_lane_u64::<0>(vreinterpret_u64_u8(bits))
+    }
+}
+
+/// Counts every matching byte of `haystack`.
+#[inline(always)]
+#[simd]
+fn count_all<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> usize {
+    // Drain after 255 chunks to prevent byte-lane overflow.
+    const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
+
+    let (chunks, tail) = haystack.as_chunks::<CHUNK_BYTES>();
+    let (blocks, tail) = tail.as_chunks::<BLOCK_BYTES>();
+
+    let mut total = 0;
+    for batch in chunks.chunks(CHUNKS_PER_ACCUMULATOR) {
+        let mut counts = u8x64::splat(simd, 0);
+        for chunk in batch {
+            let match_mask = kernel.matches(u8x64::from_slice(simd, chunk));
+            let match_mask: u8x64<_> = i8x64::load_array(simd, match_mask.into()).bitcast();
+            // Subtracting an all-ones match mask adds one per lane.
+            counts -= match_mask;
+        }
+        total += sum_lanes_64(simd, counts);
+    }
+    if !blocks.is_empty() {
+        let mut counts = u8x16::splat(simd, 0);
+        for block in blocks {
+            let match_mask = kernel.matches(u8x16::load_array_ref(simd, block));
+            let match_mask: u8x16<_> = i8x16::load_array(simd, match_mask.into()).bitcast();
+            counts -= match_mask;
+        }
+        let (count_l, count_r) = counts.widen();
+        total += usize::from((count_l + count_r).reduce_sum());
+    }
+    if !tail.is_empty() {
+        let bits = tail_bits(simd, kernel, haystack, tail);
+        total += bits.count_ones() as usize;
+    }
+    total
+}
+
+/// Returns match bits for the final partial block in `haystack`.
+///
+/// Re-reads the last full block when possible; shorter haystacks are staged.
+#[inline(always)]
+fn tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
+    debug_assert!(!tail.is_empty() && tail.len() < BLOCK_BYTES);
+    if let Some(chunk) = haystack.last_chunk::<BLOCK_BYTES>() {
+        let matched = kernel.matches(u8x16::load_array_ref(simd, chunk));
+        matched.to_bitmask() >> (BLOCK_BYTES - tail.len())
+    } else {
+        short_tail_bits(simd, kernel, tail)
+    }
+}
+
+/// Returns match bits for both ends of a haystack shorter than [`BLOCK_BYTES`].
+///
+/// General-purpose registers avoid store-forwarding stalls from a partially initialized vector
+/// buffer. The returned halves may overlap and only their lowest `staged_len` bits are valid.
+#[inline(always)]
+fn staged_ends_bits<S: Simd, K: Kernel>(
+    simd: S,
+    kernel: &K,
+    short_haystack: &[u8],
+) -> (u64, usize) {
+    /// Packs the first and last `N` bytes into one word.
+    #[inline]
+    fn ends<const N: usize>(haystack: &[u8]) -> u64 {
+        const { assert!(N <= 4) }
+        debug_assert!(haystack.len() >= N);
+
+        #[inline]
+        fn end<const N: usize>(bytes: &[u8]) -> u64 {
+            let mut buf = [0; 8];
+            buf[..N].copy_from_slice(bytes);
+            u64::from_le_bytes(buf)
+        }
+
+        let (first, last) = (&haystack[..N], &haystack[haystack.len() - N..]);
+        end::<N>(first) | end::<N>(last) << (N * 8)
+    }
+
+    let len = short_haystack.len();
+    debug_assert!(!short_haystack.is_empty() && len < BLOCK_BYTES);
+
+    let (words, staged_len) = match len {
+        8.. => {
+            let first = u64::from_le_bytes(*short_haystack.first_chunk::<8>().unwrap());
+            let last = u64::from_le_bytes(*short_haystack.last_chunk::<8>().unwrap());
+            ([first, last], 8)
+        }
+        4..8 => ([ends::<4>(short_haystack), 0], 4),
+        2..4 => ([ends::<2>(short_haystack), 0], 2),
+        0..2 => ([ends::<1>(short_haystack), 0], 1),
+    };
+    let words = [words[0].to_le(), words[1].to_le()];
+    let ends: u8x16<S> = u64x2::load_array(simd, words).bitcast();
+    (kernel.matches(ends).to_bitmask(), staged_len)
+}
+
+/// [`staged_ends_bits`] with the two ends slid back to the positions they were read from, for
+/// a caller that wants every match rather than the first.
+#[inline(always)]
+fn short_tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, short_haystack: &[u8]) -> u64 {
+    let len = short_haystack.len();
+    let (bits, staged_len) = staged_ends_bits(simd, kernel, short_haystack);
+    let keep_mask = !(u64::MAX << staged_len);
+    (bits & keep_mask) | (((bits >> staged_len) & keep_mask) << (len - staged_len))
+}
+
+/// Sums every lane of a vector.
+#[inline(always)]
+fn sum_lanes_64<S: Simd>(simd: S, counts: u8x64<S>) -> usize {
+    // With AVX2 and up, llvm does well, but for lower levels, we can do better.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if simd.level().as_avx2().is_none()
+        && let Some(sse2) = simd.level().as_sse2()
+    {
+        let (l, r) = counts.split();
+        let ((a, b), (c, d)) = (l.split(), r.split());
+        let a: u64x2<_> = x86_sum_widen(sse2, a.into()).simd_into(simd);
+        let b: u64x2<_> = x86_sum_widen(sse2, b.into()).simd_into(simd);
+        let c: u64x2<_> = x86_sum_widen(sse2, c.into()).simd_into(simd);
+        let d: u64x2<_> = x86_sum_widen(sse2, d.into()).simd_into(simd);
+        return ((a + b) + (c + d)).reduce_sum() as usize;
+    }
+    // NEON benefits from explicit pairwise widening.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(neon) = simd.level().as_neon() {
+        use fearless_simd::u16x8;
+
+        let (l, r) = counts.split();
+        let ((a, b), (c, d)) = (l.split(), r.split());
+        let a: u16x8<_> = aarch64_sum_widen(neon, a.into()).simd_into(simd);
+        let b: u16x8<_> = aarch64_sum_widen(neon, b.into()).simd_into(simd);
+        let c: u16x8<_> = aarch64_sum_widen(neon, c.into()).simd_into(simd);
+        let d: u16x8<_> = aarch64_sum_widen(neon, d.into()).simd_into(simd);
+        return usize::from(((a + b) + (c + d)).reduce_sum());
+    }
+    let _ = simd;
+    let mut total = 0;
+    for &lane in counts.as_array() {
+        total += usize::from(lane);
+    }
+    total
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+kernel! {
+    #[inline(always)]
+    fn x86_sum_widen(simd: Sse2, lanes: [u8; 16]) -> [u64; 2] {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::*;
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+
+        let lanes = u8x16::load_array(simd, lanes);
+        let summed: u64x2<_> = _mm_sad_epu8(lanes.into(), _mm_setzero_si128()).simd_into(simd);
+        summed.into()
+    }
+}
+
+kernel! {
+    #[inline(always)]
+    fn aarch64_sum_widen(simd: Neon, lanes: [u8; 16]) -> [u16; 8] {
+        use core::arch::aarch64::*;
+        use fearless_simd::u16x8;
+
+        let lanes = u8x16::load_array(simd, lanes);
+        let summed: u16x8<_> = vpaddlq_u8(lanes.into()).simd_into(simd);
+        summed.into()
+    }
+}
+
+kernel! {
+    #[inline(always)]
+    fn aarch64_swizzle_32_to_16(simd: Neon, table: [u8; 32], idx: [u8; 16]) -> [u8; 16] {
+        use core::arch::aarch64::*;
+
+        let table = u8x32::load_array(simd, table);
+        let idx = u8x16::load_array(simd, idx);
+        let res = vqtbl2q_u8(table.into(), idx.into());
+        u8x16::simd_from(simd, res).into()
+    }
+}
+
+pub(crate) fn scan_ops<S: Simd, K: Kernel>(simd: S) -> &'static ScanOps {
+    /// Rebuilds a SIMD token, which holds no data beyond the support it proves.
+    ///
+    /// # Safety
+    ///
+    /// The running target must support `S`'s level.
+    #[inline(always)]
+    unsafe fn token<S: Simd>() -> S {
+        const {
+            assert!(size_of::<S>() == 0);
+            assert!(align_of::<S>() == 1);
+        };
+        // SAFETY: `S` is zero-sized, and the caller guarantees target support.
+        unsafe { transmute_copy(&()) }
+    }
+    /// Scans for the next matching chunk.
+    ///
+    /// # Safety
+    ///
+    /// The running target must support this module's level, and `kernel_storage`'s live field
+    /// must be the one `K` reads.
+    unsafe fn next_match_batch_impl<S: Simd, K: Kernel>(
+        kernel_storage: &KernelStorage,
+        state: &mut IterState<'_>,
+    ) -> MatchedBitset {
+        // SAFETY: guaranteed by the caller.
+        let simd = unsafe { token::<S>() };
+        // SAFETY: `kernel_storage` has `K`'s live field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        next_match_batch(simd, kernel, state)
+    }
+
+    /// Counts all matching bytes.
+    ///
+    /// # Safety
+    ///
+    /// The running target must support `S`, and `kernel_storage` must have the field `K` reads as its
+    /// live field.
+    unsafe fn count_all_impl<S: Simd, K: Kernel>(
+        kernel_storage: &KernelStorage,
+        haystack: &[u8],
+    ) -> usize {
+        // SAFETY: guaranteed by the caller.
+        let simd = unsafe { token::<S>() };
+        // SAFETY: `kernel_storage` has `K`'s live field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        count_all(simd, haystack, kernel)
+    }
+
+    /// Finds the first matching byte.
+    ///
+    /// # Safety
+    ///
+    /// The running target must support `S`, and `kernel_storage` must have the field `K` reads as its
+    /// live field.
+    unsafe fn first_match_impl<S: Simd, K: Kernel>(
+        kernel_storage: &KernelStorage,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: guaranteed by the caller.
+        let simd = unsafe { token::<S>() };
+        // SAFETY: `kernel_storage` has `K`'s live field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        first_match(simd, haystack, kernel)
+    }
+    /// # Safety
+    ///
+    /// The target must support `S`, and `kernel_storage` must contain `K`.
+    unsafe fn last_match_impl<S: Simd, K: Kernel>(
+        kernel_storage: &KernelStorage,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: the caller guarantees target support and the live kernel field.
+        let simd = unsafe { token::<S>() };
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        last_match(simd, haystack, kernel)
+    }
+    _ = simd;
+
+    &const {
+        // SAFETY: all entry points use `K` and `S`; vector scans and masked tails preserve
+        // the scan contracts.
+        unsafe {
+            ScanOps::new(
+                next_match_batch_impl::<S, K>,
+                count_all_impl::<S, K>,
+                first_match_impl::<S, K>,
+                last_match_impl::<S, K>,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_short_inputs_preserve_offsets() {
+        fn check<S: Simd>(simd: S) {
+            for needle in [0, b'x', u8::MAX] {
+                let kernel = kernels::AnyOf::new([needle]);
+                for len in 1..BLOCK_BYTES {
+                    let mut haystack = vec![needle.wrapping_add(1); len];
+                    assert_eq!(short_tail_bits(simd, &kernel, &haystack), 0);
+                    assert_eq!(first_match_short(simd, &haystack, &kernel), None);
+                    assert_eq!(last_match_short(simd, &haystack, &kernel), None);
+                    for offset in 0..len {
+                        haystack[offset] = needle;
+                        assert_eq!(short_tail_bits(simd, &kernel, &haystack), 1 << offset);
+                        assert_eq!(first_match_short(simd, &haystack, &kernel), Some(offset));
+                        assert_eq!(last_match_short(simd, &haystack, &kernel), Some(offset));
+                        haystack[offset] = needle.wrapping_add(1);
+                    }
+                }
+            }
+        }
+
+        fearless_simd::dispatch!(Level::new(), simd => check(simd));
+    }
+}

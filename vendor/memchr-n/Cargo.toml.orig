@@ -1,0 +1,30 @@
+[package]
+name = "memchr-n"
+version = "0.1.9"
+edition = "2024"
+# Matches the minimum supported Rust version of fearless_simd.
+rust-version = "1.89"
+authors = ["Zachary Dremann <dremann@gmail.com>"]
+description = "Fast SIMD-accelerated search and iteration over the bytes belonging to an arbitrary set of byte values"
+repository = "https://github.com/Dr-Emann/memchr_n"
+license = "MIT OR Apache-2.0"
+keywords = ["memchr", "simd", "search", "bytes", "scan"]
+categories = ["algorithms", "text-processing"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+manual_level = []
+
+[dependencies]
+fearless_simd = "1.0.0"
+fearless_simd_macros = "0.1.0"
+
+[dev-dependencies]
+criterion = "0.8"
+memchr = "2.8"
+
+[[bench]]
+name = "memchr_n"
+harness = false

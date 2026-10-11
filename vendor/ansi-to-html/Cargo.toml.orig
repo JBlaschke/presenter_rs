@@ -1,0 +1,32 @@
+[package]
+name = "ansi-to-html"
+version = "0.2.4"
+description = "ANSI escape codes to HTML converter"
+categories = ["command-line-interface", "encoding"]
+keywords = ["color", "cli", "terminal", "html"]
+homepage = "https://github.com/Aloso/to-html/tree/main/crates/ansi-to-html"
+readme = "README.md"
+repository.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.85.1"
+
+exclude = ["/benches"]
+
+[dependencies]
+memchr = "2.8.0"
+
+[features]
+# A now unused feature that will be removed in a future release
+lazy-init = []
+
+[dev-dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+divan = "0.1.21"
+flate2 = "1.1.9"
+insta = "1.47.2"
+
+[[bench]]
+name = "convert"
+harness = false
