@@ -166,6 +166,15 @@ live-reloads too). Debounce 150 ms (implemented by T20 directly on `notify` with
 (vim, VS Code "safe write") produce `Remove`+`Create`; treat any event kind as a change and
 re-add watches for paths that were recreated.
 
+> **Note (2026-10-11):** one exception to "any event kind is a change": an event for a path
+> whose inode change time lies before the last batch was sent (at first, before the watcher
+> started) is dropped. FSEvents reports changes made shortly before its stream was created,
+> and it creates a stream on every watch, so the files written to set a project up, or the
+> change behind the last rebuild, came back as a second batch and a spurious rebuild (seen
+> as the `content` build after `hello` that `tests/cli_serve.rs` did not expect, on loaded
+> macOS runners). The build that the last batch started read the path after that change.
+> Whole-second change times never qualify; Windows has no change time.
+
 > **Note (A2, 2026-10-09; audit F18):** below the recursively watched theme directories only
 > `.git/` and editor files (backups, swap, lock and auto-save files, `.DS_Store`) are
 > ignored. Directories named `dist/` or `target/` count like any other: a theme may keep

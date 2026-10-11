@@ -40,10 +40,17 @@
 //! becomes **one** [`ChangeBatch`]: its relevant paths, sorted, and their [`ChangeKind`]
 //! ([`classify`]). Any event kind counts as a change (create, modify, remove, rename,
 //! metadata) except a mere access: inotify reports every `open()`, and the build itself
-//! opens its inputs. When the backend lost events (a rescan), the batch lists every
-//! watched file. A watched directory that is created or removed (deleted and recreated,
-//! e.g. by `git checkout`) counts as a change too, and the next [`Watcher::update`]
-//! watches it again. So does the removal or renaming of a directory above a watched one.
+//! opens its inputs. An event for a path last changed (inode change time) before the last
+//! batch was sent, at first before the watcher started, is dropped: FSEvents reports
+//! changes made shortly before its stream was created, and it creates a stream on every
+//! watch, so the files written to set a project up, or the change that caused the last
+//! rebuild, would come back as changes; the build that the last batch started (or the
+//! first build, which runs after the watcher started) read the path after that change.
+//! A path with a whole-second change time is never dropped (`changed_before`). When the
+//! backend lost events (a rescan), the batch lists every watched file. A watched
+//! directory that is created or removed (deleted and recreated, e.g. by `git checkout`)
+//! counts as a change too, and the next [`Watcher::update`] watches it again. So does the
+//! removal or renaming of a directory above a watched one.
 //! On Windows the parent of every watched directory is watched as well, non-recursively
 //! (`guard_watches`): there, a watched directory's own removal is reported only by its
 //! parent's watch, the directory's handle dies with it.
@@ -941,6 +948,33 @@ fn modified_since(path: &Path, since: SystemTime) -> bool {
         .is_ok_and(|modified| modified >= since)
 }
 
+/// Whether `path` exists and was last changed before `since`, by its inode change time
+/// (set by every write, rename, `touch` and permission change, and not by user code).
+/// Only a sub-second change time counts: a file system with whole-second times cannot
+/// tell a change in the same second as `since` from an earlier one, so nothing there is
+/// ever "before". Windows has no change time: nothing is.
+fn changed_before(path: &Path, since: SystemTime) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        let (Ok(secs), Ok(nanos)) = (
+            u64::try_from(meta.ctime()),
+            u32::try_from(meta.ctime_nsec()),
+        ) else {
+            return false;
+        };
+        nanos != 0 && std::time::UNIX_EPOCH + Duration::new(secs, nanos) < since
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, since);
+        false
+    }
+}
+
 /// Adds the files below `dir` (inside the recursively watched `root`) that were modified at
 /// or after `since` to `found`, skipping the ignore list. Symbolic links are not followed.
 fn modified_below(root: &Path, dir: &Path, since: SystemTime, found: &mut BTreeSet<PathBuf>) {
@@ -1067,6 +1101,15 @@ fn collect(
             // A directory reported as modified (Windows does that when an entry in it is
             // written, renamed or removed) is no change by itself: the entry has its own
             // event. A created, removed or renamed directory still counts.
+            continue;
+        } else if changed_before(&path, shared.since) {
+            // FSEvents reports changes made shortly before its stream was created, and it
+            // creates a stream on every watch (module docs): the build that the last batch
+            // started (or the first build) read the path after this change.
+            tracing::debug!(
+                "file watcher: {} last changed before the last batch; skipped",
+                path.display()
+            );
             continue;
         }
         pending.insert(path);
@@ -1246,6 +1289,47 @@ mod tests {
 
     fn paths(list: &[&str]) -> Vec<PathBuf> {
         list.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn changes_from_before_the_last_batch_are_skipped() {
+        use notify::event::{DataChange, ModifyKind, RemoveKind};
+        let dir = tempfile::tempdir().unwrap();
+        let file = canonical(&dir.path().join("slides.md"));
+        std::fs::write(&file, "one\n").unwrap();
+        let set = WatchSet {
+            files: vec![file.clone()],
+            ..WatchSet::default()
+        };
+        let shared = Mutex::new(Shared {
+            filter: Filter::new(&set),
+            missing: BTreeSet::new(),
+            recreated: BTreeSet::new(),
+            since: SystemTime::now(),
+        });
+        let modified = |path: &Path| -> notify::Result<Event> {
+            Ok(
+                Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(path.to_path_buf()),
+            )
+        };
+        let mut pending = BTreeSet::new();
+        // Written before the watcher started, as FSEvents reports it: no change (where
+        // the file system has sub-second change times; elsewhere it counts).
+        if changed_before(&file, SystemTime::now()) {
+            assert!(!collect(modified(&file), &shared, &mut pending));
+            assert!(pending.is_empty());
+        }
+        // Written again: a change.
+        std::fs::write(&file, "two\n").unwrap();
+        assert!(collect(modified(&file), &shared, &mut pending));
+        assert_eq!(pending.iter().collect::<Vec<_>>(), vec![&file]);
+        // Removed: a change (there is nothing to compare).
+        std::fs::remove_file(&file).unwrap();
+        let removed = Ok(Event::new(EventKind::Remove(RemoveKind::File)).add_path(file.clone()));
+        let mut pending = BTreeSet::new();
+        assert!(collect(removed, &shared, &mut pending));
+        assert_eq!(pending.iter().collect::<Vec<_>>(), vec![&file]);
     }
 
     #[test]

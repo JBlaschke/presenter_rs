@@ -221,6 +221,31 @@ fn unrelated_and_ignored_paths_do_not_count() {
     assert_eq!(drain(&rx, QUIET), vec![]);
 }
 
+/// FSEvents reports changes made shortly before its stream was created ([`start_with`]
+/// drains them for the other tests; inotify and Windows report none). The watcher drops
+/// them, by the change time: the build that follows a start reads the files anyway. So a
+/// watcher started right after the files were written, as `presenter serve` starts its
+/// own, reports nothing, and a change made afterwards still counts.
+///
+/// FSEvents lags a few milliseconds on an idle Mac and more on a loaded one; `Watcher::start`
+/// takes about as long before its stream exists, so without the filter this fails on a
+/// loaded machine (the CI runners) and passes by timing on an idle one. The unit test
+/// `changes_from_before_the_last_batch_are_skipped` covers the filter itself.
+#[test]
+fn changes_from_before_the_watcher_started_are_not_reported() {
+    let (_dir, deck, theme, css) = deck_and_theme();
+    let set = WatchSet::new([deck], [theme]);
+    let (tx, rx) = mpsc::channel();
+    let _watcher = Watcher::start(&set, tx).unwrap();
+    assert_eq!(drain(&rx, QUIET), vec![]);
+
+    write(&css, "body { color: blue; }\n");
+    let batch = next(&rx, "editing the stylesheet");
+    assert_eq!(batch.paths, vec![canonical(&css)]);
+    assert_eq!(batch.kind, ChangeKind::Css);
+    assert_eq!(drain(&rx, QUIET), vec![]);
+}
+
 /// Audit F18: a theme may keep inputs in directories named `dist` or `target` (a bundled
 /// script entry, a vendored library's stylesheet), at any depth; editing them counts like
 /// any other theme file. Only `.git/` and editor files are ignored.
