@@ -165,7 +165,11 @@ jobs:
           # The crates linked into the binary: the normal dependencies for this target,
           # without proc-macros (they only run at compile time). Their license expression
           # and source in crates.txt, and their license files.
-          cargo tree --locked -e normal,no-proc-macro --target "$TARGET" --prefix none --format '{p}' \
+          # --color never: the workflow sets CARGO_TERM_COLOR=always, and cargo tree then colours
+          # the "(*)" that marks a repeated dependency. The escape code sits before the "(",
+          # so the sed below would not strip it, and that line would count as a crate that
+          # cargo metadata does not know.
+          cargo tree --color never --locked -e normal,no-proc-macro --target "$TARGET" --prefix none --format '{p}' \
             | sed -E 's/ \(.*$//' | sort -u > "$RUNNER_TEMP/linked.txt"
           # (The manifest path ends in /Cargo.toml, or \Cargo.toml on Windows.)
           cargo metadata --locked --format-version 1 --filter-platform "$TARGET" \
