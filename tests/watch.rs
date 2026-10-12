@@ -222,10 +222,10 @@ fn unrelated_and_ignored_paths_do_not_count() {
 }
 
 /// FSEvents reports changes made shortly before its stream was created ([`start_with`]
-/// drains them for the other tests; inotify and Windows report none). The watcher drops
-/// them, by the change time: the build that follows a start reads the files anyway. So a
-/// watcher started right after the files were written, as `presenter serve` starts its
-/// own, reports nothing, and a change made afterwards still counts.
+/// drains them for the other tests; inotify and Windows report none). On macOS the watcher
+/// drops them, by the change time: the build that follows a start reads the files anyway.
+/// So a watcher started right after the files were written, as `presenter serve` starts
+/// its own, reports nothing, and a change made afterwards still counts.
 ///
 /// FSEvents lags a few milliseconds on an idle Mac and more on a loaded one; `Watcher::start`
 /// takes about as long before its stream exists, so without the filter this fails on a

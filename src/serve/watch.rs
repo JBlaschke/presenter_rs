@@ -40,17 +40,19 @@
 //! becomes **one** [`ChangeBatch`]: its relevant paths, sorted, and their [`ChangeKind`]
 //! ([`classify`]). Any event kind counts as a change (create, modify, remove, rename,
 //! metadata) except a mere access: inotify reports every `open()`, and the build itself
-//! opens its inputs. An event for a path last changed (inode change time) before the last
-//! batch was sent, at first before the watcher started, is dropped: FSEvents reports
-//! changes made shortly before its stream was created, and it creates a stream on every
-//! watch, so the files written to set a project up, or the change that caused the last
-//! rebuild, would come back as changes; the build that the last batch started (or the
-//! first build, which runs after the watcher started) read the path after that change.
-//! A path with a whole-second change time is never dropped (`changed_before`). When the
-//! backend lost events (a rescan), the batch lists every watched file. A watched
-//! directory that is created or removed (deleted and recreated, e.g. by `git checkout`)
-//! counts as a change too, and the next [`Watcher::update`] watches it again. So does the
-//! removal or renaming of a directory above a watched one.
+//! opens its inputs. On macOS, an event for a path last changed (inode change time) before
+//! the last batch was sent, at first before the watcher started, is dropped, a directory's
+//! creation included: FSEvents reports changes made shortly before its stream was created,
+//! and it creates a stream on every watch, so the files and directories written to set a
+//! project up, or the change that caused the last rebuild, would come back as changes; the
+//! build that the last batch started (or the first build, which runs after the watcher
+//! started) read the path after that change. A path with a whole-second change time is
+//! never dropped, and nothing is on Linux, whose file times come from a coarse clock, or
+//! on Windows (`changed_before`). When the backend lost events (a rescan), the batch lists
+//! every watched file. A watched directory that is created or removed (deleted and
+//! recreated, e.g. by `git checkout`) counts as a change too, and the next
+//! [`Watcher::update`] watches it again. So does the removal or renaming of a directory
+//! above a watched one.
 //! On Windows the parent of every watched directory is watched as well, non-recursively
 //! (`guard_watches`): there, a watched directory's own removal is reported only by its
 //! parent's watch, the directory's handle dies with it.
@@ -952,27 +954,32 @@ fn modified_since(path: &Path, since: SystemTime) -> bool {
 /// (set by every write, rename, `touch` and permission change, and not by user code).
 /// Only a sub-second change time counts: a file system with whole-second times cannot
 /// tell a change in the same second as `since` from an earlier one, so nothing there is
-/// ever "before". Windows has no change time: nothing is.
+/// ever "before".
+///
+/// macOS only, the one platform whose backend reports changes from before a watch
+/// (FSEvents, module docs), and one that stamps files from the system clock. Linux stamps
+/// them from a coarse clock that runs up to a tick (1-10 ms) behind it, so a change made
+/// right after a batch can look older than the batch; inotify and Windows report nothing
+/// from before a watch anyway, so there nothing is "before".
+#[cfg(target_os = "macos")]
 fn changed_before(path: &Path, since: SystemTime) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        let (Ok(secs), Ok(nanos)) = (
-            u64::try_from(meta.ctime()),
-            u32::try_from(meta.ctime_nsec()),
-        ) else {
-            return false;
-        };
-        nanos != 0 && std::time::UNIX_EPOCH + Duration::new(secs, nanos) < since
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, since);
-        false
-    }
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let (Ok(secs), Ok(nanos)) = (
+        u64::try_from(meta.ctime()),
+        u32::try_from(meta.ctime_nsec()),
+    ) else {
+        return false;
+    };
+    nanos != 0 && std::time::UNIX_EPOCH + Duration::new(secs, nanos) < since
+}
+
+/// The macOS version says why nothing is "before" elsewhere.
+#[cfg(not(target_os = "macos"))]
+fn changed_before(_path: &Path, _since: SystemTime) -> bool {
+    false
 }
 
 /// Adds the files below `dir` (inside the recursively watched `root`) that were modified at
@@ -1095,22 +1102,26 @@ fn collect(
     );
     let mut relevant = false;
     for path in event.paths.iter().map(|path| canonical(path)) {
-        if structural && shared.is_structural(&path) {
-            shared.recreated.insert(path.clone());
-        } else if (!structural && path.is_dir()) || !shared.filter.matches(&path) {
+        let recreated = structural && shared.is_structural(&path);
+        if !recreated && ((!structural && path.is_dir()) || !shared.filter.matches(&path)) {
             // A directory reported as modified (Windows does that when an entry in it is
             // written, renamed or removed) is no change by itself: the entry has its own
             // event. A created, removed or renamed directory still counts.
             continue;
-        } else if changed_before(&path, shared.since) {
+        }
+        if changed_before(&path, shared.since) {
             // FSEvents reports changes made shortly before its stream was created, and it
             // creates a stream on every watch (module docs): the build that the last batch
-            // started (or the first build) read the path after this change.
+            // started (or the first build) read the path after this change, and a
+            // directory that existed before it was not recreated since.
             tracing::debug!(
                 "file watcher: {} last changed before the last batch; skipped",
                 path.display()
             );
             continue;
+        }
+        if recreated {
+            shared.recreated.insert(path.clone());
         }
         pending.insert(path);
         relevant = true;
@@ -1314,8 +1325,8 @@ mod tests {
             )
         };
         let mut pending = BTreeSet::new();
-        // Written before the watcher started, as FSEvents reports it: no change (where
-        // the file system has sub-second change times; elsewhere it counts).
+        // Written before the watcher started, as FSEvents reports it: no change on macOS
+        // (where the file system has sub-second change times); elsewhere it counts.
         if changed_before(&file, SystemTime::now()) {
             assert!(!collect(modified(&file), &shared, &mut pending));
             assert!(pending.is_empty());
