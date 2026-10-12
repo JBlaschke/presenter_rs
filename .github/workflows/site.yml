@@ -2,9 +2,12 @@
 #
 # Builds `presenter` in release mode, runs scripts/site.py (the landing page with the latest
 # release's downloads, and every committed example rendered to one HTML file each) and
-# deploys the result to GitHub Pages. Deploys on every push to `main`, when a release is
-# published (so the download table shows it) and on "Run workflow"; a pull request only
-# builds, and the site is the run's `github-pages` artifact.
+# deploys the result to GitHub Pages. Deploys on every push to `main`, when release.yml has
+# published a release (its last step asks for a run on `main`, so the download table shows
+# the release: GitHub starts no workflow for the release event when a workflow's own token
+# raised it, and the github-pages environment deploys from `main` only, not from a tag) and
+# on "Run workflow"; a pull request only builds, and the site is the run's `github-pages`
+# artifact.
 #
 # One-time setup: Settings → Pages → Source: "GitHub Actions" (docs/dev/site.md).
 name: Site
@@ -12,8 +15,6 @@ name: Site
 on:
   push:
     branches: [main]
-  release:
-    types: [published]
   pull_request:
   workflow_dispatch:
 

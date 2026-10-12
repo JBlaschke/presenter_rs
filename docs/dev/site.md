@@ -48,7 +48,7 @@ build under `target/`). It empties its output directory first, but only one it w
 | Event | What happens |
 |---|---|
 | Push to `main` | Build and deploy. The examples and the guide links follow `main`. |
-| A release is published | Build and deploy from the tag, so the download table shows the new release as soon as `release.yml` has published it. |
+| `release.yml` has published a release | Its last step asks for a "Run workflow" run on `main`, so the download table shows the new release. A run on `main` rather than the `release: published` event, because GitHub starts no workflow for an event that a workflow's own token raised, and rather than on the tag, because the `github-pages` environment deploys from `main` only (Settings → Environments); a release tag is on `main`, so the run builds the tagged commit. A release published by hand needs a "Run workflow" run too. |
 | Pull request | Build only. The site is the run's `github-pages` artifact, for a look at a change; nothing is deployed. |
 | "Run workflow" on the Actions tab | Build and deploy from the chosen branch. |
 

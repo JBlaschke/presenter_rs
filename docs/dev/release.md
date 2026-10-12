@@ -76,7 +76,7 @@ on Windows: `src/pdf.rs` starts Chrome through `/bin/sh`, and says so.
 |---|---|
 | `label` | On a tag push, the tag is exactly `v` + the `Cargo.toml` version, and it is annotated. |
 | `build` (×6) | The runner builds for the matrix target natively (`rustc -vV` host). `cargo test --release --locked` passes; this tests the embedded assets, as shipped. `cargo build --release --locked` succeeds. `--version` is exactly `presenter <version> (<tag>)`. `presenter build examples/basic/slides.md` works. Every crate linked into the binary is in `THIRD-PARTY-LICENSES/crates.txt`. The "package" step reads the archive back (Python's `tarfile`) and fails unless every entry belongs to `root:root` (uid and gid 0, so not to the builder's user), no entry is an AppleDouble `._*` file, and no entry has a pax header keyword that POSIX does not define. macOS `tar` would store extended attributes such as `com.apple.provenance` as `LIBARCHIVE.xattr.*` and `SCHILY.xattr.*` headers, and GNU `tar` warns about each of them when it extracts the archive. On Windows the step writes a zip with Python's `zipfile` instead and reads it back: the data checks out (`testzip`), every entry is under the archive's directory with `/` separators, and `presenter.exe` is there. |
-| `release` | All six archives exist. `gh release create --verify-tag` publishes them with `SHA256SUMS`. |
+| `release` | All six archives exist. `gh release create --verify-tag` publishes them with `SHA256SUMS`. Then it asks `site.yml` for a run on `main` (`gh workflow run`), so that the website's download table shows the release: GitHub starts no workflow for the `release: published` event when a workflow's own token published it, and the `github-pages` environment deploys from `main` only, which holds the tagged commit. A request that fails is a warning, not a failure, as the release is out; run the Site workflow by hand then. |
 
 The release job runs only after all six builds succeed, so a release is never partial.
 The `label` job checks the tag first, so a wrong or lightweight tag fails in seconds
@@ -135,6 +135,9 @@ There are two ways to try the workflow without publishing a real release.
   after it published. `gh release create` then fails. Delete the release on GitHub
   (`gh release delete v0.1.0`) before re-running the job, or upload the files by hand with
   `gh release upload`.
+- **The website still says that no release has been published.** The release job's last
+  step asks for a Site run; when that failed (a warning in the job's log), start one by
+  hand: `gh workflow run site.yml --ref main`, or "Run workflow" on the Actions tab.
 - **A runner label is retired.** GitHub retires runner images. For example, the task plan
   named `macos-13`, which no longer exists, so x86_64 macOS builds on `macos-15-intel`; and
   `macos-14` retires in November 2026 (with brownouts through October), so arm64 macOS

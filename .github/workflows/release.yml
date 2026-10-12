@@ -332,6 +332,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      # To ask site.yml for a run (the last step).
+      actions: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -379,3 +381,19 @@ jobs:
             --notes-file "$RUNNER_TEMP/notes.md" \
             "${flags[@]}" \
             dist/*.tar.gz dist/*.zip dist/SHA256SUMS
+      - name: redeploy the site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # The website's download table shows the latest release (site.yml), but GitHub
+          # starts no workflow for an event that this job's token caused, such as the
+          # release just published; a workflow_dispatch is the exception. So ask for a run.
+          # On the default branch, not the tag: the github-pages environment deploys from
+          # `main` only, and a release tag is on `main` (docs/dev/release.md), so the run
+          # builds the tagged commit. The release is out either way: when this fails, run
+          # the Site workflow by hand (docs/dev/site.md).
+          if ! gh workflow run site.yml --ref "$BRANCH"; then
+            echo "::warning::could not start the Site workflow; run it by hand on $BRANCH"
+          fi
