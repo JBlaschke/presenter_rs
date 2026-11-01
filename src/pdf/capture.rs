@@ -1,7 +1,7 @@
 //! A deck's pages as PowerPoint shapes (`presenter export pptx`, `docs/spec/cli.md` export).
 //!
 //! [`html_to_pages`] opens a standalone deck in reveal.js' print view with headless
-//! Chrome, exactly as the PDF export does (module docs of [`crate::pdf`], steps 1–3 and 5),
+//! Chrome, exactly as the PDF export does (module docs of [`crate::pdf`], steps 1–4 and 6),
 //! and instead of printing converts every page of that view into shapes: a slide, a
 //! fragment step (with reveal's default `pdfSeparateFragments`, reveal clones a slide's
 //! page once per step, so the steps build the slide up one page at a time) or one page of
@@ -11,15 +11,16 @@
 //!
 //! # How a page becomes shapes
 //!
-//! Once reveal.js has laid the pages out ([`crate::pdf::READY_SCRIPT`]), [`PAGES_SCRIPT`]
-//! lists them: it computes the page size as reveal's print view does (the slide size, plus
-//! the `margin` on each side), sets every `.pdf-page` to whole pages tall (reveal makes them
+//! Once reveal.js has laid the pages out ([`crate::pdf::READY_SCRIPT`]) and presenter has
+//! fitted them to their slides ([`crate::pdf::FIT_SCRIPT`]), [`PAGES_SCRIPT`] lists them: it
+//! computes the page size as reveal's print view does (the slide size, plus the `margin` on
+//! each side), sets every `.pdf-page` to whole pages tall (reveal makes them
 //! `pdfPageHeightOffset`, one pixel by default, short of that, which suits printing), and
-//! records where each starts, how many pages tall it is, whether it is a slide's own page
-//! or a clone of it for a fragment step (reveal sets a `slideBackgroundElement` property on
-//! the slide element itself, and `cloneNode` copies no properties), the slide's first
-//! heading, and its notes (reveal's `getSlideNotes`, as `innerText` of an element off
-//! screen, KaTeX's hidden MathML removed, so that a line of text is a line of notes).
+//! records where each starts, how many pages tall it is, whether it is a slide's own page or a
+//! clone of it for a fragment step (reveal sets a `slideBackgroundElement` property on the
+//! slide element itself, and `cloneNode` copies no properties), the slide's first heading, and
+//! its notes (reveal's `getSlideNotes`, as `innerText` of an element off screen, KaTeX's
+//! hidden MathML removed, so that a line of text is a line of notes).
 //!
 //! Then, page by page, the scene extractor (`scene.js`, embedded as [`SCENE_SCRIPT`]) walks
 //! the page's DOM and returns its shapes in slide coordinates: text boxes for headings,

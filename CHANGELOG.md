@@ -11,6 +11,13 @@ publishes that section as the GitHub Release notes (see
 
 ## [Unreleased]
 
+### Fixed
+- `export pdf` and `export pptx` fit each page to what its slide shows before Chrome prints.
+  A picture that runs off the slide, as on screen, no longer gives the slide a second page
+  onto which Chrome moved the whole picture, leaving the first page without it: the slide
+  prints on one page with the picture cut off at the page's edge. A slide whose content ends
+  in the page's bottom margin no longer gets an empty second page.
+
 ### Added
 - Release archives for Windows (x64 and arm64): `.zip` files with `presenter.exe`. The C
   runtime is linked statically, so no redistributable is needed. Paths in messages are

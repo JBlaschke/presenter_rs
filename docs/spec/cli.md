@@ -174,6 +174,18 @@ presenter export pptx <INPUT> [-o FILE] [--chrome PATH] [--theme …] [--scale N
 > step in `export pdf` (re-measuring each slide with the print rules before Chrome prints),
 > which is not implemented.
 
+> **Clarification (2026-11-01):** before printing, `export pdf` and `export pptx` fit each page
+> of the print view to what its slide shows (`FIT_SCRIPT`, `src/pdf.rs`). reveal.js reserves a
+> slide's pages from its `scrollHeight`, measured before the pages are laid out, so a slide
+> whose content ends in the page's bottom margin got an empty second page, and a picture that
+> runs off the slide (as it does on screen) counted as content for a further page, onto which
+> Chrome then moved the whole picture, since it cannot split one at a page break, leaving the
+> first page without it. presenter counts a slide's pages from the laid-out slide's visible
+> text, pictures and painted boxes, and prints a slide whose only overflow past the page is
+> such pictures on one page, clipped at the page's edge as on screen; text that runs past the
+> page keeps its extra pages. The slides are still measured on screen, not with the print
+> rules, for the room the paragraph above describes, so its empty page remains.
+
 ## Global behaviour
 - `-v` info, `-vv` debug (`tracing-subscriber` with `EnvFilter`; `RUST_LOG` also honoured).
 - `--config PATH` bypasses `presenter.toml` discovery.
