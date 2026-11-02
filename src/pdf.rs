@@ -49,9 +49,16 @@
 //!    end of reveal's print layout (`html.print-pdf` set, `loading-scroll-mode` gone from
 //!    the viewport, i.e. after its `pdf-ready` event), `document.fonts.ready` and two
 //!    animation frames. KaTeX and highlight.js run before reveal is ready.
-//! 4. `Page.printToPDF {preferCSSPageSize, printBackground, margins 0, ReturnAsStream}`
+//! 4. `Runtime.evaluate` of [`FIT_SCRIPT`] (awaited): fits every `.pdf-page` to what its
+//!    slide prints. reveal.js reserves a slide's pages from its height before it lays the
+//!    pages out, while the slide is still as wide as the page, and counts a picture that
+//!    overflows the slide as content for the next page, though Chrome cannot split a
+//!    picture at a page break and moves it there whole. The script counts the pages from
+//!    the laid-out pages instead, and prints a slide whose only overflow past the page is
+//!    such pictures on one page, clipped at the page's edge as on screen.
+//! 5. `Page.printToPDF {preferCSSPageSize, printBackground, margins 0, ReturnAsStream}`
 //!    (reveal sets `@page { size: …; margin: 0 }`), read with `IO.read` until `eof`.
-//! 5. `Browser.close`, and the command pipe is closed; Chrome gets [`CLOSE_GRACE`] to exit,
+//! 6. `Browser.close`, and the command pipe is closed; Chrome gets [`CLOSE_GRACE`] to exit,
 //!    then it is killed.
 //!
 //! Everything shares one deadline (`timeout`, [`DEFAULT_TIMEOUT`] for the CLI); an exited
@@ -76,7 +83,7 @@
 //!
 //! # Other uses
 //!
-//! [`capture`] runs steps 1–3 and 5 unchanged and, instead of printing, converts each page
+//! [`capture`] runs steps 1–4 and 6 unchanged and, instead of printing, converts each page
 //! of the print view into shapes (`presenter export pptx`).
 //!
 //! With the `browser-tests` feature, `devtools::Page` starts Chrome the same way and opens
@@ -251,6 +258,145 @@ pub const READY_SCRIPT: &str = r#"(async () => {
   return { slides: Reveal.getTotalSlides(), pages: document.querySelectorAll('.pdf-page').length };
 })()"#;
 
+/// Awaited in the page after [`READY_SCRIPT`] (module docs, step 4): fits every `.pdf-page`
+/// to what its slide prints. Resolves to `{pages, fitted: [{page, from, to, clipped}]}`:
+/// the number of pages and, for each page it changed, its number (from 1), its page count
+/// before and after, and whether its slide was clipped.
+///
+/// reveal.js reserves a slide's pages from its `scrollHeight` before it lays the pages out,
+/// while the slide is still as wide as the page (it gets its own width in the page), and
+/// counts everything that overflows the slide, however Chrome will print it. This script
+/// measures the laid-out pages and corrects two things:
+///
+/// - The page count comes from what the slide shows: its visible text (a hidden fragment
+///   takes no page), its pictures (`img`, `video`, `canvas`, `svg`, `iframe`, `embed`,
+///   `object`) and the boxes that paint a background, border or shadow, each cut to the
+///   boxes that clip it (an ancestor whose overflow is not `visible`). Content that ends on
+///   a page needs no page after it, so a slide whose content ends in the page's bottom
+///   margin gets no empty second page.
+/// - Chrome cannot split a picture at a page break: it moves the whole picture to the next
+///   page, leaving a gap where it was; in a slide printed on one page the picture then
+///   lands out of sight, the `.pdf-page` clips it. When the pictures that start on the
+///   first page and run past its bottom are all that runs past it, the slide is printed on
+///   one page and clipped at the page's edge (`overflow: clip`, with the clip margin that
+///   reaches the page), which keeps the picture where it is, cut off as on screen. A slide
+///   with its natural height (`.center` in the default theme) is capped at the slide size
+///   for that and placed as a slide-high slide is, since Chrome would otherwise break inside
+///   the slide's own box. Text that runs past the page keeps its extra pages, with the
+///   pictures on them wherever Chrome puts them; reveal's `pdfMaxPagesPerSlide` still caps
+///   the count.
+///
+/// The slides are measured on screen, not in print media, on purpose: the default theme
+/// sets lines closer in print, and the pages reserved from the taller screen layout give
+/// the lines Chrome moves at page breaks the room they need (the theme's print rules).
+/// Images are waited for first (up to 10 s, lazy ones made eager), since an image without
+/// its size yet would be measured as empty.
+pub const FIT_SCRIPT: &str = r#"(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const pending = Array.from(document.images).filter((image) => !image.complete);
+  pending.forEach((image) => { image.loading = 'eager'; });
+  const loaded = Promise.all(pending.map((image) => new Promise((resolve) => {
+    if (image.complete) return resolve();
+    image.addEventListener('load', resolve, { once: true });
+    image.addEventListener('error', resolve, { once: true });
+  })));
+  if (pending.length) {
+    await Promise.race([loaded, sleep(10000)]);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }
+  const config = Reveal.getConfig();
+  const size = Reveal.getComputedSlideSize(window.innerWidth, window.innerHeight);
+  const pageHeight = Math.floor(size.height * (1 + config.margin));
+  const offset = Number(config.pdfPageHeightOffset) || 0;
+  const maxPages = Number(config.pdfMaxPagesPerSlide) || Infinity;
+  const PICTURES = 'img, video, canvas, svg, iframe, embed, object';
+  const SKIPPED = 'script, style, template, noscript, aside.notes';
+  // Chrome computes a 3px outline width for an outline whose style is none.
+  const paints = (style) =>
+    (style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')
+    || style.backgroundImage !== 'none' || style.boxShadow !== 'none'
+    || ['Top', 'Right', 'Bottom', 'Left'].some((side) => parseFloat(style['border' + side + 'Width']) > 0)
+    || (style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) > 0);
+  const range = document.createRange();
+  const pages = Array.from(document.querySelectorAll('.reveal .slides .pdf-page'));
+  const fitted = [];
+  pages.forEach((page, index) => {
+    const slide = page.querySelector(':scope > section');
+    if (!slide) return;
+    const pageTop = page.getBoundingClientRect().top;
+    // `bottom` (a viewport coordinate), cut to the boxes from `box` up to the slide that
+    // clip their overflow, as a coordinate in the page.
+    const cut = (box, bottom) => {
+      for (; box && box !== slide; box = box.parentElement) {
+        if (getComputedStyle(box).overflowY !== 'visible') {
+          bottom = Math.min(bottom, box.getBoundingClientRect().bottom);
+        }
+      }
+      return bottom - pageTop;
+    };
+    let content = 0;
+    const pictures = [];
+    const walker = document.createTreeWalker(slide, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => {
+        const parent = node.parentElement;
+        if (parent !== slide && parent.closest(PICTURES)) return NodeFilter.FILTER_REJECT;
+        if (node.nodeType === Node.TEXT_NODE) {
+          return /\S/.test(node.data) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        }
+        return node.matches(SKIPPED) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const parent = node.parentElement;
+        if (getComputedStyle(parent).visibility === 'hidden') continue;
+        range.selectNodeContents(node);
+        for (const rect of range.getClientRects()) {
+          if (rect.height > 0) content = Math.max(content, cut(parent, rect.bottom));
+        }
+        continue;
+      }
+      const style = getComputedStyle(node);
+      if (style.visibility === 'hidden') continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.height <= 0) continue;
+      if (node.matches(PICTURES)) {
+        pictures.push({ top: rect.top - pageTop, bottom: cut(node.parentElement, rect.bottom) });
+      } else if (paints(style)) {
+        content = Math.max(content, cut(node.parentElement, rect.bottom));
+      }
+    }
+    const needed = (shown) => Math.max(1, Math.ceil(shown.reduce((most, picture) => Math.max(most, picture.bottom), content) / pageHeight));
+    let count = needed(pictures);
+    let clipped = false;
+    if (count > 1) {
+      const runsOff = (picture) => picture.top < pageHeight && picture.bottom > pageHeight;
+      if (needed(pictures.filter((picture) => !runsOff(picture))) === 1) {
+        count = 1;
+        clipped = true;
+      }
+    }
+    count = Math.min(count, maxPages);
+    const before = Math.max(1, Math.round(page.offsetHeight / (pageHeight + offset)));
+    if (count !== before) page.style.height = ((pageHeight + offset) * count) + 'px';
+    if (clipped) {
+      slide.style.overflow = 'clip';
+      if (slide.getBoundingClientRect().height > size.height + 0.5) {
+        const style = getComputedStyle(slide);
+        const edges = style.boxSizing === 'border-box' ? 0
+          : ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth']
+            .reduce((sum, edge) => sum + (parseFloat(style[edge]) || 0), 0);
+        slide.style.maxHeight = Math.max(size.height - edges, 0) + 'px';
+        slide.style.top = Math.floor((pageHeight - size.height) / 2) + 'px';
+      }
+      const bottom = slide.getBoundingClientRect().bottom - pageTop;
+      slide.style.overflowClipMargin = Math.max(0, Math.floor(pageHeight - bottom)) + 'px';
+    }
+    if (count !== before || clipped) fitted.push({ page: index + 1, from: before, to: count, clipped });
+  });
+  return { pages: pages.length, fitted };
+})()"#;
+
 /// Finds a Chrome or Chromium executable, in this order:
 ///
 /// 1. `explicit` (`--chrome PATH`). When given, it is the only candidate: `None` if it is
@@ -384,8 +530,8 @@ pub fn html_to_pdf(chrome: &Path, html: &str, timeout: Duration) -> Result<Vec<u
 }
 
 /// Opens the standalone deck `html` in reveal.js' print view with `chrome` (module docs,
-/// steps 1–3), runs `job` on the ready page (with the page's DevTools session), stops
-/// Chrome (step 5) and returns what the job returned. `verb` says what the job does in an
+/// steps 1–4), runs `job` on the ready page (with the page's DevTools session), stops
+/// Chrome (step 6) and returns what the job returned. `verb` says what the job does in an
 /// error (`Chrome failed to <verb> the deck: …`). Everything, the job included, must finish
 /// within `timeout`, unless the job moves the deadline ([`Cdp::deadline`]). The errors are
 /// those of [`html_to_pdf`].
@@ -710,7 +856,7 @@ fn is_pdf_delimiter(byte: u8) -> bool {
     )
 }
 
-/// Steps 2, 3 and 5 of the module docs on a launched browser, with `job` as step 4. The
+/// Steps 2 to 4 and 6 of the module docs on a launched browser, with `job` as step 5. The
 /// error is the reason, without the browser's name and stderr ([`chrome_error`] adds
 /// those).
 fn drive<T>(
@@ -762,8 +908,9 @@ fn chrome_error(chrome: &Path, verb: &str, reason: &str, stderr: &[String]) -> E
     Error::Other(message)
 }
 
-/// Steps 2 and 3 of the module docs: open a page, load the deck in print view and wait for
-/// reveal.js to lay the pages out. Returns the page's DevTools session.
+/// Steps 2 to 4 of the module docs: open a page, load the deck in print view, wait for
+/// reveal.js to lay the pages out and fit them to their slides. Returns the page's DevTools
+/// session.
 fn open_deck(cdp: &mut Cdp) -> std::result::Result<String, Failure> {
     cdp.stage = "starting Chrome";
     let target = cdp.call(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
@@ -797,10 +944,12 @@ fn open_deck(cdp: &mut Cdp) -> std::result::Result<String, Failure> {
 
     cdp.stage = "waiting for reveal.js to lay out the pages";
     wait_until_ready(cdp, page)?;
+    cdp.stage = "fitting the pages to their slides";
+    fit_pages(cdp, page)?;
     Ok(session)
 }
 
-/// Step 4 of the module docs: prints the page `session` and returns the PDF.
+/// Step 5 of the module docs: prints the page `session` and returns the PDF.
 fn print_pdf(cdp: &mut Cdp, session: &str) -> std::result::Result<Vec<u8>, Failure> {
     let page = Some(session);
     cdp.stage = "printing";
@@ -858,6 +1007,23 @@ fn wait_until_ready(cdp: &mut Cdp, page: Option<&str>) -> std::result::Result<()
         pages = %value["pages"],
         "reveal.js print layout ready"
     );
+    Ok(())
+}
+
+/// Evaluates [`FIT_SCRIPT`] in the page (module docs, step 4) and logs what it changed.
+fn fit_pages(cdp: &mut Cdp, page: Option<&str>) -> std::result::Result<(), Failure> {
+    let value = evaluate(cdp, page, FIT_SCRIPT)?;
+    let fitted = value["fitted"].as_array().cloned().unwrap_or_default();
+    for change in &fitted {
+        tracing::debug!(
+            page = %change["page"],
+            from = %change["from"],
+            to = %change["to"],
+            clipped = %change["clipped"],
+            "fitted a page to its slide"
+        );
+    }
+    tracing::debug!(pages = %value["pages"], fitted = fitted.len(), "pages fitted to their slides");
     Ok(())
 }
 

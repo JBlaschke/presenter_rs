@@ -272,13 +272,19 @@ Chrome sets it closer for print. A slide whose content ends within a line or two
 boundary on screen ends a page earlier in print, and its last page prints empty but for the
 slide's background. Nothing is lost, but expect such an empty page after about one in ten to
 twenty of the slides that run onto more pages (measured with code blocks of 18 to 71 lines).
-The theme cannot drop the page: reveal fixes each slide's page count before printing.
+The theme cannot drop the page: reveal fixes each slide's page count before printing, and
+`presenter export`, which fits the pages to what the slides show before Chrome prints, keeps
+the pages the screen layout reserved on purpose, for that room.
 
 What does not print in full: lines longer than the box and tables wider than it are cut off
 at its right edge (on screen they scroll sideways); a `.r-stretch` code block keeps the size
 it has on screen; and an image that straddles a page break moves to the next page whole, so
 a slide that spans pages with several images in it can lose its last lines; split such a
-slide.
+slide. An image that runs off the slide, as on screen, is a case of its own: `presenter
+export` prints the slide on one page with the image cut off at the page's edge when such
+images are all that runs past the page (and gives no empty second page to a slide whose
+content ends in the page's bottom margin, which reveal counts as a page); a browser printing
+`?print-pdf` does neither.
 
 ## Extending it
 

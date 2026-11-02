@@ -468,6 +468,98 @@ fn images_by_absolute_path_and_file_url_are_printed() {
     assert_cleaned_up(private_tmp.path());
 }
 
+/// A deck whose pictures run off their slides, as on screen, and whose last slide ends with
+/// a margin that runs off the page. reveal.js gave each slide two pages (it counts them from
+/// the slide's `scrollHeight`, which takes in the trailing margin of a column's last block
+/// as it does a theme's picture margins), and Chrome moved the picture that straddled the
+/// page break whole onto the second page. presenter fits the pages to their slides instead
+/// (`presenter::pdf::FIT_SCRIPT`): every slide prints on one page, the pictures cut off at
+/// the page's edge, in the PDF and in the PowerPoint file alike.
+#[cfg(unix)]
+#[test]
+fn pictures_that_run_off_the_slide_print_on_one_page() {
+    use base64::Engine as _;
+
+    if chrome().is_none() {
+        return;
+    }
+    let dir = project(&[]);
+    let (width, height, png) = PICTURES[0];
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(png)
+        .unwrap();
+    std::fs::write(dir.path().join("pic.png"), bytes).unwrap();
+    // The default theme: 40px of slide padding, a heading of 2.2em at 36px with a 0.5em
+    // margin, then the spacer, so the 300px picture starts near 620px and runs 200px past
+    // the 720px slide. The last slide's line ends near 600px, its margin near 800px.
+    let picture = "<img src=\"pic.png\" style=\"width: 300px; height: 300px\" alt=\"off\">";
+    let deck = format!(
+        "# Off the page\n\n<div style=\"height: 450px\"></div>\n\n{picture}\n\n---\n\n\
+         # Centred {{.center}}\n\n<div style=\"height: 450px\"></div>\n\n{picture}\n\n---\n\n\
+         ## Columns\n\n::::columns widths=\"1fr 1fr\"\n:::column\n\
+         <div style=\"height: 400px\"></div>\n\n\
+         <p style=\"margin-bottom: 200px\">The last line</p>\n:::\n:::column\nRight\n:::\n::::\n"
+    );
+    std::fs::write(dir.path().join("deck.md"), deck).unwrap();
+    let output = presenter(dir.path())
+        .args(["-vv", "export", "pdf", "deck.md", "-o", "deck.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote(&output, "deck.pdf"), 3);
+    let pdf = read_pdf(&dir.path().join("deck.pdf"));
+    assert_eq!(page_count(&pdf), 3);
+    assert!(
+        pdf_image_sizes(&pdf).contains(&(width, height)),
+        "no {width}x{height} image in the PDF"
+    );
+    // The debug log names every page whose count reveal.js got wrong.
+    let log = text(&output.stderr)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "page=1 from=2 to=1 clipped=true",
+        "page=2 from=2 to=1 clipped=true",
+        "page=3 from=2 to=1 clipped=false",
+    ] {
+        assert!(log.contains(expected), "{expected:?} in {log}");
+    }
+
+    let output = presenter(dir.path())
+        .args(["export", "pptx", "deck.md", "-o", "deck.pptx"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(assert_wrote_slides(&output, "deck.pptx"), 3);
+}
+
+/// Text that runs past the page keeps its extra pages: the print view lifts a code block's
+/// `max-height`, so a long one continues on further pages, as it did before the pages were
+/// fitted to their slides.
+#[test]
+fn text_that_runs_past_the_page_keeps_its_extra_pages() {
+    if chrome().is_none() {
+        return;
+    }
+    let code = (1..=60)
+        .map(|n| format!("line {n} of a long code block\n"))
+        .collect::<String>();
+    let deck = format!("# Code\n\n```text\n{code}```\n");
+    let dir = project(&[("deck.md", deck.as_str())]);
+    let output = presenter(dir.path())
+        .args(["export", "pdf", "deck.md", "-o", "deck.pdf"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let pages = assert_wrote(&output, "deck.pdf");
+    assert!(pages >= 2, "{pages} pages");
+    assert_eq!(page_count(&read_pdf(&dir.path().join("deck.pdf"))), pages);
+}
+
 #[cfg(unix)]
 #[test]
 fn decks_larger_than_one_devtools_message_are_printed() {

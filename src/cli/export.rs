@@ -66,7 +66,9 @@ Limitations (reveal.js print mode, ?print-pdf):
   - Animations, transitions and auto-animate are not exported: every page is a static
     snapshot. Videos and iframes show whatever they display when the page is printed.
   - A slide taller than the page continues on extra pages, up to [reveal]
-    pdfMaxPagesPerSlide. The default theme prints the lines of code blocks and outputs
+    pdfMaxPagesPerSlide. A picture that runs off the slide, as on screen, is cut off at
+    the page's edge when it is all that runs past the page (Chrome cannot split a picture
+    at a page break). The default theme prints the lines of code blocks and outputs
     slightly closer than on screen, to leave room for the line Chrome moves at each page
     break; reveal.js reserves the pages from the screen height, so such a slide that ends
     just past a page boundary on screen can end with a page that is empty but for its
@@ -101,7 +103,8 @@ What the file holds (from reveal.js' print mode, ?print-pdf):
     revealed.
   - Animations, transitions and auto-animate are not exported: every slide is static.
   - A slide taller than the page continues on extra slides, up to [reveal]
-    pdfMaxPagesPerSlide, with the same pages as the PDF.
+    pdfMaxPagesPerSlide, with the same pages as the PDF. A picture that runs off the
+    slide, as on screen, hangs off the slide (the PDF cuts it off at the page's edge).
   - Fonts: PowerPoint substitutes a font the viewer's machine does not have, so text
     may wrap differently there; a text box grows to fit when it is edited.
   - Needs Chrome or Chromium (Edge and Brave work too); without one the command

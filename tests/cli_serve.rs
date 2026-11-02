@@ -797,7 +797,8 @@ fn a_recursive_stylesheet_at_startup_still_serves() {
     let page = server.text("/");
     assert!(page.contains("id=\"presenter-overlay\""), "{page}");
     assert!(page.contains("@function f always calls itself"), "{page}");
-    assert!(server.stderr().contains("error: "), "{}", server.stderr());
+    // The line reaches the test's stderr buffer a moment after the server answers.
+    server.wait_for_stderr(r"(?m)^error: ", 1);
 }
 
 /// Audit F03 (live-reload.md §4): in serve mode theme files carry content versions. An
