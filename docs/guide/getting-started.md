@@ -15,22 +15,22 @@ and arm64, glibc) and Windows (x64 and arm64):
 
 | Platform | Archive |
 |---|---|
-| macOS, Apple silicon | `presenter-v0.1.0-aarch64-apple-darwin.tar.gz` |
-| macOS, Intel | `presenter-v0.1.0-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `presenter-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 | `presenter-v0.1.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x64 | `presenter-v0.1.0-x86_64-pc-windows-msvc.zip` |
-| Windows arm64 | `presenter-v0.1.0-aarch64-pc-windows-msvc.zip` |
+| macOS, Apple silicon | `presenter-v0.1.1-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `presenter-v0.1.1-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `presenter-v0.1.1-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `presenter-v0.1.1-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x64 | `presenter-v0.1.1-x86_64-pc-windows-msvc.zip` |
+| Windows arm64 | `presenter-v0.1.1-aarch64-pc-windows-msvc.zip` |
 
 Download yours and `SHA256SUMS` from the project's GitHub Releases page or from the
 [project website](https://jblaschke.github.io/presenter_rs/) (the names carry the version,
-here 0.1.0), then check, unpack and install it; here for Apple silicon, into `~/.local/bin`:
+here 0.1.1), then check, unpack and install it; here for Apple silicon, into `~/.local/bin`:
 
 ```sh
 shasum -a 256 -c --ignore-missing SHA256SUMS      # Linux: sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf presenter-v0.1.0-aarch64-apple-darwin.tar.gz
+tar -xzf presenter-v0.1.1-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin
-cp presenter-v0.1.0-aarch64-apple-darwin/presenter ~/.local/bin/
+cp presenter-v0.1.1-aarch64-apple-darwin/presenter ~/.local/bin/
 ```
 
 `~/.local/bin` must be on your `PATH`. The archive also holds `LICENSE`, `README.md` and
@@ -47,7 +47,7 @@ xattr -d com.apple.quarantine ~/.local/bin/presenter
 
 Files downloaded with `curl` are not quarantined.
 
-On Windows, check the download with `Get-FileHash presenter-v0.1.0-x86_64-pc-windows-msvc.zip`
+On Windows, check the download with `Get-FileHash presenter-v0.1.1-x86_64-pc-windows-msvc.zip`
 in PowerShell against the line in `SHA256SUMS`, unpack the `.zip` (Explorer's "Extract
 All…", or `tar -xf` in a terminal) and put the directory that holds `presenter.exe` on your
 `PATH`, or copy the file into a directory that is. The binary needs no runtime installed.
@@ -70,7 +70,7 @@ This builds a release binary and copies it to `~/.cargo/bin/presenter`.
 presenter --version
 ```
 
-It prints the version and the build, for example `presenter 0.1.0 (v0.1.0)`.
+It prints the version and the build, for example `presenter 0.1.1 (v0.1.1)`.
 
 ## Create a presentation
 

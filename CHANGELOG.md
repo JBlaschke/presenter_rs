@@ -11,12 +11,19 @@ publishes that section as the GitHub Release notes (see
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-02
+
 ### Fixed
 - `export pdf` and `export pptx` fit each page to what its slide shows before Chrome prints.
   A picture that runs off the slide, as on screen, no longer gives the slide a second page
   onto which Chrome moved the whole picture, leaving the first page without it: the slide
   prints on one page with the picture cut off at the page's edge. A slide whose content ends
   in the page's bottom margin no longer gets an empty second page.
+- The project website is rebuilt after a release, so its download table shows the
+  release: GitHub starts no workflow for a release that a workflow's own token published,
+  so the release workflow now asks for the site build itself.
+
+## [0.1.0] - 2026-10-12
 
 ### Added
 - Release archives for Windows (x64 and arm64): `.zip` files with `presenter.exe`. The C

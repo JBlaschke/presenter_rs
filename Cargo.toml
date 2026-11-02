@@ -1,6 +1,6 @@
 [package]
 name = "presenter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"  # comrak 0.56 requires 1.89 (edition 2024 alone would need 1.85)
 description = "Turn Markdown files and Jupyter notebooks into reveal.js presentations"

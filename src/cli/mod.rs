@@ -822,12 +822,12 @@ mod tests {
     fn version_string() {
         let rendered = Cli::command().render_version().to_string();
         assert_eq!(rendered, format!("presenter {}\n", version()));
-        assert!(rendered.starts_with("presenter 0.1.0"), "{rendered}");
-        assert_eq!(version_text("0.1.0", None), "0.1.0");
-        assert_eq!(version_text("0.1.0", Some(" ")), "0.1.0");
-        assert_eq!(version_text("0.1.0", Some("abc1234")), "0.1.0 (abc1234)");
+        assert!(rendered.starts_with("presenter 0.1.1"), "{rendered}");
+        assert_eq!(version_text("0.1.1", None), "0.1.1");
+        assert_eq!(version_text("0.1.1", Some(" ")), "0.1.1");
+        assert_eq!(version_text("0.1.1", Some("abc1234")), "0.1.1 (abc1234)");
         if option_env!("PRESENTER_GIT_SHA").is_none() {
-            assert_eq!(rendered, "presenter 0.1.0\n");
+            assert_eq!(rendered, "presenter 0.1.1\n");
         }
     }
 
