@@ -11,6 +11,21 @@ publishes that section as the GitHub Release notes (see
 
 ## [Unreleased]
 
+### Added
+- The default theme styles `:::callout` blocks: a tinted box like an alert's that holds any
+  content, in the accent colour or the one a second word names (`:::callout tip`; also
+  `note`, `important`, `warning`, `caution` and `muted`), with an optional
+  `title="…"` set over the text as an alert's title is. Callouts straight inside
+  `::::columns` are columns, and when every column is a callout they are as tall as each
+  other. The `--p-callout` token sets the default colour; a theme adds colours by setting
+  `--p-callout-color` on a class of its own.
+
+### Fixed
+- `export pptx` makes the translucent colour of text that a theme draws with `::before` or
+  `::after` (such as a callout's title) opaque over what is behind it, as it already did for
+  all other text. Keynote, Preview and QuickLook ignore alpha on text and showed such text
+  as dark as the body text.
+
 ## [0.1.1] - 2026-11-02
 
 ### Fixed

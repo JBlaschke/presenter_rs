@@ -1413,6 +1413,21 @@ fn exports_the_example_deck_to_editable_slides() {
     assert!(!step1.contains("First click"), "{step1}");
     assert!(step2.contains("First click"), "{step2}");
 
+    // A callout's title (a `::before` pseudo-element) is text in capitals. Its `muted` colour
+    // is translucent and is composited to an opaque grey, since Keynote and QuickLook ignore
+    // alpha on text and would show it as dark as the body text.
+    let callouts = slide_xml(&entries, find("Callouts and quotes"));
+    let title_run = Regex::new(r"<a:r>.*?</a:r>")
+        .unwrap()
+        .find_iter(&callouts)
+        .map(|run| run.as_str())
+        .find(|run| run.contains("<a:t>A callout</a:t>"))
+        .unwrap_or_else(|| panic!("no callout title run: {callouts}"));
+    assert!(title_run.contains(r#"cap="all""#), "{title_run}");
+    assert!(title_run.contains(r#"b="1""#), "{title_run}");
+    assert!(title_run.contains("<a:srgbClr"), "{title_run}");
+    assert!(!title_run.contains("<a:alpha"), "{title_run}");
+
     // The figure is the deck's own PNG, byte for byte.
     let plot = std::fs::read(root().join("examples/basic/figures/plot.png")).unwrap();
     let media = slide_media(&entries, find("Two columns"));

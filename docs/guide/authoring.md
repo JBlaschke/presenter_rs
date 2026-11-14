@@ -244,6 +244,7 @@ block becomes `<div class="name">`.
 | `:::fragment` | appears on the next click; add reveal effects and an order: `:::fragment fade-up index=2` |
 | `:::columns` … `:::column` | side-by-side columns (CSS grid); `:::columns widths="2fr 3fr"` sets their widths |
 | `:::center`, `:::small`, `:::large` | centred text, smaller or larger text (built-in theme) |
+| `:::callout` | a tinted box like an alert's, for any content, with an optional title: `:::callout tip title="Before you start"` ([Callouts](#callouts); built-in theme) |
 | `:::include part2.md` | the slides of another Markdown file or a notebook ([Including files](#including-files)) |
 | `:::anything a b key=v` | `<div class="anything a b" data-key="v">`, for your theme's CSS |
 
@@ -305,6 +306,47 @@ top-level lists of a slide step; nested items come with their parent.
 - first
 - second
 ```
+
+### Callouts
+
+A `:::callout` sets content apart in a tinted box like an
+[alert](#tables-alerts-footnotes-task-lists), without a `> ` on every line, in more colours,
+and with a title only when you give it one:
+
+```markdown
+:::callout tip title="Before you start"
+- Install presenter
+- Bring a deck
+:::
+```
+
+- Without a colour the box is in the theme's accent colour. A second word picks one:
+  `note`, `tip`, `important`, `warning` and `caution` are the alerts' colours, `muted` is
+  grey.
+- `title="…"` sets a title over the text, in small upper-case letters like an alert's. A
+  colon in it is written `&#58;` (`title="Note&#58; draft"`), as everywhere on a
+  directive's opening line.
+- Other classes still apply: `:::callout warning small` is smaller text,
+  `:::callout fragment` appears on the next click.
+- Callouts straight inside `::::columns`, without `:::column` around them, are columns
+  themselves; when all the columns are callouts, they are as tall as each other:
+
+```markdown
+::::columns
+:::callout muted title="Before"
+Slides in a presentation program
+:::
+:::callout tip title="After"
+Slides in Markdown, in version control, built in CI
+:::
+::::
+```
+
+A theme changes the default colour with `--p-callout` and adds colours of its own, such as
+`:::callout brand`, with a rule like
+`.reveal .callout.brand { --p-callout-color: color-mix(in oklab, #8a5a44 75%, currentColor); }`
+(mixed with the text colour, as the theme's own colours are, so that it stays readable on
+dark slides; [tokens](../../assets/themes/default/README.md#tokens)).
 
 ## Code
 

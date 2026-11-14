@@ -61,6 +61,7 @@
   --p-alert-important: color-mix(in oklab, #7c3aed 75%, currentColor); /* > [!IMPORTANT] */
   --p-alert-warning: color-mix(in oklab, #d97706 75%, currentColor);   /* > [!WARNING] */
   --p-alert-caution: color-mix(in oklab, #dc2626 75%, currentColor);   /* > [!CAUTION] */
+  --p-callout: var(--p-accent);                                    /* :::callout without a colour class */
 
   /* notebook cells (cell.html; styles/notebook.css designs them and has more tokens) */
   --p-cell-gap: 0.5em;                                /* vertical space around a .cell */
@@ -272,7 +273,7 @@
   text-align: left;
 }
 
-.reveal .center > :is(table, pre, blockquote, .markdown-alert) {
+.reveal .center > :is(table, pre, blockquote, .markdown-alert, .callout) {
   margin-left: auto;
   margin-right: auto;
 }
@@ -434,7 +435,8 @@
 }
 
 /* ------------------------------------------------------------------------------------
- * Block quotes and alerts (> [!NOTE], > [!TIP], > [!IMPORTANT], > [!WARNING], > [!CAUTION])
+ * Block quotes, alerts (> [!NOTE], > [!TIP], > [!IMPORTANT], > [!WARNING], > [!CAUTION])
+ * and callouts (:::callout)
  * ------------------------------------------------------------------------------------ */
 
 .reveal blockquote {
@@ -483,6 +485,56 @@
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+/* `:::callout`: a box like an alert for any content, in --p-callout (the accent colour)
+   unless a second class names another colour: an alert's (`:::callout tip`, also note,
+   important, warning and caution) or `muted`. To add a colour, set --p-callout-color on
+   a class of your own, mixed with the text colour as the tokens are so that it stays
+   readable on dark slides: `.reveal .callout.brand { --p-callout-color:
+   color-mix(in oklab, #8a5a44 75%, currentColor); }`. */
+.reveal .callout {
+  --p-callout-color: var(--p-callout);
+  margin: var(--r-block-margin) 0;
+  padding: 0.45em 0.9em;
+  border-left: 0.15em solid var(--p-callout-color);
+  border-radius: 0 var(--p-radius) var(--p-radius) 0;
+  background: color-mix(in srgb, var(--p-callout-color) 9%, transparent);
+}
+
+.reveal .callout > :first-child {
+  margin-top: 0;
+}
+
+.reveal .callout > :last-child {
+  margin-bottom: 0;
+}
+
+.reveal .callout.note { --p-callout-color: var(--p-alert-note); }
+.reveal .callout.tip { --p-callout-color: var(--p-alert-tip); }
+.reveal .callout.important { --p-callout-color: var(--p-alert-important); }
+.reveal .callout.warning { --p-callout-color: var(--p-alert-warning); }
+.reveal .callout.caution { --p-callout-color: var(--p-alert-caution); }
+.reveal .callout.muted { --p-callout-color: var(--p-muted); }
+
+/* `:::callout title="…"` (presenter writes the title as `data-title`): the title over the
+   text, set as an alert's is, and as far from the text as an alert's title is from its
+   first paragraph. The directive's opening line cannot hold a colon; write one as `&#58;`. */
+.reveal .callout[data-title]:not(:where([data-title=""]))::before {
+  content: attr(data-title);
+  display: block;
+  margin: 0 0 var(--r-block-margin);
+  color: var(--p-callout-color);
+  font-size: 0.7em;
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* A callout that holds nothing but its title is as tall as the title. */
+.reveal .callout[data-title]:not(:where(:has(> *)))::before {
+  margin-bottom: 0;
 }
 
 /* ------------------------------------------------------------------------------------
@@ -537,6 +589,17 @@
 
 .reveal .columns > .column > :last-child {
   margin-bottom: 0;
+}
+
+/* A `:::callout` straight inside `::::columns` (no `:::column` around it) is a column
+   itself: its margins give way to the gap, as a column's first and last blocks do. When
+   every column is a callout, they are all as tall as their row. */
+.reveal .columns > .callout {
+  margin: 0;
+}
+
+.reveal .columns:not(:has(> :not(.callout))) > .callout {
+  align-self: stretch;
 }
 
 /* ------------------------------------------------------------------------------------
@@ -627,8 +690,10 @@
 
 /* section: a divider with a big centred heading on the accent colour. reveal copies the
    slide's classes to its background element, which paints the full-bleed accent (a
-   `background=` on the slide still wins). */
+   `background=` on the slide still wins). A callout without a colour class is drawn in
+   the text colour there, not in the accent it would vanish into. */
 .reveal .slides section.layout-section {
+  --p-callout: currentColor;
   height: auto;
   text-align: center;
   color: var(--p-on-accent);

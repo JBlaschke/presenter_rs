@@ -512,7 +512,10 @@
     const line = lineOf(ps, pseudo.opacity);
     if (fill || line) emit({ kind: 'rect', frame, fill, line, radius: radiusOf(ps) }, part);
     if (pseudo.text && pseudo.text.trim()) {
-      const style = runStyle(ps, pseudo.opacity, {});
+      // A translucent colour is composited over what is behind the text: the element's
+      // backdrop, with the pseudo-element's own fill over it when it has one.
+      const backdrop = fill && fill.color ? over(fill.color, backdropOf(el)) : backdropOf(el);
+      const style = runStyle(ps, pseudo.opacity, {}, backdrop);
       emit({
         kind: 'text', frame, insets: { l: 0, t: 0, r: 0, b: 0 }, fill: null, line: null, radius: null,
         wrap: true, title: false,
@@ -1356,7 +1359,7 @@
   function emitPseudoInline(el, pseudo, which) {
     const rect = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
-    const style = runStyle(pseudo.ps, pseudo.opacity, {});
+    const style = runStyle(pseudo.ps, pseudo.opacity, {}, backdropOf(el));
     const height = lineHeightOf(pseudo.ps) || style.size * 1.3;
     const top = which === '::before' ? rect.top + num(cs.paddingTop) : rect.bottom - num(cs.paddingBottom) - height;
     const { part, frame } = frameOf({ left: rect.left + num(cs.paddingLeft), top, width: rect.width - num(cs.paddingLeft) - num(cs.paddingRight), height });

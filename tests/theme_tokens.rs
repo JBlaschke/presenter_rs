@@ -1432,6 +1432,135 @@ fn loose_task_list_items_keep_their_text_on_the_box_line() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Callouts
+// ---------------------------------------------------------------------------------------
+
+/// `:::callout tip title="…"` is `<div class="callout tip" data-title="…">`: a box drawn as
+/// the alerts are, in the colour its second class names (--p-callout without one), with the
+/// title shown from `data-title` and set as an alert's title is. The rendering was checked
+/// in Chrome: a callout and an alert with the same title and paragraph are equally tall and
+/// their paragraphs start equally far down.
+#[test]
+fn callouts_are_boxes_like_the_alerts_with_their_own_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deck = tmp.path().join("callouts.md");
+    std::fs::write(
+        &deck,
+        "# Callouts\n\n:::callout tip title=\"Before you start\"\nBody\n:::\n",
+    )
+    .unwrap();
+    let html = build_deck(&BuildOptions::new(&deck)).unwrap().document.html;
+    assert!(
+        html.contains(r#"<div class="callout tip" data-title="Before you start">"#),
+        "the markup the rules select: {html}"
+    );
+
+    let rules = rules(&css());
+    let callout = rule(&rules, ".reveal .callout");
+    let alert = rule(&rules, ".reveal .markdown-alert");
+    assert_eq!(callout.get("--p-callout-color"), Some("var(--p-callout)"));
+    for property in [
+        "margin",
+        "padding",
+        "border-left",
+        "border-radius",
+        "background",
+    ] {
+        assert_eq!(
+            callout.get(property),
+            alert
+                .get(property)
+                .map(|value| value.replace("--p-alert-color", "--p-callout-color"))
+                .as_deref(),
+            "{property}"
+        );
+    }
+    assert_eq!(
+        rule(&rules, ":root").get("--p-callout"),
+        Some("var(--p-accent)")
+    );
+    for (class, colour) in [
+        ("note", "var(--p-alert-note)"),
+        ("tip", "var(--p-alert-tip)"),
+        ("important", "var(--p-alert-important)"),
+        ("warning", "var(--p-alert-warning)"),
+        ("caution", "var(--p-alert-caution)"),
+        ("muted", "var(--p-muted)"),
+    ] {
+        let selector = format!(".reveal .callout.{class}");
+        assert_eq!(
+            rule(&rules, &selector).get("--p-callout-color"),
+            Some(colour)
+        );
+    }
+    for edge in [":first-child", ":last-child"] {
+        let side = if edge == ":first-child" {
+            "margin-top"
+        } else {
+            "margin-bottom"
+        };
+        assert_eq!(
+            rule(&rules, &format!(".reveal .callout > {edge}")).get(side),
+            Some("0")
+        );
+    }
+
+    // An empty title="" shows no empty title line.
+    let title = rule(
+        &rules,
+        r#".reveal .callout[data-title]:not(:where([data-title=""]))::before"#,
+    );
+    assert_eq!(title.get("content"), Some("attr(data-title)"));
+    assert_eq!(title.get("display"), Some("block"));
+    assert_eq!(title.get("color"), Some("var(--p-callout-color)"));
+    let alert_title = rule(&rules, ".reveal .markdown-alert .markdown-alert-title");
+    for property in [
+        "font-size",
+        "font-weight",
+        "letter-spacing",
+        "text-transform",
+    ] {
+        assert_eq!(title.get(property), alert_title.get(property), "{property}");
+    }
+    // The alert title is a paragraph: its line height, and the gap the next paragraph's
+    // margin leaves under it (a callout's first child has no top margin).
+    let paragraph = rule(&rules, ".reveal p, .reveal li");
+    assert_eq!(title.get("line-height"), paragraph.get("line-height"));
+    assert_eq!(title.get("margin"), Some("0 0 var(--r-block-margin)"));
+    // ... unless the title is all the callout holds.
+    let alone = rule(
+        &rules,
+        ".reveal .callout[data-title]:not(:where(:has(> *)))::before",
+    );
+    assert_eq!(alone.get("margin-bottom"), Some("0"));
+
+    // On a section slide the accent is the background: a callout without a colour class
+    // takes the text colour there instead.
+    assert_eq!(
+        rule(&rules, ".reveal .slides section.layout-section").get("--p-callout"),
+        Some("currentColor")
+    );
+
+    // Callouts that are columns themselves line up.
+    assert_eq!(
+        rule(&rules, ".reveal .columns > .callout").get("margin"),
+        Some("0")
+    );
+    assert_eq!(
+        rule(
+            &rules,
+            ".reveal .columns:not(:has(> :not(.callout))) > .callout"
+        )
+        .get("align-self"),
+        Some("stretch")
+    );
+    assert!(
+        readme().contains("| `.callout`, `.callout.{note,tip,important,warning,caution,muted}` |"),
+        "README: what the stylesheet styles"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // Shipped files (audit F47)
 // ---------------------------------------------------------------------------------------
 
