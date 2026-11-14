@@ -4,7 +4,7 @@ The built-in theme of presenter, and the root of the usual theme chain: a theme 
 `extends = "default"` builds on it (see [Extending it](#extending-it)). It is reveal.js's stock
 `white` theme for colours, plus `styles/theme.css`: system fonts, a heading at the top of
 each slide with left-aligned content, styled code blocks, tables, quotes, alerts,
-footnotes and columns, four layouts, and print rules for PDF export.
+callouts, footnotes and columns, four layouts, and print rules for PDF export.
 
 ```
 default/
@@ -32,7 +32,7 @@ Pick a layout per slide with `layout=NAME` on the separator or the first heading
 |---|---|---|
 | `default` | `templates/layouts/default.html` | Heading at the top, content left-aligned, a short accent rule under the slide's first heading. The fallback for unknown names. |
 | `title` | `templates/layouts/title.html` | Centred both ways. An optional logo, the first block (the deck heading), then `subtitle`, `author` and `date` from the front matter (author and date fall back to `presenter.toml` `[deck]`), then the rest. |
-| `section` | `templates/layouts/section.html` | A section divider: big centred heading, text in `--p-on-accent` on a full-bleed `--p-accent` background. A `background=` on the slide still wins. |
+| `section` | `templates/layouts/section.html` | A section divider: big centred heading, text in `--p-on-accent` on a full-bleed `--p-accent` background (a callout without a colour class is drawn in that text colour). A `background=` on the slide still wins. |
 | `blank` | `templates/layouts/blank.html` | No padding and no heading rule. When the slide holds nothing but one image, video or iframe (a Markdown image `![](plot.png)` counts; speaker notes may follow), it fills the whole slide, fitted inside it; for an image that covers the slide edge to edge use `background=`. CSS cannot see text, so a lone paragraph of text with exactly one inline image would be filled the same way. |
 
 `title` and `section` add the class `center` to the slide, which makes reveal centre it
@@ -75,12 +75,12 @@ is relative to the surrounding text.
 
 | token | default | purpose |
 |---|---|---|
-| `--p-accent` | `color-mix(in oklab, #2563eb 75%, currentColor)` | Accent colour: links (`--r-link-color`), list markers, the heading rule, reveal's controls and progress bar, the `section` background. Mixed with the text colour so it stays readable on light and dark backgrounds. |
+| `--p-accent` | `color-mix(in oklab, #2563eb 75%, currentColor)` | Accent colour: links (`--r-link-color`), list markers, the heading rule, reveal's controls and progress bar, the `section` background, `:::callout` boxes (`--p-callout`). Mixed with the text colour so it stays readable on light and dark backgrounds. |
 | `--p-on-accent` | `var(--r-background-color, #fff)` | Text on an accent background (the `section` layout). |
-| `--p-muted` | `color-mix(in srgb, currentColor 66%, transparent)` | Secondary text: subtitle, date, footnotes. |
+| `--p-muted` | `color-mix(in srgb, currentColor 66%, transparent)` | Secondary text: subtitle, date, footnotes; `:::callout muted` boxes. |
 | `--p-surface` | `color-mix(in srgb, currentColor 6%, transparent)` | Subtle fills: zebra table rows, `<kbd>`. |
 | `--p-border` | `color-mix(in srgb, currentColor 22%, transparent)` | Hairlines: table rows, quotes, footnote rule, iframes. |
-| `--p-radius` | `0.25em` | Corner radius of code blocks, inline code, alerts and keys. |
+| `--p-radius` | `0.25em` | Corner radius of code blocks, inline code, alerts, callouts and keys. |
 | `--p-slide-padding` | `40px 60px` | Space inside every slide (not `blank`); kept in PDF export. |
 | `--p-code-bg` | `#272822` | Background of the code blocks the highlight style does not colour (`.plain` blocks, `highlight_style = "none"`); monokai's. Highlighted blocks take their background from `highlight_style`. |
 | `--p-code-color` | `#f8f8f2` | Text colour of those code blocks. Line numbers are a fainter shade of each block's text colour. |
@@ -92,12 +92,14 @@ is relative to the surrounding text.
 | `--p-image-max-height` | `480px` | Images and videos are at most this tall so a figure fits under a heading. Exempt: `.r-stretch` images and videos that reveal sizes itself (direct children of the slide, see below). |
 | `--p-column-gap` | `1.25em` | Gap between the columns of `:::columns`. |
 | `--p-columns` | unset | Number of columns of `:::columns`. Unset: one equal column per `:::column`. Set it (e.g. `2`) to wrap more columns into rows. A `widths="1fr 2fr"` argument overrides both. |
-| `--p-alert-note` | `color-mix(in oklab, #2563eb 75%, currentColor)` | `> [!NOTE]` alerts: border, title and tint. |
-| `--p-alert-tip` | `color-mix(in oklab, #16a34a 75%, currentColor)` | `> [!TIP]` alerts. |
-| `--p-alert-important` | `color-mix(in oklab, #7c3aed 75%, currentColor)` | `> [!IMPORTANT]` alerts. |
-| `--p-alert-warning` | `color-mix(in oklab, #d97706 75%, currentColor)` | `> [!WARNING]` alerts. |
-| `--p-alert-caution` | `color-mix(in oklab, #dc2626 75%, currentColor)` | `> [!CAUTION]` alerts. |
+| `--p-alert-note` | `color-mix(in oklab, #2563eb 75%, currentColor)` | `> [!NOTE]` alerts and `:::callout note` boxes: border, title and tint. |
+| `--p-alert-tip` | `color-mix(in oklab, #16a34a 75%, currentColor)` | `> [!TIP]` alerts and `:::callout tip` boxes. |
+| `--p-alert-important` | `color-mix(in oklab, #7c3aed 75%, currentColor)` | `> [!IMPORTANT]` alerts and `:::callout important` boxes. |
+| `--p-alert-warning` | `color-mix(in oklab, #d97706 75%, currentColor)` | `> [!WARNING]` alerts and `:::callout warning` boxes. |
+| `--p-alert-caution` | `color-mix(in oklab, #dc2626 75%, currentColor)` | `> [!CAUTION]` alerts and `:::callout caution` boxes. |
 | `--p-alert-color` | `var(--p-alert-note)` | Set on each `.markdown-alert` from the five tokens above; the alert box reads it. Override the five instead. |
+| `--p-callout` | `var(--p-accent)` | `:::callout` boxes without a colour class: border, title and tint. The `section` layout sets it to `currentColor`, so that such a callout does not vanish into the accent background there. |
+| `--p-callout-color` | `var(--p-callout)` | Set on each `.callout`: `--p-callout`, or the colour its class names (`note`, `tip`, `important`, `warning`, `caution`: the alert tokens above; `muted`: `--p-muted`); the box reads it. To add a colour, set it on a class of your own, mixed with the text colour as the tokens are so that it stays readable on dark slides: `.reveal .callout.brand { --p-callout-color: color-mix(in oklab, #8a5a44 75%, currentColor); }`, used as `:::callout brand`. |
 | `--p-cell-gap` | `0.5em` | Vertical space around a notebook `.cell`. |
 | `--p-cell-border` | `1px solid rgba(128, 128, 128, 0.4)` | Frame of a notebook cell's output area, under its input. More notebook tokens: [Notebook cells](#notebook-cells). |
 
@@ -131,6 +133,7 @@ overrides these:
 | `table` | GitHub tables | `--p-table-font-size`, zebra rows; a table wider than the slide scrolls sideways |
 | `blockquote` | `> quote` | rule on the left, italic |
 | `.markdown-alert.markdown-alert-{note,tip,important,warning,caution}` | `> [!NOTE]` … | tinted box in the alert colours |
+| `.callout`, `.callout.{note,tip,important,warning,caution,muted}` | `:::callout`, `:::callout tip title="…"` | tinted box like an alert's, for any content, in `--p-callout` or the colour its second class names; `title="…"` (written as `data-title`) is set over the text as an alert's title is. A callout straight inside `::::columns` (no `:::column` around it) is a column itself, and when every column is a callout they are all as tall as their row |
 | `.footnotes`, `sup.footnote-ref` | `[^1]` | small, muted, under a rule |
 | `.small`, `.large`, `.center` | `:::small`, `{.center}` on a slide, … | 0.7×, 1.3× text; centred text (and the whole slide when on a slide) |
 | `kbd`, `mark` | `<kbd>S</kbd>`, `<mark>` | key caps, highlighter |

@@ -50,7 +50,7 @@ With a checkout and no installed binary, use `cargo run --` in place of `present
 | 7 | Math | inline and display math (KaTeX) | `$A = \pi r^2$`, `$$…$$` |
 | 8 | A table | GitHub tables | `\| a \| b \|` |
 | 9 | A footnote | footnotes | `reveal.js[^reveal]` and `[^reveal]: …` |
-| 10 | Callouts and quotes | GitHub alerts, block quotes, text size | `> [!TIP]`, `> quote`, `:::small` |
+| 10 | Callouts and quotes | GitHub alerts, callouts, block quotes, text size | `> [!TIP]`, `:::callout muted title="…"`, `> quote`, `:::small` |
 | 11 | Backgrounds | background colour, per-slide transition | `--- {background="#0f172a" transition=zoom}` |
 | 12 | Background images | background image attributes | `--- {background=figures/plot.png background-opacity=0.2 …}` |
 | 13 | (a full-slide figure) | blank layout: no padding, the image fills the slide | `--- {layout=blank}` |

@@ -144,6 +144,10 @@ Both are bundled, so this deck works offline.
 > GitHub-style alerts start with `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` or
 > `[!CAUTION]` on the first line of a block quote.
 
+:::callout muted title="A callout"
+A `:::callout` box holds any content; `tip`, `muted`, … pick its colour.
+:::
+
 > A plain block quote sets a remark or a citation apart.
 
 :::small

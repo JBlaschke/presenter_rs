@@ -221,7 +221,7 @@ already right for reveal (`fragment`, `r-stack`, `r-fit-text`, …). We special-
 | `:::fragment [effects…] [index=N]` | `<div class="fragment effects…" [data-fragment-index="N"]>` | comrak already produces the classes; T12 adds `data-fragment-index` from an `index=` arg if present (parse `info` manually) |
 | `:::columns [widths="1fr 2fr"]` | `<div class="columns" [style="grid-template-columns: 1fr 2fr"]>` | layout is CSS grid in the default theme |
 | `:::column [width=…]` | `<div class="column">` | |
-| `:::center`, `:::small`, `:::large`, `:::note`, `:::warning` and any other name | `<div class="name args">` (default) | the default theme styles a documented subset |
+| `:::center`, `:::small`, `:::large`, `:::callout`, `:::note`, `:::warning` and any other name | `<div class="name args">` (default) | the default theme styles a documented subset |
 | `:::include path` | replaced by the included file's slides (§4.1, T48) | must be the only content of its horizontal slide |
 
 ### 4.1 Includes: composing a deck from several files (T48, contract change 2026-10-09)
