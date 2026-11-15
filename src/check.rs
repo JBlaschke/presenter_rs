@@ -98,10 +98,10 @@ use crate::assets::registry::normalize_lexically;
 use crate::config::{Config, SlideSplit};
 use crate::error::{Diagnostic, Diagnostics, Error, Level, Result};
 use crate::ir::{Block, Deck, Slide, SourceKind, SourceSpan};
-use crate::markdown::comrak_options;
 use crate::markdown::frontmatter::split_front_matter;
 use crate::markdown::include::IncludedSource;
 use crate::markdown::split::{SplitMode, source_lines, split_with_source};
+use crate::markdown::{comrak_options, mark_empty_front_matter, starts_with_empty_front_matter};
 use crate::notebook::convert::codes::FRONT_MATTER_IGNORED;
 use crate::notebook::nbformat::{self, Cell, CellType, SlideType};
 use crate::pipeline::{self, BuildOptions};
@@ -680,6 +680,12 @@ impl<'p> Origin<'p> {
 
 /// `separator-not-recognized` for one Markdown text at `origin`, split into slides in
 /// `split` mode (the deck's mode, or rules mode for a split notebook cell).
+///
+/// The text is parsed as the frontend parses it: with `options`, except that when they
+/// enable comrak's front matter extension (a deck or an included Markdown file; notebook
+/// cells are parsed without it) a text that starts with empty front matter (`---` on lines
+/// 1 and 2, dialect A3) is parsed without the extension and its two rules become the front
+/// matter ([`starts_with_empty_front_matter`], [`mark_empty_front_matter`]), as in the build.
 fn lint_text(
     text: &str,
     options: &Options<'_>,
@@ -688,13 +694,22 @@ fn lint_text(
     frontend: &Diagnostics,
 ) -> Vec<Diagnostic> {
     let arena = Arena::new();
-    let root = parse_document(&arena, text, options);
+    let empty_front_matter =
+        options.extension.front_matter_delimiter.is_some() && starts_with_empty_front_matter(text);
+    let mut options = Cow::Borrowed(options);
+    if empty_front_matter {
+        options.to_mut().extension.front_matter_delimiter = None;
+    }
+    let root = parse_document(&arena, text, &options);
+    if empty_front_matter {
+        mark_empty_front_matter(root);
+    }
     let lines = source_lines(text);
     let Some(opened) = opened_lines(root, text, &lines, split) else {
         return Vec::new();
     };
     let reported = origin.reported(frontend);
-    unrecognized_separators(root, &lines, split, &opened, &reported)
+    unrecognized_separators(root, &lines, split, &opened, &reported, origin.offset)
         .into_iter()
         .map(|(line, message)| origin.warning(codes::SEPARATOR_NOT_RECOGNIZED, line, message))
         .collect()
@@ -846,13 +861,15 @@ fn indent_columns(raw: &str) -> usize {
 /// `split` that did not open a slide (module docs), as `(line, message)` with lines of the
 /// text. `lines` are the text's lines ([`source_lines`]), `opened` the lines on which a
 /// separator opened a slide ([`opened_lines`]), `reported` the lines the splitter already
-/// reported.
+/// reported. `offset` is [`Origin::offset`]: the lines a message names (where a block
+/// opens, …) are lines of the input, like the line the diagnostic is reported on.
 fn unrecognized_separators<'a>(
     root: &'a AstNode<'a>,
     lines: &[&str],
     split: SplitMode,
     opened: &BTreeSet<usize>,
     reported: &BTreeSet<usize>,
+    offset: usize,
 ) -> Vec<(usize, String)> {
     let skipped = Ranges::new(skipped_ranges(root));
     let tops = Ranges::new(root.children().map(|node| (lines_of(node), node)).collect());
@@ -876,7 +893,7 @@ fn unrecognized_separators<'a>(
             blank_before: index == 0 || blank(index - 1),
             blank_after: blank(index + 1),
         };
-        if let Some(reason) = why_not_a_separator(root, tops.find(line), &dash, split) {
+        if let Some(reason) = why_not_a_separator(root, tops.find(line), &dash, split, offset) {
             found.push((line, format!("`{mark}` {reason}")));
         }
     }
@@ -965,20 +982,24 @@ fn deepest<'a>(node: &'a AstNode<'a>, line: usize) -> &'a AstNode<'a> {
 }
 
 /// Why the dash line inside the top-level block `top` opened no slide, or `None` when that
-/// is right (the underline of a setext heading that starts a slide in headings mode).
+/// is right (the underline of a setext heading that starts a slide in headings mode). The
+/// lines the reason names are shifted by `offset` (as in [`unrecognized_separators`]).
 fn why_not_a_separator<'a>(
     root: &'a AstNode<'a>,
     top: Option<&'a AstNode<'a>>,
     dash: &DashLine<'_>,
     split: SplitMode,
+    offset: usize,
 ) -> Option<String> {
-    if let Some(reason) = never_closed(deepest(top.unwrap_or(root), dash.line)) {
+    if let Some(reason) = never_closed(deepest(top.unwrap_or(root), dash.line), offset) {
         return Some(reason);
     }
     let Some(top) = top else {
         return Some("did not start a slide".to_string());
     };
     let (opened, end) = lines_of(top);
+    // The lines as the messages name them.
+    let (from, to) = (opened + offset, end + offset);
     let advice = dash.advice();
     Some(match &top.data().value {
         NodeValue::Heading(heading) if heading.setext && dash.line == end => {
@@ -991,7 +1012,7 @@ fn why_not_a_separator<'a>(
             )
         }
         NodeValue::Heading(heading) if heading.setext => format!(
-            "is part of the text of the heading underlined on line {end} (setext), so no \
+            "is part of the text of the heading underlined on line {to} (setext), so no \
              slide starts here; {advice}"
         ),
         NodeValue::CodeBlock(code) if !code.fenced => format!(
@@ -1003,7 +1024,7 @@ fn why_not_a_separator<'a>(
             // The paragraph's text is this line alone: the lines above it are link
             // reference definitions, which comrak removes from the paragraph.
             format!(
-                "follows link reference definitions (from line {opened}) without a blank line, \
+                "follows link reference definitions (from line {from}) without a blank line, \
                  so it is read as text and no slide starts here; {advice}"
             )
         }
@@ -1011,14 +1032,14 @@ fn why_not_a_separator<'a>(
             format!("is part of a paragraph, so no slide starts here; {advice}")
         }
         NodeValue::Table(_) => format!(
-            "is read as a row of the table that starts on line {opened}, so no slide starts \
+            "is read as a row of the table that starts on line {from}, so no slide starts \
              here; {advice}"
         ),
         NodeValue::HtmlBlock(_) => format!(
-            "is part of the HTML block that starts on line {opened} (it ends at the first \
+            "is part of the HTML block that starts on line {from} (it ends at the first \
              blank line), so no slide starts here; {advice}"
         ),
-        value => nested(value, opened, dash),
+        value => nested(value, from, dash),
     })
 }
 
@@ -1038,8 +1059,9 @@ fn has_one_inline<'a>(node: &'a AstNode<'a>) -> bool {
 }
 
 /// The reason for a dash line inside `leaf` when that is a fenced code block or a raw HTML
-/// block whose end marker is missing (it then runs to the end of its container).
-fn never_closed<'a>(leaf: &'a AstNode<'a>) -> Option<String> {
+/// block whose end marker is missing (it then runs to the end of its container); the line
+/// it opens on is shifted by `offset` (as in [`unrecognized_separators`]).
+fn never_closed<'a>(leaf: &'a AstNode<'a>, offset: usize) -> Option<String> {
     let (what, fix) = match &leaf.data().value {
         NodeValue::CodeBlock(code) if code.fenced && !code.closed => (
             "code block".to_string(),
@@ -1051,7 +1073,7 @@ fn never_closed<'a>(leaf: &'a AstNode<'a>) -> Option<String> {
         }
         _ => return None,
     };
-    let opened = lines_of(leaf).0;
+    let opened = lines_of(leaf).0 + offset;
     Some(format!(
         "is inside the {what} opened on line {opened}, which is never closed, so no slide \
          starts here; {fix}"
@@ -1059,8 +1081,8 @@ fn never_closed<'a>(leaf: &'a AstNode<'a>) -> Option<String> {
 }
 
 /// The reason for a dash line inside the top-level container `value` (a list, quote,
-/// directive, …) that opens on line `opened`. A line without indentation in a list or
-/// quote is a lazy continuation of the paragraph above it.
+/// directive, …) that opens on line `opened` (of the input, offset included). A line
+/// without indentation in a list or quote is a lazy continuation of the paragraph above it.
 fn nested(value: &NodeValue, opened: usize, dash: &DashLine<'_>) -> String {
     let unindented = !dash.raw.starts_with([' ', '\t']);
     let (container, lazy) = match value {
@@ -1482,11 +1504,17 @@ mod tests {
             assert_eq!(opened, expected, "{text:?}");
             // Every other `---`/`--` line outside code, raw HTML and the front matter is
             // reported, and no line that opened a slide is.
-            let reported: BTreeSet<usize> =
-                unrecognized_separators(root, &lines, SplitMode::Rules, &opened, &BTreeSet::new())
-                    .into_iter()
-                    .map(|(line, _)| line)
-                    .collect();
+            let reported: BTreeSet<usize> = unrecognized_separators(
+                root,
+                &lines,
+                SplitMode::Rules,
+                &opened,
+                &BTreeSet::new(),
+                0,
+            )
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
             let skipped = Ranges::new(skipped_ranges(root));
             let lost: BTreeSet<usize> = (1..=lines.len())
                 .filter(|&line| matches!(lines[line - 1].trim_matches([' ', '\t']), "---" | "--"))
@@ -1816,6 +1844,97 @@ mod tests {
                 (separator, Some(3), 2),
                 (separator, Some(5), 5),
             ]
+        );
+    }
+
+    /// The lines a message names are counted within the cell, like the line it is reported
+    /// on, also when the cell's front matter is removed before the cell is read; they are
+    /// the lines the same text has as a Markdown deck.
+    #[test]
+    fn lines_in_messages_count_a_cells_front_matter() {
+        let text = "---\ntitle: T\nnotebook:\n  split_markdown_cells: true\n---\n# Title\n\n\
+                    :::note\nX\n\n---\n\nC\n:::\n\n[x]: /u\n---\n\n| a |\n|---|\n| b |\n--\n\n\
+                    --\nHeading\n=====\n\n<div>\n---\n</div>\n\n```\ncode\n\n---\n";
+        let dir = tempfile::tempdir().unwrap();
+        let warnings = |name: &str, contents: &str| -> Vec<(Option<usize>, usize, String)> {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            run(&BuildOptions::new(&path))
+                .unwrap()
+                .iter()
+                .filter(|d| d.code == codes::SEPARATOR_NOT_RECOGNIZED)
+                .map(|d| {
+                    let span = d.span.as_ref().unwrap();
+                    (span.cell, span.start_line, d.message.clone())
+                })
+                .collect()
+        };
+        let in_cell = warnings(
+            "nb.ipynb",
+            &notebook(&[cell("markdown", text, "{}", "", "")]),
+        );
+        let expected = [
+            (11, "is inside the `:::note` directive (from line 8)"),
+            (17, "follows link reference definitions (from line 16)"),
+            (22, "is read as a row of the table that starts on line 19"),
+            (
+                24,
+                "is part of the text of the heading underlined on line 26",
+            ),
+            (29, "is part of the HTML block that starts on line 28"),
+            (
+                35,
+                "is inside the code block opened on line 32, which is never closed",
+            ),
+        ];
+        let found: Vec<(usize, String)> = in_cell
+            .iter()
+            .map(|(cell, line, message)| {
+                assert_eq!(*cell, Some(0), "{message}");
+                (*line, message.clone())
+            })
+            .collect();
+        assert_warnings(&found, &expected);
+        // The deck reads the front matter as part of its text: same lines, same messages.
+        let in_deck = warnings("deck.md", text);
+        let deck: Vec<(usize, String)> = in_deck
+            .into_iter()
+            .map(|(cell, line, message)| {
+                assert_eq!(cell, None, "{message}");
+                (line, message)
+            })
+            .collect();
+        assert_eq!(deck, found);
+    }
+
+    /// A deck that starts with empty front matter (`---` on lines 1 and 2, dialect A3) is
+    /// split as the build splits it: comrak's front matter extension would pair line 1 with
+    /// the `---` on line 9 and read line 12's `:::` as opening a directive.
+    #[test]
+    fn empty_front_matter_is_read_as_the_build_reads_it() {
+        let text = "---\n---\n\nA\n\n:::note\nx\n\n---\n\ny\n:::\n\n---\n\nB\n";
+        assert_warnings(
+            &separator_warnings(text),
+            &[(9, "is inside the `:::note` directive (from line 6)")],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.md");
+        std::fs::write(&path, text).unwrap();
+        let deck = pipeline::parse_only(&BuildOptions::new(&path))
+            .unwrap()
+            .0
+            .deck;
+        let starts: Vec<usize> = deck
+            .slides
+            .iter()
+            .map(|slide| slide.span.as_ref().unwrap().start_line)
+            .collect();
+        // Line 14 opens the slide with `B`.
+        assert_eq!(starts, [4, 14]);
+        // The two rules are the front matter, not separators (nor reported ones).
+        assert_eq!(
+            check_text("deck.md", "---\n---\n\n# A\n\n---\n\n# B\n"),
+            vec![]
         );
     }
 

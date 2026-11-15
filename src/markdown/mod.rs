@@ -433,8 +433,9 @@ fn deck_meta<'a>(root: &'a AstNode<'a>, diagnostics: &mut Diagnostics) -> Result
 /// comrak would pair the opening `---` with the first *later* `---` line, which in a deck is
 /// a slide separator, and take everything up to it for YAML (the line right after the
 /// opening `---` never closes the block). Such a text is parsed without the front matter
-/// extension and [`mark_empty_front_matter`] turns its two leading rules into front matter.
-fn starts_with_empty_front_matter(text: &str) -> bool {
+/// extension and [`mark_empty_front_matter`] turns its two leading rules into front matter
+/// (here and in `check`'s source lints, which must split the text as the build does).
+pub(crate) fn starts_with_empty_front_matter(text: &str) -> bool {
     let lines = split::source_lines(text);
     lines.len() >= 2 && lines[0] == "---" && lines[1] == "---"
 }
@@ -443,7 +444,7 @@ fn starts_with_empty_front_matter(text: &str) -> bool {
 /// extension: its first thematic break becomes an empty `FrontMatter` node spanning lines 1
 /// and 2 (as comrak makes for `---`, blank line, `---`) and the second one is detached, so
 /// neither makes a slide.
-fn mark_empty_front_matter<'a>(root: &'a AstNode<'a>) {
+pub(crate) fn mark_empty_front_matter<'a>(root: &'a AstNode<'a>) {
     let breaks: Vec<_> = root
         .children()
         .take(2)
