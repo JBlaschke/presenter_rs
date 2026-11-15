@@ -25,6 +25,13 @@ publishes that section as the GitHub Release notes (see
   `::after` (such as a callout's title) opaque over what is behind it, as it already did for
   all other text. Keynote, Preview and QuickLook ignore alpha on text and showed such text
   as dark as the body text.
+- `check` counts the lines its `separator-not-recognized` messages name ("from line 8",
+  "opened on line 32", …) within the notebook cell, as it already counted the line the
+  warning is on. In a cell that starts with front matter they were counted from after it.
+- `check` reads a deck that starts with empty front matter (`---` on lines 1 and 2) as the
+  build does. It took everything up to the first `---` after line 2, often a slide
+  separator, for front matter: it reported none of the `---`/`--` lines up to there, and
+  could report one after it that starts a slide as one inside a directive.
 
 ## [0.1.1] - 2026-11-02
 
