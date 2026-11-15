@@ -113,7 +113,94 @@
 
   function emit(shape, part) {
     if (shape.frame.w <= 0 || shape.frame.h <= 0) return;
+    if (shape.kind === 'text') fitText(shape.paragraphs);
+    if (shape.kind === 'table') for (const row of shape.rows) for (const cell of row.cells) fitText(cell.paragraphs);
     scene.parts[part].shapes.push(shape);
+  }
+
+  // Makes each run as wide in PowerPoint as it is on the page. PowerPoint draws a run in
+  // `font` (often a stand-in: Arial for the system font) without kerning, so it comes out
+  // wider or narrower than Chrome drew it and wraps or overflows its box; the difference,
+  // spread over the run's characters, goes into its letter spacing. The room an inline box
+  // keeps around its text (inline code's padding) has no box to live in in PowerPoint: it
+  // goes into the spacing after the run's last character and after the character before
+  // the run, so the glyphs keep their places (letter spacing applies after a character).
+  function fitText(paragraphs) {
+    for (const paragraph of paragraphs) {
+      const runs = [];
+      for (const run of paragraph.runs) {
+        if (run.br) {
+          delete run.soft;
+          runs.push(run);
+          continue;
+        }
+        const css = run.css;
+        delete run.css;
+        if (!css) {
+          runs.push(run);
+          continue;
+        }
+        const text = run.caps === 'all' ? run.text.toUpperCase() : run.text;
+        const count = [...text].length;
+        if (count > 0 && run.caps !== 'small' && installed(run.font)) {
+          const page = drawnWidth(run, css, run.text);
+          const office = officeWidth(run, text);
+          if (page > 0 && office > 0) run.spacing = round(run.spacing + (page - office) / count);
+        }
+        if (css.roomL) {
+          const before = runs[runs.length - 1];
+          // At the start of a line there is no character before: the room is left out.
+          if (before && !before.br) runs.splice(runs.length - 1, 1, ...spacedAfter(before, css.roomL));
+        }
+        runs.push(...(css.roomR ? spacedAfter(run, css.roomR) : [run]));
+      }
+      paragraph.runs = runs;
+    }
+  }
+
+  // `run` with `extra` pixels of spacing after its last character (split off for that).
+  function spacedAfter(run, extra) {
+    const chars = [...run.text];
+    if (chars.length === 0) return [run];
+    const tail = { ...run, text: chars.pop(), spacing: round(run.spacing + extra) };
+    return chars.length ? [{ ...run, text: chars.join('') }, tail] : [tail];
+  }
+
+  // How wide PowerPoint draws `text` in `run`'s font (without kerning, as it does).
+  function officeWidth(run, text) {
+    measure.fontKerning = 'none';
+    measure.font = `${run.italic ? 'italic ' : ''}${run.bold ? 'bold ' : ''}${run.size}px ${JSON.stringify(run.font)}`;
+    const width = measure.measureText(text).width;
+    measure.fontKerning = 'auto';
+    return width;
+  }
+
+  // How wide Chrome drew `text` in `run` with the font `css` describes (its stretch and
+  // word spacing included; letter spacing, which `run.spacing` keeps, left out).
+  function drawnWidth(run, css, text) {
+    if (run.caps === 'all') text = text.toUpperCase();
+    measure.fontKerning = 'normal';
+    measure.font = `${css.style} ${css.weight} ${run.size}px ${css.family}`;
+    measure.fontStretch = css.stretch || 'normal';
+    const width = measure.measureText(text).width + (css.wordSpacing || 0) * (text.match(/ /g) || []).length;
+    measure.fontStretch = 'normal';
+    measure.fontKerning = 'auto';
+    return width;
+  }
+
+  // The width of an inline box that holds the text of `run` (a pseudo-element's): its text
+  // and the room around it.
+  function boxWidth(run) {
+    return runWidth(run, run.css.drawn === undefined ? run.text : run.css.drawn);
+  }
+
+  // `font-stretch` (computed as a percentage) as the keyword a canvas takes.
+  const STRETCHES = [[50, 'ultra-condensed'], [62.5, 'extra-condensed'], [75, 'condensed'], [87.5, 'semi-condensed'],
+    [100, 'normal'], [112.5, 'semi-expanded'], [125, 'expanded'], [150, 'extra-expanded'], [200, 'ultra-expanded']];
+  function stretchOf(value) {
+    if (!value || !/%$/.test(value)) return value || 'normal';
+    const n = num(value);
+    return STRETCHES.reduce((best, s) => (Math.abs(s[0] - n) < Math.abs(best[0] - n) ? s : best))[1];
   }
 
   // --- Colours and fills ----------------------------------------------------------------
@@ -328,8 +415,11 @@
     return { color: c, width, dash: style === 'dashed' || style === 'dotted' };
   }
 
-  function radiusOf(cs) {
-    const r = Math.min(num(cs.borderTopLeftRadius), num(cs.borderTopRightRadius), num(cs.borderBottomLeftRadius), num(cs.borderBottomRightRadius));
+  // The smallest corner radius of a box `rect` (a percentage is one of its shorter side).
+  function radiusOf(cs, rect) {
+    const side = rect ? Math.min(rect.width, rect.height) : 0;
+    const one = (v) => (/%/.test(v) ? (num(v) / 100) * side : num(v));
+    const r = Math.min(...['TopLeft', 'TopRight', 'BottomLeft', 'BottomRight'].map((c) => one(cs['border' + c + 'Radius'])));
     return r > 0 ? round(r) : null;
   }
 
@@ -346,9 +436,13 @@
 
   // Whether `family` is available to Chrome (installed, or a loaded web font): rendered in
   // it, a test string differs in width from the generic fallbacks.
+  const installedCache = new Map();
   function installed(family) {
-    const quoted = JSON.stringify(family);
-    return ['monospace', 'serif', 'sans-serif'].some((g) => textWidth(quoted + ', ' + g) !== textWidth(g));
+    if (!installedCache.has(family)) {
+      const quoted = JSON.stringify(family);
+      installedCache.set(family, ['monospace', 'serif', 'sans-serif'].some((g) => textWidth(quoted + ', ' + g) !== textWidth(g)));
+    }
+    return installedCache.get(family);
   }
 
   // The font PowerPoint gets for a computed `font-family` stack: the first family Chrome
@@ -463,6 +557,11 @@
     const cs = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
     const auto = (v) => v === 'auto' || v === '';
+    // A computed width or height of a `content-box` is its content's: the padding and the
+    // border, which the box's fill and outline cover, come on top.
+    const content = ps.boxSizing !== 'border-box';
+    const extraW = content ? num(ps.paddingLeft) + num(ps.paddingRight) + num(ps.borderLeftWidth) + num(ps.borderRightWidth) : 0;
+    const extraH = content ? num(ps.paddingTop) + num(ps.paddingBottom) + num(ps.borderTopWidth) + num(ps.borderBottomWidth) : 0;
     if (ps.position === 'absolute' || ps.position === 'fixed') {
       const cb = containingBlock(el);
       const cbs = getComputedStyle(cb);
@@ -471,8 +570,8 @@
       const top = cbRect.top + num(cbs.borderTopWidth);
       const width = cbRect.width - num(cbs.borderLeftWidth) - num(cbs.borderRightWidth);
       const height = cbRect.height - num(cbs.borderTopWidth) - num(cbs.borderBottomWidth);
-      let w = auto(ps.width) ? null : num(ps.width);
-      let h = auto(ps.height) ? null : num(ps.height);
+      let w = auto(ps.width) ? null : num(ps.width) + extraW;
+      let h = auto(ps.height) ? null : num(ps.height) + extraH;
       let x;
       let y;
       if (!auto(ps.left)) x = left + num(ps.left);
@@ -491,8 +590,8 @@
     const contentRight = rect.right - num(cs.borderRightWidth) - num(cs.paddingRight);
     const contentTop = rect.top + num(cs.borderTopWidth) + num(cs.paddingTop);
     const contentBottom = rect.bottom - num(cs.borderBottomWidth) - num(cs.paddingBottom);
-    const w = auto(ps.width) ? contentRight - contentLeft - num(ps.marginLeft) - num(ps.marginRight) : num(ps.width);
-    const h = auto(ps.height) ? 0 : num(ps.height);
+    const w = auto(ps.width) ? contentRight - contentLeft - num(ps.marginLeft) - num(ps.marginRight) : num(ps.width) + extraW;
+    const h = auto(ps.height) ? 0 : num(ps.height) + extraH;
     const left = contentLeft + num(ps.marginLeft);
     const top = which === '::before' ? contentTop + num(ps.marginTop) : contentBottom - num(ps.marginBottom) - h;
     return { left, top, width: w, height: h };
@@ -510,17 +609,32 @@
     }
     const fill = fillOf(ps, pseudo.opacity);
     const line = lineOf(ps, pseudo.opacity);
-    if (fill || line) emit({ kind: 'rect', frame, fill, line, radius: radiusOf(ps) }, part);
+    if (fill || line) emit({ kind: 'rect', frame, fill, line, radius: radiusOf(ps, box) }, part);
     if (pseudo.text && pseudo.text.trim()) {
       // A translucent colour is composited over what is behind the text: the element's
       // backdrop, with the pseudo-element's own fill over it when it has one.
       const backdrop = fill && fill.color ? over(fill.color, backdropOf(el)) : backdropOf(el);
       const style = runStyle(ps, pseudo.opacity, {}, backdrop);
+      const insets = {
+        l: round(num(ps.paddingLeft) + num(ps.borderLeftWidth)),
+        t: round(num(ps.paddingTop) + num(ps.borderTopWidth)),
+        r: round(num(ps.paddingRight) + num(ps.borderRightWidth)),
+        b: round(num(ps.paddingBottom) + num(ps.borderBottomWidth)),
+      };
+      // Generated text has no text nodes to find Chrome's wraps in: text Chrome kept on
+      // one line (a badge, a label) must not wrap in PowerPoint either, and longer text
+      // breaks where Chrome's greedy line breaking puts it in the box.
+      const lh = lineHeightOf(ps) || style.size * 1.2;
+      const oneLine = box.height - insets.t - insets.b < lh * 1.5 || ps.whiteSpace === 'nowrap' || ps.whiteSpace === 'pre';
+      const text = pseudo.text.replace(SPACES, ' ').trim();
+      const runs = [];
+      (oneLine ? [text] : breakText(text, style, box.width - insets.l - insets.r)).forEach((line, i) => {
+        if (i > 0) runs.push({ br: true, soft: true });
+        runs.push({ ...style, css: { ...style.css }, text: line });
+      });
       emit({
-        kind: 'text', frame, insets: { l: 0, t: 0, r: 0, b: 0 }, fill: null, line: null, radius: null,
-        wrap: true, title: false,
-        paragraphs: [{ align: alignOf(ps), level: 0, bullet: null, marginLeft: 0, indent: 0,
-          lineHeight: lineHeightOf(ps), spaceBefore: 0, runs: [{ ...style, text: pseudo.text }] }],
+        kind: 'text', frame, insets, fill: null, line: null, radius: null, wrap: !oneLine, title: false,
+        paragraphs: [paragraphOf(ps, runs, { indent: 0 })],
       }, part);
     }
   }
@@ -541,8 +655,12 @@
 
   function alignOf(cs) {
     switch (cs.textAlign) {
-      case 'center': return 'ctr';
-      case 'right': return 'r';
+      case 'center':
+      case '-webkit-center': return 'ctr';
+      case 'right':
+      case '-webkit-right': return 'r';
+      case 'left':
+      case '-webkit-left': return 'l';
       case 'end': return cs.direction === 'rtl' ? 'l' : 'r';
       case 'justify': return 'just';
       default: return cs.direction === 'rtl' ? 'r' : 'l';
@@ -563,22 +681,22 @@
   function runStyle(cs, opacity, inherit, backdrop) {
     const decoration = (cs.textDecorationLine || '') + ' ' + (inherit.decoration || '');
     const weight = cs.fontWeight === 'bold' || cs.fontWeight === 'bolder' ? 700 : num(cs.fontWeight);
-    let baseline = inherit.baseline || 0;
-    const va = cs.verticalAlign;
-    if (va === 'super' || va === 'text-top') baseline = 30000;
-    else if (va === 'sub' || va === 'text-bottom') baseline = -25000;
-    else if (/px$/.test(va)) {
-      const px = num(va);
-      if (px > 1) baseline = 30000;
-      else if (px < -1) baseline = -25000;
-    }
+    const size = round(num(cs.fontSize));
+    // Raised or lowered text (`inherit.raise`, from the enclosing elements' vertical-align).
+    const baseline = shiftOf(inherit.raise || 0, size);
     let caps = null;
     if (cs.textTransform === 'uppercase') caps = 'all';
     else if (cs.fontVariantCaps === 'small-caps' || cs.fontVariantCaps === 'all-small-caps') caps = 'small';
     const spacing = cs.letterSpacing && cs.letterSpacing !== 'normal' ? round(num(cs.letterSpacing)) : 0;
     return {
+      // The font Chrome draws with, to measure the run against the one PowerPoint gets
+      // (see `fitText`); dropped before the scene leaves the page.
+      css: {
+        family: cs.fontFamily, weight: cs.fontWeight, style: /^oblique/.test(cs.fontStyle) ? 'italic' : cs.fontStyle,
+        stretch: stretchOf(cs.fontStretch), wordSpacing: num(cs.wordSpacing),
+      },
       font: fontOf(cs.fontFamily),
-      size: round(num(cs.fontSize)),
+      size,
       bold: weight >= 600,
       italic: cs.fontStyle === 'italic' || cs.fontStyle === 'oblique',
       underline: /underline/.test(decoration),
@@ -597,34 +715,330 @@
     return c && backdrop && c.a < 1 ? over(c, backdrop) : c;
   }
 
-  function sameStyle(a, b) {
+  // Whether the run `b` can join the run `a` before it: the same style, and no room between
+  // them that an inline box keeps (two adjacent key caps stay two runs).
+  function joinable(a, b) {
+    const font = (css) => (css ? [css.family, css.weight, css.style, css.stretch, css.wordSpacing].join('|') : '');
     return a.font === b.font && a.size === b.size && a.bold === b.bold && a.italic === b.italic &&
       a.underline === b.underline && a.strike === b.strike && a.caps === b.caps && a.baseline === b.baseline &&
       a.spacing === b.spacing && a.link === b.link && JSON.stringify(a.color) === JSON.stringify(b.color) &&
-      JSON.stringify(a.highlight) === JSON.stringify(b.highlight);
+      JSON.stringify(a.highlight) === JSON.stringify(b.highlight) && font(a.css) === font(b.css) &&
+      !(a.css && (a.css.roomR || a.css.drawn !== undefined)) && !(b.css && (b.css.roomL || b.css.drawn !== undefined));
   }
 
-  // Applies `text-transform` values PowerPoint has no attribute for.
-  function transformed(text, cs) {
+  // The baseline shift of a run of `size` pixels drawn `raise` pixels above the baseline,
+  // in thousandths of a percent. PowerPoint draws a run with a baseline shift at two thirds
+  // of its size, so pptx.rs writes such a run half as large again, and the shift is a share
+  // of that size. A shift under a fifth of the size is a nudge (a key cap's), left out:
+  // PowerPoint would shrink the run for it.
+  function shiftOf(raise, size) {
+    return Math.abs(raise) >= 0.2 * size ? Math.round((raise / (1.5 * size)) * 100000) : 0;
+  }
+
+  // How far `vertical-align` puts the baseline of the inline box `el` (of style `cs`) above
+  // its parent's, whose font size is `parentSize`: `super` (a third of the parent's size,
+  // plus half a pixel) and `sub` (a fifth, plus half a pixel) as Chrome lays them out, a
+  // length as it is, anything else (`top`, `middle`, a percentage…) measured on the page.
+  // A pseudo-element (`el` null) cannot be measured.
+  function raiseOf(el, cs, parentSize) {
+    const va = cs.verticalAlign;
+    if (va === 'baseline') return 0;
+    if (va === 'super') return parentSize / 3 + 0.5;
+    if (va === 'sub') return -(parentSize / 5 + 0.5);
+    if (/^-?[\d.]+px$/.test(va)) return num(va);
+    return el ? measuredRaise(el) : 0;
+  }
+
+  // How far Chrome raised the inline box `el` above its parent's baseline: a probe of no
+  // size just after it sits on the parent's baseline, the last glyph of its own text on its
+  // own baseline.
+  function measuredRaise(el) {
+    let glyph = null;
+    const range = document.createRange();
+    for (const node of Array.from(el.childNodes).reverse()) {
+      if (node.nodeType !== TEXT) continue;
+      const i = node.data.search(/[^ \t\n\r\f]\s*$/);
+      if (i < 0) continue;
+      range.setStart(node, i);
+      range.setEnd(node, i + 1);
+      const rect = range.getBoundingClientRect();
+      if (rect.width > 0 || rect.height > 0) {
+        glyph = rect;
+        break;
+      }
+    }
+    if (!glyph || !el.parentNode) return 0;
+    const probe = document.createElement('span');
+    probe.style.cssText = 'display:inline-block;width:0;height:0;margin:0;padding:0;border:0;vertical-align:baseline';
+    el.after(probe);
+    const base = probe.getBoundingClientRect().bottom;
+    probe.remove();
+    return round(base - (glyph.top + strutOf(getComputedStyle(el)).ascent));
+  }
+
+  // How wide Chrome drew `text` of `run` with the room around it: its letter spacing
+  // included.
+  function runWidth(run, text) {
+    const css = run.css;
+    return drawnWidth(run, css, text) + run.spacing * [...text].length + (css.roomL || 0) + (css.roomR || 0);
+  }
+
+  // The room an inline element keeps around its text (`out` from `start` holds its runs),
+  // for `fitText` on its first and last runs with text: PowerPoint has no such boxes, so
+  // letter spacing makes it up. That is its margins, borders and padding; an inline block
+  // on one line also leaves what its width has beyond its content (a set width or
+  // `min-width`, the gaps of a flex box), on the side its `text-align` says. With
+  // `box-decoration-break: clone`, every line has the room on both sides.
+  function roomAround(el, cs, out, start) {
+    const runs = out.slice(start);
+    const texts = runs.filter((run) => !run.br && run.css && run.text.trim());
+    if (texts.length === 0) return;
+    const edge = (side) => num(cs['margin' + side]) + num(cs['border' + side + 'Width']) + num(cs['padding' + side]);
+    let left = edge('Left');
+    let right = edge('Right');
+    if (/^inline-/.test(cs.display) && !runs.some((run) => run.br || !run.css)) {
+      const box = el.getBoundingClientRect();
+      const height = box.height - edge('Top') - edge('Bottom') + num(cs.marginTop) + num(cs.marginBottom);
+      const lh = lineHeightOf(cs) || num(cs.fontSize) * 1.2;
+      if (box.width > 0 && height < lh * 1.5) {
+        // Chrome drops the white space at the start and the end of the box's line.
+        const used = runs.reduce((w, run, i) => {
+          let text = run.css.drawn === undefined ? run.text : run.css.drawn;
+          if (i === 0) text = text.replace(LEADING_SPACES, '');
+          if (i === runs.length - 1) text = text.replace(TRAILING_SPACES, '');
+          return w + runWidth(run, text);
+        }, 0);
+        const extra = box.width - (left - num(cs.marginLeft)) - (right - num(cs.marginRight)) - used;
+        if (extra > 0.5) {
+          const share = { ctr: 0.5, r: 1 }[alignOf(cs)] || 0;
+          left += extra * share;
+          right += extra * (1 - share);
+        }
+      }
+    }
+    const add = (css, side, value) => {
+      if (Math.abs(value) > 0.5) css[side] = round((css[side] || 0) + value);
+    };
+    add(texts[0].css, 'roomL', left);
+    add(texts[texts.length - 1].css, 'roomR', right);
+    if ((cs.boxDecorationBreak || cs.webkitBoxDecorationBreak) === 'clone') {
+      runs.forEach((run, i) => {
+        if (!run.soft) return;
+        const before = runs.slice(0, i).reverse().find((r) => !r.br && r.css && r.text.trim());
+        const after = runs.slice(i + 1).find((r) => !r.br && r.css && r.text.trim());
+        if (before) add(before.css, 'roomR', right);
+        if (after) add(after.css, 'roomL', left);
+      });
+    }
+  }
+
+  // --- Line breaks ----------------------------------------------------------------------
+
+  // CSS white space (what `white-space` collapses); a no-break space is none.
+  const SPACE = /[ \t\n\r\f]/;
+  const SPACES = /[ \t\n\r\f]+/g;
+  const LEADING_SPACES = /^[ \t\n\r\f]+/;
+  const TRAILING_SPACES = /[ \t\n\r\f]+$/;
+
+  // Follows the lines of a paragraph (or of a block of `pre` text) across its text nodes and
+  // inline boxes, so that PowerPoint breaks its lines where Chrome broke them (`text-wrap:
+  // balance` and `pretty` included) and draws them where Chrome drew them:
+  //   last     the box of the glyph (or inline box) before;
+  //   rtl      the paragraph's direction;
+  //   newline  a kept new line came after it (it breaks the line itself);
+  //   row      the kept new lines (and in `pre` text the `<br>`s) before: the paragraph the
+  //            text goes into when they split it (see `splitLines`);
+  //   wrapped  the text is past the first line of its row;
+  //   at       per row, the first line's baseline (viewport y), from its first glyph that
+  //            sits on the baseline;
+  //   char     the last character of the text before (for `text-transform: capitalize`).
+  function linesOf(cs) {
+    return { last: null, rtl: cs.direction === 'rtl', newline: false, row: 0, wrapped: false, at: [], char: '' };
+  }
+
+  // The first line's baseline of `row` as a distance from the top of `rect` (the shape's
+  // box), or null when no glyph on the baseline told it.
+  function atOf(lines, row, rect) {
+    const y = lines && lines.at[row];
+    return y === undefined || y === null ? null : round(y - rect.top);
+  }
+
+  // Whether a box `rect` starts a new line after the box `last` before it: it sits lower by
+  // more than half the smaller one's height (superscripts, subscripts and mixed sizes on
+  // one line move by less) and back towards the line's start (a subscript after a
+  // superscript, or small text after a large letter, sits lower but further along).
+  function wrapsAfter(last, rect, rtl) {
+    if (!last) return false;
+    const drop = (rect.top + rect.bottom) / 2 - (last.top + last.bottom) / 2;
+    if (drop <= Math.min(last.height, rect.height) / 2) return false;
+    return rtl ? rect.right > last.left + 0.5 : rect.left < last.right - 0.5;
+  }
+
+  // Notes a box `rect` in followed lines: a soft line break goes into `out` before what
+  // comes next when the box starts a new line.
+  function follow(lines, rect, out) {
+    if (lines.newline) {
+      lines.newline = false;
+    } else if (wrapsAfter(lines.last, rect, lines.rtl)) {
+      out.push({ br: true, soft: true });
+      lines.wrapped = true;
+    }
+    lines.last = rect;
+  }
+
+  // A `<br>` in followed lines: in `pre` text it starts a new row (a paragraph of its own).
+  function lineBreak(lines, pre) {
+    lines.last = null;
+    lines.newline = false;
+    if (pre) {
+      lines.row++;
+      lines.wrapped = false;
+    } else {
+      lines.wrapped = true;
+    }
+  }
+
+  // The text of a text node as runs show it, in pieces: a new piece where Chrome wrapped a
+  // line (so the first piece is empty when the text starts a line). White space is
+  // collapsed unless `pre`, the case transformed, and a hyphen added where Chrome broke a
+  // word at a hyphenation point. `lines` (see `linesOf`) follows the paragraph's lines;
+  // without it the text is one piece. `raised`: the text is off the baseline.
+  function nodeText(node, cs, pre, lines, raised) {
+    const data = node.data;
+    const cuts = [];
+    if (lines) {
+      const glyphs = [];
+      for (let i = 0; i < data.length; i++) {
+        const code = data.charCodeAt(i);
+        const length = code >= 0xd800 && code <= 0xdbff && i + 1 < data.length ? 2 : 1;
+        if (!SPACE.test(data[i])) glyphs.push([i, length]);
+        i += length - 1;
+      }
+      // Text that cannot wrap can still start a line: its first glyph, the first after each
+      // new line and its last one tell where its lines are.
+      const wraps = cs.whiteSpace !== 'pre' && cs.whiteSpace !== 'nowrap';
+      const looked = wraps ? glyphs : glyphs.filter(([i], k) =>
+        k === 0 || k === glyphs.length - 1 || data.lastIndexOf('\n', i) > glyphs[k - 1][0]);
+      const range = document.createRange();
+      let from = 0;
+      const newLines = (text) => {
+        // New lines kept in the text break its lines (and in `pre` text start rows).
+        const n = pre ? text.split('\n').length - 1 : 0;
+        if (n > 0) {
+          lines.row += n;
+          lines.wrapped = false;
+          lines.newline = true;
+        }
+      };
+      for (const [i, length] of looked) {
+        newLines(data.slice(from, i));
+        from = i + length;
+        range.setStart(node, i);
+        range.setEnd(node, i + length);
+        // A glyph after a hyphenation break also has the hyphen's box: its own is the last.
+        const rects = range.getClientRects();
+        const rect = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+        if (rect.width <= 0 && rect.height <= 0) continue;
+        const wrapped = lines.wrapped;
+        const before = cuts.length;
+        follow(lines, rect, cuts);
+        if (cuts.length > before) cuts[cuts.length - 1] = i;
+        if (!wrapped && !lines.wrapped && !raised && lines.at[lines.row] === undefined) {
+          lines.at[lines.row] = rect.top + strutOf(cs).ascent;
+        }
+      }
+      newLines(data.slice(from));
+    }
+    const pieces = [];
+    let at = 0;
+    for (const cut of [...cuts, data.length]) {
+      let piece = data.slice(at, cut);
+      if (cut < data.length) {
+        // Chrome draws a hyphen where it broke a word at a soft hyphen or hyphenated it.
+        const end = piece[piece.length - 1] || '';
+        if (end === '­') piece = piece.slice(0, -1) + '-';
+        else if (cs.hyphens === 'auto' && /\p{L}/u.test(end) && /\p{L}/u.test(data[cut])) piece += '-';
+      }
+      const before = at > 0 ? data[at - 1] : lines ? lines.char : '';
+      pieces.push(transformed(pre ? piece : piece.replace(SPACES, ' '), cs, before));
+      at = cut;
+    }
+    if (lines && data) lines.char = data[data.length - 1];
+    return pieces;
+  }
+
+  // Pushes the runs of the text node `node` (in `style`) onto `out`, with a soft line break
+  // where Chrome wrapped a line in it.
+  function pushText(out, style, node, cs, ctx) {
+    const pieces = nodeText(node, cs, ctx.pre, ctx.lines, !!(ctx.inherit && ctx.inherit.offBaseline));
+    pieces.forEach((text, i) => {
+      if (i > 0) out.push({ br: true, soft: true });
+      if (text) out.push({ ...style, css: style.css && { ...style.css }, text });
+    });
+  }
+
+  // An atomic inline box (math, a checkbox) in a paragraph whose lines are followed: a line
+  // break before it when it starts a new line. Inline math can wrap itself: its first line's
+  // box is tested, and its last one is the box before what follows.
+  function atomWraps(el, out, lines) {
+    if (!lines) return;
+    const rects = Array.from(el.getClientRects()).filter((r) => r.width > 0 || r.height > 0);
+    if (rects.length === 0) return;
+    follow(lines, rects[0], out);
+    if (rects.length > 1) lines.wrapped = true;
+    lines.last = rects[rects.length - 1];
+  }
+
+  // The inline pseudo text `run` at the start (`::before`) or the end of an inline element
+  // whose line box fragment there is `rect`, in followed lines: a line break before it when
+  // it starts a new line (an opening quote goes with the words after it).
+  function pseudoWraps(run, which, rect, out, lines) {
+    const width = boxWidth(run);
+    const left = which === '::before' ? rect.left : rect.right - width;
+    follow(lines, { left, right: left + width, top: rect.top, bottom: rect.bottom, height: rect.height }, out);
+  }
+
+  // Applies `text-transform` values PowerPoint has no attribute for. `before`: the character
+  // before `text` (`capitalize` starts a word after anything but a letter, a digit or an
+  // apostrophe, as Chrome does: "state-of-the-art" becomes "State-Of-The-Art").
+  function transformed(text, cs, before) {
     if (cs.textTransform === 'lowercase') return text.toLowerCase();
-    if (cs.textTransform === 'capitalize') return text.replace(/(^|\s)(\S)/g, (m, s, c) => s + c.toUpperCase());
+    if (cs.textTransform === 'capitalize') {
+      const inWord = /[\p{L}\p{N}\p{M}'’]/u.test(before || '');
+      return text.replace(/(^|[^\p{L}\p{N}\p{M}'’])(\p{L})/gu,
+        (m, s, c, offset) => (offset === 0 && !s && inWord ? m : s + c.toUpperCase()));
+    }
     return text;
   }
 
+  // Generated text broken into lines as Chrome breaks it (greedily, at spaces) in `width`
+  // pixels, measured in the font of `run` as Chrome draws it.
+  function breakText(text, run, width) {
+    const fits = (t) => drawnWidth(run, run.css, t) + run.spacing * [...t].length <= width + 0.01;
+    const lines = [];
+    let line = '';
+    for (const word of text.split(' ')) {
+      const next = line ? line + ' ' + word : word;
+      if (line && !fits(next)) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = next;
+      }
+    }
+    lines.push(line);
+    return lines;
+  }
+
   // Collects the runs of the inline content of `container` into `out` (pictures inside it
-  // become shapes of their own). `ctx`: { opacity, pre, inherit, backdrop }.
+  // become shapes of their own). `ctx`: { opacity, pre, inherit, backdrop, lines }.
   function collectRuns(container, out, ctx) {
     for (const node of container.childNodes) {
       if (node.nodeType === TEXT) {
         const parent = node.parentElement;
-        if (!parent) continue;
+        if (!parent || !node.data) continue;
         const cs = getComputedStyle(parent);
-        let text = node.data;
-        if (!ctx.pre) {
-          text = text.replace(/\s+/g, ' ');
-          if (!text) continue;
-        } else if (!text) continue;
-        out.push({ ...runStyle(cs, ctx.opacity, ctx.inherit, ctx.backdrop), text: transformed(text, cs) });
+        pushText(out, runStyle(cs, ctx.opacity, ctx.inherit, ctx.backdrop), node, cs, ctx);
         continue;
       }
       if (node.nodeType !== ELEMENT) continue;
@@ -635,6 +1049,7 @@
       if (opacity <= 0.001) continue;
       if (el.matches('br')) {
         out.push({ br: true });
+        if (ctx.lines) lineBreak(ctx.lines, ctx.pre);
         continue;
       }
       if (el.matches('img')) {
@@ -642,7 +1057,10 @@
         continue;
       }
       if (el.matches('.katex')) {
+        atomWraps(el, out, ctx.lines);
+        const start = out.length;
         mathRuns(el, out, ctx);
+        fitMath(el, out.slice(start));
         continue;
       }
       if (el.matches(RASTER)) {
@@ -650,10 +1068,11 @@
         continue;
       }
       if (el.matches('input[type="checkbox"]')) {
+        atomWraps(el, out, ctx.lines);
         const style = runStyle(cs, opacity, ctx.inherit, ctx.backdrop);
         const c = withOpacity(color(cs.borderTopColor), opacity);
         if (c) style.color = solid(c, ctx.backdrop);
-        out.push({ ...style, text: (el.checked ? '☑' : '☐') + ' ' });
+        out.push({ ...style, css: undefined, text: (el.checked ? '☑' : '☐') + ' ' });
         continue;
       }
       const inherit = { ...ctx.inherit };
@@ -665,59 +1084,117 @@
       }
       const bg = withOpacity(color(cs.backgroundColor), opacity);
       if (bg) inherit.highlight = over(bg, ctx.backdrop);
+      const parent = el.parentElement;
+      const parentSize = parent ? num(getComputedStyle(parent).fontSize) : num(cs.fontSize);
+      inherit.raise = (inherit.raise || 0) + raiseOf(el, cs, parentSize);
+      if (cs.verticalAlign !== 'baseline') inherit.offBaseline = true;
       const inner = { ...ctx, opacity, inherit, pre: ctx.pre || /^pre/.test(cs.whiteSpace) };
-      const before = pseudoOf(el, '::before', opacity);
-      if (before && before.text && !before.block) {
-        out.push({ ...runStyle(before.ps, opacity, inherit, ctx.backdrop), text: spaced(before.text, before.ps) });
+      const start = out.length;
+      const size = num(cs.fontSize);
+      const inlinePseudo = (which) => {
+        const pseudo = pseudoOf(el, which, opacity);
+        return pseudo && pseudo.text && !pseudo.block ? pseudoRun(pseudo, opacity, inherit, ctx.backdrop, size) : null;
+      };
+      const before = inlinePseudo('::before');
+      const after = inlinePseudo('::after');
+      // Where an inline element's pseudo text is: on its first and last line box fragment.
+      const fragments = ctx.lines && cs.display === 'inline' && (before || after) ? el.getClientRects() : [];
+      if (before) {
+        if (fragments.length) pseudoWraps(before, '::before', fragments[0], out, ctx.lines);
+        out.push(before);
       }
       collectRuns(el, out, inner);
-      const after = pseudoOf(el, '::after', opacity);
-      if (after && after.text && !after.block) {
-        out.push({ ...runStyle(after.ps, opacity, inherit, ctx.backdrop), text: spaced(after.text, after.ps) });
+      if (after) {
+        if (fragments.length) pseudoWraps(after, '::after', fragments[fragments.length - 1], out, ctx.lines);
+        out.push(after);
       }
+      roomAround(el, cs, out, start);
     }
   }
 
-  // Pseudo text with its horizontal margins as spaces.
-  function spaced(text, ps) {
-    const left = num(ps.marginLeft) > 2 ? ' ' : '';
-    const right = num(ps.marginRight) > 2 ? ' ' : '';
-    return left + text + right;
+  // The left edge of the first character drawn after `node` inside `container`, or null.
+  function glyphLeftAfter(container, node) {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    walker.currentNode = node;
+    const range = document.createRange();
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      const i = text.data.search(/[^ \t\n\r\f]/);
+      if (i < 0) continue;
+      range.setStart(text, i);
+      range.setEnd(text, i + 1);
+      const r = range.getClientRects()[0];
+      if (r && r.width > 0) return r.left;
+    }
+    return null;
   }
 
-  // Runs merged where neighbours share a style, with blanks collapsed at run boundaries.
+  // Inline pseudo text as a run, raised or lowered by its own `vertical-align` too (its
+  // element's font size is `parentSize`). For `fitText` and `boxWidth` the run records the
+  // text Chrome drew and the room around it (margins, padding, border, and what a box of a
+  // set width leaves, on the side its `text-align` says).
+  function pseudoRun(pseudo, opacity, inherit, backdrop, parentSize) {
+    const ps = pseudo.ps;
+    const style = runStyle(ps, opacity, { ...inherit, raise: (inherit.raise || 0) + raiseOf(null, ps, parentSize) }, backdrop);
+    const room = (side) => num(ps['margin' + side]) + num(ps['padding' + side]) + num(ps['border' + side + 'Width']);
+    let roomL = room('Left');
+    let roomR = room('Right');
+    if (ps.display === 'inline-block' && /px$/.test(ps.width)) {
+      const sides = num(ps.paddingLeft) + num(ps.paddingRight) + num(ps.borderLeftWidth) + num(ps.borderRightWidth);
+      const content = num(ps.width) - (ps.boxSizing === 'border-box' ? sides : 0);
+      const extra = content - drawnWidth(style, style.css, pseudo.text) - style.spacing * [...pseudo.text].length;
+      if (extra > 0.5) {
+        const share = { ctr: 0.5, r: 1 }[alignOf(ps)] || 0;
+        roomL += extra * share;
+        roomR += extra * (1 - share);
+      }
+    }
+    style.css = { ...style.css, drawn: pseudo.text, roomL: round(roomL), roomR: round(roomR) };
+    return { ...style, text: pseudo.text };
+  }
+
+  // Runs merged where neighbours can join (see `joinable`), with blanks collapsed where runs
+  // meet and trimmed at line boundaries (unless `pre`), and no stray soft line breaks.
   function mergeRuns(runs, pre) {
     const out = [];
     for (const run of runs) {
-      if (run.br) {
-        out.push(run);
-        continue;
-      }
       const last = out[out.length - 1];
-      if (last && !last.br && sameStyle(last, run)) {
+      if (!run.br && last && !last.br && joinable(last, run)) {
         last.text += run.text;
+        if (run.css && run.css.roomR) last.css.roomR = run.css.roomR;
       } else {
-        out.push({ ...run });
+        out.push(run.br ? run : { ...run, css: run.css && { ...run.css } });
       }
     }
     if (pre) return out;
-    // Collapse the doubled spaces where runs meet, and trim at line boundaries.
     for (let i = 0; i < out.length; i++) {
       const run = out[i];
       if (run.br) continue;
       const prev = out[i - 1];
-      if ((!prev || prev.br) && run.text) run.text = run.text.replace(/^\s+/, '');
-      if (prev && !prev.br && prev.text.endsWith(' ') && run.text.startsWith(' ')) run.text = run.text.replace(/^\s+/, '');
+      if ((!prev || prev.br) && run.text) run.text = run.text.replace(LEADING_SPACES, '');
+      if (prev && !prev.br && prev.text.endsWith(' ') && SPACE.test(run.text[0] || '')) run.text = run.text.replace(LEADING_SPACES, '');
       const next = out[i + 1];
-      if ((!next || next.br) && run.text) run.text = run.text.replace(/\s+$/, '');
+      if ((!next || next.br) && run.text) run.text = run.text.replace(TRAILING_SPACES, '');
     }
-    return out.filter((run) => run.br || run.text);
+    return withoutStraySoftBreaks(out.filter((run) => run.br || run.text));
   }
 
-  // Splits runs into paragraphs at new lines (`white-space: pre`).
+  // Drops a wrap at the start or the end of a paragraph or next to another break: text
+  // that was trimmed away, or a wrap a break already makes.
+  function withoutStraySoftBreaks(runs) {
+    return runs.filter((run, i) => !run.soft ||
+      (i > 0 && i < runs.length - 1 && !runs[i - 1].br && !runs[i + 1].br));
+  }
+
+  // Splits runs into paragraphs at new lines (`white-space: pre`); a wrap stays a line
+  // break inside its paragraph, unless a new line already breaks there. The room around a
+  // run's inline box goes to its first and its last line.
   function splitLines(runs) {
     const paragraphs = [[]];
     for (const run of runs) {
+      if (run.br && run.soft) {
+        paragraphs[paragraphs.length - 1].push(run);
+        continue;
+      }
       if (run.br) {
         paragraphs.push([]);
         continue;
@@ -725,12 +1202,17 @@
       const lines = run.text.split('\n');
       lines.forEach((line, i) => {
         if (i > 0) paragraphs.push([]);
-        if (line) paragraphs[paragraphs.length - 1].push({ ...run, text: line });
+        if (!line) return;
+        const css = run.css && { ...run.css };
+        if (css && i > 0) delete css.roomL;
+        if (css && i < lines.length - 1) delete css.roomR;
+        paragraphs[paragraphs.length - 1].push({ ...run, css, text: line });
       });
     }
+    const out = paragraphs.map((p) => p.filter((run, i) => !run.soft || (i > 0 && i < p.length - 1)));
     // A trailing new line ends the last line; it is no empty line.
-    if (paragraphs.length > 1 && paragraphs[paragraphs.length - 1].length === 0) paragraphs.pop();
-    return paragraphs;
+    if (out.length > 1 && out[out.length - 1].length === 0) out.pop();
+    return out;
   }
 
   function paragraphOf(cs, runs, extra) {
@@ -741,58 +1223,118 @@
       marginLeft: 0,
       indent: round(num(cs.textIndent)),
       lineHeight: lineHeightOf(cs),
+      baseline: baselineOf(cs),
       spaceBefore: 0,
       runs,
       ...extra,
     };
   }
 
+  const strutCache = new Map();
+
+  // The ascent and descent Chrome lays out text of `cs`'s font with (its "content area").
+  function strutOf(cs) {
+    const font = `${/^oblique/.test(cs.fontStyle) ? 'italic' : cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+    if (!strutCache.has(font)) {
+      measure.font = font;
+      const m = measure.measureText('Hg');
+      // Chrome lays text out with whole-pixel ascents and descents.
+      strutCache.set(font, { ascent: Math.round(m.fontBoundingBoxAscent || 0), descent: Math.round(m.fontBoundingBoxDescent || 0) });
+    }
+    return strutCache.get(font);
+  }
+
+  // The leading above the text of `cs`'s lines: half the room between a line box and the
+  // content area of its text (negative when the line height is less than the font's),
+  // rounded down to a whole pixel as Chrome does.
+  function halfLeadingOf(cs) {
+    const lh = lineHeightOf(cs);
+    if (!lh) return 0;
+    const s = strutOf(cs);
+    return Math.floor((lh - s.ascent - s.descent) / 2);
+  }
+
+  // The leading below the text of `cs`'s lines: what the leading above leaves.
+  function leadingBelowOf(cs) {
+    const lh = lineHeightOf(cs);
+    if (!lh) return 0;
+    const s = strutOf(cs);
+    return lh - s.ascent - s.descent - halfLeadingOf(cs);
+  }
+
+  // Where Chrome puts the baseline in a line box of `cs`, from the line box's top: the
+  // leading above, then the font's ascent. `null` for `line-height: normal`.
+  function baselineOf(cs) {
+    if (!lineHeightOf(cs)) return null;
+    return round(halfLeadingOf(cs) + strutOf(cs).ascent);
+  }
+
   // The text shape of a block element whose content is inline (a heading, a paragraph, a
   // code block, a table cell's content…), with its box's fill, border and padding.
   function textShape(el, cs, opacity, extra) {
     const pre = /^pre/.test(cs.whiteSpace);
-    const ctx = { opacity, pre, inherit: {}, backdrop: backdropOf(el) };
+    const ctx = { opacity, pre, inherit: {}, backdrop: backdropOf(el), lines: linesOf(cs) };
+    const rect = el.getBoundingClientRect();
+    const insets = {
+      l: round(num(cs.paddingLeft) + num(cs.borderLeftWidth)),
+      t: round(num(cs.paddingTop) + num(cs.borderTopWidth)),
+      r: round(num(cs.paddingRight) + num(cs.borderRightWidth)),
+      b: round(num(cs.paddingBottom) + num(cs.borderBottomWidth)),
+    };
     let paragraphs;
     const table = el.querySelector(':scope > table.hljs-ln, :scope > * > table.hljs-ln');
     if (table) {
+      // Code with line numbers: a paragraph per row, its number where the page has it and
+      // its code where the code column starts.
       paragraphs = [];
       for (const row of table.querySelectorAll('tr')) {
         const rs = getComputedStyle(row);
         if (hidden(row, rs)) continue;
         const rowOpacity = opacity * num(rs.opacity);
         const runs = [];
+        const code = row.querySelector('.hljs-ln-code') || row;
+        let marginLeft = 0;
         const number = row.querySelector('.hljs-ln-numbers .hljs-ln-n, .hljs-ln-numbers');
         if (number) {
           const ns = getComputedStyle(number);
           const text = (number.getAttribute('data-line-number') || contentText(getComputedStyle(number, '::before').content, number) || '').trim();
-          if (text) runs.push({ ...runStyle(ns, rowOpacity * num(ns.opacity), {}, ctx.backdrop), text: text.padStart(3) + '  ' });
+          if (text) {
+            const run = { ...runStyle(ns, rowOpacity * num(ns.opacity), {}, ctx.backdrop), text };
+            const width = runWidth(run, text);
+            const box = number.getBoundingClientRect();
+            const left = box.left + num(ns.paddingLeft) + num(ns.borderLeftWidth);
+            const right = box.right - num(ns.paddingRight) - num(ns.borderRightWidth);
+            const align = alignOf(ns);
+            const x = align === 'r' ? right - width : align === 'ctr' ? (left + right - width) / 2 : left;
+            const cc = getComputedStyle(code);
+            const codeLeft = code.getBoundingClientRect().left + num(cc.paddingLeft) + num(cc.borderLeftWidth);
+            run.css.roomR = round(Math.max(0, codeLeft - x - width));
+            marginLeft = round(Math.max(0, x - rect.left - insets.l));
+            runs.push(run);
+          }
         }
-        const code = row.querySelector('.hljs-ln-code') || row;
-        collectRuns(code, runs, { ...ctx, opacity: rowOpacity, pre: true });
-        paragraphs.push(paragraphOf(cs, mergeRuns(runs, true), { indent: 0 }));
+        const lines = linesOf(cs);
+        collectRuns(code, runs, { ...ctx, opacity: rowOpacity, pre: true, lines });
+        paragraphs.push(paragraphOf(cs, mergeRuns(runs, true), { indent: 0, marginLeft, at: atOf(lines, 0, rect) }));
       }
     } else {
       const runs = [];
       collectRuns(el, runs, ctx);
       const merged = mergeRuns(runs, pre);
-      paragraphs = pre ? splitLines(merged).map((line) => paragraphOf(cs, line, { indent: 0 })) : [paragraphOf(cs, merged)];
+      paragraphs = pre
+        ? splitLines(merged).map((line, row) => paragraphOf(cs, line, { indent: 0, at: atOf(ctx.lines, row, rect) }))
+        : [paragraphOf(cs, merged, { at: atOf(ctx.lines, 0, rect) })];
     }
     if (paragraphs.every((p) => p.runs.length === 0)) return null;
-    const rect = el.getBoundingClientRect();
     const { part, frame } = frameOf(rect);
     return {
       shape: {
         kind: 'text',
         frame,
-        insets: {
-          l: round(num(cs.paddingLeft) + num(cs.borderLeftWidth)),
-          t: round(num(cs.paddingTop) + num(cs.borderTopWidth)),
-          r: round(num(cs.paddingRight) + num(cs.borderRightWidth)),
-          b: round(num(cs.paddingBottom) + num(cs.borderBottomWidth)),
-        },
+        insets,
         fill: fillOf(cs, opacity),
         line: lineOf(cs, opacity),
-        radius: radiusOf(cs),
+        radius: radiusOf(cs, rect),
         wrap: !(cs.whiteSpace === 'pre' || cs.whiteSpace === 'nowrap'),
         title: false,
         paragraphs,
@@ -826,10 +1368,22 @@
       if (text) out.push({ ...base, text });
       return;
     }
+    // Linearised math is not the text Chrome drew, so `fitText` leaves it alone (no css);
+    // `fitMath` fits it as a whole. `style.raise`: how far above the paragraph's baseline
+    // the text sits, in pixels.
     const emitText = (text, style) => {
       text = text.replace(/[⁡-⁤​]/g, '');
-      if (text) out.push({ ...base, ...style, text });
+      if (!text) return;
+      const { raise, ...rest } = style;
+      out.push({ ...base, ...rest, baseline: shiftOf(raise, rest.size), css: undefined, text });
     };
+    // A script as KaTeX sets one: at 0.7 of the size, raised (a superscript, an overscript)
+    // or lowered from where its base sits.
+    const script = (style, up) => ({
+      ...style,
+      size: round(style.size * 0.7),
+      raise: style.raise + (up ? 0.42 : -0.25) * style.size,
+    });
     const walk = (node, style) => {
       if (node.nodeType === TEXT) {
         emitText(node.data, style);
@@ -859,16 +1413,16 @@
           return;
         case 'msup':
           walk(kids[0], style);
-          if (kids[1]) walk(kids[1], { ...style, baseline: 30000 });
+          if (kids[1]) walk(kids[1], script(style, true));
           return;
         case 'msub':
           walk(kids[0], style);
-          if (kids[1]) walk(kids[1], { ...style, baseline: -25000 });
+          if (kids[1]) walk(kids[1], script(style, false));
           return;
         case 'msubsup':
           walk(kids[0], style);
-          if (kids[1]) walk(kids[1], { ...style, baseline: -25000 });
-          if (kids[2]) walk(kids[2], { ...style, baseline: 30000 });
+          if (kids[1]) walk(kids[1], script(style, false));
+          if (kids[2]) walk(kids[2], script(style, true));
           return;
         case 'mfrac': {
           const simple = (k) => k && (k.localName === 'mi' || k.localName === 'mn') && k.textContent.length <= 2;
@@ -887,7 +1441,7 @@
           emitText(')', style);
           return;
         case 'mroot':
-          if (kids[1]) walk(kids[1], { ...style, baseline: 30000 });
+          if (kids[1]) walk(kids[1], script(style, true));
           emitText('√(', style);
           walk(kids[0], style);
           emitText(')', style);
@@ -902,7 +1456,7 @@
             return;
           }
           walk(kids[0], style);
-          for (const k of kids.slice(1)) walk(k, { ...style, baseline: name === 'munder' ? -25000 : 30000 });
+          for (const k of kids.slice(1)) walk(k, script(style, name !== 'munder'));
           return;
         }
         case 'mtable':
@@ -923,7 +1477,27 @@
           kids.forEach((k) => walk(k, style));
       }
     };
-    walk(math, {});
+    walk(math, { size: base.size, raise: ctx.inherit.raise || 0 });
+  }
+
+  // Makes the linearised runs of the inline math `katex` (see `mathRuns`) as wide in
+  // PowerPoint as the math is on the page: smaller where they run much wider (a fraction
+  // written out on one line), then spread or closed up by letter spacing. Scaling a run's
+  // size keeps its raise in proportion, so its baseline shift (a share of its size) stays.
+  function fitMath(katex, runs) {
+    if (runs.length === 0 || runs.some((run) => run.br || run.css !== undefined || !installed(run.font))) return;
+    const page = Array.from(katex.getClientRects()).reduce((sum, r) => sum + r.width, 0);
+    const count = runs.reduce((n, run) => n + [...run.text].length, 0);
+    const office = () => runs.reduce((w, run) => w + officeWidth(run, run.text) + run.spacing * [...run.text].length, 0);
+    let width = office();
+    if (page <= 0 || width <= 0 || count === 0) return;
+    if (width > 1.1 * page) {
+      const k = Math.max(0.6, page / width);
+      for (const run of runs) run.size = round(run.size * k);
+      width = office();
+    }
+    const extra = (page - width) / count;
+    for (const run of runs) run.spacing = round(Math.max(run.spacing + extra, -0.08 * run.size));
   }
 
   // --- Pictures -------------------------------------------------------------------------
@@ -984,7 +1558,7 @@
     const image = urlOf(cs.backgroundImage);
     const fill = image ? (withOpacity(color(cs.backgroundColor), opacity) ? { color: withOpacity(color(cs.backgroundColor), opacity) } : null) : fillOf(cs, opacity);
     const line = lineOf(cs, opacity);
-    if (fill || line) emit({ kind: 'rect', frame, fill, line, radius: radiusOf(cs) }, part);
+    if (fill || line) emit({ kind: 'rect', frame, fill, line, radius: radiusOf(cs, rect) }, part);
     if (image) emitBackgroundImage(frame, part, image, cs, opacity, rect);
     if (!line) emitBoxBorders(el, cs, opacity);
   }
@@ -1065,26 +1639,44 @@
         if (liOpacity <= 0.001) continue;
         const liRect = li.getBoundingClientRect();
         const textLeft = liRect.left + num(lcs.borderLeftWidth) + num(lcs.paddingLeft);
-        const marginLeft = round(Math.max(0, textLeft - left));
-        const bullet = bulletOf(ul, li, lcs);
+        let marginLeft = round(Math.max(0, textLeft - left));
+        let bullet = bulletOf(ul, li, lcs);
         // The marker ends a little before the text: a bullet needs about 0.65 em, a
         // number about 1 em, within the room the list leaves for it.
-        const indent = round(-Math.min(room, num(lcs.fontSize) * (bullet && bullet.scheme ? 1.0 : 0.65)));
-        const ctx = { opacity: liOpacity, pre: false, inherit: {}, backdrop: backdropOf(li) };
-        const itemParagraph = (ccs, runs, first) => paragraphOf(ccs, runs, {
-          level: Math.min(8, level), bullet: first ? bullet : null, marginLeft, indent: first && bullet ? indent : 0,
+        let indent = round(-Math.min(room, num(lcs.fontSize) * (bullet && bullet.scheme ? 1.0 : 0.65)));
+        const backdrop = backdropOf(li);
+        // A task list item's checkbox takes the bullet's place: a box where the checkbox is
+        // (Wingdings' empty and ticked boxes, which every Office has; PowerPoint draws no
+        // ☑ in Arial), the item's text where it starts after it.
+        let check = li.querySelector(':scope > input[type="checkbox"]:first-child');
+        if (check) {
+          const kcs = getComputedStyle(check);
+          const box = check.getBoundingClientRect();
+          const textX = glyphLeftAfter(li, check);
+          if (hidden(check, kcs) || textX === null || textX <= box.left) {
+            check = null;
+          } else {
+            const c = withOpacity(color(kcs.borderTopColor) || color(lcs.color), liOpacity * num(kcs.opacity));
+            bullet = { char: check.checked ? 'þ' : '¨', font: 'Wingdings', color: c && solid(c, backdrop) };
+            marginLeft = round(Math.max(0, textX - left));
+            indent = round(Math.min(0, box.left - textX));
+          }
+        }
+        const ctx = { opacity: liOpacity, pre: false, inherit: {}, backdrop, lines: linesOf(lcs) };
+        const itemParagraph = (ccs, runs, first, at) => paragraphOf(ccs, runs, {
+          level: Math.min(8, level), bullet: first ? bullet : null, marginLeft, indent: first && bullet ? indent : 0, at,
         });
         let first = true;
         let inline = [];
         const flushInline = () => {
           if (inline.length === 0) return;
           const runs = [];
+          ctx.lines = linesOf(lcs);
           // An anonymous box has no element of its own to style: a text node takes the
           // style of its parent, the item.
           for (const node of inline) {
             if (node.nodeType === TEXT) {
-              const text = node.data.replace(/\s+/g, ' ');
-              if (text) runs.push({ ...runStyle(lcs, liOpacity, {}, ctx.backdrop), text: transformed(text, lcs) });
+              if (node.data) pushText(runs, runStyle(lcs, liOpacity, {}, backdrop), node, lcs, ctx);
             } else {
               collectRuns({ childNodes: [node] }, runs, ctx);
             }
@@ -1096,10 +1688,15 @@
           inline = [];
           const merged = mergeRuns(runs, false);
           if (merged.length === 0 && !first) return;
-          push(box.height > 0 ? box.top : liRect.top, box.height > 0 ? box.bottom : liRect.top, itemParagraph(lcs, merged, first));
+          // The range covers the text's content area; its lines' boxes reach the leading
+          // further up and down.
+          push(box.height > 0 ? box.top - halfLeadingOf(lcs) : liRect.top,
+            box.height > 0 ? box.bottom + leadingBelowOf(lcs) : liRect.top,
+            itemParagraph(lcs, merged, first, atOf(ctx.lines, 0, rect)));
           first = false;
         };
         for (const node of li.childNodes) {
+          if (node === check) continue;
           if (node.nodeType === TEXT) {
             if (node.data.trim() || inline.length) inline.push(node);
             continue;
@@ -1123,9 +1720,10 @@
           }
           if (node.matches('p, h1, h2, h3, h4, h5, h6, figcaption, dt, dd') && !node.querySelector('img, svg, table, pre, ul, ol')) {
             const runs = [];
-            collectRuns(node, runs, { ...ctx, pre: /^pre/.test(ccs.whiteSpace) });
+            const lines = linesOf(ccs);
+            collectRuns(node, runs, { ...ctx, pre: /^pre/.test(ccs.whiteSpace), lines });
             const nrect = node.getBoundingClientRect();
-            push(nrect.top, nrect.bottom, itemParagraph(ccs, mergeRuns(runs, false), first));
+            push(nrect.top, nrect.bottom, itemParagraph(ccs, mergeRuns(runs, false), first, atOf(lines, 0, rect)));
             first = false;
             continue;
           }
@@ -1139,8 +1737,8 @@
     if (paragraphs.length === 0) return;
     paragraphs[0].spaceBefore = 0;
     emit({
-      kind: 'text', frame, insets: { l: 0, t: round(num(cs.paddingTop)), r: 0, b: 0 }, fill: fillOf(cs, opacity),
-      line: lineOf(cs, opacity), radius: radiusOf(cs), wrap: true, title: false, paragraphs,
+      kind: 'text', frame, insets: { l: 0, t: round(num(cs.paddingTop) + num(cs.borderTopWidth)), r: 0, b: 0 }, fill: fillOf(cs, opacity),
+      line: lineOf(cs, opacity), radius: radiusOf(cs, rect), wrap: true, title: false, paragraphs,
     }, part);
   }
 
@@ -1208,7 +1806,7 @@
           continue;
         }
         const runs = [];
-        collectRuns(cell, runs, { opacity: cellOpacity, pre: /^pre/.test(ccs.whiteSpace), inherit: {}, backdrop });
+        collectRuns(cell, runs, { opacity: cellOpacity, pre: /^pre/.test(ccs.whiteSpace), inherit: {}, backdrop, lines: linesOf(ccs) });
         const merged = mergeRuns(runs, /^pre/.test(ccs.whiteSpace));
         const paragraphs = /^pre/.test(ccs.whiteSpace) ? splitLines(merged).map((line) => paragraphOf(ccs, line, { indent: 0 })) : [paragraphOf(ccs, merged)];
         // Row fills (zebra stripes) show through transparent cells.
@@ -1272,18 +1870,19 @@
     const rect = range.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
     const cs = getComputedStyle(container);
-    const ctx = { opacity, pre: /^pre/.test(cs.whiteSpace), inherit: {}, backdrop: backdropOf(container) };
+    const ctx = { opacity, pre: /^pre/.test(cs.whiteSpace), inherit: {}, backdrop: backdropOf(container), lines: linesOf(cs) };
     const runs = [];
     for (const node of nodes) {
       if (node.nodeType === TEXT) {
-        const text = ctx.pre ? node.data : node.data.replace(/\s+/g, ' ');
-        if (text) runs.push({ ...runStyle(cs, opacity, {}, ctx.backdrop), text: transformed(text, cs) });
+        if (node.data) pushText(runs, runStyle(cs, opacity, {}, ctx.backdrop), node, cs, ctx);
       } else {
         collectRuns({ childNodes: [node] }, runs, ctx);
       }
     }
     const merged = mergeRuns(runs, ctx.pre);
-    const paragraphs = ctx.pre ? splitLines(merged).map((line) => paragraphOf(cs, line, { indent: 0 })) : [paragraphOf(cs, merged)];
+    const paragraphs = ctx.pre
+      ? splitLines(merged).map((line, row) => paragraphOf(cs, line, { indent: 0, at: atOf(ctx.lines, row, rect) }))
+      : [paragraphOf(cs, merged, { at: atOf(ctx.lines, 0, rect) })];
     if (paragraphs.every((p) => p.runs.length === 0)) return;
     const { part, frame } = frameOf(rect);
     emit({ kind: 'text', frame, insets: { l: 0, t: 0, r: 0, b: 0 }, fill: null, line: null, radius: null, wrap: true, title: false, paragraphs }, part);
@@ -1305,7 +1904,8 @@
     if (el.matches('.katex')) {
       // Inline math outside a paragraph: as text.
       const runs = [];
-      mathRuns(el, runs, { opacity, pre: false, inherit: {}, backdrop: backdropOf(el) });
+      mathRuns(el, runs, { opacity, pre: false, inherit: {}, backdrop: backdropOf(el), lines: null });
+      fitMath(el, runs);
       const { part, frame } = frameOf(el.getBoundingClientRect());
       emit({ kind: 'text', frame, insets: { l: 0, t: 0, r: 0, b: 0 }, fill: null, line: null, radius: null, wrap: true, title: false, paragraphs: [paragraphOf(cs, mergeRuns(runs, false))] }, part);
       return;

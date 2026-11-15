@@ -173,8 +173,10 @@ it. A slide with fragments builds up step by step over several slides, and the s
 notes go into the notes pane. What PowerPoint cannot hold as text or shapes (display math,
 SVG, embedded pages) becomes a picture. The slide size follows the deck's: a 16:9 deck gives
 PowerPoint's Widescreen size. `--scale` sets the resolution of those pictures (2 by
-default, up to 4). PowerPoint substitutes fonts the viewer's machine lacks, so a line may
-wrap differently there; a text box grows to fit when it is edited.
+default, up to 4). Text keeps the browser's line breaks and line widths, with letter
+spacing making up for PowerPoint's font (a system font becomes Arial). PowerPoint substitutes
+fonts the viewer's machine lacks, so a line may run wider or narrower there; a text box grows
+to fit when it is edited.
 
 ## Find mistakes
 

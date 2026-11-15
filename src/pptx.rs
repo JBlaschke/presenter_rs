@@ -226,6 +226,9 @@ pub enum Bullet {
         glyph: String,
         /// Its colour; the text's when `None`.
         color: Option<Rgba>,
+        /// The font it is drawn in (Wingdings for a task list's boxes); Arial when `None`.
+        #[serde(default)]
+        font: Option<String>,
     },
     /// Automatic numbering.
     Auto {
@@ -262,6 +265,16 @@ pub struct Paragraph {
     /// The line height in slide pixels; the font's own when `None`.
     #[serde(default)]
     pub line_height: Option<f64>,
+    /// Where the browser drew the baseline of a line, in slide pixels from the top of
+    /// its line box; with the line height, it places the text's baselines where the
+    /// browser drew them (see [`SlideWriter::text_layout`]).
+    #[serde(default)]
+    pub baseline: Option<f64>,
+    /// Where the browser drew the paragraph's first baseline, in slide pixels from the top
+    /// of its shape's frame, when it measured it; it places the paragraph instead of the
+    /// line heights and spaces before it (see [`SlideWriter::text_layout`]).
+    #[serde(default)]
+    pub at: Option<f64>,
     /// Space above the paragraph in slide pixels.
     #[serde(default)]
     pub space_before: f64,
@@ -315,8 +328,10 @@ pub struct TextRun {
     /// `all` or `small` capitals.
     #[serde(default)]
     pub caps: Option<String>,
-    /// Baseline shift in thousandths of a percent of the font size (30000 for a
-    /// superscript, -25000 for a subscript).
+    /// Baseline shift in thousandths of a percent of the written font size (30000 for a
+    /// superscript, -25000 for a subscript). PowerPoint draws a shifted run at two thirds
+    /// of its size, so such a run is written half as large again as `size`, the size it
+    /// shows at.
     #[serde(default)]
     pub baseline: i32,
     /// Letter spacing in slide pixels.
@@ -1246,7 +1261,9 @@ impl SlideWriter<'_> {
     fn geometry(&self, frame: &Frame, radius: Option<f64>) -> String {
         match radius {
             Some(r) if r > 0.0 && frame.w > 0.0 && frame.h > 0.0 => {
-                let adj = (r / frame.w.min(frame.h) * 50_000.0)
+                // The preset's corner radius is `adj` hundred-thousandths of the shorter
+                // side, at most half of it.
+                let adj = (r / frame.w.min(frame.h) * 100_000.0)
                     .round()
                     .clamp(0.0, 50_000.0);
                 format!(
@@ -1298,16 +1315,61 @@ impl SlideWriter<'_> {
                 r#"<p:nvSpPr><p:cNvPr id="{id}" name="TextBox {id}: {name}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>"#
             )
         };
-        let wrap = if shape.wrap { "square" } else { "none" };
+        let mut frame = shape.frame;
+        let boxed = shape.fill.is_some() || shape.line.is_some();
+        // The lines break where the browser broke them (the scene has a line break at each
+        // wrap). PowerPoint measures text a little differently, so it could still wrap a
+        // line that fills its box: a box without fill or outline gets more room on the
+        // side its text does not align to; a visible box with one line of text (a label, a
+        // pill) does not wrap at all, and one with more takes the room from its padding.
+        let mut wrap = shape.wrap;
+        let mut insets = shape.insets;
+        if wrap && boxed {
+            if one_line(shape) {
+                wrap = false;
+            } else {
+                insets = cell_insets(&insets, frame.w, &shape.paragraphs);
+            }
+        } else if wrap {
+            widen(&mut frame, &shape.paragraphs);
+        }
+        let (mut top, spacings) = match self.text_layout(insets.t, &shape.paragraphs) {
+            Some(layout) => layout,
+            None => (
+                insets.t,
+                shape
+                    .paragraphs
+                    .iter()
+                    .map(|p| self.plain_spacing(p))
+                    .collect(),
+            ),
+        };
+        if top < 0.0 {
+            // The baseline belongs above the box's top edge: an invisible box moves up.
+            if !boxed {
+                frame.y += top;
+                frame.h -= top;
+            }
+            top = 0.0;
+        }
+        let (frame, radius, half) = outlined(&frame, shape.line.as_ref(), shape.radius);
+        // A rounded rectangle keeps its text off the corners (the preset's text box is
+        // inset by 0.29 of the corner radius on every side): the insets give that back,
+        // with the half of the outline that the smaller shape already moved inwards. What
+        // the left inset cannot give back comes off the paragraphs' left margins (a list's
+        // items), as far as they reach.
+        let corner = rounded_text_inset(&frame, radius) + half;
+        let short = (corner - insets.l).max(0.0);
+        let wrap = if wrap { "square" } else { "none" };
         let mut body = format!(
             r#"<p:txBody><a:bodyPr wrap="{wrap}" lIns="{}" tIns="{}" rIns="{}" bIns="{}" rtlCol="0" anchor="t"><a:spAutoFit/></a:bodyPr><a:lstStyle/>"#,
-            self.scale.emu(shape.insets.l),
-            self.scale.emu(shape.insets.t),
-            self.scale.emu(shape.insets.r),
-            self.scale.emu(shape.insets.b)
+            self.scale.emu(insets.l - corner),
+            self.scale.emu(top - corner),
+            self.scale.emu(insets.r - corner),
+            self.scale.emu(insets.b - corner)
         );
-        for paragraph in &shape.paragraphs {
-            body.push_str(&self.paragraph_xml(paragraph));
+        for (paragraph, spacing) in shape.paragraphs.iter().zip(spacings) {
+            body.push_str(&self.paragraph_xml(paragraph, spacing, short));
         }
         if shape.paragraphs.is_empty() {
             body.push_str("<a:p><a:endParaRPr/></a:p>");
@@ -1316,8 +1378,8 @@ impl SlideWriter<'_> {
         let _ = write!(
             self.xml,
             "<p:sp>{nv}<p:spPr>{}{}{}{}</p:spPr>{body}</p:sp>",
-            self.xfrm(&shape.frame),
-            self.geometry(&shape.frame, shape.radius),
+            self.xfrm(&frame),
+            self.geometry(&frame, radius),
             self.fill_xml(shape.fill.as_ref()),
             self.line_xml(shape.line.as_ref())
         );
@@ -1325,11 +1387,12 @@ impl SlideWriter<'_> {
 
     fn rect(&mut self, shape: &RectShape) {
         let id = self.id();
+        let (frame, radius, _) = outlined(&shape.frame, shape.line.as_ref(), shape.radius);
         let _ = write!(
             self.xml,
             r#"<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="Rectangle {id}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{}{}{}{}</p:spPr></p:sp>"#,
-            self.xfrm(&shape.frame),
-            self.geometry(&shape.frame, shape.radius),
+            self.xfrm(&frame),
+            self.geometry(&frame, radius),
             self.fill_xml(shape.fill.as_ref()),
             self.line_xml(shape.line.as_ref())
         );
@@ -1385,7 +1448,8 @@ impl SlideWriter<'_> {
                 }
                 let mut body = String::from("<a:txBody><a:bodyPr/><a:lstStyle/>");
                 for paragraph in &cell.paragraphs {
-                    body.push_str(&self.paragraph_xml(paragraph));
+                    let spacing = self.plain_spacing(paragraph);
+                    body.push_str(&self.paragraph_xml(paragraph, spacing, 0.0));
                 }
                 if cell.paragraphs.is_empty() {
                     body.push_str("<a:p><a:endParaRPr/></a:p>");
@@ -1396,10 +1460,19 @@ impl SlideWriter<'_> {
                     Some("b") => "b",
                     _ => "t",
                 };
+                // A cell always wraps: what room PowerPoint needs to keep the browser's lines
+                // comes out of the padding on the side the text does not align to.
+                let width: f64 = shape
+                    .columns
+                    .iter()
+                    .skip(column)
+                    .take(usize::try_from(cell.grid_span.max(1)).unwrap_or(1))
+                    .sum();
+                let insets = cell_insets(&cell.insets, width, &cell.paragraphs);
                 let mut pr = format!(
                     r#"<a:tcPr marL="{}" marR="{}" marT="{}" marB="{}" anchor="{anchor}">"#,
-                    self.scale.emu(cell.insets.l),
-                    self.scale.emu(cell.insets.r),
+                    self.scale.emu(insets.l),
+                    self.scale.emu(insets.r),
                     self.scale.emu(cell.insets.t),
                     self.scale.emu(cell.insets.b)
                 );
@@ -1435,10 +1508,103 @@ impl SlideWriter<'_> {
         self.xml.push_str(&xml);
     }
 
-    fn paragraph_xml(&mut self, paragraph: &Paragraph) -> String {
+    /// Space before a paragraph as PowerPoint applies it: whole points.
+    fn space_before(&self, px: f64) -> i64 {
+        (px * self.scale.pt100_per_px / 100.0).round().max(0.0) as i64 * 100
+    }
+
+    /// A paragraph's spacing as the scene gives it: its space before and line height, in
+    /// the whole points PowerPoint applies.
+    fn plain_spacing(&self, paragraph: &Paragraph) -> Spacing {
+        Spacing {
+            before: self.space_before(paragraph.space_before),
+            line: paragraph
+                .line_height
+                .filter(|h| *h > 0.0)
+                .map(|h| line_points(h * self.scale.pt100_per_px / 100.0)),
+        }
+    }
+
+    /// Where PowerPoint draws the paragraphs' baselines where the browser drew them: the
+    /// top inset in slide pixels (negative when the first baseline needs the text to start
+    /// above the box) and each paragraph's spacing.
+    ///
+    /// PowerPoint (measured on PowerPoint for Mac) rounds exact line spacing and space
+    /// before to whole points, and puts a line's baseline at [`office_baseline`], which is
+    /// not where the browser puts it (the leading above the font's ascent). The first
+    /// baseline is matched through the top inset, every further paragraph's first baseline
+    /// through its space before, which so takes up what the rounding moved. The browser's
+    /// first baselines are the ones it measured (`at`), else the ones its line heights and
+    /// spaces before give. Lines inside a paragraph keep the rounded spacing; a paragraph
+    /// of one line among others gets its spacing rounded down, so that PowerPoint never
+    /// runs ahead of the browser (a space before cannot be negative to take that back).
+    /// `None` when a paragraph has no line height or baseline: then the scene's spacing is
+    /// written as it is.
+    fn text_layout(&self, inset: f64, paragraphs: &[Paragraph]) -> Option<(f64, Vec<Spacing>)> {
+        let pt_per_px = self.scale.pt100_per_px / 100.0;
+        let several = paragraphs.len() > 1;
+        // Positions in points from the top of the box.
+        let (mut page_end, mut office_end) = (inset * pt_per_px, 0.0);
+        let mut top = inset;
+        let mut spacings = Vec::with_capacity(paragraphs.len());
+        for (i, paragraph) in paragraphs.iter().enumerate() {
+            let line = paragraph.line_height.filter(|h| *h > 0.0)? * pt_per_px;
+            let baseline = paragraph.baseline? * pt_per_px;
+            let size = paragraph
+                .runs
+                .iter()
+                .filter_map(|run| match run {
+                    Run::Text(run) => Some(run.size * pt_per_px),
+                    Run::Break { .. } => None,
+                })
+                .fold(0.0, f64::max);
+            let size = if size > 0.0 { size } else { line / 1.2 };
+            let lines = 1 + paragraph
+                .runs
+                .iter()
+                .filter(|run| matches!(run, Run::Break { .. }))
+                .count();
+            let office_line = if several && lines == 1 {
+                line.floor().max(1.0)
+            } else {
+                line_points(line)
+            };
+            // The rounded spacing moves each further line by the difference: aim the
+            // paragraph's middle line, so its first and last lines are off by half as much.
+            let office_baseline = office_baseline(office_line, size)
+                + (lines - 1) as f64 * (office_line - line) / 2.0;
+            let target = match paragraph.at {
+                Some(at) => at * pt_per_px,
+                None if i == 0 => page_end + baseline,
+                None => page_end + paragraph.space_before.max(0.0) * pt_per_px + baseline,
+            };
+            let office_top = if i == 0 {
+                top = (target - office_baseline) / pt_per_px;
+                spacings.push(Spacing {
+                    before: 0,
+                    line: Some(office_line),
+                });
+                target - office_baseline
+            } else {
+                let space = (target - office_baseline - office_end).round().max(0.0);
+                spacings.push(Spacing {
+                    before: space as i64 * 100,
+                    line: Some(office_line),
+                });
+                office_end + space
+            };
+            page_end = target - baseline + lines as f64 * line;
+            office_end = office_top + lines as f64 * office_line;
+        }
+        Some((top, spacings))
+    }
+
+    /// A paragraph with `spacing`, its left margin `short` slide pixels less (what the box's
+    /// left inset could not give back of a rounded corner).
+    fn paragraph_xml(&mut self, paragraph: &Paragraph, spacing: Spacing, short: f64) -> String {
         let mut pr = format!(
             r#"<a:pPr marL="{}" indent="{}" lvl="{}" algn="{}">"#,
-            self.scale.emu(paragraph.margin_left),
+            self.scale.emu(paragraph.margin_left - short),
             self.scale.pos(paragraph.indent),
             paragraph.level.min(8),
             match paragraph.align {
@@ -1448,28 +1614,32 @@ impl SlideWriter<'_> {
                 Align::Just => "just",
             }
         );
-        if let Some(height) = paragraph.line_height.filter(|h| *h > 0.0) {
+        if let Some(points) = spacing.line {
             let _ = write!(
                 pr,
                 r#"<a:lnSpc><a:spcPts val="{}"/></a:lnSpc>"#,
-                self.scale.pt100(height)
+                points as i64 * 100
             );
         }
-        if paragraph.space_before > 0.0 {
+        if spacing.before > 0 {
             let _ = write!(
                 pr,
                 r#"<a:spcBef><a:spcPts val="{}"/></a:spcBef>"#,
-                self.scale.pt100_signed(paragraph.space_before).max(0)
+                spacing.before
             );
         }
         match &paragraph.bullet {
-            Some(Bullet::Char { glyph, color }) => {
+            Some(Bullet::Char { glyph, color, font }) => {
                 if let Some(color) = color {
                     let _ = write!(pr, "<a:buClr>{}</a:buClr>", color_xml(color));
                 }
+                let font = font
+                    .as_deref()
+                    .map_or("Arial".into(), |f| cut(&single_line(f), 60));
                 let _ = write!(
                     pr,
-                    r#"<a:buFont typeface="Arial"/><a:buChar char="{}"/>"#,
+                    r#"<a:buFont typeface="{}"/><a:buChar char="{}"/>"#,
+                    escape(&font),
                     escape(&cut(glyph, 4))
                 );
             }
@@ -1511,8 +1681,9 @@ impl SlideWriter<'_> {
                     if text.is_empty() {
                         continue;
                     }
-                    let sz = self.scale.pt100(run.size);
-                    last_size = Some(sz);
+                    // Breaks and the paragraph's end take the size the text shows at.
+                    last_size = Some(self.scale.pt100(run.size));
+                    let sz = self.scale.pt100(written_size(run));
                     xml.push_str(&self.run_xml(run, &text, sz));
                 }
             }
@@ -1580,6 +1751,138 @@ impl SlideWriter<'_> {
             escape(text)
         )
     }
+}
+
+/// How a paragraph is spaced in PowerPoint: its space before in hundredths of a point and
+/// its exact line spacing in whole points (the font's own when `None`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Spacing {
+    before: i64,
+    line: Option<f64>,
+}
+
+/// Whether a text shape holds one line of text: one paragraph without line breaks, in a
+/// box less than one and a half lines high.
+fn one_line(shape: &TextShape) -> bool {
+    let [paragraph] = shape.paragraphs.as_slice() else {
+        return false;
+    };
+    let content = shape.frame.h - shape.insets.t - shape.insets.b;
+    !paragraph
+        .runs
+        .iter()
+        .any(|run| matches!(run, Run::Break { .. }))
+        && paragraph
+            .line_height
+            .filter(|h| *h > 0.0)
+            .is_none_or(|h| content < 1.5 * h)
+}
+
+/// Exact line spacing as PowerPoint applies it: whole points (it rounds what it is given),
+/// at least one.
+fn line_points(points: f64) -> f64 {
+    points.round().max(1.0)
+}
+
+/// Where PowerPoint puts the baseline of a line of exact spacing `line` whose largest
+/// text is `size` (both in points), from the top of the line: measured on PowerPoint for
+/// Mac, a line taller than single spacing (1.2 times the size) has its baseline at three
+/// quarters of its height, a line up to single spacing keeps 0.23 of the size below it.
+fn office_baseline(line: f64, size: f64) -> f64 {
+    if line > 1.2 * size + 0.01 {
+        0.75 * line
+    } else {
+        line - 0.23 * size
+    }
+}
+
+/// The font size to write for `run`: its size, or half as large again when it is raised or
+/// lowered, as PowerPoint draws such a run at two thirds of its size.
+fn written_size(run: &TextRun) -> f64 {
+    if run.baseline == 0 {
+        run.size
+    } else {
+        run.size * 1.5
+    }
+}
+
+/// The shape of a box with an outline: a CSS border lies inside its box, a DrawingML
+/// outline is centred on the shape's edge, so the shape is the box inset by half the
+/// outline's width, its corner radius too. Returns the frame, the radius and that half.
+fn outlined(frame: &Frame, line: Option<&Line>, radius: Option<f64>) -> (Frame, Option<f64>, f64) {
+    let Some(line) = line.filter(|l| l.width > 0.0) else {
+        return (*frame, radius, 0.0);
+    };
+    let half = (line.width / 2.0)
+        .min(frame.w / 2.0)
+        .min(frame.h / 2.0)
+        .max(0.0);
+    let inset = Frame {
+        x: frame.x + half,
+        y: frame.y + half,
+        w: frame.w - 2.0 * half,
+        h: frame.h - 2.0 * half,
+    };
+    (inset, radius.map(|r| (r - half).max(0.0)), half)
+}
+
+/// How far the `roundRect` preset of a box with corner `radius` insets its text: 0.29289
+/// of the corner radius it draws (at most half the shorter side).
+fn rounded_text_inset(frame: &Frame, radius: Option<f64>) -> f64 {
+    match radius {
+        Some(r) if r > 0.0 && frame.w > 0.0 && frame.h > 0.0 => {
+            0.29289 * r.min(frame.w.min(frame.h) / 2.0)
+        }
+        _ => 0.0,
+    }
+}
+
+/// The alignment all `paragraphs` share, if they share one.
+fn common_align(paragraphs: &[Paragraph]) -> Option<Align> {
+    let first = paragraphs.first()?.align;
+    paragraphs.iter().all(|p| p.align == first).then_some(first)
+}
+
+/// The room PowerPoint gets beyond the browser's widest line in a box `width` slide
+/// pixels wide: its text measures within a fraction of a percent of the browser's.
+fn wrap_room(width: f64) -> f64 {
+    4.0 + 0.02 * width.max(0.0)
+}
+
+/// Widens an invisible text box on the side its text does not align to, so PowerPoint
+/// keeps the browser's lines whole (justified or mixed alignment: unchanged).
+fn widen(frame: &mut Frame, paragraphs: &[Paragraph]) {
+    let room = wrap_room(frame.w);
+    match common_align(paragraphs) {
+        Some(Align::L) => frame.w += room,
+        Some(Align::R) => {
+            frame.x -= room;
+            frame.w += room;
+        }
+        Some(Align::Ctr) => {
+            frame.x -= room / 2.0;
+            frame.w += room;
+        }
+        Some(Align::Just) | None => {}
+    }
+}
+
+/// A table cell's insets with up to [`wrap_room`] taken from the padding on the side its
+/// text does not align to (`width`: the cell's width).
+fn cell_insets(insets: &Edges, width: f64, paragraphs: &[Paragraph]) -> Edges {
+    let room = wrap_room(width);
+    let mut out = *insets;
+    match common_align(paragraphs) {
+        Some(Align::L) => out.r = (out.r - room).max(0.0),
+        Some(Align::R) => out.l = (out.l - room).max(0.0),
+        Some(Align::Ctr) => {
+            let half = (room / 2.0).min(out.l).min(out.r);
+            out.l -= half;
+            out.r -= half;
+        }
+        Some(Align::Just) | None => {}
+    }
+    out
 }
 
 /// The numbering schemes written as given (anything else becomes `arabicPeriod`).
@@ -2228,6 +2531,198 @@ mod tests {
     }
 
     #[test]
+    fn lines_land_on_the_browsers_baselines_with_room_to_keep_them_whole() {
+        let sized = |text: &str| match run(text) {
+            Run::Text(run) => Run::Text(TextRun { size: 36.0, ..run }),
+            other => other,
+        };
+        // 36 px text on 48.6 px lines (36.45 pt, which PowerPoint makes 36 pt), the
+        // baseline 37.7 px (28.275 pt) below the top of each line box.
+        let paragraph = |runs: Vec<Run>, space_before: f64, align: Align| Paragraph {
+            align,
+            line_height: Some(48.6),
+            baseline: Some(37.7),
+            space_before,
+            runs,
+            ..Paragraph::default()
+        };
+        let frame = Frame {
+            x: 100.0,
+            y: 50.0,
+            w: 500.0,
+            h: 200.0,
+        };
+        let left = TextShape {
+            frame,
+            paragraphs: vec![
+                paragraph(
+                    vec![sized("one"), Run::Break { br: true }, sized("two")],
+                    0.0,
+                    Align::L,
+                ),
+                paragraph(vec![sized("three")], 12.0, Align::L),
+            ],
+            wrap: true,
+            ..TextShape::default()
+        };
+        let centred = TextShape {
+            frame,
+            paragraphs: vec![Paragraph {
+                baseline: Some(20.0),
+                ..paragraph(vec![sized("four")], 0.0, Align::Ctr)
+            }],
+            wrap: true,
+            ..TextShape::default()
+        };
+        let boxed = TextShape {
+            frame: Frame { h: 60.0, ..frame },
+            fill: Some(Fill::Color {
+                color: rgb(1, 2, 3),
+            }),
+            paragraphs: vec![paragraph(vec![sized("five")], 0.0, Align::L)],
+            wrap: true,
+            ..TextShape::default()
+        };
+        let padded = TextShape {
+            frame: Frame { y: 300.0, ..frame },
+            insets: Edges {
+                l: 10.0,
+                t: 0.0,
+                r: 20.0,
+                b: 0.0,
+            },
+            fill: Some(Fill::Color {
+                color: rgb(1, 2, 3),
+            }),
+            paragraphs: vec![paragraph(
+                vec![sized("six"), Run::Break { br: true }, sized("seven")],
+                0.0,
+                Align::L,
+            )],
+            wrap: true,
+            ..TextShape::default()
+        };
+        let file = write(&presentation(vec![slide(
+            "S",
+            vec![
+                Shape::Text(left),
+                Shape::Text(centred),
+                Shape::Text(boxed),
+                Shape::Text(padded),
+            ],
+            &[],
+        )]))
+        .unwrap();
+        let xml = text(&entries(&file), "ppt/slides/slide1.xml");
+        // PowerPoint puts the baseline of a 36 pt line at 27 pt; the second line of the
+        // first paragraph is 0.45 pt higher than in the browser, so the paragraph aims
+        // between its lines (26.775 pt) and starts 1.5 pt (2 px) down. 14 px more room on
+        // the right (4 px and 2 % of 500 px).
+        assert!(
+            xml.contains(r#"<a:off x="952500" y="476250"/><a:ext cx="4895850" cy="1905000"/>"#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"<a:bodyPr wrap="square" lIns="0" tIns="19050" rIns="0" bIns="0" rtlCol="0" anchor="t">"#), "{xml}");
+        assert!(xml.contains(r#"<a:pPr marL="0" indent="0" lvl="0" algn="l"><a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:buNone/></a:pPr><a:r><a:rPr lang="en-US" sz="2700""#), "{xml}");
+        // The browser's third line starts at 72.9 + 9 pt, its baseline at 110.175 pt;
+        // PowerPoint's second paragraph starts at 73.5 pt plus whole points: 10 of them.
+        assert!(xml.contains(r#"<a:lnSpc><a:spcPts val="3600"/></a:lnSpc><a:spcBef><a:spcPts val="1000"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="en-US" sz="2700" dirty="0"><a:solidFill><a:srgbClr val="000000"/></a:solidFill><a:latin typeface="Arial"/><a:ea typeface="Arial"/><a:cs typeface="Arial"/></a:rPr><a:t>three</a:t>"#), "{xml}");
+        // A baseline 15 pt down needs the text 12 pt (16 px) above the box: the invisible
+        // box moves up, and grows 7 px on both sides of its centred text.
+        assert!(
+            xml.contains(r#"<a:off x="885825" y="323850"/><a:ext cx="4895850" cy="2057400"/>"#),
+            "{xml}"
+        );
+        // A visible box keeps its frame; with one line of text it does not wrap, and that
+        // line starts 1.275 pt (1.7 px) down.
+        assert!(
+            xml.contains(r#"<a:off x="952500" y="476250"/><a:ext cx="4762500" cy="571500"/>"#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"<a:bodyPr wrap="none" lIns="0" tIns="16193" rIns="0" bIns="0" rtlCol="0" anchor="t">"#), "{xml}");
+        // With more lines it wraps, the 14 px of room taken from its right padding (20 px).
+        assert!(
+            xml.contains(r#"<a:off x="952500" y="2857500"/><a:ext cx="4762500" cy="1905000"/>"#),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"<a:bodyPr wrap="square" lIns="95250" tIns="19050" rIns="57150" bIns="0" rtlCol="0" anchor="t">"#), "{xml}");
+    }
+
+    #[test]
+    fn measured_baselines_place_paragraphs_and_code_lines_never_run_ahead() {
+        // Code: 21.6 px text on 30.24 px lines (22.68 pt), one paragraph per line, the
+        // baseline 22 px (16.5 pt) down each line box.
+        let line = |text: &str, at: Option<f64>| Paragraph {
+            line_height: Some(30.24),
+            baseline: Some(22.0),
+            at,
+            runs: vec![match run(text) {
+                Run::Text(run) => Run::Text(TextRun { size: 21.6, ..run }),
+                other => other,
+            }],
+            ..Paragraph::default()
+        };
+        let shape = TextShape {
+            frame: Frame {
+                x: 0.0,
+                y: 0.0,
+                w: 500.0,
+                h: 300.0,
+            },
+            paragraphs: vec![
+                line("a", None),
+                line("b", None),
+                line("c", Some(90.0)),
+                line("d", None),
+            ],
+            wrap: false,
+            ..TextShape::default()
+        };
+        let file = write(&presentation(vec![slide(
+            "S",
+            vec![Shape::Text(shape)],
+            &[],
+        )]))
+        .unwrap();
+        let xml = text(&entries(&file), "ppt/slides/slide1.xml");
+        let paragraphs: Vec<&str> = xml.split("<a:p>").skip(1).collect();
+        let spacing = |p: &str| {
+            let line = p
+                .split(r#"<a:lnSpc><a:spcPts val=""#)
+                .nth(1)
+                .and_then(|r| r.split('"').next());
+            let before = p
+                .split(r#"<a:spcBef><a:spcPts val=""#)
+                .nth(1)
+                .and_then(|r| r.split('"').next());
+            (
+                line.unwrap_or("").to_owned(),
+                before.unwrap_or("0").to_owned(),
+            )
+        };
+        // 22.68 pt lines are written as 22 pt, never 23: PowerPoint falls behind by at most
+        // a point, which a whole point of space before takes up. The third line was
+        // measured 90 px (67.5 pt) down: 6 pt before it puts it there.
+        let got: Vec<(String, String)> = paragraphs.iter().map(|p| spacing(p)).collect();
+        let want = [
+            ("2200", "0"),
+            ("2200", "100"),
+            ("2200", "600"),
+            ("2200", "100"),
+        ];
+        assert_eq!(
+            got,
+            want.map(|(l, b)| (l.to_owned(), b.to_owned())).to_vec(),
+            "{xml}"
+        );
+        // A 22 pt line has its baseline at 16.5 pt, where the browser has it: no inset.
+        assert!(
+            xml.contains(r#"lIns="0" tIns="0" rIns="0" bIns="0""#),
+            "{xml}"
+        );
+    }
+
+    #[test]
     fn text_runs_carry_their_formatting() {
         let mut shape = TextShape {
             frame: Frame {
@@ -2285,10 +2780,13 @@ mod tests {
                 bullet: Some(Bullet::Char {
                     glyph: "•".into(),
                     color: Some(rgb(47, 91, 214)),
+                    font: None,
                 }),
                 margin_left: 40.0,
                 indent: -20.0,
                 line_height: Some(32.0),
+                baseline: None,
+                at: None,
                 space_before: 8.0,
                 runs: vec![
                     Run::Text(fancy),
@@ -2314,11 +2812,20 @@ mod tests {
         .unwrap();
         let entries = entries(&file);
         let xml = text(&entries, "ppt/slides/slide1.xml");
-        assert!(xml.contains(r#"<a:bodyPr wrap="none" lIns="95250" tIns="47625" rIns="95250" bIns="47625" rtlCol="0" anchor="t"><a:spAutoFit/></a:bodyPr>"#), "{xml}");
-        assert!(xml.contains(r#"<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 4000"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="F0F0F0"><a:alpha val="50000"/></a:srgbClr></a:solidFill><a:ln w="19050"><a:solidFill><a:srgbClr val="C80000"/></a:solidFill><a:prstDash val="dash"/></a:ln>"#), "{xml}");
+        // The 2 px outline is centred on the shape's edge, so the shape is the box inset
+        // by 1 px, its corner radius 7 px (7/98 of the short side).
+        assert!(
+            xml.contains(r#"<a:off x="9525" y="9525"/><a:ext cx="3790950" cy="933450"/>"#),
+            "{xml}"
+        );
+        // 10 px and 5 px insets less that 1 px and the rounded rectangle's own text
+        // inset, 0.29289 of its 7 px corner radius (2.05 px).
+        assert!(xml.contains(r#"<a:bodyPr wrap="none" lIns="66197" tIns="18572" rIns="66197" bIns="18572" rtlCol="0" anchor="t"><a:spAutoFit/></a:bodyPr>"#), "{xml}");
+        assert!(xml.contains(r#"<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 7143"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="F0F0F0"><a:alpha val="50000"/></a:srgbClr></a:solidFill><a:ln w="19050"><a:solidFill><a:srgbClr val="C80000"/></a:solidFill><a:prstDash val="dash"/></a:ln>"#), "{xml}");
         // 40 px margin = 381000 EMU; 32 px line height = 24 pt; 8 px before = 6 pt.
         assert!(xml.contains(r#"<a:pPr marL="381000" indent="-190500" lvl="1" algn="ctr"><a:lnSpc><a:spcPts val="2400"/></a:lnSpc><a:spcBef><a:spcPts val="600"/></a:spcBef><a:buClr><a:srgbClr val="2F5BD6"/></a:buClr><a:buFont typeface="Arial"/><a:buChar char="•"/></a:pPr>"#), "{xml}");
-        assert!(xml.contains(r#"<a:rPr lang="en-US" sz="1800" b="1" i="1" u="sng" strike="sngStrike" cap="all" spc="-75" baseline="30000" dirty="0"><a:solidFill><a:srgbClr val="010203"><a:alpha val="40000"/></a:srgbClr></a:solidFill><a:highlight><a:srgbClr val="FFFF00"/></a:highlight><a:latin typeface="Menlo"/><a:ea typeface="Menlo"/><a:cs typeface="Menlo"/><a:hlinkClick r:id="rId2"/></a:rPr><a:t>Q&amp;A &lt;b&gt;</a:t>"#), "{xml}");
+        // A superscript is written half as large again: PowerPoint draws it at two thirds.
+        assert!(xml.contains(r#"<a:rPr lang="en-US" sz="2700" b="1" i="1" u="sng" strike="sngStrike" cap="all" spc="-75" baseline="30000" dirty="0"><a:solidFill><a:srgbClr val="010203"><a:alpha val="40000"/></a:srgbClr></a:solidFill><a:highlight><a:srgbClr val="FFFF00"/></a:highlight><a:latin typeface="Menlo"/><a:ea typeface="Menlo"/><a:cs typeface="Menlo"/><a:hlinkClick r:id="rId2"/></a:rPr><a:t>Q&amp;A &lt;b&gt;</a:t>"#), "{xml}");
         assert!(
             xml.contains(r#"<a:br><a:rPr lang="en-US" sz="1800"/></a:br>"#),
             "{xml}"
@@ -2327,6 +2834,42 @@ mod tests {
         assert!(xml.contains(r#"<a:buFont typeface="+mj-lt"/><a:buAutoNum type="alphaLcPeriod" startAt="3"/></a:pPr><a:endParaRPr lang="en-US"/></a:p>"#), "{xml}");
         let rels = text(&entries, "ppt/slides/_rels/slide1.xml.rels");
         assert!(rels.contains(r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.org/?a=1&amp;b=2" TargetMode="External"/>"#), "{rels}");
+    }
+
+    #[test]
+    fn outlines_stay_inside_the_box_like_css_borders() {
+        let outlined = |width: f64, radius| {
+            Shape::Rect(RectShape {
+                frame: Frame {
+                    x: 10.0,
+                    y: 20.0,
+                    w: 100.0,
+                    h: 40.0,
+                },
+                fill: None,
+                line: Some(Line {
+                    color: rgb(0, 0, 0),
+                    width,
+                    dash: false,
+                }),
+                radius,
+            })
+        };
+        let file = write(&presentation(vec![slide(
+            "S",
+            vec![outlined(4.0, Some(10.0)), outlined(100.0, None)],
+            &[],
+        )]))
+        .unwrap();
+        let xml = text(&entries(&file), "ppt/slides/slide1.xml");
+        // A 4 px border lies inside the box: the outline, centred on the shape's edge,
+        // needs the shape 2 px smaller on every side and its radius 2 px smaller.
+        assert!(xml.contains(r#"<a:off x="114300" y="209550"/><a:ext cx="914400" cy="342900"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 22222"/>"#), "{xml}");
+        // A border wider than the box never turns the shape inside out.
+        assert!(
+            xml.contains(r#"<a:off x="285750" y="381000"/><a:ext cx="571500" cy="1"/>"#),
+            "{xml}"
+        );
     }
 
     #[test]
@@ -2456,7 +2999,8 @@ mod tests {
         );
         assert!(xml.contains(r#"<a:tc hMerge="1">"#), "{xml}");
         assert!(xml.contains(r#"<a:tc gridSpan="2">"#), "{xml}");
-        assert!(xml.contains(r#"<a:tcPr marL="76200" marR="76200" marT="38100" marB="38100" anchor="ctr"><a:lnL w="0"><a:noFill/></a:lnL><a:lnR w="0"><a:noFill/></a:lnR><a:lnT w="0"><a:noFill/></a:lnT><a:lnB w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:lnB><a:solidFill><a:srgbClr val="FAFAFA"/></a:solidFill></a:tcPr>"#), "{xml}");
+        // The left-aligned cell (100 px wide) gives PowerPoint 6 px of its right padding.
+        assert!(xml.contains(r#"<a:tcPr marL="76200" marR="19050" marT="38100" marB="38100" anchor="ctr"><a:lnL w="0"><a:noFill/></a:lnL><a:lnR w="0"><a:noFill/></a:lnR><a:lnT w="0"><a:noFill/></a:lnT><a:lnB w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:lnB><a:solidFill><a:srgbClr val="FAFAFA"/></a:solidFill></a:tcPr>"#), "{xml}");
         // CSS "to right" (90°) is DrawingML's 0°.
         assert!(xml.contains(r#"<a:gradFill rotWithShape="1"><a:gsLst><a:gs pos="0"><a:srgbClr val="A96D4B"/></a:gs><a:gs pos="100000"><a:srgbClr val="000000"><a:alpha val="0"/></a:srgbClr></a:gs></a:gsLst><a:lin ang="0" scaled="0"/></a:gradFill>"#), "{xml}");
     }
@@ -2496,7 +3040,12 @@ mod tests {
         assert_eq!(picture.fit.map(|f| f.l), Some(0.1));
         let bullet: Bullet =
             serde_json::from_str(r#"{"char": "•", "color": {"r": 1, "g": 1, "b": 1}}"#).unwrap();
-        assert!(matches!(bullet, Bullet::Char { glyph, .. } if glyph == "•"));
+        assert!(matches!(bullet, Bullet::Char { glyph, font: None, .. } if glyph == "•"));
+        let bullet: Bullet =
+            serde_json::from_str(r#"{"char": "þ", "font": "Wingdings", "color": null}"#).unwrap();
+        assert!(
+            matches!(bullet, Bullet::Char { glyph, font: Some(font), .. } if glyph == "þ" && font == "Wingdings")
+        );
         let background: Background = serde_json::from_str(r#"{"color": null, "imageRef": null, "shot": null, "alpha": null, "sizing": null, "position": null, "shotOnly": true}"#).unwrap();
         assert!(background.shot_only);
     }

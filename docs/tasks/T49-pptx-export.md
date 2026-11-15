@@ -84,11 +84,50 @@ notes pane.
   pull request (2026-10-10): looks good. That check stays manual: PowerPoint and Keynote
   cannot be scripted into opening a file from here (both stop answering AppleScript on
   `open`, as sandboxed apps do when asked for a file outside their granted access).
+  (2026-11-14: PowerPoint does open a file copied into its own container,
+  `~/Library/Containers/com.microsoft.Powerpoint/Data/tmp/`, and saves it as PDF over
+  AppleScript; the text fitting below was measured and checked that way, line by line
+  against Chrome's PDF, on the example deck and a talk.)
 
 ## Known limits
-- Text boxes keep the browser's geometry; PowerPoint reflows the text in its own font
-  (substituted when the viewer lacks the theme's), so a long line may wrap differently and
-  a box then grows over what follows it.
+- The scene is the browser's screen layout, as the HTML shows it, not the print layout of
+  `export pdf`: where the theme's print rules differ (code lines print 5 % closer), the
+  slides follow the screen.
+- Text boxes keep the browser's geometry and the browser's line breaks (soft wraps become
+  `<a:br>`; a box with a fill or outline and one line of text does not wrap, one with more
+  lines wraps with the room taken from its padding on the side its text does not align to,
+  and one without fill or outline wraps with a little room to spare, so a slightly wider
+  line keeps whole). Each run's letter spacing makes up
+  the width difference between the page's font and the one PowerPoint draws with,
+  measured on a canvas (Arial with kerning off matches PowerPoint to ~0.25 %), plus the
+  room inline elements keep around their text (inline code's and key caps' padding,
+  borders and margins, an inline block's width, `::before`/`::after` margins). A run's
+  letter spacing follows each character, so a key cap's letter sits at the left of its
+  highlight rather than centred. A viewer without the font gets a substitute and lines run
+  wider or narrower.
+- PowerPoint draws a run with a baseline shift at two thirds of its size: a raised or
+  lowered run (`vertical-align: super`, `sub` or a length of at least a fifth of the font
+  size; smaller nudges are dropped) is written half as large again, its shift a share of
+  that size, so it shows at the browser's size and height. Inline math is linearised
+  text: its scripts are 0.7 of the size and raised or lowered as KaTeX sets them, and the
+  whole is fitted to the math's width on the page (smaller where the text runs much wider,
+  as a fraction written out on one line does).
+- A task list item's checkbox is the item's bullet: Wingdings' empty or ticked box (Office
+  has that font everywhere; PowerPoint draws no `☑` in Arial), where the checkbox is.
+- PowerPoint (measured on Mac) rounds exact line spacing and space before to whole points,
+  places the first baseline 0.75 of the line pitch down (or `line − 0.23 × size` for tight
+  lines), insets a rounded rectangle's text by 0.29 of its corner radius, and centres an
+  outline on the shape's edge. The writer compensates each (`text_layout`, `outlined`,
+  `rounded_text_inset`). Each paragraph's first baseline is the one the browser drew
+  (measured on its first glyph, so Chrome's whole-pixel leading and line boxes that a
+  larger inline box made taller are matched), and a paragraph of one line among others
+  (a code block's line) gets its spacing rounded down, so PowerPoint never runs ahead and
+  a whole point of space before takes up what it falls behind. What is left is about 1 px
+  per line, plus up to half a point per line inside a paragraph whose line height is not a
+  whole number of points (centred over the paragraph: a 7-line paragraph at 25.5 pt is
+  ~2 px off at its first and last lines). Lines inside a paragraph share one spacing: a
+  line the browser makes taller (a subscript, larger inline text) is not taller in
+  PowerPoint, so the lines after it sit higher.
 - Transforms, shadows, rotations, radial gradients and CSS filters are not carried over;
   inline math loses fraction and root layout (`a/b`, `√(x)`); reveal's slide number is left
   out (PowerPoint has its own).
