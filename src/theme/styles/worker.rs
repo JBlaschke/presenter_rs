@@ -15,14 +15,15 @@
 //! and `@warn` output (logged by the caller with `tracing`), and last the CSS or the
 //! error. A worker that ends without that last line crashed: its stderr tells whether its
 //! stack overflowed. A worker whose caller is gone ends itself, at the latest
-//! [`WORKER_GRACE`] after the time limit.
+//! [`WORKER_GRACE`] after the time limit. The caller sees the end of a worker's answer as
+//! the end of its stdout, so workers start one at a time ([`STARTING`]).
 
 use std::cell::RefCell;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
-use std::sync::OnceLock;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,15 @@ const EXIT_ORPHANED: u8 = 4;
 
 /// The worker of this process ([`isolate_in_worker`]).
 static WORKER: OnceLock<PathBuf> = OnceLock::new();
+
+/// Held while a worker is started ([`compile`]), so that workers start one at a time. Where
+/// std makes a pipe in two steps, `pipe` and then close-on-exec (macOS; Linux has
+/// `pipe2`), a worker that another thread starts in between inherits this worker's pipes
+/// and keeps them open while it runs. This worker's stdout then does not end when the
+/// worker does: a stack overflow waits for the other worker (an endless loop: its time
+/// limit) and is reported as a timeout, and a worker whose stdin does not end never
+/// starts compiling.
+static STARTING: Mutex<()> = Mutex::new(());
 
 thread_local! {
     /// The worker of the compilations started on this thread ([`with_worker`]).
@@ -243,12 +253,15 @@ pub(super) fn compile(
 ) -> io::Result<Outcome> {
     let request = serde_json::to_vec(&Request::new(theme, key, source, limit))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    let mut child = Command::new(exe)
-        .arg(WORKER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = {
+        let _starting = STARTING.lock().unwrap_or_else(PoisonError::into_inner);
+        Command::new(exe)
+            .arg(WORKER_ARG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?
+    };
     let deadline = Instant::now() + limit;
     let pipes = Pipes::open(&mut child, request);
     let mut reads = Vec::new();
