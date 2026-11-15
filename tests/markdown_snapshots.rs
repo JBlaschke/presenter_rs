@@ -285,6 +285,223 @@ fn directives_md() {
     assert!(parsed.diagnostics.is_empty());
 }
 
+/// dialect §4 (contract change 2026-11-14): a `:::` closes the innermost open directive, so
+/// directives nest with fences of one length, also inside the guide's `::::columns` form;
+/// the slide after them is split off as usual.
+#[test]
+fn directives_nest_with_fences_of_one_length() {
+    let text = "\
+## Small text in a column
+
+::::columns
+:::column
+:::small
+Small.
+:::
+:::
+:::column
+Right.
+:::
+::::
+
+---
+
+## Pandoc style
+
+::: {.columns}
+::: {.column}
+::: {.small}
+Small.
+:::
+:::
+:::
+";
+    let parsed = parse_text(text).unwrap();
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    assert_eq!(shape(&parsed.deck), [0, 0]);
+    let slides = &parsed.deck.slides;
+    assert_eq!(
+        html(&slides[0]),
+        "<h2>Small text in a column</h2>\n\
+         <div class=\"columns\">\n\
+         <div class=\"column\">\n<div class=\"small\">\n<p>Small.</p>\n</div>\n</div>\n\
+         <div class=\"column\">\n<p>Right.</p>\n</div>\n\
+         </div>\n"
+    );
+    assert_eq!(
+        slides[1].span.as_ref().map(|span| span.start_line),
+        Some(14)
+    );
+    assert_eq!(
+        html(&slides[1]),
+        "<h2>Pandoc style</h2>\n\
+         <div class=\"columns\">\n\
+         <div class=\"column\">\n<div class=\"small\">\n<p>Small.</p>\n</div>\n</div>\n\
+         </div>\n"
+    );
+}
+
+/// dialect §4 (contract change 2026-11-15): a bare `:::` closes a directive it can close
+/// wherever it is inside it, also in an HTML block, a code block or a list item, as in
+/// comrak, whatever the lengths the dialect gives the fences around it.
+#[test]
+fn a_fence_closes_a_directive_wherever_it_is_inside_it() {
+    // after an HTML block, with fences of one length and with a longer outer one
+    for text in [
+        ":::columns\n:::column\n:::small\nA\n:::\n<br class=\"c\">\n:::\n:::column\nB\n:::\n:::\n",
+        "::::columns\n:::column\n:::small\nA\n:::\n<br class=\"c\">\n:::\n:::column\nB\n:::\n::::\n",
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{text:?}: {:?}",
+            parsed.diagnostics
+        );
+        assert_eq!(
+            html(&parsed.deck.slides[0]),
+            "<div class=\"columns\">\n\
+             <div class=\"column\">\n<div class=\"small\">\n<p>A</p>\n</div>\n\
+             <br class=\"c\">\n</div>\n\
+             <div class=\"column\">\n<p>B</p>\n</div>\n\
+             </div>\n",
+            "{text:?}"
+        );
+    }
+    let parsed = parse_text(
+        "# One\n\n:::fragment\n:::small\nnote\n:::\n<div class=\"box\">B</div>\n:::\n\n---\n\n# Two\n",
+    )
+    .unwrap();
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    assert_eq!(shape(&parsed.deck), [0, 0]);
+    // in a code block: the `:::` closes `a` whether or not `b` came before it
+    for (text, inner) in [
+        (":::a\n```\ncode\n:::\n\n---\n\nNext\n", ""),
+        (
+            ":::a\n:::b\nx\n:::\n```\ncode\n:::\n\n---\n\nNext\n",
+            "<div class=\"b\">\n<p>x</p>\n</div>\n",
+        ),
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{text:?}: {:?}",
+            parsed.diagnostics
+        );
+        let slides = &parsed.deck.slides;
+        assert_eq!(slides.len(), 2, "{text:?}");
+        assert_eq!(
+            html(&slides[0]),
+            format!("<div class=\"a\">\n{inner}<pre><code data-trim>code</code></pre>\n</div>\n"),
+            "{text:?}"
+        );
+        assert_eq!(html(&slides[1]), "<p>Next</p>\n", "{text:?}");
+    }
+    // in a list item: the `:::` closes the note around the list, although the dialect
+    // makes the note's fence longer than the small's, and the note's own `:::` is ignored
+    let parsed = parse_text(":::note\n:::small\nx\n:::\n- item\n  :::\n:::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 7)]);
+    assert_eq!(
+        html(&parsed.deck.slides[0]),
+        "<div class=\"note\">\n<div class=\"small\">\n<p>x</p>\n</div>\n\
+         <ul>\n<li>item</li>\n</ul>\n</div>\n"
+    );
+}
+
+/// dialect §4: an ignored `:::` line in a tight list ends its line, as the fence line did
+/// (comrak's unnamed directive), and adds nothing else.
+#[test]
+fn an_ignored_line_in_a_tight_list_ends_its_line() {
+    for (text, expected, line) in [
+        (
+            "- a\n  :::\n  b\n- c\n",
+            "<ul>\n<li>a\nb</li>\n<li>c</li>\n</ul>\n",
+            2,
+        ),
+        (
+            "- [ ] task one\n  :::\n  continued\n- [x] done\n",
+            "task one\ncontinued</li>",
+            2,
+        ),
+        (
+            "Term\n: first\n  :::\n  second\n",
+            "<dl>\n<dt>Term</dt>\n<dd>first\nsecond</dd>\n</dl>\n",
+            3,
+        ),
+        (
+            "::::fragment\n- one\n  :::\n  more text\n- two\n::::\n",
+            "<div class=\"fragment\">\n<ul>\n<li>one\nmore text</li>\n<li>two</li>\n</ul>\n</div>\n",
+            3,
+        ),
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert_eq!(
+            codes(&parsed.diagnostics),
+            [("invalid-directive", line)],
+            "{text:?}"
+        );
+        let html = html(&parsed.deck.slides[0]);
+        assert!(html.contains(expected), "{text:?}: {html}");
+        assert!(!html.contains("<p>"), "{text:?}: {html}");
+    }
+}
+
+/// dialect §4: where slides are split, an ignored `:::` line counts as a blank line.
+#[test]
+fn an_ignored_line_takes_no_part_in_slides() {
+    // before the first separator: it does not make a slide of its own
+    let parsed = parse_text(":::\n\n---\n\n# A\n\nText\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 1)]);
+    assert_eq!(shape(&parsed.deck), [0]);
+    assert_eq!(html(&parsed.deck.slides[0]), "<h1>A</h1>\n<p>Text</p>\n");
+    // nor does it make the first separator a vertical one's slide
+    let parsed = parse_text(":::\n\n--\n\n# A\n").unwrap();
+    assert_eq!(
+        codes(&parsed.diagnostics),
+        [("invalid-directive", 1), ("orphan-vertical", 3)]
+    );
+    assert_eq!(shape(&parsed.deck), [0]);
+    // a slide with nothing else is empty
+    let parsed = parse_text("# A\n\n---\n\n:::\n\n---\n\n# B\n").unwrap();
+    assert_eq!(
+        codes(&parsed.diagnostics),
+        [("empty-slide", 3), ("invalid-directive", 5)]
+    );
+    assert_eq!(shape(&parsed.deck), [0, 0, 0]);
+    assert!(parsed.deck.slides[1].blocks.is_empty());
+}
+
+/// dialect §4, §7: the warning for an ignored `:::` line in speaker notes says why it closes
+/// nothing, as one anywhere else does.
+#[test]
+fn an_ignored_line_in_notes_is_reported_with_its_reason() {
+    for (text, line, expected) in [
+        (
+            "# S\n\n::::notes\nSay this.\n:::\n::::\n",
+            5,
+            "cannot close the `notes` directive around it, whose fence is longer",
+        ),
+        (
+            "# S\n\n:::notes\n- a\n\n  :::small\n  x\n  :::\n- b\n:::\n",
+            10,
+            "in the list at the end of the `notes` directive above closed it",
+        ),
+        (
+            "# S\n\n:::notes\n- item\n- :::\n:::\n",
+            5,
+            "cannot close the `notes` directive around the list item it is in",
+        ),
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert_eq!(
+            codes(&parsed.diagnostics),
+            [("invalid-directive", line)],
+            "{text:?}"
+        );
+        let message = &parsed.diagnostics.iter().next().unwrap().message;
+        assert!(message.contains(expected), "{text:?}: {message}");
+    }
+}
+
 /// dialect §5, one entry per code block of code.md: the exact opening tags.
 const CODE_ROWS: [&str; 12] = [
     r#"<pre><code class="language-python" data-trim>"#,
@@ -1013,34 +1230,58 @@ fn split_notebook_cells_lift_a_heading_only_onto_an_empty_slide() {
     assert_eq!(found, ["unlifted-slide-attr", "unlifted-slide-attr"]);
 }
 
-/// A3 (F13): same-length nested directive fences are reported in both split modes.
+/// Same-length nested directive fences nest, in both split modes, exactly as with a longer
+/// outer fence (dialect §4, contract change 2026-11-14; A3 F13 reported them before). A
+/// `:::` too many is still reported.
 #[test]
-fn same_length_nested_directives_are_reported() {
+fn same_length_nested_directives_nest() {
+    let graduated = |text: &str| {
+        text.replacen(":::columns", "::::columns", 1)
+            .replacen(":::\n\n", "::::\n\n", 1)
+    };
+    let same_deck = |a: &Parsed, b: &Parsed| {
+        assert_eq!(shape(&a.deck), shape(&b.deck));
+        for (a, b) in a.deck.slides.iter().zip(&b.deck.slides) {
+            assert_eq!(html(a), html(b));
+        }
+    };
     let text = "# Title\n\n---\n\n## Cols\n\n:::columns\n:::column\nLeft\n:::\n:::column\nRight\n:::\n:::\n\n---\n\n## Next slide\n";
     let parsed = parse_text(text).unwrap();
-    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 14)]);
-    let message = &parsed.diagnostics.iter().next().unwrap().message;
-    assert!(
-        message.contains("`::::columns` … `:::column` … `:::` … `::::`"),
-        "{message}"
-    );
-    let headings = "# Title\n\n## Cols\n\n:::columns\n:::column\nL\n:::\n:::column\nR\n:::\n:::\n\n## Next slide\n";
-    let parsed = parse(&source("inline"), headings, &headings_config()).unwrap();
-    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 12)]);
-    // the longer outer fence is fine
-    let fixed = text.replacen(":::columns", "::::columns", 1).replacen(
-        ":::\n\n---\n\n## Next",
-        "::::\n\n---\n\n## Next",
-        1,
-    );
-    let parsed = parse_text(&fixed).unwrap();
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     assert_eq!(parsed.deck.slides.len(), 3);
-    // the warning says how far the unnamed directive runs
     assert!(
-        message.contains("to the end of the document (or notebook cell), and `---` lines inside it start no slides"),
+        html(&parsed.deck.slides[1])
+            .ends_with("<div class=\"column\">\n<p>Right</p>\n</div>\n</div>\n"),
+        "{}",
+        html(&parsed.deck.slides[1])
+    );
+    let fixed = parse_text(&graduated(text)).unwrap();
+    assert!(fixed.diagnostics.is_empty(), "{:?}", fixed.diagnostics);
+    same_deck(&parsed, &fixed);
+    let headings = "# Title\n\n## Cols\n\n:::columns\n:::column\nL\n:::\n:::column\nR\n:::\n:::\n\n## Next slide\n";
+    let parsed = parse(&source("inline"), headings, &headings_config()).unwrap();
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let fixed = parse(&source("inline"), &graduated(headings), &headings_config()).unwrap();
+    same_deck(&parsed, &fixed);
+    // a `:::` too many is ignored, with a warning, and the next slide is split off
+    let extra = text.replacen(":::\n\n---\n\n## Next", ":::\n:::\n\n---\n\n## Next", 1);
+    let parsed = parse_text(&extra).unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 15)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.contains("closes no directive, so it is ignored"),
         "{message}"
     );
+    assert!(message.contains("one `:::` too many"), "{message}");
+    assert_eq!(parsed.deck.slides.len(), 3);
+    same_deck(&parsed, &parse_text(text).unwrap());
+    // a block runs to its own `:::`, in headings mode too: the `fragment` without one holds
+    // the next slide heading, and is reported
+    let missing = "# One\n\n:::fragment\n:::small\nx\n:::\n\n# Two\n\ny\n";
+    let parsed = parse(&source("inline"), missing, &headings_config()).unwrap();
+    assert_eq!(parsed.deck.slides.len(), 1, "{:?}", parsed.diagnostics);
+    assert!(html(&parsed.deck.slides[0]).contains("<h1>Two</h1>"));
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 3)]);
 }
 
 /// A3 fix round: a `:::name a:b` line comrak did not open is reported once, with the fix,

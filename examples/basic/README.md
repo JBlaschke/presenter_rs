@@ -57,5 +57,5 @@ With a checkout and no installed binary, use `cargo run --` in place of `present
 | 14 | Raw HTML: an embedded page | raw HTML, a bundled local `<iframe>` | `<iframe src="figures/embed.html" …>` |
 | 15 | Thank you | section layout | `# Thank you {layout=section}` |
 
-Nested directives need a longer outer fence: `::::columns` … `::::` around `:::column` …
-`:::` (slide 5).
+Nested directives can share one fence length, or take a longer outer fence as slide 5 does:
+`::::columns` … `::::` around `:::column` … `:::`.

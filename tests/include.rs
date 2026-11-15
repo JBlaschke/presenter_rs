@@ -525,6 +525,52 @@ fn slide_warnings_name_the_included_file() {
     );
 }
 
+/// dialect §4: an ignored `:::` line in an included file is reported there, and makes no
+/// slide of its own there either.
+#[test]
+fn ignored_lines_in_an_included_file_are_reported_there() {
+    let dir = project(&[
+        (
+            "deck.md",
+            "# Main\n\n---\n\n:::include part.md\n:::\n\n---\n\n# End\n",
+        ),
+        (
+            "part.md",
+            ":::\n\n---\n\n# P1\n\n:::fragment\nA\n:::\n:::\n\n---\n\n# P2\n",
+        ),
+    ]);
+    let deck = dir.path().join("deck.md");
+    let part = dir.path().join("part.md");
+    let parsed = parse(&deck).unwrap();
+    assert_eq!(
+        titles(&parsed.deck),
+        [
+            ("Main".to_string(), vec![]),
+            ("P1".to_string(), vec![]),
+            ("P2".to_string(), vec![]),
+            ("End".to_string(), vec![]),
+        ]
+    );
+    let found: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| {
+            (
+                d.code,
+                d.path.clone(),
+                d.span.as_ref().map(|s| s.start_line),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("invalid-directive", Some(part.clone()), Some(1)),
+            ("invalid-directive", Some(part), Some(10)),
+        ]
+    );
+}
+
 #[test]
 fn headings_mode_decks_include_too() {
     let dir = project(&[
@@ -650,6 +696,8 @@ fn a_notebook_cannot_include() {
         found,
         [
             ("include-in-notebook", Some(0), 3),
+            // the second cell's include has no closing fence
+            ("invalid-directive", Some(1), 1),
             ("include-in-notebook", Some(1), 1),
         ]
     );

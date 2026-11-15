@@ -1411,6 +1411,67 @@ fn attachment_urls_spelled_differently_from_the_name_resolve() {
     assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
 }
 
+/// Dialect §4 in notebooks: a closing fence closes the innermost open directive, in a cell
+/// read as one slide and in a cell split at its separators.
+#[test]
+fn directives_nest_with_fences_of_one_length_in_cells() {
+    let nested = ":::columns\n:::column\n:::small\nA\n:::\n:::\n:::column\nB\n:::\n:::\n";
+    let columns = |body: &str| {
+        assert_eq!(body.matches("<div class=\"column\">").count(), 2, "{body}");
+        assert!(
+            body.contains(
+                "<div class=\"small\">\n<p>A</p>\n</div>\n</div>\n<div class=\"column\">"
+            ),
+            "{body}"
+        );
+    };
+    let parsed = inline(json!([md(nested, json!({}))]));
+    assert_eq!(parsed.deck.slides.len(), 1);
+    columns(html(&parsed.deck.slides[0].blocks[0]));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
+
+    let mut config = Config::default();
+    config.notebook.split_markdown_cells = true;
+    let cell = md(&format!("{nested}\n---\n\nNext\n"), json!({}));
+    let parsed = parse_inline(&notebook(json!([cell]), python()), &config).unwrap();
+    assert_eq!(parsed.deck.slides.len(), 2);
+    columns(html(&parsed.deck.slides[0].blocks[0]));
+    assert!(html(&parsed.deck.slides[1].blocks[0]).contains("<p>Next</p>"));
+    assert!(parsed.diagnostics.is_empty(), "{:?}", codes(&parsed));
+}
+
+/// Dialect §4 in notebooks: a `:::` with nothing to close is ignored, and a directive with
+/// no closing fence runs to the end of its cell; both warnings name the cell and its line.
+#[test]
+fn ignored_fences_and_unclosed_directives_in_cells() {
+    let parsed = inline(json!([
+        md("Intro\n", json!({})),
+        md("x\n\n:::fragment\nA\n:::\n:::\n\n:::note\nB\n", json!({})),
+        md("After.\n", json!({})),
+    ]));
+    let found: Vec<_> = codes(&parsed)
+        .into_iter()
+        .filter(|(code, ..)| *code == "invalid-directive")
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("invalid-directive", Some(1), 6),
+            ("invalid-directive", Some(1), 8)
+        ]
+    );
+    let body: String = parsed
+        .deck
+        .slides
+        .iter()
+        .flat_map(|slide| &slide.blocks)
+        .map(html)
+        .collect();
+    assert!(!body.contains("presenter:ignored-fence"), "{body}");
+    // the note ends with its cell: the next cell is not in it
+    assert!(body.contains("<p>After.</p>"), "{body}");
+}
+
 /// One markdown cell (`source`, with the attachment `a+b.png`) parsed with `config`.
 fn attachment_cell(source: &str, config: &Config) -> Parsed {
     let cell = json!({

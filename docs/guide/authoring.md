@@ -248,7 +248,8 @@ block becomes `<div class="name">`.
 | `:::include part2.md` | the slides of another Markdown file or a notebook ([Including files](#including-files)) |
 | `:::anything a b key=v` | `<div class="anything a b" data-key="v">`, for your theme's CSS |
 
-To nest directives, make the **outer** fence longer than the inner ones:
+Directives nest: a `:::` line closes the innermost `:::` block that is still open. A longer
+fence on the outer block makes the pairs easier to see:
 
 ```markdown
 ::::columns widths="2fr 3fr"
@@ -263,9 +264,47 @@ The figure is a local file.
 
 ![Two columns](../screenshots/columns.png)
 
-With fences of the same length, the first `:::` closes the outer block, and the outer
-block's own `:::` then opens an empty one that swallows everything up to the next `:::`
-line (separators included); presenter warns about it.
+Fences of one length nest just as well, here three levels deep:
+
+```markdown
+:::columns
+:::column
+:::small
+Small print in the left column.
+:::
+:::
+:::column
+The right column.
+:::
+:::
+```
+
+In general, a closing fence closes the innermost of the open blocks with the longest fence
+that is not longer than its own, and anything still open inside that block: `::::` closes
+the innermost `::::` block, or the innermost `:::` one when no `::::` block is open. Longer
+outer fences thus pair up as they always have.
+
+A `:::` closes a block wherever it is inside it, also in a code block, so a code block that
+shows a `:::` line inside a block needs a longer fence around it: `::::note`, the code block,
+then `::::`.
+
+Every block runs to its own closing fence, and a slide's end does not end it. A block
+whose `:::` is missing runs on to the end of the file (or notebook cell), or to the longer
+fence that closes a block around it, and a `---` or slide heading inside it starts no slide;
+presenter warns about the block. A `:::` line with nothing left to close is ignored, with a
+warning: it closes nothing, opens nothing and shows nothing. Such a line is usually one
+`:::` too many, or the `:::` meant for a block that one too many above it closed early.
+Because a block runs to the next `:::` that can close it, a missing `:::` and a `:::` too
+many further on pair up without a warning about either; `presenter check` then warns about
+each `---` inside the block.
+
+Inside a list item, block quote, footnote or definition, a `:::` closes the outermost
+directive it can within it, with everything in it. A `:::` in a list item or definition
+first closes a block around the list (or definition list) when it can, with that list and
+everything in it. Nested directives there need a longer outer fence, and every block around
+a list or definition list with directives in it needs a fence longer than those in it:
+`::::columns` … `::::column` around a list with `:::note` … `:::` in it, then `::::` …
+`::::`.
 
 Pandoc's form works too: `::: {.fragment .fade-up}` is `:::fragment fade-up`,
 `::: {#intro .note}` adds `id="intro"`, and `::: {.notes}` is `:::notes`.

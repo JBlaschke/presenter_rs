@@ -208,12 +208,60 @@ the node to `HtmlInline`/`HtmlBlock` before formatting. The reveal-compat
 
 ## 4. Directives
 
-`:::name arg arg` … `:::` is a comrak block directive. To nest directives the **outer**
-fence must be longer than the inner ones (`::::columns` … `::::` around `:::column` … `:::`):
-comrak 0.56 closes the first open directive whose fence is not longer than the closing fence,
-so same-length or indented inner fences close the outer directive early (verified by T01,
-contract change 2026-10-08). Default rendering by comrak is `<div class="name arg arg">…</div>`, which is
-already right for reveal (`fragment`, `r-stack`, `r-fit-text`, …). We special-case:
+`:::name arg arg` … `:::` is a comrak block directive. A closing fence closes the innermost
+open directive (contract change 2026-11-14): of the open directives whose fence is not
+longer than the closing fence (and whose indentation lets the fence close them), the
+innermost one among those with the longest fence; directives still open inside it close with
+it. Directives therefore nest with fences of one length, as pandoc reads them
+(`:::columns` … `:::column` … `:::small` … `:::` … `:::` … `:::`), and with a longer outer
+fence (`::::columns` … `::::` around `:::column` … `:::`). comrak 0.56 itself gives a closing
+fence to the *outermost* such directive (verified by T01, contract change 2026-10-08), so the
+frontend reads the fences again and lengthens outer fences before the final parse
+(`markdown::nesting` has the details). Only colons are added to fence lines, so line numbers
+do not change. This applies to directives whose ancestors are all directives: inside a list
+item, block quote, footnote or definition comrak's rule stays, and the outer fence must be
+longer. A bare `:::` line closes a directive it can close wherever it is inside it, as in
+comrak, which looks for closing fences before it looks at what is inside a directive: also
+in a code block, an HTML block, a list item or a definition (contract change 2026-11-15). A code block
+that shows a `:::` line inside a `:::` directive therefore needs the directive's fences to be
+longer (`::::note` … `::::`). In a list item or definition the line closes a directive around
+the list (or definition list) when it is indented by at most 3 columns more than comrak
+strips there (as much as the most indented fence of the directives around that one is
+indented; nothing at the top), and closes that list and everything in it with the directive:
+comrak looks at the directives around the list first, and the dialect's rule picks the one it
+closes among them (the innermost of those with the longest fence).
+Directives nest 32 deep at most: when comrak's reading or the dialect's nests deeper, the
+whole text (the deck, or a notebook cell) is read as comrak reads it, which is an
+`invalid-directive` warning on its first directive line, and directives left open there are
+not reported (bare `:::` lines are still ignored, below). The same warning says when the
+frontend cannot rewrite the fences for comrak to read them as the dialect does, or cannot
+take the ignored lines out (it has not happened with real decks); the text is then read as
+comrak reads it too.
+
+A bare `:::` line opens no directive (updated 2026-11-15). One with no directive left to
+close is ignored: it renders nothing and is an `invalid-directive` warning (§10) that says
+why it closes nothing. The same holds for a `:::` followed only by characters that read as
+white space or as nothing but are not a space or tab (a no-break or full-width space, or a
+character reference such as `&#32;`): comrak does not take it as a closing fence, so it
+closes nothing either. This holds everywhere, also inside a list item, block quote,
+footnote or definition, where comrak opens a directive without a name for such a line. The
+frontend replaces the line, from its colons to the end of the line, with an HTML comment
+(`<!--presenter:ignored-fence colons=N offset=M-->`, an HTML block that ends a paragraph as
+the fence line does, keeps a list tight and renders nothing), so line numbers do not
+change; where slides are split it counts as a blank line. A `:::` too many inside a directive still closes it early, and the `:::` meant for
+it is then the one ignored.
+
+A directive runs to its own closing fence; the end of a slide does not end it, and `---`
+lines and slide headings inside it start no slides. One with no closing fence of its own
+runs to the fence that closes a directive around it, or to the end of the text (the deck, or
+a notebook cell), and is an `invalid-directive` warning on its opening line. This is
+reported for directives whose ancestors are all directives; inside a list item, block
+quote, footnote or definition a directive ends with it, as in comrak, without a warning.
+Nothing is repaired: a missing `:::` and a `:::` too many further on pair up, and `presenter
+check` reports the `---` lines inside the directive (`separator-not-recognized`, §10).
+
+Default rendering by comrak is `<div class="name arg arg">…</div>`, which is already right
+for reveal (`fragment`, `r-stack`, `r-fit-text`, …). We special-case:
 
 | directive | rendered as | notes |
 |---|---|---|
@@ -286,11 +334,13 @@ escapes in the info string, so a value containing `"` must be single-quoted.
 > `::: {.column width="40%"}` is `:::column width=40%`, `::: {#intro .note}` adds
 > `id="intro"`, and `::: {.notes}` is `:::notes` (the first class is the name). `index=N` of
 > `:::fragment` must be a non-negative integer (reveal.js never shows a fragment with another
-> index); any other value is dropped with an `invalid-directive-arg` warning. A directive opened
-> by a bare `:::` line (mostly a nested closing fence as long as the outer one's, as pandoc
-> allows) is an `invalid-directive` warning that names the longer-outer-fence fix: the empty
-> `<div>` runs to the next `:::` line or to the end of the document, and `---` lines inside it
-> start no slides. A `:::name …` or `::: {.name …}` line comrak does not open (a `:` after the
+> index); any other value is dropped with an `invalid-directive-arg` warning. A bare `:::` line
+> with no directive left to close (one too many, or, inside a list item, block quote, footnote
+> or definition, a nested closing fence as long as the outer one's) is ignored with an
+> `invalid-directive` warning that says why it closes nothing (updated 2026-11-15: it opened
+> an empty `<div>` before, §4). A directive with no closing fence of its own (§4) is an
+> `invalid-directive` warning on its opening line, naming the fence that closes it or the end
+> of the document or notebook cell. A `:::name …` or `::: {.name …}` line comrak does not open (a `:` after the
 > fence, also pandoc's closing colons `::: {.notes} :::`) is one `invalid-directive` warning
 > naming the fix (`&#58;`, or no closing colons); the bare `:::` that closes it is not reported
 > again.
@@ -376,9 +426,9 @@ than the reveal-compat forms are passed through unchanged.
 
 > **A3 note (2026-10-09):** the Markdown frontend's own warnings, which `check` reports with the
 > lints above: `unparsed-attr-block` (§3.1), `unlifted-slide-attr` (§3.2), `asset-case-mismatch`
-> (§6), `front-matter-empty` and `front-matter-unclosed` (§2.1), `invalid-directive` for a bare
-> `:::` and for a directive line comrak does not open, and `invalid-directive-arg` for a bad
-> `:::fragment index=` (§4).
+> (§6), `front-matter-empty` and `front-matter-unclosed` (§2.1), `invalid-directive` for an
+> ignored `:::` line, a directive with no closing fence of its own, a directive line comrak
+> does not open and a text whose directives are read as comrak reads them, and `invalid-directive-arg` for a bad `:::fragment index=` (§4).
 
 ## 11. Fixtures (`tests/fixtures/md/`, created by T01, filled in by T11/T12)
 `minimal.md` (one slide), `separators.md` (horizontal, vertical, consecutive, inside code

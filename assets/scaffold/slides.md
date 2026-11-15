@@ -53,7 +53,7 @@ More effects: [fragments in reveal.js](https://revealjs.com/fragments/)
 
 ## Two columns
 
-<!-- Nested blocks need a longer outer fence: ::::columns around :::column. -->
+<!-- A ::: line closes the innermost open block; the longer ::::columns fence shows the pairs. -->
 ::::columns
 :::column
 **Content:** `slides.md`

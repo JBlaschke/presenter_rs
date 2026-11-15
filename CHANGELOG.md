@@ -11,6 +11,27 @@ publishes that section as the GitHub Release notes (see
 
 ## [Unreleased]
 
+### Changed
+- Directives nest with fences of one length, as in pandoc: a closing fence closes, of the
+  open directives whose fence is not longer than its own, the innermost one with the longest
+  fence. `:::small` inside a `:::column` inside `::::columns` now works: before, the `:::`
+  that closed the `small` closed its column too, and the column's own `:::` opened an empty
+  block that took in everything up to the next `:::` line, such as the next column. Decks
+  with a longer fence at every level of nesting read as before. A deck that let one `:::`
+  close two directives now leaves the outer one open, with a warning, so write the missing
+  `:::`. Inside a list item, block quote, footnote or definition, nested directives still
+  need a longer outer fence.
+- A `:::` line with nothing left to close is ignored, with an `invalid-directive` warning
+  that says why: the directive around it has a longer fence, the line is indented too far or
+  followed by white space other than a space or tab (such as a no-break space or `&#32;`), it
+  is in a list item, block quote or definition inside that directive, a `:::` in a list item
+  or definition may have closed an outer directive, or there is a `:::` too many. Before, it
+  opened an empty block that ran to the next `:::` line, and `---` lines in it started no
+  slides.
+- A directive runs to its own closing fence, also past the end of its slide. One without a
+  `:::` of its own is an `invalid-directive` warning, which says whether a longer fence that
+  closes a directive around it ends it, or the end of the deck (or notebook cell).
+
 ### Added
 - The default theme styles `:::callout` blocks: a tinted box like an alert's that holds any
   content, in the accent colour or the one a second word names (`:::callout tip`; also

@@ -100,6 +100,7 @@ use crate::error::{Diagnostic, Diagnostics, Error, Level, Result};
 use crate::ir::{Block, Deck, Slide, SourceKind, SourceSpan};
 use crate::markdown::frontmatter::split_front_matter;
 use crate::markdown::include::IncludedSource;
+use crate::markdown::nesting::renest_directives;
 use crate::markdown::split::{SplitMode, source_lines, split_with_source};
 use crate::markdown::{comrak_options, mark_empty_front_matter, starts_with_empty_front_matter};
 use crate::notebook::convert::codes::FRONT_MATTER_IGNORED;
@@ -701,11 +702,13 @@ fn lint_text(
         options.to_mut().extension.front_matter_delimiter = None;
     }
     let root = parse_document(&arena, text, &options);
+    // the deck's own read reports what it finds in the directives
+    let (root, text) = renest_directives(&arena, root, text, &options, &mut Diagnostics::new());
     if empty_front_matter {
         mark_empty_front_matter(root);
     }
-    let lines = source_lines(text);
-    let Some(opened) = opened_lines(root, text, &lines, split) else {
+    let lines = source_lines(&text);
+    let Some(opened) = opened_lines(root, &text, &lines, split) else {
         return Vec::new();
     };
     let reported = origin.reported(frontend);
@@ -1241,6 +1244,32 @@ mod tests {
                     "is part of a paragraph, so no slide starts here; put a blank line after it",
                 ),
             ],
+        );
+    }
+
+    #[test]
+    fn directives_nested_with_fences_of_one_length_are_read_as_the_deck_reads_them() {
+        let text = ":::columns\n:::column\nA\n:::\n:::column\nB\n:::\n:::\n\n---\n\nNext\n";
+        assert_eq!(check_text("deck.md", text), vec![]);
+        // a `---` in the second column is inside the columns
+        let text = ":::columns\n:::column\nA\n:::\n:::column\nB\n\n---\n\nC\n:::\n:::\n";
+        assert_warnings(
+            &separator_warnings(text),
+            &[(8, "is inside the `:::columns` directive (from line 1)")],
+        );
+        // the `:::` missing from the `fragment`: the last `:::` closes it, and it holds the
+        // `---` (a slide's end does not end it)
+        let text = ":::fragment\n:::small\nA\n:::\n\n---\n\nB\n:::\n";
+        assert_warnings(
+            &separator_warnings(text),
+            &[(6, "is inside the `:::fragment` directive (from line 1)")],
+        );
+        // nor does a slide heading in headings mode: the `fragment` holds slide `Two`
+        let text = "---\nslides:\n  split: headings\n---\n\n# One\n\n:::fragment\n:::small\nx\n\
+                    :::\n\n# Two\n\n:::note\ny\n\n---\n\nz\n:::\n:::\n";
+        assert_warnings(
+            &separator_warnings(text),
+            &[(18, "is inside the `:::fragment` directive (from line 8)")],
         );
     }
 
