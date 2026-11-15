@@ -21,6 +21,17 @@ publishes that section as the GitHub Release notes (see
   `--p-callout-color` on a class of its own.
 
 ### Fixed
+- `export pptx` text looks like the browser's in PowerPoint: lines break where the browser
+  broke them, keep their widths (letter spacing makes up for PowerPoint drawing a system
+  font as Arial, which is wider), and sit on the browser's baselines (PowerPoint's
+  whole-point line spacing and first-line placement are allowed for). The padding of
+  inline code and key caps counts in a line's width, and superscripts and subscripts
+  (footnote marks, and the scripts of inline math) are raised as far and drawn as large as
+  in the browser. A task list's checkboxes are its items' bullets, and the text of an item
+  that wraps lines up after its box. Before, text in boxed labels such as a pill wrapped
+  onto a second line, lists overflowed their slide, the lines of a long code block ran
+  lower and lower, footnote marks sat on the baseline at half size, and rounded boxes had
+  half the corner radius, their text off-centre, and outlines one border-half too big.
 - `export pptx` makes the translucent colour of text that a theme draws with `::before` or
   `::after` (such as a callout's title) opaque over what is behind it, as it already did for
   all other text. Keynote, Preview and QuickLook ignore alpha on text and showed such text

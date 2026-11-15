@@ -105,8 +105,14 @@ What the file holds (from reveal.js' print mode, ?print-pdf):
   - A slide taller than the page continues on extra slides, up to [reveal]
     pdfMaxPagesPerSlide, with the same pages as the PDF. A picture that runs off the
     slide, as on screen, hangs off the slide (the PDF cuts it off at the page's edge).
+  - Text keeps the browser's line breaks (as line breaks in its paragraphs) and every
+    line its width: letter spacing makes up for the font PowerPoint draws with (a
+    system font becomes Arial). PowerPoint rounds line spacing to whole points, so the
+    first and last lines of a long paragraph can be a few pixels off the browser's.
+  - Text is laid out as on screen, as in the HTML: code lines, which print a little
+    closer in the PDF, keep their screen spacing.
   - Fonts: PowerPoint substitutes a font the viewer's machine does not have, so text
-    may wrap differently there; a text box grows to fit when it is edited.
+    may run wider or narrower there; a text box grows to fit when it is edited.
   - Needs Chrome or Chromium (Edge and Brave work too); without one the command
     exits with code 3. Chrome gets 120 s to load the deck, plus 3 s per page.
   - The file is reproducible for one Chrome version: the same deck gives the same
