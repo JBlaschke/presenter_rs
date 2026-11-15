@@ -11,9 +11,12 @@
 //!    text is parsed again with the new options. `---` on line 1 directly followed by `---`
 //!    on line 2 is empty front matter (A3): the text is then parsed without comrak's front
 //!    matter extension, so the opening `---` is not paired with a later separator, and the
-//!    two rules become an empty `FrontMatter` node. Attribute blocks comrak rejected are
-//!    then read again ([`recover::recover_attr_blocks`], which may parse the text once more
-//!    with those blocks rewritten in comrak's own syntax; that text is used from then on);
+//!    two rules become an empty `FrontMatter` node. Directives nested with fences of one
+//!    length are then read as the dialect nests them ([`nesting::renest_directives`], which
+//!    may parse the text once more with longer outer fences), and attribute blocks comrak
+//!    rejected are read again ([`recover::recover_attr_blocks`], which may parse the text
+//!    once more with those blocks rewritten in comrak's own syntax); the rewritten text is
+//!    used from then on;
 //! 3. [`split::split_with_source`] splits the document into slides, and
 //!    `include::find_includes` finds the `:::include` slides (dialect §4.1, T48): each is
 //!    replaced by the slides of the file it names (`include::expand`, which parses that file
@@ -44,11 +47,13 @@ pub mod code;
 pub mod compat;
 pub mod frontmatter;
 pub mod include;
+pub mod nesting;
 pub mod postprocess;
 pub mod recover;
 pub mod render;
 pub mod split;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use comrak::nodes::{AstNode, NodeValue};
@@ -59,6 +64,7 @@ use crate::config::{Config, MarkdownConfig, SlideSplit, SlidesConfig};
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{Block, Deck, DeckMeta, Features, Parsed, Slide, SourceInfo};
 use crate::markdown::include::{Context, IncludedSource};
+use crate::markdown::nesting::{as_written, renest_directives};
 use crate::markdown::recover::recover_attr_blocks;
 use crate::markdown::render::{DirListings, RenderCtx, RenderMode, rewrite_slide_assets};
 use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
@@ -209,7 +215,8 @@ fn include_config(config: &Config, meta: &DeckMeta, defer: bool) -> Config {
 struct Front<'a> {
     /// The document, parsed with `opts` (attribute blocks comrak rejected read again).
     root: &'a AstNode<'a>,
-    /// The text `root` was parsed from (rewritten when attribute blocks were recovered).
+    /// The text `root` was parsed from (rewritten when nested directives needed longer
+    /// fences or attribute blocks were recovered).
     text: String,
     /// The deck metadata.
     meta: DeckMeta,
@@ -260,8 +267,20 @@ fn read_front<'a>(
     if opts.parse.smart != first_opts.parse.smart {
         root = parse_document(arena, text, &parse_options(&opts));
     }
-    let (root, text) =
-        recover_attr_blocks(arena, root, text, &parse_options(&opts), &mut diagnostics);
+    let (root, nested) =
+        renest_directives(arena, root, text, &parse_options(&opts), &mut diagnostics);
+    let (root, recovered) = recover_attr_blocks(
+        arena,
+        root,
+        &nested,
+        &parse_options(&opts),
+        &mut diagnostics,
+    );
+    if let Cow::Owned(_) = recovered {
+        // a new tree, whose directives the warnings need as written
+        as_written(root, text);
+    }
+    let text = recovered;
     if empty_front_matter {
         mark_empty_front_matter(root);
     }

@@ -8,9 +8,9 @@
 #   - `:::columns widths="1fr 2fr"` (a quoted arg with a space) →
 #     <div class="columns" style="grid-template-columns: 1fr 2fr">, with nested
 #     `:::column` / `:::column width=40%` → <div class="column">;
-#   - NESTING with comrak 0.56: the OUTER fence must be longer than the inner ones
-#     (`::::columns` … `::::` around `:::column` … `:::`). With equal-length fences the
-#     first `:::` closes the outer directive.
+#   - NESTING: a closing fence closes the innermost open directive (contract change
+#     2026-11-14), so fences of one length nest; this deck writes the longer outer
+#     fence (`::::columns` … `::::` around `:::column` … `:::`), which reads the same.
 #   - any other name → comrak's default <div class="name args">: `:::center`,
 #     `:::warning large` (extra tokens are classes), `:::r-stack`;
 #   - unconsumed `key=value` args → data-<key>="<value>": `:::callout tip title=Hint`.

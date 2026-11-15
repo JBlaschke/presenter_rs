@@ -131,6 +131,7 @@ use crate::ir::{
 };
 use crate::markdown::attrs::{ParsedAttrs, SlideAttrs};
 use crate::markdown::frontmatter::{meta_from_json, parse_front_matter, split_front_matter};
+use crate::markdown::nesting::renest_directives;
 use crate::markdown::render::{
     RenderCtx, RenderMode, Rendered, has_math_markup, html_attr_values, html_start_tags,
     percent_decode, render_fragment, render_fragment_with_lift, render_nodes, rewrite_html_assets,
@@ -923,6 +924,15 @@ impl<'a> Converter<'a> {
         let mut opts = self.opts.clone();
         opts.extension.front_matter_delimiter = None;
         let root = parse_document(&arena, text, &opts);
+        let mut local = Diagnostics::new();
+        let (root, text) = renest_directives(&arena, root, text, &opts, &mut local);
+        let span = cell.span(index);
+        let path = &self.source.path;
+        self.diags.extend(
+            local
+                .into_iter()
+                .map(|d| relocate(d, Some(&span), offset, path)),
+        );
         let Some(first) = root.first_child() else {
             return Ok(());
         };
@@ -933,7 +943,7 @@ impl<'a> Converter<'a> {
             Some(heading) if !self.cur_is_empty() => heading.data_mut().attrs.take(),
             _ => None,
         };
-        let raw = split_with_source(root, text, SplitMode::Rules)
+        let raw = split_with_source(root, &text, SplitMode::Rules)
             .map_err(|err| cell_error(err, &self.source.path, index, offset));
         if let (Some(heading), Some(kept)) = (heading, kept) {
             heading.data_mut().attrs = Some(kept);

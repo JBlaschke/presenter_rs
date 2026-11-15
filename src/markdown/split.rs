@@ -114,7 +114,7 @@ use comrak::nodes::{AstNode, NodeValue};
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::SourceSpan;
 use crate::markdown::attrs::{ParsedAttrs, SlideAttrs, parse_attr_block};
-use crate::markdown::{compat, render};
+use crate::markdown::{compat, nesting, render};
 
 /// How slide boundaries are found (`slides.split` in the config).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,6 +790,8 @@ impl<'a, 's> Builder<'a, 's> {
                 }
                 // placed by their source line, see `flush_footnotes`
                 NodeValue::FootnoteDefinition(_) => return Ok(()),
+                // a `:::` line the dialect ignores: no content, as if the line were blank
+                NodeValue::HtmlBlock(_) if nesting::is_marker(node) => return Ok(()),
                 _ => lines,
             }
         };

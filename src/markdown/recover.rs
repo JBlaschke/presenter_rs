@@ -487,7 +487,7 @@ fn read_by_comrak<'a>(root: &'a AstNode<'a>, targets: &[Target<'_>]) -> Vec<bool
 /// end a line, and a leading byte-order mark stays in line 1, since comrak counts its bytes
 /// in that line's columns (unlike [`source_lines`](crate::markdown::split::source_lines),
 /// which drops it). Returns each line's start offset in `text` and its text.
-fn split_lines(text: &str) -> (Vec<usize>, Vec<&str>) {
+pub(crate) fn split_lines(text: &str) -> (Vec<usize>, Vec<&str>) {
     let starts = line_starts(text);
     let lines = starts
         .iter()
