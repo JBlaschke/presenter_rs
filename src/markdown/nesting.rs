@@ -448,6 +448,19 @@ enum Fallback {
     Strays,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many rewritten texts [`renest`] parsed on this thread (tests count them).
+    static REPARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one parse of a rewritten text in [`renest`] (`REPARSES`, in tests); nothing
+/// outside tests.
+fn count_reparse() {
+    #[cfg(test)]
+    REPARSES.set(REPARSES.get() + 1);
+}
+
 /// How many times the text may be parsed again ([`ATTEMPTS`], [`REPARSE_BUDGET`]).
 fn attempts(text: &str) -> usize {
     (REPARSE_BUDGET / text.len().max(1)).clamp(*ATTEMPTS.start(), *ATTEMPTS.end())
@@ -578,6 +591,7 @@ fn renest<'a, 't>(
             return unchanged(Err(Fallback::Unread));
         };
         let new_root = parse_document(arena, &edited, opts);
+        count_reparse();
         let (_, new_lines) = text_lines(&edited);
         let new_scopes = Scopes::new(new_root, &new_lines, bom);
         let Some(new_found) = collect(&new_scopes, &new_lines) else {
@@ -2582,6 +2596,7 @@ fn report_fallback(line: Option<usize>, fallback: Fallback, diagnostics: &mut Di
 mod tests {
     use super::*;
     use crate::markdown::split::dialect_options;
+    use std::time::{Duration, Instant};
 
     /// The text as the dialect reads it (rewritten or not), its tree ([`tree`]), and the
     /// lines and messages of the warnings, without those for ignored `:::` lines
@@ -2633,6 +2648,25 @@ mod tests {
     fn renest(text: &str) -> (String, String) {
         let (edited, tree, _) = renest_warned(text);
         (edited, tree)
+    }
+
+    /// The time comrak takes to parse `text` (the mean of a parse before `work` and one
+    /// after it), the time `work` takes, and what it returns. Tests of how renesting scales
+    /// bound the ratio of the two times, not a time: a slow or busy machine slows both alike
+    /// (CI runs the tests side by side, and took more than 20 s for what takes 6 s here),
+    /// but work that grows faster with the text than comrak's parse takes ever more times
+    /// as long.
+    fn timed<T>(text: &str, work: impl FnOnce() -> T) -> (Duration, Duration, T) {
+        let parse = || {
+            let started = Instant::now();
+            parse_document(&Arena::new(), text, &dialect_options());
+            started.elapsed()
+        };
+        let before = parse();
+        let started = Instant::now();
+        let done = work();
+        let working = started.elapsed();
+        ((before + parse()) / 2, working, done)
     }
 
     /// The lines of the warnings [`renest_warned`] finds.
@@ -3102,9 +3136,9 @@ Numbers went up.
             .chain((0..n).map(|level| format!("{}\n", ":".repeat(3 + level))))
             .collect();
         assert_eq!(edited(&deep(n)), (expected, false, Vec::new(), 0));
-        let started = std::time::Instant::now();
         let text = deep(3000);
-        let (edited, unnamed, warnings, ignored) = edited(&text);
+        let (parsing, renesting, (edited, unnamed, warnings, ignored)) =
+            timed(&text, || edited(&text));
         // no fence is made longer; comrak's reading stays, and its `:::` lines that close
         // nothing are ignored all the same; a warning says why the nesting is comrak's, and
         // none is about what stays open
@@ -3121,9 +3155,13 @@ Numbers went up.
             "{warnings:?}"
         );
         assert_eq!(ignored, 2999);
-        // took tens of seconds when the depth was not bounded (now well under one, in a debug
-        // build; the bound leaves room for slow machines)
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // took tens of seconds when the depth was not bounded: renesting takes about 13 times
+        // as long as comrak's parse here (which is quadratic in the depth), and took about 140
+        // times as long with no bound ([`timed`])
+        assert!(
+            renesting < parsing * 40,
+            "renesting took {renesting:?}, parsing {parsing:?}"
+        );
     }
 
     #[test]
@@ -3131,47 +3169,59 @@ Numbers went up.
         // each parse settles one more of these code blocks, and every rewrite that makes
         // markers of the fences from a line on leaves each `a` past it open, so that comrak's
         // tree nests about as deep as there are code blocks left: counting only the bytes
-        // parsed, 221 parses took 11 s in a release build; with the lines of the directives,
-        // the text is left as comrak reads it after a few
-        let started = std::time::Instant::now();
+        // parsed took 108 parses here (a minute in a debug build); with the lines of the
+        // directives, the text is left as comrak reads it after 10, which take about 500
+        // times as long as comrak's parse of the text as written ([`timed`])
         let text = ":::a\n- ```\n  :::\n```\n".repeat(3600);
-        let (edited, _, warnings) = renest_warned(&text);
+        let before = REPARSES.get();
+        let (parsing, renesting, (edited, _, warnings)) = timed(&text, || renest_warned(&text));
+        let parses = REPARSES.get() - before;
         assert_eq!(edited, text);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].1.starts_with("presenter could not rewrite"),
             "{warnings:?}"
         );
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(parses <= 20, "{parses} parses");
+        assert!(
+            renesting < parsing * 2000,
+            "renesting took {renesting:?}, parsing {parsing:?}"
+        );
     }
 
     #[test]
     fn many_directives_take_linear_time() {
-        // collect and the reading were quadratic in the number of fences: a debug build takes
-        // about 2 s here, and took about 40 s with a quadratic lookup in collect
-        let started = std::time::Instant::now();
+        // collect and the reading were quadratic in the number of fences: renesting these
+        // texts takes about 5 times as long as comrak's parse of them, and took about 60 times
+        // as long with a quadratic lookup in collect ([`timed`])
+        let mut parsing = Duration::ZERO;
+        let mut renesting = Duration::ZERO;
+        let mut renested = |text: &str| {
+            let (one_parse, one_renesting, (edited, _)) = timed(text, || renest(text));
+            parsing += one_parse;
+            renesting += one_renesting;
+            edited
+        };
         let text = ":::fragment\nA\n:::\n\n---\n\n".repeat(80_000);
-        let (edited, _) = renest(&text);
-        assert_eq!(edited, text);
+        assert_eq!(renested(&text), text);
         let text = ":::fragment\nA\n:::\n\n".repeat(80_000);
-        let (edited, _) = renest(&text);
-        assert_eq!(edited, text);
+        assert_eq!(renested(&text), text);
         // the dialect's reading nests as deep as there are `a`s (comrak's, two deep): reading
         // stops past MAX_DEPTH, and the text is left as comrak reads it
         let text = ":::a\n:::b\n:::\n".repeat(40_000);
-        let (edited, _) = renest(&text);
-        assert_eq!(edited, text);
+        assert_eq!(renested(&text), text);
         let text = format!(
             "::::a\n{}::::\n",
             format!("{}\n---\n\n", "\n:::c\n:::d\n:::\n".repeat(1000)).repeat(31)
         );
-        let (edited, _) = renest(&text);
-        assert_eq!(edited, text);
+        assert_eq!(renested(&text), text);
         // strays, all made markers in one rewrite
         let text = ":::fragment\nA\n:::\n:::\n\n".repeat(40_000);
-        let (edited, _) = renest(&text);
-        assert_eq!(edited.matches(&marker(0)).count(), 40_000);
-        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(renested(&text).matches(&marker(0)).count(), 40_000);
+        assert!(
+            renesting < parsing * 20,
+            "renesting took {renesting:?}, parsing {parsing:?}"
+        );
     }
 
     #[test]
