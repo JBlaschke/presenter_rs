@@ -359,7 +359,10 @@ the item's text.
 > fence, also pandoc's closing colons `::: {.notes} :::`, or the fence right after a task
 > item's checkbox) is one `invalid-directive` warning that says why and names the fix
 > (`&#58;`, no closing colons, or a line of its own); the bare `:::` that closes it is not
-> reported again.
+> reported again. Only colons typed as such count (updated 2026-11-16): a line whose fence
+> has a colon escaped or written as a character reference (`\:::small`, `&#58;::small`) is
+> text, which is how a deck shows such a line, so it is not reported, `\:::include` is no
+> include, and a bare `:::` after it is reported on its own.
 
 ## 5. Code blocks
 

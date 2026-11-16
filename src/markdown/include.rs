@@ -51,7 +51,7 @@ use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{DeckMeta, Features, Parsed, Slide, SourceInfo, SourceKind, SourceSpan};
 use crate::markdown::compat;
 use crate::markdown::render::{is_include_info, is_notes_info, starts_task_item};
-use crate::markdown::split::RawSlide;
+use crate::markdown::split::{RawSlide, SourceLines};
 
 /// How deep includes may nest: a file included by the top-level deck is at depth 1, a file
 /// it includes at depth 2, and so on (markdown-dialect §4.1).
@@ -166,7 +166,7 @@ pub(crate) struct Expanded {
 /// The `:::include` directives of a split deck (module docs, step 1): for each horizontal
 /// slide of `slides`, the include it consists of, if it is an include slide.
 ///
-/// `lines` is the source the deck was split from ([`super::split::source_lines`]), `path`
+/// `source` is the source the deck was split from, `path`
 /// the including file (for errors), `headings` whether it is split in headings mode (for the
 /// hint of an include next to other content). Ignored slide attributes and notes are
 /// reported in `diagnostics` (no path). Errors: [`Error::Parse`] at the line of the first
@@ -175,7 +175,7 @@ pub(crate) struct Expanded {
 /// a heading).
 pub(crate) fn find_includes<'a>(
     slides: &[(RawSlide<'a>, Vec<RawSlide<'a>>)],
-    lines: &[&str],
+    source: &SourceLines,
     path: &Path,
     headings: bool,
     diagnostics: &mut Diagnostics,
@@ -185,10 +185,11 @@ pub(crate) fn find_includes<'a>(
         line: Some(line),
         message,
     };
+    let lines = source.lines.as_slice();
     let mut found = Vec::with_capacity(slides.len());
     for (slide, children) in slides {
         for raw in std::iter::once(slide).chain(children) {
-            check_nested(&raw.nodes).map_err(|(line, message)| error(line, message))?;
+            check_nested(&raw.nodes, source).map_err(|(line, message)| error(line, message))?;
         }
         for child in children {
             if let Some(node) = child.nodes.iter().find(|node| is_include(node)) {
@@ -215,10 +216,14 @@ pub(crate) fn find_includes<'a>(
 type Misuse = (usize, String);
 
 /// Errors for an `:::include` nested inside one of `nodes` (a list, a quote, another
-/// directive, …) and for a `:::include` line comrak did not open as a directive.
-fn check_nested<'a>(nodes: &[&'a AstNode<'a>]) -> std::result::Result<(), Misuse> {
+/// directive, …) and for a `:::include` line comrak did not open as a directive (its colons
+/// typed as such in `source`).
+fn check_nested<'a>(
+    nodes: &[&'a AstNode<'a>],
+    source: &SourceLines,
+) -> std::result::Result<(), Misuse> {
     for node in nodes.iter().flat_map(|node| node.descendants()) {
-        if let Some(message) = unopened_include(node) {
+        if let Some(message) = unopened_include(node, source) {
             return Err((start_line(node), message));
         }
         let Some(parent) = node.parent() else {
@@ -445,8 +450,10 @@ fn include_path(info: &str) -> std::result::Result<String, String> {
 
 /// For a paragraph that starts like `:::include …` (comrak did not open a directive, because
 /// of a `:` after the fence, or because it is the text of a task item, which is no place for
-/// an include anyway), the error message.
-fn unopened_include<'a>(node: &'a AstNode<'a>) -> Option<String> {
+/// an include anyway), the error message. Not for one whose colons are not typed as such in
+/// `source` (`\:::include`, `&#58;::include`: the way to show the line as text,
+/// [`SourceLines::typed_colons`]).
+fn unopened_include<'a>(node: &'a AstNode<'a>, source: &SourceLines) -> Option<String> {
     if !matches!(node.data().value, NodeValue::Paragraph) {
         return None;
     }
@@ -458,7 +465,9 @@ fn unopened_include<'a>(node: &'a AstNode<'a>) -> Option<String> {
     let line = text.lines().next().unwrap_or_default();
     let rest = line.trim_start_matches(':');
     let after = rest.trim_start().strip_prefix("include")?;
-    if line.len() - rest.len() < 3 || !(after.is_empty() || after.starts_with(char::is_whitespace))
+    if line.len() - rest.len() < 3
+        || !(after.is_empty() || after.starts_with(char::is_whitespace))
+        || !source.typed_colons(node)
     {
         return None;
     }
@@ -834,7 +843,7 @@ mod tests {
 
     use super::*;
     use crate::markdown::comrak_options;
-    use crate::markdown::split::{SplitMode, source_lines, split_with_source};
+    use crate::markdown::split::{SplitMode, split_with_source};
 
     /// `find_includes` on `text` (rules mode, or headings mode with `headings`): the include
     /// of each horizontal slide, or the error's line and message; and the warnings' codes.
@@ -847,7 +856,7 @@ mod tests {
             false => SplitMode::Rules,
         };
         let raw = split_with_source(root, text, mode).unwrap();
-        let lines = source_lines(text);
+        let lines = SourceLines::new(text);
         let mut diagnostics = Diagnostics::new();
         let found = find_includes(
             &raw.slides,

@@ -42,7 +42,7 @@ use comrak::nodes::{AstNode, NodeValue};
 
 use crate::error::Result;
 use crate::markdown::render::{self, RenderCtx, RenderMode, Rendered, render_nodes};
-use crate::markdown::split;
+use crate::markdown::split::{self, SourceLines};
 
 /// The text after `.slide:` when `literal` (an HTML block's literal) is exactly one HTML
 /// comment, surrounded by optional whitespace, whose content starts with `.slide:` (after
@@ -233,8 +233,8 @@ fn strip_note_marker<'a>(paragraph: &'a AstNode<'a>, marker: &str) -> bool {
 
 /// Renders one deck slide ([`render_nodes`]) with the `Note:` convention (dialect §7): in
 /// [`RenderMode::Deck`], the first top-level paragraph starting with `Note:` or `Notes:`
-/// (`note_marker`; `lines` is the deck's source split by `split::source_lines`, or `None`
-/// to read the marker from the AST only) ends the body. That paragraph (without the marker;
+/// (`note_marker`; `source` is the deck's source, or `None` to read the marker, and what
+/// [`render_nodes`] reads as typed, from the AST only) ends the body. That paragraph (without the marker;
 /// dropped when nothing else is in it) and every later node are rendered as a second document
 /// and become notes. Footnote definitions, which the splitter keeps last, go with the part
 /// they were written in (by source line). The `Note:` part comes first in the slide's notes,
@@ -247,10 +247,11 @@ fn strip_note_marker<'a>(paragraph: &'a AstNode<'a>, marker: &str) -> bool {
 pub fn render_slide<'a>(
     arena: &'a Arena<'a>,
     nodes: &[&'a AstNode<'a>],
-    lines: Option<&[&str]>,
+    source: Option<&SourceLines>,
     opts: &Options,
     ctx: &mut RenderCtx,
 ) -> Result<Rendered> {
+    let lines = source.map(|source| source.lines.as_slice());
     let found = match ctx.mode {
         RenderMode::Deck => nodes
             .iter()
@@ -259,7 +260,7 @@ pub fn render_slide<'a>(
         RenderMode::Notebook => None,
     };
     let Some((at, marker)) = found else {
-        return render_nodes(arena, nodes, opts, ctx);
+        return render_nodes(arena, nodes, source, opts, ctx);
     };
     let cut_line = nodes[at].data().sourcepos.start.line;
     tracing::debug!(
@@ -285,8 +286,8 @@ pub fn render_slide<'a>(
             body.push(*node);
         }
     }
-    let mut rendered = render_nodes(arena, &body, opts, ctx)?;
-    let part = render_nodes(arena, &notes, opts, ctx)?;
+    let mut rendered = render_nodes(arena, &body, source, opts, ctx)?;
+    let part = render_nodes(arena, &notes, source, opts, ctx)?;
     let mut all = part.html;
     all.push_str(rendered.notes.as_deref().unwrap_or_default());
     all.push_str(part.notes.as_deref().unwrap_or_default());
@@ -385,8 +386,8 @@ mod tests {
         let arena = Arena::new();
         let root = comrak::parse_document(&arena, text, &opts);
         let nodes: Vec<_> = root.children().collect();
-        let lines = split::source_lines(text);
-        let lines = source.then_some(lines.as_slice());
+        let lines = SourceLines::new(text);
+        let lines = source.then_some(&lines);
         let rendered = render_slide(&arena, &nodes, lines, &opts, &mut ctx).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         rendered

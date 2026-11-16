@@ -106,6 +106,7 @@ use crate::error::Diagnostics;
 use crate::ir::SourceSpan;
 use crate::markdown::recover::split_lines;
 use crate::markdown::render::{directive_label, report_ignored_fences};
+use crate::markdown::split::SourceLines;
 
 /// How many times the text may be parsed again at least and at most (module docs, steps 4
 /// and 5): as often as [`REPARSE_BUDGET`] allows within these bounds. A parse of the
@@ -382,7 +383,8 @@ pub fn renest_directives<'a, 't>(
             _ => None,
         })
     };
-    report_ignored_fences(root, diagnostics, &mut around_footnote);
+    let source = SourceLines::new(&edited);
+    report_ignored_fences(root, &source, diagnostics, &mut around_footnote);
     finish_blocks(root, &edited, opts);
     (root, edited)
 }

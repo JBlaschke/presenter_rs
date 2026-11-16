@@ -137,7 +137,7 @@ use crate::markdown::render::{
     percent_decode, render_fragment, render_fragment_with_lift, render_nodes, rewrite_html_assets,
     rewrite_slide_assets,
 };
-use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
+use crate::markdown::split::{RawSlide, SourceLines, SplitMode, split_with_source};
 use crate::markdown::{comrak_options, postprocess};
 use crate::notebook::nbformat::{self, Cell, CellType, MultilineString, Notebook, SlideType};
 use crate::notebook::outputs::{OutputFiles, render_cell_outputs};
@@ -502,6 +502,8 @@ fn overlay(meta: &mut DeckMeta, later: DeckMeta) {
 /// Where rendered content and its diagnostics belong: one part of a split markdown cell.
 struct Part<'n, 'c> {
     arena: &'n Arena<'n>,
+    /// The cell's text the tree in `arena` was parsed from.
+    source: &'c SourceLines<'c>,
     cell: &'c Cell,
     index: usize,
     offset: usize,
@@ -961,8 +963,10 @@ impl<'a> Converter<'a> {
                 .filter(|d| d.code == SEPARATOR_NOT_RECOGNIZED)
                 .map(|d| relocate(d, Some(&span), offset, path)),
         );
+        let source = SourceLines::new(&text);
         let part = Part {
             arena: &arena,
+            source: &source,
             cell,
             index,
             offset,
@@ -1020,7 +1024,7 @@ impl<'a> Converter<'a> {
     ) -> Result<()> {
         let arena = part.arena;
         let mut rendered = self.render(Some(span), part.offset, |ctx, opts| {
-            render_nodes(arena, nodes, opts, ctx)
+            render_nodes(arena, nodes, Some(part.source), opts, ctx)
         })?;
         self.resolve_rendered(part.index, part.cell, &mut rendered, span);
         self.push_rendered(rendered, part.fragment, span)

@@ -1371,6 +1371,78 @@ fn unopened_directives_name_the_fix() {
     );
 }
 
+/// A `:::name` line whose colons are escaped or written as character references (`\:::small`,
+/// `&#58;::small`) is how an author shows such a line as text. comrak decodes the colons, but
+/// the dialect reads them as typed: no directive comrak did not open, so no warning, and no
+/// misplaced `:::include` either (dialect §4). A bare `:::` after such a line closes nothing,
+/// and has its own warning.
+#[test]
+fn escaped_directive_lines_are_text() {
+    for line in [
+        "\\:::small",
+        "&#58;::small",
+        ":&#58;:small",
+        "&colon;&colon;&colon;small",
+        "\\::: {.small}",
+        "\\:::note title=\"a:b\"",
+        "\\:::include part.md",
+        "&#58;::include part.md",
+    ] {
+        for text in [
+            format!("# T\n\n{line}\n"),
+            format!("# T\n\n> {line}\n"),
+            format!("# T\n\n- [ ] {line}\n"),
+            format!("# T\n\n[a]: https://example.org\n{line}\n"),
+            format!("\u{feff}{line}\n"),
+            format!("\u{feff}- [ ] {line}\n"),
+        ] {
+            let parsed = parse_text(&text).unwrap();
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{text:?}: {:?}",
+                parsed.diagnostics
+            );
+            let html = html(&parsed.deck.slides[0]);
+            assert!(
+                html.contains(":::") && !html.contains("<div"),
+                "{text:?}: {html}"
+            );
+        }
+    }
+    // the same lines with the colons typed are reported, in these places too
+    for text in [
+        "# T\n\n> :::small: x\n",
+        "# T\n\n- [ ] :::small\n",
+        "# T\n\n[a]: https://example.org\n:::small: x\n",
+        "\u{feff}:::small: x\n",
+        "\u{feff}- [ ] :::small\n",
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .map(|d| d.code)
+                .collect::<Vec<_>>(),
+            ["invalid-directive"],
+            "{text:?}"
+        );
+    }
+    let err = parse_text("# T\n\n:::include a:b.md\n").unwrap_err();
+    assert!(err.to_string().contains("`&#58;`"), "{err}");
+    // a `:::` after an escaped line closes nothing and says so; after a line comrak did not
+    // open, it is that line's closing fence, and that line's warning says it all
+    let parsed = parse_text("# T\n\n\\:::small\n\nx\n\n:::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 7)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.starts_with("this `:::` line closes no directive"),
+        "{message}"
+    );
+    let parsed = parse_text("# T\n\n:::small: x\n\nx\n\n:::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 3)]);
+}
+
 /// comrak's tasklist extension takes the checkbox from the start of a task item's text only
 /// after it has read the line, so a `:::name` after it opens no directive. The warning says
 /// so (there is no colon to blame), and as for any directive line comrak does not open, the

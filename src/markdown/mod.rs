@@ -67,7 +67,7 @@ use crate::markdown::include::{Context, IncludedSource};
 use crate::markdown::nesting::{as_written, renest_directives};
 use crate::markdown::recover::recover_attr_blocks;
 use crate::markdown::render::{DirListings, RenderCtx, RenderMode, rewrite_slide_assets};
-use crate::markdown::split::{RawSlide, SplitMode, split_with_source};
+use crate::markdown::split::{RawSlide, SourceLines, SplitMode, split_with_source};
 
 /// Parses a Markdown deck into the IR (see the module docs for the steps).
 ///
@@ -142,7 +142,7 @@ fn parse_with(
     let raw =
         split_with_source(root, &text, mode).map_err(|err| with_source_path(err, &source.path))?;
     diagnostics.extend(raw.diagnostics);
-    let lines = split::source_lines(&text);
+    let lines = SourceLines::new(&text);
     let headings = matches!(mode, SplitMode::Headings { .. });
     let found = include::find_includes(
         &raw.slides,
@@ -379,7 +379,7 @@ struct Stack<'a> {
 fn build_stack<'a>(
     arena: &'a Arena<'a>,
     stack: Stack<'a>,
-    lines: &[&str],
+    lines: &SourceLines,
     opts: &Options,
     ctx: &mut RenderCtx,
     features: &mut Features,
@@ -493,11 +493,11 @@ fn split_mode(slides: &SlidesConfig) -> SplitMode {
 }
 
 /// Renders one raw slide into an IR [`Slide`] (without children); `lines` is the source
-/// split by [`split::source_lines`] (for `Note:` paragraphs, T43).
+/// (for `Note:` paragraphs, T43, and the colons of `:::` lines as typed).
 fn build_slide<'a>(
     arena: &'a Arena<'a>,
     raw: RawSlide<'a>,
-    lines: &[&str],
+    lines: &SourceLines,
     opts: &Options,
     ctx: &mut RenderCtx,
     features: &mut Features,

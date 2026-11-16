@@ -23,7 +23,9 @@
 //! 3. **checks**: a paragraph that starts like a directive (`:::name …`, `::: {.name …}`) but
 //!    is not one is an `invalid-directive` warning: comrak does not open a directive whose
 //!    line has a `:` after the fence (`title="a:b"`, a URL, pandoc's closing `:::`); `&#58;`
-//!    is the way to write that colon;
+//!    is the way to write that colon. Its colons count as typed in the source the nodes were
+//!    parsed from ([`SourceLines::typed_colons`]): a line written `\:::name` or `&#58;::name`
+//!    shows the fence as text;
 //! 4. **assets** (§6): relative image URLs and relative `src` / `poster` attributes of raw
 //!    HTML start tags ([`rewrite_html_assets`]) are resolved against [`RenderCtx::base_dir`]:
 //!    an existing file is registered ([`AssetRegistry::register_file`]) and the URL becomes
@@ -125,7 +127,7 @@ use crate::markdown::code::{
 use crate::markdown::compat::is_invisible;
 use crate::markdown::nesting::{IgnoredFence, Kind, as_written, is_marker, renest_directives};
 use crate::markdown::recover::{fence_attrs, recover_attr_blocks, unparsed};
-use crate::markdown::split::{first_heading_text, lift_heading_attrs};
+use crate::markdown::split::{SourceLines, first_heading_text, lift_heading_attrs};
 
 /// The attribute every math element carries (`Features.math` is derived from it).
 const MATH_ATTR: &str = "data-math-style";
@@ -195,13 +197,16 @@ pub struct Rendered {
 /// afterwards they no longer belong to their original document. Heading attributes are
 /// *not* lifted here: callers that lift them onto a slide do so before calling this (the
 /// splitter already did for Markdown decks), and attributes still on a heading are written
-/// on the element.
+/// on the element. `source` is the text the nodes were parsed from, for pass 3 to read the
+/// colons as typed ([`SourceLines::typed_colons`]); with `None` it reads them as comrak
+/// decoded them.
 ///
 /// Errors: [`Error::MissingAsset`] for a missing local image when
 /// `ctx.missing_asset_is_error`.
 pub fn render_nodes<'a>(
     arena: &'a Arena<'a>,
     nodes: &[&'a AstNode<'a>],
+    source: Option<&SourceLines>,
     opts: &Options,
     ctx: &mut RenderCtx,
 ) -> Result<Rendered> {
@@ -210,7 +215,7 @@ pub fn render_nodes<'a>(
     for node in nodes {
         doc.append(node);
     }
-    let mut rendered = render_document(arena, doc, opts, ctx)?;
+    let mut rendered = render_document(arena, doc, source, opts, ctx)?;
     rendered.title = title;
     Ok(rendered)
 }
@@ -269,7 +274,8 @@ pub fn render_fragment_with_lift(
     } else {
         None
     };
-    let rendered = render_nodes(&arena, &nodes, opts, ctx)?;
+    let source = SourceLines::new(&recovered);
+    let rendered = render_nodes(&arena, &nodes, Some(&source), opts, ctx)?;
     Ok((rendered, lifted))
 }
 
@@ -619,12 +625,13 @@ fn attr_value(bytes: &[u8], at: usize) -> (Option<Range<usize>>, usize) {
 fn render_document<'a>(
     arena: &'a Arena<'a>,
     doc: &'a AstNode<'a>,
+    source: Option<&SourceLines>,
     opts: &Options,
     ctx: &mut RenderCtx,
 ) -> Result<Rendered> {
     drop_notebook_includes(doc, ctx);
-    let (notes, mut features) = extract_notes(arena, doc, opts, ctx)?;
-    check_unopened_directives(doc, ctx);
+    let (notes, mut features) = extract_notes(arena, doc, source, opts, ctx)?;
+    check_unopened_directives(doc, source, ctx);
     let _listings = DirListings::enter();
     rewrite_assets(doc, ctx)?;
     let footnotes = prepare_footnotes(doc, ctx);
@@ -649,6 +656,7 @@ fn render_document<'a>(
 fn extract_notes<'a>(
     arena: &'a Arena<'a>,
     doc: &'a AstNode<'a>,
+    source: Option<&SourceLines>,
     opts: &Options,
     ctx: &mut RenderCtx,
 ) -> Result<(Option<String>, Features)> {
@@ -679,7 +687,7 @@ fn extract_notes<'a>(
         for definition in definitions {
             notes_doc.append(definition);
         }
-        let rendered = render_document(arena, notes_doc, opts, ctx)?;
+        let rendered = render_document(arena, notes_doc, source, opts, ctx)?;
         html.push_str(&rendered.html);
         html.push_str(rendered.notes.as_deref().unwrap_or_default());
         features.merge(rendered.features);
@@ -693,14 +701,18 @@ fn is_notes(node: &AstNode<'_>) -> bool {
         NodeValue::BlockDirective(directive) if is_notes_info(&directive.info))
 }
 
-/// Pass 3: a paragraph whose text starts with `:::name` (or pandoc's `::: {.name …}`) is a
-/// directive comrak did not open (module docs): an `invalid-directive` warning on its first
-/// line, which says why and names the fix (a line of its own for the text of a task item,
-/// `&#58;` for a colon; no closing `:::` after a pandoc block) and, for `:::notes`, says
-/// that the speaker notes show on the slide.
-fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
+/// Pass 3: a paragraph whose text starts with `:::name` (or pandoc's `::: {.name …}`) as
+/// typed in `source` is a directive comrak did not open (module docs): an
+/// `invalid-directive` warning on its first line, which says why and names the fix (a line
+/// of its own for the text of a task item, `&#58;` for a colon; no closing `:::` after a
+/// pandoc block) and, for `:::notes`, says that the speaker notes show on the slide.
+fn check_unopened_directives<'a>(
+    doc: &'a AstNode<'a>,
+    source: Option<&SourceLines>,
+    ctx: &mut RenderCtx,
+) {
     for node in doc.descendants() {
-        let Some(unopened) = unopened_directive(node) else {
+        let Some(unopened) = unopened_directive(node, source) else {
             continue;
         };
         let name = &unopened.name;
@@ -763,8 +775,10 @@ struct Unopened {
 }
 
 /// The directive a paragraph starts like (`:::name …` or `::: {.name …}` on its first line,
-/// the name starting with a letter) but is not, for pass 3; `None` for any other node.
-fn unopened_directive<'a>(node: &'a AstNode<'a>) -> Option<Unopened> {
+/// the name starting with a letter) but is not, for pass 3; `None` for any other node, and
+/// for a paragraph whose colons are not typed as such in `source` (`&#58;::name`,
+/// `\:::name`: the way to show the line as text, [`SourceLines::typed_colons`]).
+fn unopened_directive<'a>(node: &'a AstNode<'a>, source: Option<&SourceLines>) -> Option<Unopened> {
     if !matches!(node.data().value, NodeValue::Paragraph) {
         return None;
     }
@@ -801,10 +815,8 @@ fn unopened_directive<'a>(node: &'a AstNode<'a>) -> Option<Unopened> {
             closing_colons: false,
         },
     };
-    unopened
-        .name
-        .starts_with(char::is_alphabetic)
-        .then_some(unopened)
+    let typed = || source.is_none_or(|source| source.typed_colons(node));
+    (unopened.name.starts_with(char::is_alphabetic) && typed()).then_some(unopened)
 }
 
 /// Pass 4: images and raw HTML `src`/`poster` (module docs).
@@ -1510,11 +1522,12 @@ fn write_directive<'a>(
 /// directives without a name that comrak still opens where the text was left as it was.
 /// Reported for the whole text at once, so that each warning sees the directives and
 /// containers around its line, also in speaker notes and on slides that are never rendered
-/// (an `:::include` slide). `around_footnote` gives the label of the innermost directive
-/// around a footnote definition of `root` (which comrak may have moved to the end of the
-/// document), if any.
+/// (an `:::include` slide). `source` is the text of `root`. `around_footnote` gives the
+/// label of the innermost directive around a footnote definition of `root` (which comrak may
+/// have moved to the end of the document), if any.
 pub(crate) fn report_ignored_fences<'a>(
     root: &'a AstNode<'a>,
+    source: &SourceLines,
     diagnostics: &mut Diagnostics,
     around_footnote: &mut dyn FnMut(&'a AstNode<'a>) -> Option<String>,
 ) {
@@ -1534,7 +1547,7 @@ pub(crate) fn report_ignored_fences<'a>(
             _ => None,
         };
         if let Some(fence) = fence {
-            report_ignored_fence(diagnostics, node, fence, around_footnote);
+            report_ignored_fence(diagnostics, node, fence, source, around_footnote);
         }
     }
 }
@@ -1545,11 +1558,14 @@ pub(crate) fn report_ignored_fences<'a>(
 /// other than spaces and tabs (written as such or as character references), that it is no
 /// closing fence at all ([`odd_fence_message`]); unless a `:::name` paragraph that pass 3
 /// reports comes before it among its siblings, after any directive or other ignored line
-/// (then it is that one's closing fence, and that line's warning says it all).
+/// (then it is that one's closing fence, and that line's warning says it all). A paragraph
+/// whose colons are escaped or written as character references is no such line: the author
+/// showed it as text, and a `:::` after it is reported.
 fn report_ignored_fence<'a>(
     diagnostics: &mut Diagnostics,
     node: &'a AstNode<'a>,
     fence: IgnoredFence,
+    source: &SourceLines,
     around_footnote: &mut dyn FnMut(&'a AstNode<'a>) -> Option<String>,
 ) {
     let after_unopened = node
@@ -1558,7 +1574,7 @@ fn report_ignored_fence<'a>(
         .take_while(|&sibling| {
             !matches!(sibling.data().value, NodeValue::BlockDirective(_)) && !is_marker(sibling)
         })
-        .any(|sibling| unopened_directive(sibling).is_some());
+        .any(|sibling| unopened_directive(sibling, Some(source)).is_some());
     if after_unopened {
         return;
     }
@@ -2898,6 +2914,35 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
     }
 
     #[test]
+    fn escaped_colons_are_no_directive_line_in_a_fragment() {
+        let text = "&#58;::small\n\n\\:::box title=\"a:b\"\n\n- [ ] \\:::small\n";
+        for mode in [RenderMode::Deck, RenderMode::Notebook] {
+            let (rendered, _, codes) = render_with(text, mode, false);
+            assert_eq!(codes, [], "{mode:?}");
+            assert!(rendered.html.starts_with("<p>:::small</p>\n"), "{mode:?}");
+        }
+        // after an escaped line, a `:::` that closes nothing is reported on its own
+        let (_, _, codes) = render_with("\\:::small\n\nx\n\n:::\n", RenderMode::Notebook, false);
+        assert_eq!(codes, [("invalid-directive", 5)]);
+        // the source is what tells: `render_nodes` without it reads the decoded text
+        let arena = Arena::new();
+        let opts = comrak_options(&MarkdownConfig::default());
+        let root = parse_document(&arena, "\\:::small\n", &opts);
+        let nodes: Vec<_> = root.children().collect();
+        let (mut assets, mut diagnostics) = (AssetRegistry::new(), Diagnostics::new());
+        let dir = fixture_dir();
+        let mut ctx = RenderCtx {
+            assets: &mut assets,
+            base_dir: &dir,
+            mode: RenderMode::Deck,
+            diagnostics: &mut diagnostics,
+            missing_asset_is_error: false,
+        };
+        render_nodes(&arena, &nodes, None, &opts, &mut ctx).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
     fn a_fence_followed_by_another_kind_of_space_is_reported_as_such() {
         let message_of = |text: &str| {
             let mut assets = AssetRegistry::new();
@@ -3428,7 +3473,7 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
             diagnostics: &mut diagnostics,
             missing_asset_is_error: true,
         };
-        let rendered = render_nodes(&arena, &nodes, &opts, &mut ctx).unwrap();
+        let rendered = render_nodes(&arena, &nodes, None, &opts, &mut ctx).unwrap();
         assert_eq!(rendered.html, "<h1>A</h1>\n<p>para</p>\n");
         assert_eq!(rendered.notes.as_deref(), Some("<p>n</p>\n"));
         assert_eq!(

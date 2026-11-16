@@ -77,6 +77,11 @@ publishes that section as the GitHub Release notes (see
   and the warning says to start the directive on the next line. It used to blame a `:`
   after the fence that was not there. A `- [ ] :::include` line is an error that says an
   include cannot be in a list.
+- A line that shows a directive fence as text, its colons escaped or written as character
+  references (`\:::small`, `&#58;::small`), is no longer reported as a directive comrak did
+  not open, with advice to write a colon as `&#58;` that it already followed, and
+  `\:::include part.md` is no longer an error. A bare `:::` after such a line closes nothing
+  and is now reported, as anywhere else.
 
 ## [0.1.1] - 2026-11-02
 
