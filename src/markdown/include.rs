@@ -50,7 +50,7 @@ use crate::config::Config;
 use crate::error::{Diagnostics, Error, Result};
 use crate::ir::{DeckMeta, Features, Parsed, Slide, SourceInfo, SourceKind, SourceSpan};
 use crate::markdown::compat;
-use crate::markdown::render::{is_include_info, is_notes_info};
+use crate::markdown::render::{is_include_info, is_notes_info, starts_task_item};
 use crate::markdown::split::RawSlide;
 
 /// How deep includes may nest: a file included by the top-level deck is at depth 1, a file
@@ -227,14 +227,18 @@ fn check_nested<'a>(nodes: &[&'a AstNode<'a>]) -> std::result::Result<(), Misuse
         if !is_include(&node) || matches!(parent.data().value, NodeValue::Document) {
             continue;
         }
-        let message = format!(
-            "`:::include` must be a top-level block of a slide of its own, not inside {}: an \
-             included file's slides replace that slide",
-            container_name(parent)
-        );
-        return Err((start_line(node), message));
+        return Err((start_line(node), nested_include(parent)));
     }
     Ok(())
+}
+
+/// The error for an `:::include` inside `parent`, a node that holds blocks.
+fn nested_include<'a>(parent: &'a AstNode<'a>) -> String {
+    format!(
+        "`:::include` must be a top-level block of a slide of its own, not inside {}: an \
+         included file's slides replace that slide",
+        container_name(parent)
+    )
 }
 
 /// What opened the vertical slide `child`, for messages: ``the `--` on line 8`` or, in
@@ -440,7 +444,8 @@ fn include_path(info: &str) -> std::result::Result<String, String> {
 }
 
 /// For a paragraph that starts like `:::include …` (comrak did not open a directive, because
-/// of a `:` after the fence), the error message.
+/// of a `:` after the fence, or because it is the text of a task item, which is no place for
+/// an include anyway), the error message.
 fn unopened_include<'a>(node: &'a AstNode<'a>) -> Option<String> {
     if !matches!(node.data().value, NodeValue::Paragraph) {
         return None;
@@ -456,6 +461,9 @@ fn unopened_include<'a>(node: &'a AstNode<'a>) -> Option<String> {
     if line.len() - rest.len() < 3 || !(after.is_empty() || after.starts_with(char::is_whitespace))
     {
         return None;
+    }
+    if starts_task_item(node) {
+        return node.parent().map(nested_include);
     }
     Some(if after.contains("://") {
         format!(
@@ -914,7 +922,7 @@ mod tests {
 
     #[test]
     fn every_misuse_is_an_error_at_the_directive() {
-        let cases: [(&str, bool, usize, &str); 17] = [
+        let cases: [(&str, bool, usize, &str); 18] = [
             (
                 "# A\n\n:::include b.md\n:::\n",
                 false,
@@ -974,6 +982,13 @@ mod tests {
             ),
             (
                 "- item\n\n  :::include b.md\n  :::\n",
+                false,
+                3,
+                "not inside a list",
+            ),
+            // comrak opens no directive at the start of a task item's text
+            (
+                "# A\n\n- [ ] :::include b.md\n  :::\n",
                 false,
                 3,
                 "not inside a list",

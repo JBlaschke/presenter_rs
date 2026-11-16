@@ -67,6 +67,16 @@ publishes that section as the GitHub Release notes (see
   build does. It took everything up to the first `---` after line 2, often a slide
   separator, for front matter: it reported none of the `---`/`--` lines up to there, and
   could report one after it that starts a slide as one inside a directive.
+- An HTML block or code block at the end of the last item of a list, right before the `:::`
+  of a directive around the list, keeps its content, such as `- <img src="a.png"
+  width="200">` as a column's last line, or an indented or fenced code sample that ends a
+  list. comrak leaves such a block unfinished and empty. It rendered as an empty item or
+  an empty code block, without a warning, and `check` did not see the image in it.
+- A `:::name` line right after a task item's checkbox (`- [ ] :::small`) is reported as
+  what it is: comrak reads it as the item's text, since a directive cannot start that text,
+  and the warning says to start the directive on the next line. It used to blame a `:`
+  after the fence that was not there. A `- [ ] :::include` line is an error that says an
+  include cannot be in a list.
 
 ## [0.1.1] - 2026-11-02
 

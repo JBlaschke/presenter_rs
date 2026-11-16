@@ -695,8 +695,9 @@ fn is_notes(node: &AstNode<'_>) -> bool {
 
 /// Pass 3: a paragraph whose text starts with `:::name` (or pandoc's `::: {.name …}`) is a
 /// directive comrak did not open (module docs): an `invalid-directive` warning on its first
-/// line, which names the fix (`&#58;` for a colon; no closing `:::` after a pandoc block)
-/// and, for `:::notes`, says that the speaker notes show on the slide.
+/// line, which says why and names the fix (a line of its own for the text of a task item,
+/// `&#58;` for a colon; no closing `:::` after a pandoc block) and, for `:::notes`, says
+/// that the speaker notes show on the slide.
 fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
     for node in doc.descendants() {
         let Some(unopened) = unopened_directive(node) else {
@@ -708,15 +709,23 @@ fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
         } else {
             format!(":::{name} …")
         };
-        let fix = if unopened.closing_colons {
-            "remove the `:::` after the attribute block (pandoc allows it, comrak does not)"
+        let mut message = if starts_task_item(node) {
+            format!(
+                "`{shown}` is not a directive: a directive cannot start the text of a task \
+                 item (comrak reads the rest of the line after the checkbox as text); start \
+                 it on the next line, indented as the item's text"
+            )
         } else {
-            "write the colon as `&#58;`"
+            let fix = if unopened.closing_colons {
+                "remove the `:::` after the attribute block (pandoc allows it, comrak does not)"
+            } else {
+                "write the colon as `&#58;`"
+            };
+            format!(
+                "`{shown}` is not a directive: comrak does not open one when the line has a `:` \
+                 after the fence (a URL, `title=\"a:b\"`); {fix}"
+            )
         };
-        let mut message = format!(
-            "`{shown}` is not a directive: comrak does not open one when the line has a `:` \
-             after the fence (a URL, `title=\"a:b\"`); {fix}"
-        );
         if name == "notes" {
             message.push_str(". Until then the speaker notes in it are shown on the slide");
         }
@@ -726,6 +735,21 @@ fn check_unopened_directives<'a>(doc: &'a AstNode<'a>, ctx: &mut RenderCtx) {
         });
         ctx.diagnostics.warn("invalid-directive", message).span = span;
     }
+}
+
+/// Whether `node` is the paragraph that a task item starts with, on the item's first line:
+/// comrak's tasklist extension takes the `[ ]` (or `[x]`) from the start of the item's text
+/// only after it has read the line, so a `:::` after it opens no directive, and is the text.
+pub(crate) fn starts_task_item<'a>(node: &'a AstNode<'a>) -> bool {
+    let Some(item) = node.parent() else {
+        return false;
+    };
+    matches!(node.data().value, NodeValue::Paragraph)
+        && matches!(item.data().value, NodeValue::TaskItem(_))
+        && item
+            .first_child()
+            .is_some_and(|first| std::ptr::eq(first, node))
+        && node.data().sourcepos.start.line == item.data().sourcepos.start.line
 }
 
 /// A paragraph that starts like a directive comrak did not open (see [`unopened_directive`]).
