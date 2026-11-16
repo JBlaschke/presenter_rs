@@ -286,25 +286,38 @@ outer fences thus pair up as they always have.
 
 A `:::` closes a block wherever it is inside it, also in a code block, so a code block that
 shows a `:::` line inside a block needs a longer fence around it: `::::note`, the code block,
-then `::::`.
+then `::::`. (In a list item, block quote, footnote or definition, this holds for the blocks
+opened in it, below.)
 
-Every block runs to its own closing fence, and a slide's end does not end it. A block
-whose `:::` is missing runs on to the end of the file (or notebook cell), or to the longer
-fence that closes a block around it, and a `---` or slide heading inside it starts no slide;
-presenter warns about the block. A `:::` line with nothing left to close is ignored, with a
-warning: it closes nothing, opens nothing and shows nothing. Such a line is usually one
-`:::` too many, or the `:::` meant for a block that one too many above it closed early.
-Because a block runs to the next `:::` that can close it, a missing `:::` and a `:::` too
-many further on pair up without a warning about either; `presenter check` then warns about
-each `---` inside the block.
+Every block runs to its own closing fence, and a slide's end does not end it. A block whose
+`:::` is missing runs on to the end of the file (or notebook cell), of its list item, quote,
+footnote or definition, or to the longer fence that closes a block around it, and a `---` or
+slide heading inside it starts no slide; presenter warns about the block. A `:::` line with
+nothing left to close is ignored, with a warning: it closes nothing, opens nothing and shows
+nothing. Such a line is usually one `:::` too many, or the `:::` meant for a block that one
+too many above it closed early. Because a block runs to the next `:::` that can close it, a
+missing `:::` and a `:::` too many further on pair up without a warning about either;
+`presenter check` then warns about each `---` inside the block.
 
-Inside a list item, block quote, footnote or definition, a `:::` closes the outermost
-directive it can within it, with everything in it. A `:::` in a list item or definition
-first closes a block around the list (or definition list) when it can, with that list and
-everything in it. Nested directives there need a longer outer fence, and every block around
-a list or definition list with directives in it needs a fence longer than those in it:
-`::::columns` … `::::column` around a list with `:::note` … `:::` in it, then `::::` …
-`::::`.
+List items, block quotes, footnotes and definitions (in description lists) keep their own
+blocks. A `:::` in one closes only a block opened in it, never one around it. A block opened
+in one ends with it at the latest, and presenter warns when that block's `:::` is missing.
+Blocks nest the same way in all of them as anywhere else:
+
+```markdown
+:::column
+- First point
+- Second point, with an aside:
+
+  :::small
+  Measured in 2025.
+  :::
+:::
+```
+
+Markdown's own rules decide which one a line is in. A line indented as far as a list
+item's text is in the item, and a line that starts with `>` is in the quote. The `:::`
+under `Measured in 2025.` closes the `small` block, and the last `:::` closes the column.
 
 Pandoc's form works too: `::: {.fragment .fade-up}` is `:::fragment fade-up`,
 `::: {#intro .note}` adds `id="intro"`, and `::: {.notes}` is `:::notes`.
@@ -629,7 +642,8 @@ It finds, among others:
 - separator lines that did not start a slide, with the reason;
 - empty slides and duplicate slide ids;
 - unknown layouts, unknown slide attributes and attribute blocks it could not read;
-- directive mistakes (a bare `:::` opener, a `:` in the opening line);
+- directive mistakes (a `:::` with nothing to close, a block without its `:::`, a `:` in the
+  opening line);
 - missing images and file names that match only in letter case;
 - front matter that probably swallowed a slide;
 - problems with the theme that would fail the build;

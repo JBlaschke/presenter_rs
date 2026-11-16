@@ -342,8 +342,8 @@ Small.
 }
 
 /// dialect §4 (contract change 2026-11-15): a bare `:::` closes a directive it can close
-/// wherever it is inside it, also in an HTML block, a code block or a list item, as in
-/// comrak, whatever the lengths the dialect gives the fences around it.
+/// wherever it is inside it, also in an HTML block or a code block, as in comrak, whatever
+/// the lengths the dialect gives the fences around it; in a list item, only one opened in it.
 #[test]
 fn a_fence_closes_a_directive_wherever_it_is_inside_it() {
     // after an HTML block, with fences of one length and with a longer outer one
@@ -396,14 +396,66 @@ fn a_fence_closes_a_directive_wherever_it_is_inside_it() {
         );
         assert_eq!(html(&slides[1]), "<p>Next</p>\n", "{text:?}");
     }
-    // in a list item: the `:::` closes the note around the list, although the dialect
-    // makes the note's fence longer than the small's, and the note's own `:::` is ignored
+    // in a list item, a `:::` closes only directives opened in it: this one closes nothing,
+    // so it is ignored, and the note's own `:::` closes the note
     let parsed = parse_text(":::note\n:::small\nx\n:::\n- item\n  :::\n:::\n").unwrap();
-    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 7)]);
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 6)]);
     assert_eq!(
         html(&parsed.deck.slides[0]),
         "<div class=\"note\">\n<div class=\"small\">\n<p>x</p>\n</div>\n\
-         <ul>\n<li>item</li>\n</ul>\n</div>\n"
+         <ul>\n<li>item\n</li>\n</ul>\n</div>\n"
+    );
+}
+
+/// dialect §4 (contract change 2026-11-15): list items, block quotes (also alerts), footnotes
+/// and definitions keep their own directives, which nest there as anywhere else; a directive
+/// opened in one ends with it at the latest, with a warning when its `:::` is missing.
+#[test]
+fn directives_nest_in_containers_as_anywhere_else() {
+    for (text, expected, warned) in [
+        (
+            ":::column\n- First point\n- Second point, with an aside:\n\n  :::small\n  Measured in 2025.\n  :::\n:::\n",
+            "<div class=\"column\"><ul><li><p>First point</p></li><li><p>Second point, with an aside:</p>\
+             <div class=\"small\"><p>Measured in 2025.</p></div></li></ul></div>",
+            vec![],
+        ),
+        (
+            ":::note\n> :::small\n> quoted\n> :::\n:::\n",
+            "<div class=\"note\"><blockquote><div class=\"small\"><p>quoted</p></div></blockquote></div>",
+            vec![],
+        ),
+        (
+            ":::note\n> [!TIP]\n> :::small\n> x\n> :::\n:::\n",
+            "<div class=\"note\"><div class=\"markdown-alert markdown-alert-tip\">\
+             <p class=\"markdown-alert-title\">Tip</p><div class=\"small\"><p>x</p></div></div></div>",
+            vec![],
+        ),
+        (
+            "Term\n\n: :::small\n  x\n  :::\n",
+            "<dl><dt>Term</dt><dd><div class=\"small\"><p>x</p></div></dd></dl>",
+            vec![],
+        ),
+        (
+            "Text[^1]\n\n[^1]: :::small\n    x\n    :::\n",
+            "<li id=\"fn-1\"><div class=\"small\"><p>x</p></div>",
+            vec![],
+        ),
+        (
+            "- :::small\n  x\n- y\n",
+            "<ul><li><div class=\"small\"><p>x</p></div></li><li>y</li></ul>",
+            vec![("invalid-directive", 1)],
+        ),
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert_eq!(codes(&parsed.diagnostics), warned, "{text:?}");
+        let got = html(&parsed.deck.slides[0]).replace('\n', "");
+        assert!(got.contains(expected), "{text:?}\n{got}");
+    }
+    let parsed = parse_text("- :::small\n  x\n- y\n").unwrap();
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.contains("no closing fence in the list item it is in"),
+        "{message}"
     );
 }
 
@@ -481,9 +533,9 @@ fn an_ignored_line_in_notes_is_reported_with_its_reason() {
             "cannot close the `notes` directive around it, whose fence is longer",
         ),
         (
-            "# S\n\n:::notes\n- a\n\n  :::small\n  x\n  :::\n- b\n:::\n",
-            10,
-            "in the list at the end of the `notes` directive above closed it",
+            "# S\n\n:::notes\n> Say this.\n> :::\n:::\n",
+            5,
+            "cannot close the `notes` directive around the block quote it is in",
         ),
         (
             "# S\n\n:::notes\n- item\n- :::\n:::\n",
