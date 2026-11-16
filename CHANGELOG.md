@@ -17,20 +17,23 @@ publishes that section as the GitHub Release notes (see
   fence. `:::small` inside a `:::column` inside `::::columns` now works: before, the `:::`
   that closed the `small` closed its column too, and the column's own `:::` opened an empty
   block that took in everything up to the next `:::` line, such as the next column. Decks
-  with a longer fence at every level of nesting read as before. A deck that let one `:::`
+  with a longer fence at every level of nesting read as before, unless a `:::` in a list
+  item or definition closed a directive around the list (below). A deck that let one `:::`
   close two directives now leaves the outer one open, with a warning, so write the missing
-  `:::`. Inside a list item, block quote, footnote or definition, nested directives still
-  need a longer outer fence.
+  `:::`. The same rule holds inside a list item, block quote, footnote or definition, and
+  each keeps its own directives. A `:::` in one closes only a directive opened in it, never
+  one around it, so it no longer closes a directive around a list along with the list. A
+  directive opened in one ends with it, with a warning when its `:::` is missing there.
 - A `:::` line with nothing left to close is ignored, with an `invalid-directive` warning
   that says why: the directive around it has a longer fence, the line is indented too far or
   followed by white space other than a space or tab (such as a no-break space or `&#32;`), it
-  is in a list item, block quote or definition inside that directive, a `:::` in a list item
-  or definition may have closed an outer directive, or there is a `:::` too many. Before, it
-  opened an empty block that ran to the next `:::` line, and `---` lines in it started no
-  slides.
+  is in a list item, block quote, footnote or definition where no directive is left open
+  (it never closes one around it), or there is a `:::` too many. Before, it opened an empty
+  block that ran to the next `:::` line, and `---` lines in it started no slides.
 - A directive runs to its own closing fence, also past the end of its slide. One without a
-  `:::` of its own is an `invalid-directive` warning, which says whether a longer fence that
-  closes a directive around it ends it, or the end of the deck (or notebook cell).
+  `:::` of its own is an `invalid-directive` warning, which says what ends it: a longer fence
+  that closes a directive around it, the end of its list item, block quote, footnote or
+  definition, or the end of the deck (or notebook cell).
 
 ### Added
 - The default theme styles `:::callout` blocks: a tinted box like an alert's that holds any

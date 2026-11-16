@@ -65,9 +65,9 @@
 //!      [`report_ignored_fences`], which `nesting` calls once the document is parsed, makes
 //!      it an `invalid-directive` warning that says why the line closes nothing: the
 //!      directive around it has a longer fence, the line is indented too far, something
-//!      follows the colons, the line is in a list item, block quote or definition inside that
-//!      directive, a `:::` in a list item or definition may have closed the directive above,
-//!      or there is a `:::` too many. A directive without a name that comrak still opens
+//!      follows the colons, the line is in a list item, block quote, footnote or definition
+//!      and cannot close a directive around it (a `:::` there closes only directives opened in
+//!      it), or there is a `:::` too many. A directive without a name that comrak still opens
 //!      (the text left as it was) is reported the same way, and its contents are written
 //!      without a `<div>`;
 //!    - `CodeBlock` (§5): [`render_code_block`](crate::markdown::code::render_code_block);
@@ -123,7 +123,7 @@ use crate::markdown::code::{
     code_attrs, push_attr, render_code_block_with, strip_trailing_newline,
 };
 use crate::markdown::compat::is_invisible;
-use crate::markdown::nesting::{IgnoredFence, as_written, is_marker, renest_directives};
+use crate::markdown::nesting::{IgnoredFence, Kind, as_written, is_marker, renest_directives};
 use crate::markdown::recover::{fence_attrs, recover_attr_blocks, unparsed};
 use crate::markdown::split::{first_heading_text, lift_heading_attrs};
 
@@ -1486,8 +1486,14 @@ fn write_directive<'a>(
 /// directives without a name that comrak still opens where the text was left as it was.
 /// Reported for the whole text at once, so that each warning sees the directives and
 /// containers around its line, also in speaker notes and on slides that are never rendered
-/// (an `:::include` slide).
-pub(crate) fn report_ignored_fences<'a>(root: &'a AstNode<'a>, diagnostics: &mut Diagnostics) {
+/// (an `:::include` slide). `around_footnote` gives the label of the innermost directive
+/// around a footnote definition of `root` (which comrak may have moved to the end of the
+/// document), if any.
+pub(crate) fn report_ignored_fences<'a>(
+    root: &'a AstNode<'a>,
+    diagnostics: &mut Diagnostics,
+    around_footnote: &mut dyn FnMut(&'a AstNode<'a>) -> Option<String>,
+) {
     for node in root.descendants() {
         let fence = match &node.data().value {
             NodeValue::HtmlBlock(block) => IgnoredFence::from_html(&block.literal),
@@ -1504,7 +1510,7 @@ pub(crate) fn report_ignored_fences<'a>(root: &'a AstNode<'a>, diagnostics: &mut
             _ => None,
         };
         if let Some(fence) = fence {
-            report_ignored_fence(diagnostics, node, fence);
+            report_ignored_fence(diagnostics, node, fence, around_footnote);
         }
     }
 }
@@ -1520,6 +1526,7 @@ fn report_ignored_fence<'a>(
     diagnostics: &mut Diagnostics,
     node: &'a AstNode<'a>,
     fence: IgnoredFence,
+    around_footnote: &mut dyn FnMut(&'a AstNode<'a>) -> Option<String>,
 ) {
     let after_unopened = node
         .preceding_siblings()
@@ -1534,7 +1541,7 @@ fn report_ignored_fence<'a>(
     let message = if fence.odd {
         odd_fence_message()
     } else {
-        ignored_fence_message(node, fence)
+        ignored_fence_message(node, fence, around_footnote)
     };
     diagnostics.warn("invalid-directive", message).span = node_span(node).map(|span| SourceSpan {
         end_line: span.start_line,
@@ -1546,79 +1553,73 @@ fn report_ignored_fence<'a>(
 /// [`report_ignored_fence`]): that it is ignored, then why it closes nothing (dialect §4).
 /// The tree's fence lengths are those written ([`as_written`]), and a line followed by
 /// something that reads as nothing has its own warning ([`odd_fence_message`]). So the line
-/// cannot close the directive right around it only when that one's fence is longer, or when
-/// the line is indented 4 columns or more where that directive's closing fence is looked for
-/// (comrak looks before it strips the directive's own indentation): the dialect would have
-/// closed it otherwise. It cannot close a directive around the list item, block quote or
-/// definition it is in when it follows a marker, is indented too far or is too short (a
-/// footnote is never inside a directive here: comrak moves footnote definitions to the end of
-/// the document). Inside such a container, a `:::` closes the outermost directive it can, and
-/// a `:::` in a list item or definition can close a directive around the list.
-/// Otherwise there is a `:::` too many, perhaps after a `:::` in a list item or definition
-/// closed the directive it was meant for ([`list_closed_hint`]). The message names no lines:
-/// in a notebook cell they would be the cell's own.
-fn ignored_fence_message<'a>(node: &'a AstNode<'a>, fence: IgnoredFence) -> String {
+/// cannot close the directive right around it in its list item, block quote, footnote or
+/// definition (or the document) only when that one's fence is longer, or when the line is
+/// indented 4 columns or more where that directive's closing fence is looked for (comrak
+/// looks before it strips the directive's own indentation): the dialect would have closed it
+/// otherwise. A directive around the container it is in it never closes (a footnote
+/// definition, which comrak moves to the end of the document, is in the directives its lines
+/// are in, which `around_footnote` names). Otherwise there is a `:::` too many. The message
+/// names no lines: in a notebook cell they would be the cell's own.
+fn ignored_fence_message<'a>(
+    node: &'a AstNode<'a>,
+    fence: IgnoredFence,
+    around_footnote: &mut dyn FnMut(&'a AstNode<'a>) -> Option<String>,
+) -> String {
     let (own_length, own_offset) = (fence.colons, fence.offset);
-    // the innermost container the line is in; the innermost directive around the line
-    // (label, fence length and indentation), and whether that container is inside it
+    // the innermost container the line is in; the innermost directive around the line in
+    // it (label, fence length and indentation), else the innermost one around the container
     let mut container = None;
     let mut around = None;
+    let mut outer = None;
     for ancestor in node.ancestors().skip(1) {
         match &ancestor.data().value {
             NodeValue::Document => break,
+            // comrak may have moved the footnote definition out of the blocks it is in, to the
+            // end of the document
+            NodeValue::FootnoteDefinition(_) => {
+                container.get_or_insert(Kind::Footnote.name());
+                if around.is_none() && outer.is_none() {
+                    outer = around_footnote(ancestor);
+                }
+                break;
+            }
             NodeValue::BlockDirective(directive) => {
-                if around.is_none() {
-                    around = Some((
-                        directive_label(&directive.info),
-                        directive.fence_length,
-                        directive.fence_offset,
-                        container.is_some(),
-                    ));
+                let label = directive_label(&directive.info);
+                if container.is_none() {
+                    around.get_or_insert((label, directive.fence_length, directive.fence_offset));
+                } else if around.is_none() {
+                    outer.get_or_insert(label);
                 }
             }
             value => {
-                container.get_or_insert(container_name(value));
+                if container.is_none() {
+                    container = Kind::of(value).map(Kind::name);
+                }
             }
         }
     }
     let mut message = "this `:::` line closes no directive, so it is ignored.".to_string();
-    let mut hedged = false;
-    if let Some(kind) = container {
-        message.push_str(&format!(
-            " In a {kind}, a `:::` meant for an inner directive can close an outer one, with \
-             everything in it (nested directives there need longer outer fences, e.g. \
-             `::::columns` … `:::column` … `:::` … `::::`)."
-        ));
-        hedged = true;
-    }
-    let reason = match (&around, container) {
-        (Some((.., true)), Some(kind)) => Some(format!(
-            "around the {kind} it is in: a fence that closes it there must not follow a `>` or \
-             another marker, nor be indented by 4 columns or more, and needs at least as many \
-             colons as its opening fence"
+    let reason = match &around {
+        Some((label, _, offset)) if offset + own_offset >= 4 => Some(format!(
+            " It cannot close the {label} around it: this line is indented by 4 columns or \
+             more where that directive's closing fence is looked for, and a closing fence may \
+             be indented by 3 at most."
         )),
-        (Some((_, _, offset, _)), _) if offset + own_offset >= 4 => Some(
-            "around it: this line is indented by 4 columns or more where that directive's \
-             closing fence is looked for, and a closing fence may be indented by 3 at most"
-                .to_string(),
-        ),
-        (Some((_, length, _, _)), _) if *length > own_length => Some(
-            "around it, whose fence is longer: a closing fence needs at least as many colons \
-             as its opening fence"
-                .to_string(),
-        ),
-        _ => None,
+        Some((label, length, _)) if *length > own_length => Some(format!(
+            " It cannot close the {label} around it, whose fence is longer: a closing fence \
+             needs at least as many colons as its opening fence."
+        )),
+        Some(_) => None,
+        None => container.zip(outer).map(|(kind, label)| {
+            format!(
+                " It cannot close the {label} around the {kind} it is in: a `:::` in a {kind} \
+                 closes only directives opened in it."
+            )
+        }),
     };
-    if let (Some((label, ..)), Some(reason)) = (&around, reason) {
-        message.push_str(&format!(" It cannot close the {label} {reason}."));
-        hedged = true;
-    } else if around.is_none()
-        && container.is_none()
-        && let Some(hint) = list_closed_hint(node)
-    {
-        message.push_str(&hint);
-        hedged = true;
-    }
+    let hedged = reason.is_some();
+    message.push_str(&reason.unwrap_or_default());
     message.push_str(if hedged {
         " Otherwise, there is"
     } else {
@@ -1629,22 +1630,6 @@ fn ignored_fence_message<'a>(node: &'a AstNode<'a>, fence: IgnoredFence) -> Stri
          was meant for.",
     );
     message
-}
-
-/// What an author calls the container block `value` in a warning.
-fn container_name(value: &NodeValue) -> &'static str {
-    match value {
-        NodeValue::List(_) | NodeValue::Item(_) | NodeValue::TaskItem(_) => "list item",
-        NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) | NodeValue::Alert(_) => {
-            "block quote"
-        }
-        NodeValue::FootnoteDefinition(_) => "footnote",
-        NodeValue::DescriptionList
-        | NodeValue::DescriptionItem(_)
-        | NodeValue::DescriptionTerm
-        | NodeValue::DescriptionDetails => "definition",
-        _ => "block",
-    }
 }
 
 /// How a warning names the directive with `info`: by its name, by its attributes for a
@@ -1658,135 +1643,6 @@ pub(crate) fn directive_label(info: &str) -> String {
     } else {
         "unnamed directive".to_string()
     }
-}
-
-/// The hint for `node`, a `:::` too many outside every directive and container, when a named
-/// directive above it among its siblings ends with a list or definition list, or has a
-/// named directive that does nested in it through named directives: a `:::` in a list item
-/// or definition closes the directive it closes with the list, which therefore ends that
-/// directive (what follows it goes to the directive around it). Such a `:::` may have closed
-/// that directive or one around it, and the line was meant for one of those. Every
-/// directive around the list needs a fence longer than those in the list. The example gives
-/// each one colon more than the longest fence among them and the directives in the list
-/// (the lengths written, see [`renest_directives`]), since a `:::` that closed one of them is
-/// at least as long as that one, and one meant for a directive in the list most likely as
-/// long as that one.
-///
-/// A `:::` meant for a directive in the list closes that one with the list, so the list
-/// that had such a line holds a directive. Of the directives that end with a list in the
-/// siblings (nearest first, and in each the last in the text first), the hint therefore
-/// names the first whose list holds a directive, and when none does, the first one in the
-/// nearest sibling that has one. A list without a directive is often no culprit: after a
-/// `:::` in an item that is not the last closed a nested directive with the list, the
-/// later items are a new list at the end of the directive around it. It never names one in
-/// a list item, block quote or other container of theirs (a `:::` in a list there closes
-/// nothing outside that container), nor one inside a directive without a name (a `:::`
-/// line comrak still reads as opening one, see [`write_directive`]). Only the siblings since
-/// the last ignored `:::` line (or directive without a name) are looked at, so that each is
-/// looked at for one line at most, and each list once: the warnings take time linear in the
-/// length of the text.
-fn list_closed_hint<'a>(node: &'a AstNode<'a>) -> Option<String> {
-    let is_named = |node: &'a AstNode<'a>| {
-        matches!(&node.data().value,
-            NodeValue::BlockDirective(directive) if !directive.info.trim().is_empty())
-    };
-    let is_directive =
-        |node: &'a AstNode<'a>| matches!(node.data().value, NodeValue::BlockDirective(_));
-    // of `sibling` and the named directives nested in it through named directives, the last
-    // in the text whose list holds a directive, and the last that ends with a list: depth
-    // first, the last child first (a stack, since directives may nest as deep as the text
-    // is long)
-    let ends_with_list = |sibling: &'a AstNode<'a>| {
-        let mut stack = vec![sibling];
-        let mut first = None;
-        while let Some(directive) = stack.pop() {
-            if !is_named(directive) {
-                continue;
-            }
-            if let Some(list) = directive.last_child().filter(|last| {
-                matches!(
-                    last.data().value,
-                    NodeValue::List(_) | NodeValue::DescriptionList
-                )
-            }) {
-                if list.descendants().any(is_directive) {
-                    return (Some(directive), first);
-                }
-                first.get_or_insert(directive);
-            }
-            stack.extend(directive.children().filter(|&child| is_directive(child)));
-        }
-        (None, first)
-    };
-    let mut fallback = None;
-    let inner = node
-        .preceding_siblings()
-        .skip(1)
-        .filter(|&sibling| is_directive(sibling) || is_marker(sibling))
-        .take_while(|&sibling| is_named(sibling))
-        .find_map(|sibling| {
-            let (holding, first) = ends_with_list(sibling);
-            fallback = fallback.or(first);
-            holding
-        })
-        .or(fallback)?;
-    let list = inner.last_child()?;
-    let (list_kind, item_kind) = match list.data().value {
-        NodeValue::DescriptionList => ("definition list", "definition"),
-        _ => ("list", "list item"),
-    };
-    // the directives around the list, outermost first, as an opening fence would name
-    // them (a pandoc block without a class by its attributes), and their fence lengths
-    let mut around: Vec<(String, usize)> = inner
-        .ancestors()
-        .map_while(|ancestor| match &ancestor.data().value {
-            NodeValue::BlockDirective(directive) => {
-                let name = directive_info(&directive.info).name;
-                let name = if name.is_empty() {
-                    format!(" {}", directive.info.trim())
-                } else {
-                    name
-                };
-                Some((name, directive.fence_length))
-            }
-            _ => None,
-        })
-        .collect();
-    around.reverse();
-    // a fence that closed one of them is at least as long as it
-    let longest = list
-        .descendants()
-        .filter_map(|n| match &n.data().value {
-            NodeValue::BlockDirective(directive) => Some(directive.fence_length),
-            _ => None,
-        })
-        .chain(around.iter().map(|(_, length)| *length))
-        .fold(3, usize::max);
-    let colons = ":".repeat(longest + 1);
-    let example = around
-        .iter()
-        .map(|(name, _)| format!("`{colons}{name}`"))
-        .chain(around.iter().map(|_| format!("`{colons}`")))
-        .collect::<Vec<_>>()
-        .join(" … ");
-    let label = match &inner.data().value {
-        NodeValue::BlockDirective(directive) => directive_label(&directive.info),
-        _ => return None,
-    };
-    let (closed, advice) = if around.len() == 1 {
-        ("it", format!("Give the {label} a fence"))
-    } else {
-        (
-            "it or a directive around it",
-            format!("Give every directive around the {list_kind} a fence"),
-        )
-    };
-    Some(format!(
-        " If a `:::` line in the {list_kind} at the end of the {label} above closed {closed}, \
-         that line was meant for something in the {list_kind}: a `:::` in a {item_kind} closes \
-         a directive around the {list_kind} when it can, with the {list_kind} and everything \
-         in it. {advice} longer than those in the {list_kind} (e.g. {example})."
-    ))
 }
 
 /// The warning for a `:::` line followed only by white space other than spaces and tabs
@@ -3066,23 +2922,28 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
             "{}",
             messages[0]
         );
-        // fences of one length in a list item
+        // fences of one length in a list item nest as at the top
         let messages = message_of(
             "- item\n\n  :::columns\n  :::column\n  A\n  :::\n  :::column\n  B\n  :::\n  :::\n",
         );
-        assert_eq!(messages.len(), 1, "{messages:?}");
-        assert!(messages[0].contains("In a list item"), "{}", messages[0]);
-        assert!(!messages[0].contains("cannot close"), "{}", messages[0]);
-        // a `:::` in a block quote, or indented by 4 columns in a list item, closes no
-        // directive around them, whatever its length
+        assert_eq!(messages, Vec::<String>::new());
+        // a `:::` in a block quote or a list item closes no directive around them, whatever
+        // its length
         for (text, kind) in [
             (":::note\n> :::\n:::\n", "block quote"),
             (":::note\n1.  item\n\n    :::\n:::\n", "list item"),
+            (":::note\n- item\n\n  :::\n:::\n", "list item"),
+            (":::note\n- item\n  :::\n:::\n", "list item"),
+            (":::note\nTerm\n: Text\n\n  :::\n:::\n", "definition"),
         ] {
             let messages = message_of(text);
-            assert_eq!(messages.len(), 1, "{messages:?}");
-            let expected = format!("cannot close the `note` directive around the {kind} it is in");
-            assert!(messages[0].contains(&expected), "{}", messages[0]);
+            assert_eq!(messages.len(), 1, "{text:?}: {messages:?}");
+            let expected = format!(
+                "It cannot close the `note` directive around the {kind} it is in: a `:::` in a \
+                 {kind} closes only directives opened in it. Otherwise, there is one `:::` too \
+                 many"
+            );
+            assert!(messages[0].contains(&expected), "{text:?}: {}", messages[0]);
             assert!(
                 !messages[0].contains("whose fence is longer"),
                 "{}",
@@ -3139,178 +3000,127 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
                 );
             }
         }
-        // in a list item, the `:::` is ignored all the same
-        let messages = message_of("- item\n\n  :::\n\nAfter the list.\n");
-        assert_eq!(messages.len(), 1, "{messages:?}");
-        for expected in ["closes no directive, so it is ignored", "In a list item"] {
-            assert!(messages[0].contains(expected), "{}", messages[0]);
-        }
-        assert!(!messages[0].contains("end of"), "{}", messages[0]);
-        // a `:::` in a list item inside a directive whose fence the rewrite makes longer
-        // closes it, as one in a list item does where the fences are as written: the
-        // directive's own `:::` is then the one ignored
-        let messages = message_of(":::note\n:::small\nx\n:::\n- item\n  :::\n:::\n");
-        assert_eq!(messages.len(), 1, "{messages:?}");
-        let expected = "If a `:::` line in the list at the end of the `note` directive above \
-                        closed it";
-        assert!(messages[0].contains(expected), "{}", messages[0]);
-        // not where the fence written is longer, nor in a block quote
+        // in a container with no directive around, the `:::` is one too many, as at the top
         for text in [
-            "::::note\n:::small\nx\n:::\n- item\n  :::\n::::\n",
-            ":::note\n> :::\n:::\n",
+            "- item\n\n  :::\n\nAfter the list.\n",
+            "> :::\n",
+            "Text[^1]\n\n[^1]: Note\n    :::\n",
         ] {
             let messages = message_of(text);
             assert_eq!(messages.len(), 1, "{text:?}: {messages:?}");
-            assert!(
-                messages[0].contains("cannot close the `note`"),
-                "{}",
-                messages[0]
-            );
+            let expected = "closes no directive, so it is ignored. There is one `:::` too many";
+            assert!(messages[0].contains(expected), "{text:?}: {}", messages[0]);
         }
+        // a footnote is in the directive its lines are in, though comrak moves it out
+        for text in [
+            ":::note\nText[^1]\n\n[^1]: Note\n    :::\n:::\n",
+            ":::note\n- Item[^1]\n\n  [^1]: Note\n      :::\n:::\n",
+        ] {
+            let messages = message_of(text);
+            assert_eq!(messages.len(), 1, "{text:?}: {messages:?}");
+            let expected = "It cannot close the `note` directive around the footnote it is in: \
+                            a `:::` in a footnote closes only directives opened in it.";
+            assert!(messages[0].contains(expected), "{text:?}: {}", messages[0]);
+        }
+        let messages = message_of(":::note\nText[^1]\n:::\n\n[^1]: Note\n    :::\n");
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(!messages[0].contains("cannot close"), "{}", messages[0]);
+        // nor in a directive of a list item before it, whose lines comrak may count up to the
+        // footnote's first line; a directive around both is named
+        let messages = message_of("Text[^1]\n\n- :::warn\n  x\n\n[^1]: Note\n    :::\n");
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("cannot close")),
+            "{messages:?}"
+        );
+        let messages =
+            message_of(":::note\nText[^1]\n\n- :::warn\n  x\n\n[^1]: Note\n    :::\n:::\n");
+        let expected = "It cannot close the `note` directive around the footnote it is in";
+        assert!(
+            messages.iter().any(|message| message.contains(expected)),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().all(|message| !message.contains("`warn`")),
+            "{messages:?}"
+        );
+        // and in the directive of the list item the footnote is in
+        let messages = message_of("Text[^1]\n\n- :::note\n  [^1]: Note\n      :::\n  :::\n");
+        assert!(
+            messages.iter().any(|message| message
+                .contains("It cannot close the `note` directive around the footnote it is in")),
+            "{messages:?}"
+        );
+        // not where the fence written is longer
+        let messages = message_of("::::note\n:::small\nx\n:::\n- item\n  :::\n::::\n");
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("cannot close the `note` directive around the list item"),
+            "{}",
+            messages[0]
+        );
         // a pandoc block without a class is named by its attributes
         let messages = message_of(":::: {#intro}\nA\n:::\n::::\n");
         assert_eq!(messages.len(), 1, "{messages:?}");
         let expected = "cannot close the `{#intro}` directive around it, whose fence is longer";
         assert!(messages[0].contains(expected), "{}", messages[0]);
-        // a `:::` in a list item closed the directive around the list, or one around that:
-        // every directive around the list needs a fence longer than the fences in it
-        for (text, expected) in [
-            (
-                ":::note\n- item\n\n  :::small\n  text\n  :::\n- item 2\n:::\n",
-                "If a `:::` line in the list at the end of the `note` directive above closed \
-                 it, that line was meant for something in the list: a `:::` in a list item \
-                 closes a directive around the list when it can, with the list and everything \
-                 in it. Give the `note` directive a fence longer than those in the list (e.g. \
-                 `::::note` … `::::`).",
-            ),
-            (
-                "::::note\n- item\n\n  ::::small\n  text\n  ::::\n::::\n",
-                "(e.g. `:::::note` … `:::::`)",
-            ),
-            (
-                ":::columns\n:::column\n- item\n\n  :::note\n  text\n  :::\n:::\n:::column\n\
-                 Right\n:::\n:::\n",
-                "If a `:::` line in the list at the end of the `column` directive above closed \
-                 it or a directive around it, that line was meant for something in the list: a \
-                 `:::` in a list item closes a directive around the list when it can, with the \
-                 list and everything in it. Give every directive around the list a fence longer \
-                 than those in the list (e.g. `::::columns` … `::::column` … `::::` … `::::`).",
-            ),
-            // the advice to lengthen the inner one only, followed
-            (
-                ":::columns\n::::column\n- item\n\n  :::note\n  text\n  :::\n::::\n:::column\n\
-                 Right\n:::\n:::\n",
-                "(e.g. `:::::columns` … `:::::column` … `:::::` … `:::::`)",
-            ),
-            // a `::::` in the list closed the `::::note` in the `:::a`
-            (
-                ":::a\n::::note\n:::e\nx\n:::\n- item\n  ::::\n::::\n:::\n",
-                "(e.g. `:::::a` … `:::::note` … `:::::` … `:::::`)",
-            ),
-            // what followed the list in the directive it closed went to the one around it
-            (
-                ":::columns\n:::column\n- Point\n\n  :::fragment\n  Detail\n  :::\n\nCaption\n\
-                 :::\n:::column\nRight\n:::\n:::\n",
-                "(e.g. `::::columns` … `::::column` … `::::` … `::::`)",
-            ),
-            (
-                ":::a\n:::b\n:::c\n- x\n\n  :::tip\n  t\n  :::\n:::\nMore b.\n:::\nMore a.\n:::\n",
-                "(e.g. `::::a` … `::::b` … `::::c` … `::::` … `::::` … `::::`)",
-            ),
-            // the later items of the list, a new list in the directive around, hold no
-            // directive and closed nothing
-            (
-                ":::columns\n:::column\n- one\n\n  :::fragment\n  t\n  :::\n- two\n:::\n\
-                 :::column\nRight\n:::\n:::\n",
-                "(e.g. `::::columns` … `::::column` … `::::` … `::::`)",
-            ),
-            // nor did a list without a directive in a sibling after the one whose list did
-            (
-                ":::a\n- one\n  :::tip\n  t\n  :::\n:::b\n:::c\n- plain\n:::\npara\n:::\n:::\n",
-                "the list at the end of the `a` directive above closed it",
-            ),
-            (
-                ":::a\n- one\n  :::tip\n  t\n  :::\n:::b\nTerm\n: Text\n:::\n:::\n",
-                "the list at the end of the `a` directive above closed it",
-            ),
-        ] {
-            let messages = message_of(text);
-            assert!(!messages.is_empty(), "{text:?}");
-            assert!(messages[0].contains(expected), "{text:?}: {}", messages[0]);
-            assert!(
-                messages[0].contains("Otherwise, there is"),
-                "{}",
-                messages[0]
-            );
-        }
-        // the advice works
+        // a `:::` in a list item or definition closes the directive opened in it, never one
+        // around the list: these read as written, with no warning
         for text in [
+            ":::note\n- item\n\n  :::small\n  text\n  :::\n- item 2\n:::\n",
+            "::::note\n- item\n\n  ::::small\n  text\n  ::::\n::::\n",
+            ":::columns\n:::column\n- item\n\n  :::note\n  text\n  :::\n:::\n:::column\nRight\n\
+             :::\n:::\n",
+            ":::a\n::::note\n:::e\nx\n:::\n- item\n  :::tip\n  t\n  :::\n::::\n:::\n",
+            ":::columns\n:::column\n- Point\n\n  :::fragment\n  Detail\n  :::\n\nCaption\n:::\n\
+             :::column\nRight\n:::\n:::\n",
+            ":::a\n:::b\n:::c\n- x\n\n  :::tip\n  t\n  :::\n:::\nMore b.\n:::\nMore a.\n:::\n",
+            ":::columns\n:::column\n- one\n\n  :::fragment\n  t\n  :::\n- two\n:::\n:::column\n\
+             Right\n:::\n:::\n",
+            ":::a\n- one\n  :::tip\n  t\n  :::\n:::b\n:::c\n- plain\n:::\npara\n:::\n:::\n",
+            ":::note\n- a\n\n  :::small\n  - b\n  :::\n:::\n",
+            ":::note\nTerm\n: Text\n\n  :::small\n  N\n  :::\n:::\n",
+            "> :::columns\n> :::column\n> A\n> :::\n> :::\n",
+            // longer outer fences, as before
             "::::note\n- item\n\n  :::small\n  text\n  :::\n- item 2\n::::\n",
-            ":::::note\n- item\n\n  ::::small\n  text\n  ::::\n:::::\n",
             "::::columns\n::::column\n- item\n\n  :::note\n  text\n  :::\n::::\n:::column\n\
              Right\n:::\n::::\n",
-            "::::columns\n::::column\n- Point\n\n  :::fragment\n  Detail\n  :::\n\nCaption\n\
-             ::::\n:::column\nRight\n:::\n::::\n",
-            "::::a\n::::b\n::::c\n- x\n\n  :::tip\n  t\n  :::\n::::\nMore b.\n::::\nMore a.\n\
-             ::::\n",
-            "::::columns\n::::column\n- one\n\n  :::fragment\n  t\n  :::\n- two\n::::\n\
-             :::column\nRight\n:::\n::::\n",
-            "::::a\n- one\n  :::tip\n  t\n  :::\n:::b\n:::c\n- plain\n:::\npara\n:::\n::::\n",
         ] {
             assert_eq!(message_of(text), Vec::<String>::new(), "{text:?}");
         }
-        // not after another ignored line in between, which had the hint
+        // a `:::` too many after the list is one too many
         let messages = message_of(
             ":::note\n- item\n\n  :::small\n  text\n  :::\n- item 2\n:::\n:::\n\nx\n\n:::\n",
         );
-        assert_eq!(messages.len(), 3, "{messages:?}");
-        assert!(messages[0].contains("If a `:::` line"), "{}", messages[0]);
-        for message in &messages[1..] {
-            assert!(!message.contains("If a `:::` line"), "{message}");
-        }
-        // the list at the end of a directive, not one in its list items, has the `:::` that
-        // closed it; a definition's `:::` closes one too
-        for (text, expected) in [
-            (
-                ":::note\n- a\n\n  :::small\n  - b\n  :::\n:::\n",
-                "If a `:::` line in the list at the end of the `note` directive above closed \
-                 it, that line was meant for something in the list: a `:::` in a list item \
-                 closes a directive around the list when it can, with the list and everything \
-                 in it. Give the `note` directive a fence longer than those in the list (e.g. \
-                 `::::note` … `::::`).",
-            ),
-            (
-                ":::note\nTerm\n: Text\n\n  :::small\n  N\n  :::\n:::\n",
-                "If a `:::` line in the definition list at the end of the `note` directive \
-                 above closed it, that line was meant for something in the definition list: a \
-                 `:::` in a definition closes a directive around the definition list when it \
-                 can, with the definition list and everything in it. Give the `note` directive \
-                 a fence longer than those in the definition list (e.g. `::::note` … \
-                 `::::`).",
-            ),
-        ] {
-            let messages = message_of(text);
-            assert_eq!(messages.len(), 1, "{text:?}: {messages:?}");
-            assert!(messages[0].contains(expected), "{text:?}: {}", messages[0]);
-        }
-        for text in [
-            "::::note\n- a\n\n  :::small\n  - b\n  :::\n::::\n",
-            "::::note\nTerm\n: Text\n\n  :::small\n  N\n  :::\n::::\n",
-        ] {
-            assert_eq!(message_of(text), Vec::<String>::new(), "{text:?}");
-        }
-        // the `:::` in the `::::note` is ignored, and the `::::` in the list closes the note
-        let messages = message_of("::::note\n:::\n- a\n  ::::\n:::\n");
         assert_eq!(messages.len(), 2, "{messages:?}");
+        for message in &messages {
+            assert!(
+                message.ends_with(
+                    "ignored. There is one `:::` too many: this line, or one above it that \
+                     closed the directive this line was meant for."
+                ),
+                "{message}"
+            );
+        }
+        // the `:::` in the `::::note` is ignored, the `::::` in the list cannot close the
+        // note around it, and the last `:::` is too short
+        let messages = message_of("::::note\n:::\n- a\n  ::::\n:::\n");
+        assert_eq!(messages.len(), 3, "{messages:?}");
         assert!(
             messages[0].contains("whose fence is longer"),
             "{}",
             messages[0]
         );
         assert!(
-            messages[1].contains("(e.g. `:::::note` … `:::::`)"),
+            messages[1].contains("around the list item it is in"),
             "{}",
             messages[1]
+        );
+        assert!(
+            messages[2].contains("whose fence is longer"),
+            "{}",
+            messages[2]
         );
         // a character reference after the colons, after a container's marker on the line
         for text in [
@@ -3333,12 +3143,7 @@ x <script>var s = '<img src=\"images/missing.png\">';</script> <img src=images/o
             ),
             (
                 "# T {background='#222'}\n\n:::note\n:::small\nx\n:::\n- item\n  :::\n:::\n",
-                "If a `:::` line in the list at the end of the `note` directive above closed it",
-            ),
-            (
-                "# T {background='#222'}\n\n:::columns\n:::column\n- item\n\n  :::note\n  text\n  \
-                 :::\n:::\n:::column\nRight\n:::\n:::\n",
-                "(e.g. `::::columns` … `::::column` … `::::` … `::::`)",
+                "cannot close the `note` directive around the list item it is in",
             ),
         ] {
             let messages = message_of(text);
