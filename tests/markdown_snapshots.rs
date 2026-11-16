@@ -1371,6 +1371,177 @@ fn unopened_directives_name_the_fix() {
     );
 }
 
+/// A `:::name` line whose colons are escaped or written as character references (`\:::small`,
+/// `&#58;::small`) is how an author shows such a line as text. comrak decodes the colons, but
+/// the dialect reads them as typed: no directive comrak did not open, so no warning, and no
+/// misplaced `:::include` either (dialect §4). A bare `:::` after such a line closes nothing,
+/// and has its own warning.
+#[test]
+fn escaped_directive_lines_are_text() {
+    for line in [
+        "\\:::small",
+        "&#58;::small",
+        ":&#58;:small",
+        "&colon;&colon;&colon;small",
+        "\\::: {.small}",
+        "\\:::note title=\"a:b\"",
+        "\\:::include part.md",
+        "&#58;::include part.md",
+    ] {
+        for text in [
+            format!("# T\n\n{line}\n"),
+            format!("# T\n\n> {line}\n"),
+            format!("# T\n\n- [ ] {line}\n"),
+            format!("# T\n\n[a]: https://example.org\n{line}\n"),
+            format!("\u{feff}{line}\n"),
+            format!("\u{feff}- [ ] {line}\n"),
+        ] {
+            let parsed = parse_text(&text).unwrap();
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{text:?}: {:?}",
+                parsed.diagnostics
+            );
+            let html = html(&parsed.deck.slides[0]);
+            assert!(
+                html.contains(":::") && !html.contains("<div"),
+                "{text:?}: {html}"
+            );
+        }
+    }
+    // the same lines with the colons typed are reported, in these places too
+    for text in [
+        "# T\n\n> :::small: x\n",
+        "# T\n\n- [ ] :::small\n",
+        "# T\n\n[a]: https://example.org\n:::small: x\n",
+        "\u{feff}:::small: x\n",
+        "\u{feff}- [ ] :::small\n",
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .map(|d| d.code)
+                .collect::<Vec<_>>(),
+            ["invalid-directive"],
+            "{text:?}"
+        );
+    }
+    let err = parse_text("# T\n\n:::include a:b.md\n").unwrap_err();
+    assert!(err.to_string().contains("`&#58;`"), "{err}");
+    // a `:::` after an escaped line closes nothing and says so; after a line comrak did not
+    // open, it is that line's closing fence, and that line's warning says it all
+    let parsed = parse_text("# T\n\n\\:::small\n\nx\n\n:::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 7)]);
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.starts_with("this `:::` line closes no directive"),
+        "{message}"
+    );
+    let parsed = parse_text("# T\n\n:::small: x\n\nx\n\n:::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 3)]);
+}
+
+/// comrak's tasklist extension takes the checkbox from the start of a task item's text only
+/// after it has read the line, so a `:::name` after it opens no directive. The warning says
+/// so (there is no colon to blame), and as for any directive line comrak does not open, the
+/// `:::` that was meant to close it is not reported again (dialect §4). The fix it names
+/// works.
+#[test]
+fn a_directive_cannot_start_a_task_item() {
+    for (text, line, shown) in [
+        (
+            "# T\n\n:::note\n- [ ] :::small\n  x\n  :::\n:::\n",
+            4,
+            "`:::small …`",
+        ),
+        (
+            "# T\n\n- [x] ::: {.small}\n  x\n  :::\n",
+            3,
+            "`::: {.small …}`",
+        ),
+        (
+            "# T\n\n- [ ] :::notes\n  secret\n  :::\n",
+            3,
+            "`:::notes …`",
+        ),
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert_eq!(
+            codes(&parsed.diagnostics),
+            [("invalid-directive", line)],
+            "{text:?}"
+        );
+        let message = &parsed.diagnostics.iter().next().unwrap().message;
+        assert!(
+            message.starts_with(&format!(
+                "{shown} is not a directive: a directive cannot start the text of a task item"
+            )) && message.contains("start it on the next line, indented as the item's text")
+                && !message.contains("`:`"),
+            "{message}"
+        );
+    }
+    let parsed = parse_text("# T\n\n- [ ] :::notes\n  secret\n  :::\n").unwrap();
+    let message = &parsed.diagnostics.iter().next().unwrap().message;
+    assert!(
+        message.ends_with("the speaker notes in it are shown on the slide"),
+        "{message}"
+    );
+    // a directive on the next line, also after a bare checkbox
+    for text in [
+        "# T\n\n:::note\n- [ ] Task\n  :::small\n  x\n  :::\n:::\n",
+        "# T\n\n:::note\n- [ ]\n  :::small\n  x\n  :::\n:::\n",
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let html = html(&parsed.deck.slides[0]);
+        assert!(
+            html.contains("<div class=\"small\">\n<p>x</p>\n</div>\n</li>"),
+            "{html}"
+        );
+    }
+    // a `:::name` later in the item's text is a directive
+    let parsed = parse_text("# T\n\n- [ ] :::small\n  :::big\n  y\n  :::\n").unwrap();
+    assert_eq!(codes(&parsed.diagnostics), [("invalid-directive", 3)]);
+    assert!(html(&parsed.deck.slides[0]).contains("<div class=\"big\">\n<p>y</p>\n</div>"));
+}
+
+/// An HTML block or code block that ends the last item of a list right before a directive's
+/// closing `:::` keeps its text: comrak 0.56 does not finish the item, and leaves the block
+/// empty. The image in it is an asset like any other.
+#[test]
+fn blocks_that_end_a_list_in_a_directive_keep_their_text() {
+    for (text, shown) in [
+        (
+            ":::column\n- <img src=\"images/ok.png\" width=\"200\">\n:::\n",
+            "<li>\n<img src=\"asset:",
+        ),
+        (
+            ":::columns\n:::column\n- Example:\n\n      cargo run\n\n:::\n:::\n",
+            "<pre><code data-trim>cargo run</code></pre>",
+        ),
+        (
+            ":::note\n- a\n- <details>\n  <summary>More</summary>\n  </details>\n:::\n",
+            "<li>\n<details>\n<summary>More</summary>\n</details>\n</li>",
+        ),
+        (
+            ":::note\n- x\n  ```rust {.big}\n  let a = 1;\n:::\n",
+            "<pre class=\"big\"><code class=\"language-rust\" data-trim>let a = 1;</code></pre>",
+        ),
+        // also when an attribute block is recovered and the text parsed again
+        (
+            "# H {data-background-color='#222'}\n\n:::note\n- <div>x</div>\n:::\n",
+            "<li>\n<div>x</div>\n</li>",
+        ),
+    ] {
+        let parsed = parse_text(text).unwrap();
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let html = html(&parsed.deck.slides[0]);
+        assert!(html.contains(shown), "{text:?}: {html}");
+    }
+}
+
 /// A3 (F22): a deck image found only by letter case is reported (on a case-insensitive
 /// file system; elsewhere it is missing).
 #[test]

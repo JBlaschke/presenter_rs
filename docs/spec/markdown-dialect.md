@@ -231,6 +231,12 @@ container ends with the container at the latest. (comrak lets a `:::` in a list 
 definition close a directive around the list or description list, which closes it with the
 directive; pandoc does the same.)
 
+A list at the end of a directive keeps all its content when the directive's `:::` ends it
+(updated 2026-11-16). comrak 0.56 does not finish the last block of the list's last item
+there, and an HTML block or code block that it does not finish keeps no text (it rendered
+empty: `- <img …>` as a column's last line, or an indented code sample that ends a list).
+The frontend gives such a block the text comrak would have given it, from its lines.
+
 A bare `:::` line closes a directive it can close wherever it is inside it, within its
 container: also in a code block or an HTML block (contract change 2026-11-15; comrak, too,
 looks for closing fences before it looks at what is inside a directive). A code block that
@@ -332,7 +338,11 @@ not consumed by the table above are emitted as `data-<key>="<value>"`.
 
 Directive opening lines may not contain `:` after the fence (comrak 0.56 then does not open a
 directive; T12 warns `invalid-directive`); write `&#58;` instead. comrak resolves backslash
-escapes in the info string, so a value containing `"` must be single-quoted.
+escapes in the info string, so a value containing `"` must be single-quoted. A directive
+cannot start the text of a task item either (`- [ ] :::small`): comrak takes the checkbox
+from the item's text only after it has read the line, so the fence is text (T12 warns
+`invalid-directive`, updated 2026-11-16). Start the directive on the next line, indented as
+the item's text.
 
 > **A3 note (2026-10-09):** pandoc's attribute block is accepted as the info string:
 > `::: {.fragment .fade-up}` is `:::fragment fade-up`, `:::: {.columns}` is `::::columns`,
@@ -346,9 +356,13 @@ escapes in the info string, so a value containing `"` must be single-quoted.
 > an empty `<div>` before, §4). A directive with no closing fence of its own (§4) is an
 > `invalid-directive` warning on its opening line, naming the fence that closes it or the end
 > of its container, the document or the notebook cell. A `:::name …` or `::: {.name …}` line comrak does not open (a `:` after the
-> fence, also pandoc's closing colons `::: {.notes} :::`) is one `invalid-directive` warning
-> naming the fix (`&#58;`, or no closing colons); the bare `:::` that closes it is not reported
-> again.
+> fence, also pandoc's closing colons `::: {.notes} :::`, or the fence right after a task
+> item's checkbox) is one `invalid-directive` warning that says why and names the fix
+> (`&#58;`, no closing colons, or a line of its own); the bare `:::` that closes it is not
+> reported again. Only colons typed as such count (updated 2026-11-16): a line whose fence
+> has a colon escaped or written as a character reference (`\:::small`, `&#58;::small`) is
+> text, which is how a deck shows such a line, so it is not reported, `\:::include` is no
+> include, and a bare `:::` after it is reported on its own.
 
 ## 5. Code blocks
 

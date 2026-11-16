@@ -557,6 +557,52 @@ pub(crate) fn first_text_line<'s, 'a>(node: &'a AstNode<'a>, lines: &[&'s str]) 
     lines.get(first.checked_sub(1)?).copied()
 }
 
+/// A Markdown text split into lines the way comrak numbers them ([`source_lines`]), with the
+/// length of the byte-order mark it starts with, which the lines drop and comrak's columns on
+/// line 1 count. For reading what was typed where comrak's tree holds it decoded.
+#[derive(Debug, Clone, Default)]
+pub struct SourceLines<'s> {
+    /// The lines, by [`source_lines`].
+    pub lines: Vec<&'s str>,
+    /// The length in bytes of the byte-order mark the text starts with (0 without one).
+    pub bom: usize,
+}
+
+impl<'s> SourceLines<'s> {
+    /// Splits `text`, the text a comrak tree was parsed from.
+    pub fn new(text: &'s str) -> Self {
+        let bom = match text.starts_with('\u{feff}') {
+            true => '\u{feff}'.len_utf8(),
+            false => 0,
+        };
+        Self {
+            lines: source_lines(text),
+            bom,
+        }
+    }
+
+    /// Whether the text of paragraph `node`, whose first line comrak decoded to three colons
+    /// or more, has them as typed: three colons at the paragraph's sourcepos column (comrak's
+    /// 1-based byte where the paragraph starts, after the markers of its containers and its
+    /// indentation, and the byte-order mark on line 1). Not when comrak decoded any of the
+    /// three from a character reference or a backslash escape (`&#58;::`, `\:::`), which an
+    /// author writes to show the colons as text. The line is the one the paragraph's own text
+    /// starts on ([`text_lines`]), read from the same column past the spaces and tabs that
+    /// comrak strips from a continuation line. `true` when that line lies outside the lines,
+    /// or the column is not on a character of it: the decoded text is all there is to go by.
+    pub(crate) fn typed_colons<'a>(&self, node: &'a AstNode<'a>) -> bool {
+        let column = node.data().sourcepos.start.column;
+        let (first, _) = text_lines(node, Some(&self.lines));
+        let bom = if first == 1 { self.bom } else { 0 };
+        let typed = first
+            .checked_sub(1)
+            .and_then(|index| self.lines.get(index))
+            .zip(column.checked_sub(1 + bom))
+            .and_then(|(line, at)| line.get(at..));
+        typed.is_none_or(|text| text.trim_start_matches([' ', '\t']).starts_with(":::"))
+    }
+}
+
 /// Splits Markdown source into lines the way comrak numbers them: `\n`, `\r\n` and a lone
 /// `\r` end a line; a leading byte-order mark is dropped.
 pub(crate) fn source_lines(source: &str) -> Vec<&str> {

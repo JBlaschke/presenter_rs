@@ -38,6 +38,7 @@ use comrak::{Arena, Options, parse_document};
 use crate::error::{Diagnostic, Diagnostics};
 use crate::ir::SourceSpan;
 use crate::markdown::attrs::{ElementAttrs, read_element_attrs};
+use crate::markdown::nesting::finish_blocks;
 
 /// Diagnostic code of an attribute block that is left as text although it was meant as
 /// attributes (warning).
@@ -122,7 +123,10 @@ const NOT_READ_THERE: &str = "comrak does not read it in this place, even with e
 /// block that reads as attributes is rewritten in comrak's own syntax, every value
 /// double-quoted (`{."dark" background="#222"}`), the result is parsed again (into `arena`,
 /// with `opts`) and the new root and text are returned; the caller must use both from then
-/// on (the splitter reads separators from the text). Each node must then carry exactly the
+/// on (the splitter reads separators from the text). The code blocks and HTML blocks that
+/// comrak left unfinished in the new tree have their text, as in the tree of
+/// [`renest_directives`](crate::markdown::nesting::renest_directives) ([`finish_blocks`]).
+/// Each node must then carry exactly the
 /// block's attributes; a block for which that is not so is put back as written and
 /// reported, and the text is parsed again without it (at most three times, then
 /// nothing is recovered). Blocks that were meant as attributes but are not read are reported
@@ -144,6 +148,7 @@ pub fn recover_attr_blocks<'a, 't>(
         let new_root = parse_document(arena, &edited, opts);
         let read = read_by_comrak(new_root, &targets);
         if read.iter().all(|&read| read) {
+            finish_blocks(new_root, &edited, opts);
             return (new_root, Cow::Owned(edited));
         }
         let (kept, missed): (Vec<_>, Vec<_>) =

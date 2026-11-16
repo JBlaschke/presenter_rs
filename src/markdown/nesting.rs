@@ -82,7 +82,14 @@
 //!    left ([`mark_strays`], as often as [`attempts`] allows, since a marker frees the `:::`
 //!    that closed the unnamed directive, which may then open one, or lands in a code block
 //!    that directive no longer ends, and gets its text back; when they do not settle, a
-//!    warning says so).
+//!    warning says so);
+//! 6. **unfinished blocks**: when a closing fence ends a directive, comrak 0.56 finishes the
+//!    open blocks in it only down to the first list, so the last block of that list's last
+//!    item stays unfinished. A code block or HTML block gets its text (and a fenced code
+//!    block its info string) only when comrak finishes it, so it would render empty, the
+//!    code or image in it lost without a word. [`finish_blocks`] gives it the text comrak
+//!    would have given it, from the lines it holds (also in the tree that
+//!    [`recover_attr_blocks`](crate::markdown::recover::recover_attr_blocks) parses again).
 //!
 //! Only colons are added to fence lines, and ignored lines are replaced from their colons
 //! on, so every line keeps its number, every container keeps its prefixes, and slide
@@ -99,6 +106,7 @@ use crate::error::Diagnostics;
 use crate::ir::SourceSpan;
 use crate::markdown::recover::split_lines;
 use crate::markdown::render::{directive_label, report_ignored_fences};
+use crate::markdown::split::SourceLines;
 
 /// How many times the text may be parsed again at least and at most (module docs, steps 4
 /// and 5): as often as [`REPARSE_BUDGET`] allows within these bounds. A parse of the
@@ -327,7 +335,9 @@ impl IgnoredFence {
 /// fences and with markers for the `:::` lines it ignores, and its tree, parsed again into
 /// `arena` with `opts`. The caller must use both from then on (the splitter reads
 /// separators from the text). A directive that no fence of its own closes is an
-/// `invalid-directive` warning in `diagnostics`, on its opening line.
+/// `invalid-directive` warning in `diagnostics`, on its opening line. The code blocks and
+/// HTML blocks that comrak left unfinished in the tree it returns have their text
+/// ([`finish_blocks`]).
 ///
 /// The directives of the tree it returns are as written, for the warnings to compare
 /// ([`as_written`], which a caller that parses the text again must apply again): each has
@@ -373,7 +383,9 @@ pub fn renest_directives<'a, 't>(
             _ => None,
         })
     };
-    report_ignored_fences(root, diagnostics, &mut around_footnote);
+    let source = SourceLines::new(&edited);
+    report_ignored_fences(root, &source, diagnostics, &mut around_footnote);
+    finish_blocks(root, &edited, opts);
     (root, edited)
 }
 
@@ -1560,6 +1572,166 @@ fn unfinished_end<'a>(
         child = parent;
     }
     None
+}
+
+/// Gives the code blocks and HTML blocks that comrak 0.56 left unfinished in `root`, a tree
+/// of `text` parsed with `opts`, the text that comrak would have given them (module docs,
+/// step 6). comrak takes a block's text, and a fenced code block's info string, from the
+/// lines it holds only when it finishes the block, and it does not finish the last block of
+/// the last list item of a list at the end of a directive that a closing fence ends
+/// ([`unfinished_end`]): such a block would render empty.
+///
+/// The block gets its lines up to there (as long as they continue the containers it is in),
+/// from where the content of its parent starts on them: as written for an HTML block; for
+/// an indented code block, without its 4 columns of indentation and the blank lines at its
+/// end; for a fenced code block, without the indentation of its fence, and the info string
+/// (and attributes) that comrak reads from its first line.
+pub(crate) fn finish_blocks<'a>(root: &'a AstNode<'a>, text: &str, opts: &Options) {
+    // a block that comrak finished has text, unless it is a fenced code block that holds no
+    // lines: one that a fence closed, or one that has an info string, comrak finished
+    let unfinished: Vec<&'a AstNode<'a>> = root
+        .descendants()
+        .filter(|node| match &node.data().value {
+            NodeValue::HtmlBlock(html) => html.literal.is_empty(),
+            NodeValue::CodeBlock(code) => {
+                code.literal.is_empty() && (!code.fenced || !code.closed && code.info.is_empty())
+            }
+            _ => false,
+        })
+        .collect();
+    if unfinished.is_empty() {
+        return;
+    }
+    let (starts, lines) = text_lines(text);
+    let bom = bom_length(text);
+    let scopes = Scopes::new(root, &lines, bom);
+    // the line ending of line `number`, as comrak adds it to a block
+    let ending = |number: usize| {
+        let index = number - 1;
+        let end = starts.get(index + 1).copied().unwrap_or(text.len());
+        &text[(starts[index] + lines[index].len()).min(end)..end]
+    };
+    for leaf in unfinished {
+        let start = leaf.data().sourcepos.start.line;
+        // the scope the block is in, and the directives and lists between
+        let mut between = Vec::new();
+        let mut up = leaf.parent();
+        let scope = loop {
+            let Some(node) = up else { break None };
+            if let Some(scope) = scopes.id(node) {
+                break Some(scope);
+            }
+            if matches!(node.data().value, NodeValue::Document) {
+                break Some(0);
+            }
+            between.push(node);
+            up = node.parent();
+        };
+        let Some(scope) = scope else { continue };
+        // the lines the block holds, and where its parent's content starts on each
+        let held: Vec<(usize, &str, Cursor)> = (start..=scopes.end(leaf))
+            .map_while(|number| {
+                let line = *lines.get(number - 1)?;
+                let at = scopes.content(scope, number, line)?;
+                let at = between
+                    .iter()
+                    .rev()
+                    .try_fold(at, |at, &node| scopes.prefix(node, number, line, at))?;
+                Some((number, line, at))
+            })
+            .collect();
+        let Some(&(mut last, _, _)) = held.last() else {
+            continue;
+        };
+        let mut literal = String::new();
+        let mut data = leaf.data_mut();
+        let start_column = data.sourcepos.start.column;
+        match &mut data.value {
+            NodeValue::HtmlBlock(html) => {
+                for &(number, line, at) in &held {
+                    let rest = rest(line, at);
+                    if !rest.trim_matches([' ', '\t']).is_empty() {
+                        // it ends on its last line that is not blank, as comrak finishes it
+                        last = number;
+                    }
+                    literal.push_str(&rest);
+                    literal.push_str(ending(number));
+                }
+                html.literal = literal;
+            }
+            NodeValue::CodeBlock(code) if !code.fenced => {
+                for &(number, line, at) in &held {
+                    let (nonspace, indent) = nonspace(line, at);
+                    if indent >= CODE_INDENT {
+                        literal.push_str(&rest(line, advance(line, at, CODE_INDENT)));
+                    } else if nonspace.byte < line.len() {
+                        break;
+                    }
+                    literal.push_str(ending(number));
+                }
+                // without the blank lines at its end, as comrak finishes it
+                let text = literal.trim_end_matches([' ', '\t', '\r', '\n']).len();
+                let cut = literal[text..]
+                    .find(['\r', '\n'])
+                    .map_or(literal.len(), |cut| text + cut);
+                literal.truncate(if text == 0 { 0 } else { cut });
+                literal.push('\n');
+                code.literal = literal;
+            }
+            NodeValue::CodeBlock(code) => {
+                for &(number, line, at) in &held[1..] {
+                    literal.push_str(&rest(line, strip(line, at, code.fence_offset)));
+                    literal.push_str(ending(number));
+                }
+                code.literal = literal;
+                // the info string, as comrak reads it from the opening fence on
+                let opening = start_column
+                    .checked_sub(1 + if start == 1 { bom } else { 0 })
+                    .and_then(|byte| held[0].1.get(byte..));
+                if let Some((info, attrs)) = opening.and_then(|line| fence_info(line, opts)) {
+                    code.info = info;
+                    data.attrs = attrs;
+                }
+            }
+            _ => continue,
+        }
+        if !matches!(&data.value, NodeValue::CodeBlock(code) if !code.fenced) {
+            data.sourcepos.end = (last, lines[last - 1].len().max(1)).into();
+        }
+    }
+}
+
+/// The columns of indentation that make a line an indented code block.
+const CODE_INDENT: usize = 4;
+
+/// The rest of `line` from `at`, as comrak adds it to a block: the columns that are left of
+/// a tab that `at` lies inside are spaces.
+fn rest(line: &str, at: Cursor) -> Cow<'_, str> {
+    let tail = line.get(at.byte..).unwrap_or_default();
+    match tail.strip_prefix('\t') {
+        Some(after) if advance_bytes(line, Cursor::default(), at.byte).column < at.column => {
+            Cow::Owned(" ".repeat(TAB_STOP - at.column % TAB_STOP) + after)
+        }
+        _ => Cow::Borrowed(tail),
+    }
+}
+
+/// The info string and attributes that comrak gives a fenced code block whose opening line
+/// is `line` from its fence on.
+fn fence_info(
+    line: &str,
+    opts: &Options,
+) -> Option<(String, Option<Box<comrak::nodes::Attributes>>)> {
+    let arena = Arena::new();
+    let mut opts = opts.clone();
+    opts.extension.front_matter_delimiter = None;
+    let root = parse_document(&arena, line, &opts);
+    let block = root.first_child()?;
+    let data = block.data();
+    match &data.value {
+        NodeValue::CodeBlock(code) if code.fenced => Some((code.info.clone(), data.attrs.clone())),
+        _ => None,
+    }
 }
 
 /// Where the content of a list item starts on its first line, whose marker is the first byte
@@ -3735,6 +3907,80 @@ Appears on the next click.
                 .contains("It cannot close the `d` directive around the definition it is in")),
             "{warnings:?}"
         );
+    }
+
+    /// The code blocks and HTML blocks of `text` as the dialect reads it, in tree order: kind,
+    /// info string, attributes, text, and how many lines after its first it ends.
+    fn leaf_blocks(text: &str) -> Vec<String> {
+        let arena = Arena::new();
+        let opts = dialect_options();
+        let root = parse_document(&arena, text, &opts);
+        let (root, _) = renest_directives(&arena, root, text, &opts, &mut Diagnostics::new());
+        root.descendants()
+            .filter_map(|node| {
+                let data = node.data();
+                let span = data.sourcepos.end.line - data.sourcepos.start.line;
+                match &data.value {
+                    NodeValue::CodeBlock(code) => Some(format!(
+                        "code {:?} {:?} {:?}{}",
+                        code.info,
+                        data.attrs,
+                        code.literal,
+                        // comrak ends a fenced code block that the end of the text ends
+                        // elsewhere
+                        if code.fenced {
+                            String::new()
+                        } else {
+                            format!(" +{span}")
+                        }
+                    )),
+                    NodeValue::HtmlBlock(html) => Some(format!("html {:?} +{span}", html.literal)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blocks_left_open_at_the_end_of_a_list_item_keep_their_text() {
+        // comrak does not finish the last block of the last item of a list that a
+        // directive's closing fence ends: it has the text it has when the end of the text
+        // ends it
+        for body in [
+            "- <img src=\"a.png\" width=\"200\">\n",
+            "- Example:\n\n      cargo run\n\n",
+            "- a\n- <details>\n  <summary>More</summary>\n  </details>\n",
+            "- x\n  ```rust {.x}\n  let a = 1;\n\n",
+            "- ```py&#32;x \\{\n  a\n",
+            "- x\n   ```\n   a\n    b\n  c\n",
+            "> - <div>\n>   hi\n",
+            ">- <pre>\n>   a\n>\n>    b\n",
+            "- - <div>\n    hi\n",
+            "- > <div>\n  > hi\n",
+            "Term\n: - <div>\n    hi\n",
+            "- :::b\n  <div>\n",
+            "- <pre>\n  a\n\n  b\n\n",
+            "- x\n\n      a  \n      \n\n",
+            "- x\n\n\t  code\n\t\t\tmore\n",
+            "-\t<div>\n\t  hi\n",
+            "1.  <div>\n\t x\n",
+            "- <div>\r\n  hi\r\n",
+            "- <div>\r  hi\r",
+            "[^1]\n\n[^1]: - <div>\n      hi\n",
+        ] {
+            let text = format!(":::a\n{body}:::\n");
+            let blocks = leaf_blocks(&text);
+            assert_eq!(blocks, leaf_blocks(body), "{text:?}");
+            assert!(!blocks.is_empty(), "{text:?}");
+        }
+        // a block that comrak finished keeps what it has
+        for (text, block) in [
+            (":::a\n- ```\n:::\n", "code \"\" None \"\""),
+            (":::a\n- x\n  ```\n  ```\n:::\n", "code \"\" None \"\""),
+            (":::a\n- > ```\n\n:::\n", "code \"\" None \"\""),
+        ] {
+            assert_eq!(leaf_blocks(text), [block], "{text:?}");
+        }
     }
 
     #[test]
