@@ -11,10 +11,16 @@ publishes that section as the GitHub Release notes (see
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
+Directives nest by new rules (under Changed), so a deck written for 0.1 can render
+differently. `presenter check` finds the places: it warns about a directive left without a
+closing `:::` and about a `:::` line that closes nothing.
+
 ### Changed
-- Directives nest with fences of one length, as in pandoc: a closing fence closes, of the
-  open directives whose fence is not longer than its own, the innermost one with the longest
-  fence. `:::small` inside a `:::column` inside `::::columns` now works: before, the `:::`
+- A closing fence closes, of the open directives whose fence is not longer than its own, the
+  innermost one with the longest fence, so directives nest with fences of one length, as in
+  pandoc. `:::small` inside a `:::column` inside `::::columns` now works: before, the `:::`
   that closed the `small` closed its column too, and the column's own `:::` opened an empty
   block that took in everything up to the next `:::` line, such as the next column. Decks
   with a longer fence at every level of nesting read as before, unless a `:::` in a list
